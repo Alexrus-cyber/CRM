@@ -1,0 +1,412 @@
+/**
+ * Dual-database layer: PostgreSQL (primary) + SQLite (portable fallback).
+ *
+ * Selection order:
+ *   1. DB_DIALECT=postgres | sqlite  — explicit choice
+ *   2. otherwise: if DATABASE_URL is reachable -> PostgreSQL, else -> SQLite
+ *
+ * All application code talks to the database through `q` / `q1` (drizzle `sql`
+ * templates), so the exact same SQL source works on both engines: drizzle
+ * serialises the query with the right placeholder style per dialect.
+ */
+import fs from "node:fs";
+import path from "node:path";
+import { sql, type SQL } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
+import { Pool } from "pg";
+import Database from "better-sqlite3";
+
+export type DbDialect = "postgres" | "sqlite";
+
+type Executor = {
+  dialect: DbDialect;
+  label: string;
+  all<T>(query: SQL): Promise<T[]>;
+  exec(statement: string): Promise<void>;
+  ping(): Promise<void>;
+};
+
+const globalForDb = globalThis as typeof globalThis & {
+  __crmDatabase?: Promise<Executor>;
+  __crmPool?: Pool;
+  __crmSqlite?: Database.Database;
+};
+
+/* ------------------------------------------------------------------ */
+/* DDL — kept in sync with src/db/schema.ts (PostgreSQL / drizzle-kit) */
+/* ------------------------------------------------------------------ */
+
+const PG_DDL = [
+  `create table if not exists users (
+    id serial primary key,
+    email text not null unique,
+    password_hash text not null,
+    name text not null,
+    phone text,
+    position text,
+    bio text,
+    role text not null default 'user',
+    avatar_color text not null default '#7c5cff',
+    avatar_url text,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`,
+  `create table if not exists sessions (
+    id serial primary key,
+    token text not null unique,
+    user_id integer not null references users(id) on delete cascade,
+    expires_at timestamptz not null,
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists sessions_user_idx on sessions (user_id)`,
+  `create table if not exists counterparties (
+    id serial primary key,
+    name text not null,
+    phone text,
+    email text,
+    address text,
+    inn text,
+    kpp text,
+    notes text,
+    created_by_id integer references users(id) on delete set null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`,
+  `create table if not exists tasks (
+    id serial primary key,
+    title text not null,
+    description text,
+    assignee_id integer not null references users(id) on delete cascade,
+    author_id integer not null references users(id) on delete cascade,
+    counterparty_id integer references counterparties(id) on delete set null,
+    deadline date not null,
+    deadline_time text,
+    accepted_at timestamptz,
+    hours real not null default 0,
+    status text not null default 'new',
+    priority text not null default 'medium',
+    completed_at timestamptz,
+    closed_at timestamptz,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`,
+  `create index if not exists tasks_assignee_idx on tasks (assignee_id)`,
+  `create index if not exists tasks_author_idx on tasks (author_id)`,
+  `create index if not exists tasks_deadline_idx on tasks (deadline)`,
+  `create table if not exists messages (
+    id serial primary key,
+    sender_id integer not null references users(id) on delete cascade,
+    recipient_id integer references users(id) on delete cascade,
+    content text not null,
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists messages_created_idx on messages (created_at)`,
+  `create table if not exists task_exports (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    task_id integer not null references tasks(id) on delete cascade,
+    created_at timestamptz not null default now()
+  )`,
+  `create unique index if not exists task_exports_user_task_uq on task_exports (user_id, task_id)`,
+];
+
+/**
+ * SQLite schema. ISO-8601 TEXT timestamps keep sorting/comparison identical
+ * to PostgreSQL, so no query has to be dialect-specific.
+ */
+const SQLITE_DDL = [
+  `create table if not exists users (
+    id integer primary key autoincrement,
+    email text not null unique,
+    password_hash text not null,
+    name text not null,
+    phone text,
+    position text,
+    bio text,
+    role text not null default 'user',
+    avatar_color text not null default '#7c5cff',
+    avatar_url text,
+    created_at text not null,
+    updated_at text not null
+  )`,
+  `create table if not exists sessions (
+    id integer primary key autoincrement,
+    token text not null unique,
+    user_id integer not null references users(id) on delete cascade,
+    expires_at text not null,
+    created_at text not null
+  )`,
+  `create index if not exists sessions_user_idx on sessions (user_id)`,
+  `create table if not exists counterparties (
+    id integer primary key autoincrement,
+    name text not null,
+    phone text,
+    email text,
+    address text,
+    inn text,
+    kpp text,
+    notes text,
+    created_by_id integer references users(id) on delete set null,
+    created_at text not null,
+    updated_at text not null
+  )`,
+  `create table if not exists tasks (
+    id integer primary key autoincrement,
+    title text not null,
+    description text,
+    assignee_id integer not null references users(id) on delete cascade,
+    author_id integer not null references users(id) on delete cascade,
+    counterparty_id integer references counterparties(id) on delete set null,
+    deadline text not null,
+    deadline_time text,
+    accepted_at text,
+    hours real not null default 0,
+    status text not null default 'new',
+    priority text not null default 'medium',
+    completed_at text,
+    closed_at text,
+    created_at text not null,
+    updated_at text not null
+  )`,
+  `create index if not exists tasks_assignee_idx on tasks (assignee_id)`,
+  `create index if not exists tasks_author_idx on tasks (author_id)`,
+  `create index if not exists tasks_deadline_idx on tasks (deadline)`,
+  `create table if not exists messages (
+    id integer primary key autoincrement,
+    sender_id integer not null references users(id) on delete cascade,
+    recipient_id integer references users(id) on delete cascade,
+    content text not null,
+    created_at text not null
+  )`,
+  `create index if not exists messages_created_idx on messages (created_at)`,
+  `create table if not exists task_exports (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    task_id integer not null references tasks(id) on delete cascade,
+    created_at text not null
+  )`,
+  `create unique index if not exists task_exports_user_task_uq on task_exports (user_id, task_id)`,
+];
+
+/* ------------------------------------------------------------------ */
+/* Value normalisation (PostgreSQL may return Date / bigint-string)    */
+/* ------------------------------------------------------------------ */
+
+export function toIso(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value.toISOString();
+  const d = new Date(String(value));
+  return Number.isNaN(d.getTime()) ? String(value) : d.toISOString();
+}
+
+export function toYmd(value: unknown): string {
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value ?? "").slice(0, 10);
+}
+
+export function toNum(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+export function nowIso(): string {
+  return new Date().toISOString();
+}
+
+/* ------------------------------------------------------------------ */
+/* Executors                                                           */
+/* ------------------------------------------------------------------ */
+
+function sqliteFile(): string {
+  return process.env.SQLITE_PATH || path.join(process.cwd(), "data", "crm.sqlite");
+}
+
+function sqliteParams(params: unknown[]): unknown[] {
+  return params.map((p) => {
+    if (p === undefined) return null;
+    if (p instanceof Date) return p.toISOString();
+    if (typeof p === "boolean") return p ? 1 : 0;
+    return p;
+  });
+}
+
+async function buildPostgres(): Promise<Executor> {
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) throw new Error("DATABASE_URL is not set");
+  const pool = new Pool({ connectionString, max: 10, connectionTimeoutMillis: 4000 });
+  const db = drizzle(pool);
+  try {
+    await pool.query("select 1");
+  } catch (error) {
+    // Do not leak a half-open pool when we are about to fall back to SQLite.
+    await pool.end().catch(() => undefined);
+    throw error;
+  }
+  globalForDb.__crmPool = pool;
+
+  return {
+    dialect: "postgres",
+    label: "PostgreSQL",
+    async all<T>(query: SQL): Promise<T[]> {
+      const res = await db.execute(query);
+      return res.rows as T[];
+    },
+    async exec(statement: string) {
+      await pool.query(statement);
+    },
+    async ping() {
+      await pool.query("select 1");
+    },
+  };
+}
+
+async function buildSqlite(): Promise<Executor> {
+  const file = sqliteFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const database = new Database(file);
+  database.pragma("journal_mode = WAL");
+  // 50+ concurrent users mostly read; WAL allows readers while one writer runs.
+  // busy_timeout makes writers wait for the lock instead of failing instantly.
+  database.pragma("busy_timeout = 5000");
+  database.pragma("synchronous = NORMAL");
+  database.pragma("foreign_keys = ON");
+  database.pragma("cache_size = -16000");
+  database.pragma("wal_autocheckpoint = 1000");
+  globalForDb.__crmSqlite = database;
+  const dialect = new SQLiteSyncDialect();
+
+  return {
+    dialect: "sqlite",
+    label: "SQLite",
+    async all<T>(query: SQL): Promise<T[]> {
+      const { sql: text, params } = dialect.sqlToQuery(query);
+      const args = sqliteParams(params);
+      // Short retry for SQLITE_BUSY: with several writers this avoids user-facing
+      // 500s when the WAL writer lock is held by another request for a moment.
+      const attempt = <R>(fn: () => R): R => {
+        let lastError: unknown;
+        for (let i = 0; i < 4; i += 1) {
+          try {
+            return fn();
+          } catch (error) {
+            lastError = error;
+            const code = (error as { code?: string }).code ?? "";
+            if (!code.startsWith("SQLITE_BUSY") && !code.startsWith("SQLITE_LOCKED")) break;
+            const until = Date.now() + 50 * (i + 1);
+            while (Date.now() < until) {
+              /* small synchronous backoff, better-sqlite3 has no async lock wait */
+            }
+          }
+        }
+        throw lastError;
+      };
+      const statement = database.prepare(text);
+      // better-sqlite3 requires run() for statements that return no rows
+      // (INSERT/UPDATE/DELETE without RETURNING); all() throws in that case.
+      if (!statement.reader) {
+        attempt(() => statement.run(...args));
+        return [];
+      }
+      return attempt(() => statement.all(...args)) as T[];
+    },
+    async exec(statement: string) {
+      database.exec(statement);
+    },
+    async ping() {
+      database.prepare("select 1").get();
+    },
+  };
+}
+
+async function init(): Promise<Executor> {
+  const requested = (process.env.DB_DIALECT || "").trim().toLowerCase();
+  let executor: Executor;
+
+  if (requested === "sqlite" || requested === "sqlite3") {
+    executor = await buildSqlite();
+  } else if (requested === "postgres" || requested === "postgresql" || requested === "pg") {
+    executor = await buildPostgres();
+  } else {
+    // Auto: prefer PostgreSQL when reachable, otherwise fall back to SQLite.
+    try {
+      executor = await buildPostgres();
+    } catch (error) {
+      console.warn("[db] PostgreSQL is unavailable, using SQLite instead:", (error as Error).message);
+      executor = await buildSqlite();
+    }
+  }
+
+  const ddl = executor.dialect === "postgres" ? PG_DDL : SQLITE_DDL;
+  for (const statement of ddl) {
+    await executor.exec(statement);
+  }
+  await migrateColumns(executor);
+  console.info(`[db] connected: ${executor.label}${executor.dialect === "sqlite" ? ` (${sqliteFile()})` : ""}`);
+  return executor;
+}
+
+/**
+ * Additive migrations for databases created before a column existed.
+ * `add column` cannot be made idempotent in SQLite, so errors about existing
+ * columns are ignored while everything else is re-thrown.
+ */
+async function migrateColumns(executor: Executor): Promise<void> {
+  const timestamp = executor.dialect === "postgres" ? "timestamptz" : "text";
+  const statements = [
+    `alter table tasks add column deadline_time text`,
+    `alter table tasks add column accepted_at ${timestamp}`,
+  ];
+  for (const statement of statements) {
+    try {
+      await executor.exec(statement);
+    } catch (error) {
+      const message = (error as Error).message ?? "";
+      if (!/already exists|duplicate column/i.test(message)) throw error;
+    }
+  }
+}
+
+export function getDb(): Promise<Executor> {
+  if (!globalForDb.__crmDatabase) {
+    globalForDb.__crmDatabase = init().catch((error) => {
+      globalForDb.__crmDatabase = undefined;
+      throw error;
+    });
+  }
+  return globalForDb.__crmDatabase;
+}
+
+/** Run a query and return all rows. Works on both dialects. */
+export async function q<T = Record<string, unknown>>(query: SQL): Promise<T[]> {
+  const db = await getDb();
+  return db.all<T>(query);
+}
+
+/** Run a query and return the first row or null. */
+export async function q1<T = Record<string, unknown>>(query: SQL): Promise<T | null> {
+  const rows = await q<T>(query);
+  return rows[0] ?? null;
+}
+
+export async function getDialect(): Promise<DbDialect> {
+  return (await getDb()).dialect;
+}
+
+export async function getDialectLabel(): Promise<string> {
+  return (await getDb()).label;
+}
+
+export async function getDbInfo(): Promise<{ dialect: DbDialect; label: string; target: string }> {
+  const db = await getDb();
+  return {
+    dialect: db.dialect,
+    label: db.label,
+    target: db.dialect === "sqlite" ? sqliteFile() : "PostgreSQL (DATABASE_URL)",
+  };
+}
+
+export async function pingDb(): Promise<void> {
+  const db = await getDb();
+  await db.ping();
+}
