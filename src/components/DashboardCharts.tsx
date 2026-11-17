@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import {
   Bar,
@@ -22,19 +22,34 @@ import { Button, Input, Select } from "./ui";
 
 const tick = { fill: "var(--muted)", fontSize: 11 };
 
-/** Track the real pixel width of a chart card so axes never squeeze the plot. */
-function useContainerWidth<T extends HTMLDivElement>() {
-  const ref = useRef<T | null>(null);
+/**
+ * Реальная ширина контейнера графика, чтобы оси не сжимали поле.
+ *
+ * Важно: это callback-ref, а не `useEffect` с пустыми зависимостями.
+ * Карточка может сначала показать «Нет данных» (контейнера графика в DOM нет),
+ * а после смены фильтра — данные. С обычным ref эффект в такой ситуации уже
+ * отработал и повторно не запустится: ширина остаётся 0, и `width > 0 &&`
+ * навсегда скрывает график. Callback-ref измеряет заново каждый раз, когда
+ * контейнер появляется в DOM, — графики возвращаются вместе с данными.
+ */
+export function useContainerWidth<T extends HTMLDivElement>() {
   const [width, setWidth] = useState(0);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const update = () => setWidth(el.getBoundingClientRect().width);
-    update();
-    const observer = new ResizeObserver(update);
-    observer.observe(el);
-    return () => observer.disconnect();
+  const observerRef = useRef<ResizeObserver | null>(null);
+
+  const ref = useCallback((node: T | null) => {
+    observerRef.current?.disconnect();
+    observerRef.current = null;
+    if (!node) {
+      setWidth(0);
+      return;
+    }
+    setWidth(node.getBoundingClientRect().width);
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => setWidth(node.getBoundingClientRect().width));
+    observer.observe(node);
+    observerRef.current = observer;
   }, []);
+
   return { ref, width };
 }
 
@@ -49,7 +64,13 @@ export function StatusDonut({ data }: { data: { status: TaskStatus; count: numbe
   const { ref, width } = useContainerWidth();
   const size = Math.max(120, Math.min(208, width || 160));
   const chart = data.filter((d) => d.count > 0).map((d) => ({ name: STATUS_LABELS[d.status], value: d.count, color: STATUS_COLORS[d.status] }));
-  if (total === 0) return <p className="py-10 text-center text-xs text-muted">Нет данных</p>;
+  if (total === 0) {
+    return (
+      <p className="flex min-h-[160px] items-center justify-center py-10 text-center text-xs text-muted sm:min-h-[208px]">
+        Нет данных
+      </p>
+    );
+  }
   return (
     <div className="flex w-full min-w-0 flex-col items-center gap-4 sm:flex-row">
       <div ref={ref} className="relative shrink-0" style={{ width: size, height: size }}>
@@ -83,7 +104,9 @@ export type PersonBar = { name: string; open: number; done: number; overdue?: nu
 
 export function PeopleBars({ data, stacked = true, height = 240 }: { data: PersonBar[]; stacked?: boolean; height?: number }) {
   const { ref, width } = useContainerWidth();
-  if (data.length === 0) return <p className="py-10 text-center text-xs text-muted">Нет данных</p>;
+  if (data.length === 0) {
+    return <p className="flex items-center justify-center py-10 text-center text-xs text-muted" style={{ minHeight: height }}>Нет данных</p>;
+  }
   const h = Math.max(height, data.length * 34 + 40);
   const axisWidth = width === 0 ? 96 : Math.max(56, Math.min(120, Math.round(width * 0.34)));
   const nameLimit = Math.max(6, Math.floor(axisWidth / 6.3));
@@ -107,7 +130,9 @@ export function PeopleBars({ data, stacked = true, height = 240 }: { data: Perso
 
 export function SimpleBars({ data, color = "#a78bfa", name, unit, height = 240 }: { data: { name: string; value: number }[]; color?: string; name: string; unit?: string; height?: number }) {
   const { ref, width } = useContainerWidth();
-  if (data.length === 0) return <p className="py-10 text-center text-xs text-muted">Нет данных</p>;
+  if (data.length === 0) {
+    return <p className="flex items-center justify-center py-10 text-center text-xs text-muted" style={{ minHeight: height }}>Нет данных</p>;
+  }
   const h = Math.max(height, data.length * 34 + 40);
   const axisWidth = width === 0 ? 96 : Math.max(56, Math.min(120, Math.round(width * 0.34)));
   const nameLimit = Math.max(6, Math.floor(axisWidth / 6.3));

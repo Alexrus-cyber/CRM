@@ -28,6 +28,13 @@ type ProgressiveOptions = {
   initial?: number;
   /** Сколько строк добавлять за раз. */
   step?: number;
+  /**
+   * Значение, при изменении которого список начинается заново.
+   * Сюда передаётся «подпись» фильтров: когда данные просто обновились
+   * (живое обновление, повторный рендер), порция сохраняется и список
+   * не сворачивается к первой странице.
+   */
+  resetKey?: string | number | boolean | null;
 };
 
 export type ProgressiveList<T> = {
@@ -48,13 +55,17 @@ export type ProgressiveList<T> = {
  */
 export function useProgressiveList<T>(
   rows: T[],
-  { initial = 24, step = 24 }: ProgressiveOptions = {},
+  { initial = 24, step = 24, resetKey = null }: ProgressiveOptions = {},
 ): ProgressiveList<T> {
-  // Храним вместе набор строк и счётчик догруженных порций: когда набор меняется
-  // (поиск, фильтр, сортировка), порция сбрасывается прямо во время рендера —
-  // лишний проход через эффект не нужен.
-  const [state, setState] = useState<{ rows: T[]; extra: number }>({ rows, extra: 0 });
-  if (state.rows !== rows) setState({ rows, extra: 0 });
+  // Храним «подпись» фильтров вместе со счётчиком догруженных порций: при смене
+  // фильтра/сортировки/поиска порция сбрасывается прямо во время рендера
+  // (лишний проход через эффект не нужен), а при обычном обновлении данных
+  // (живые события, повторный рендер) — сохраняется.
+  const [state, setState] = useState<{ key: ProgressiveOptions["resetKey"]; extra: number }>({
+    key: resetKey,
+    extra: 0,
+  });
+  if (state.key !== resetKey) setState({ key: resetKey, extra: 0 });
 
   const [waiting, setWaiting] = useState(false);
   const [pending, startTransition] = useTransition();

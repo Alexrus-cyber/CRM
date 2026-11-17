@@ -19,6 +19,7 @@ import {
   hashPassword,
   verifyPassword,
 } from "@/lib/auth";
+import { publishLiveEvent } from "@/lib/events";
 import { isAdminRole } from "@/lib/utils";
 
 export type ActionResult = { ok: true; id?: number } | { ok: false; error: string };
@@ -59,6 +60,7 @@ export async function createUserAction(input: CreateUserInput): Promise<ActionRe
     avatarColor: colors[Math.floor(Math.random() * colors.length)],
   });
   revalidatePath("/", "layout");
+  publishLiveEvent("users", me.id);
   return { ok: true, id };
 }
 
@@ -72,6 +74,7 @@ export async function updateUserRoleAction(userId: number, role: Role): Promise<
   if (targetRole === "super_admin") return { ok: false, error: "Нельзя изменить главного админа" };
   await setUserRole(userId, role);
   revalidatePath("/", "layout");
+  publishLiveEvent("users", me.id);
   return { ok: true };
 }
 
@@ -82,6 +85,7 @@ export async function deleteUserAction(userId: number): Promise<ActionResult> {
   if ((await getRole(userId)) === "super_admin") return { ok: false, error: "Нельзя удалить главного админа" };
   await deleteUser(userId);
   revalidatePath("/", "layout");
+  publishLiveEvent("users", me.id);
   return { ok: true };
 }
 
@@ -127,6 +131,7 @@ export async function updateProfileAction(input: ProfileInput): Promise<ActionRe
     avatarUrl: input.avatarUrl ?? null,
   });
   revalidatePath("/", "layout");
+  publishLiveEvent("users", me.id);
   return { ok: true };
 }
 

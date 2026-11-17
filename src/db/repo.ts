@@ -576,6 +576,32 @@ export async function markTasksExported(userId: number, taskIds: number[]): Prom
     on conflict do nothing`);
 }
 
+/**
+ * Отпечаток состояния данных для мягкой проверки обновлений.
+ * Клиент опрашивает его раз в 20 секунд: если отпечаток изменился, значит
+ * где-то создали/изменили/удалили запись и страницу пора перерисовать.
+ * Дёшево: только count(*) и max(updated_at) по трём таблицам.
+ */
+export async function getLiveRevision(): Promise<string> {
+  const rows = await q(sql`
+    select
+      (select count(*) from tasks) as tasks_count,
+      (select max(updated_at) from tasks) as tasks_updated,
+      (select count(*) from counterparties) as counterparties_count,
+      (select max(updated_at) from counterparties) as counterparties_updated,
+      (select count(*) from users) as users_count,
+      (select max(updated_at) from users) as users_updated`);
+  const row = rows[0] ?? {};
+  return [
+    toNum(row.tasks_count),
+    toIso(row.tasks_updated) ?? "",
+    toNum(row.counterparties_count),
+    toIso(row.counterparties_updated) ?? "",
+    toNum(row.users_count),
+    toIso(row.users_updated) ?? "",
+  ].join("|");
+}
+
 export async function userExists(id: number): Promise<boolean> {
   const row = await q1<{ id: number }>(sql`select id from users where id = ${id} limit 1`);
   return Boolean(row);
