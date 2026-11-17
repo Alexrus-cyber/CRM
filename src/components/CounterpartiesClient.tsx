@@ -21,6 +21,7 @@ import {
 } from "@/lib/counterpartyImport";
 import { cn, formatDateTime } from "@/lib/utils";
 import { Badge, Button, EmptyState, Field, Input, Modal, Select, Textarea } from "./ui";
+import { LoadMore, useProgressiveList } from "./lazy";
 
 type SortKey = "name" | "inn" | "email" | "phone" | "tasksCount" | "createdAt";
 
@@ -57,6 +58,10 @@ export function CounterpartiesClient({ items, isAdmin }: { items: CounterpartyRo
       }
     });
   }, [items, search, sort, withTasks]);
+
+  // Таблица и карточки рисуются порциями: база может быть большой,
+  // а на слабых ПК лишние строки в первом кадре заметно тормозят страницу.
+  const list = useProgressiveList(filtered, { initial: 30, step: 30 });
 
   const openCreate = () => { setForm(empty); setError(null); setModal({ open: true }); };
   const openEdit = (c: CounterpartyRow, readonly = false) => {
@@ -138,7 +143,7 @@ export function CounterpartiesClient({ items, isAdmin }: { items: CounterpartyRo
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map((c) => (
+                  {list.items.map((c) => (
                     <tr key={c.id} onClick={() => openEdit(c, !isAdmin)} className="cursor-pointer border-b border-border/60 last:border-0 hover:bg-card2/70">
                       <td className="px-3 py-2.5">
                         <div className="flex items-center gap-2">
@@ -175,7 +180,7 @@ export function CounterpartiesClient({ items, isAdmin }: { items: CounterpartyRo
           </div>
 
           <div className="grid min-w-0 grid-cols-1 gap-2 md:hidden">
-            {filtered.map((c) => (
+            {list.items.map((c) => (
               <button key={c.id} onClick={() => openEdit(c, !isAdmin)} className="card-hover rounded-2xl border border-border bg-card p-3 text-left">
                 <div className="flex items-center justify-between">
                   <p className="font-medium">{c.name}</p>
@@ -190,6 +195,17 @@ export function CounterpartiesClient({ items, isAdmin }: { items: CounterpartyRo
               </button>
             ))}
           </div>
+
+          <LoadMore
+            shown={list.shown}
+            total={list.total}
+            hasMore={list.hasMore}
+            loading={list.loading}
+            onShowMore={list.showMore}
+            sentinelRef={list.sentinelRef}
+            initial={30}
+            unit="контрагентов"
+          />
         </>
       )}
 

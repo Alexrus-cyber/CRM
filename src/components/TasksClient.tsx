@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useState, useTransition } from "react";
+import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
 import {
   ArrowUpDown,
@@ -33,7 +34,13 @@ import {
 import { Avatar, Button, Input, PriorityBadge, Select, StatusBadge, EmptyState, Modal } from "./ui";
 import { acceptTaskAction } from "@/app/actions/tasks";
 import { formatDateTime } from "@/lib/utils";
-import { TaskModal } from "./TaskModal";
+import { LoadMore, useProgressiveList } from "./lazy";
+
+/** Модалка задачи грузится отдельным чанком — только когда её открыли. */
+const TaskModal = dynamic(() => import("./TaskModal").then((module) => module.TaskModal), {
+  ssr: false,
+  loading: () => null,
+});
 
 type SortKey = "title" | "assignee" | "author" | "counterparty" | "deadline" | "hours" | "status" | "priority";
 
@@ -119,6 +126,22 @@ export function TasksClient({
     return [...list].sort(cmp);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tasks, search, status, assignee, author, cp, priority, from, to, sort, today]);
+
+  // Список рисуем порциями: на слабых ПК сотни строк не блокируют первый кадр.
+  const list = useProgressiveList(filtered, { initial: 25, step: 25 });
+
+  // Модалка задачи грузится отдельным чанком; в простое подтягиваем его заранее,
+  // чтобы первый клик по строке открывал задачу без задержки, но первый кадр
+  // страницы оставался лёгким.
+  useEffect(() => {
+    const load = () => { void import("./TaskModal"); };
+    const idle = (window as Window & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+    }).requestIdleCallback;
+    if (typeof idle === "function") return void idle(load, { timeout: 2000 });
+    const timer = window.setTimeout(load, 800);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   const toggleSort = (key: SortKey) =>
     setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: 1 }));
@@ -230,7 +253,7 @@ export function TasksClient({
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map((t) => {
+                  {list.items.map((t) => {
                     const overdue = isOverdue(t);
                     const mustAcceptRow = mustAccept(t);
                     return (
@@ -310,7 +333,7 @@ export function TasksClient({
 
           {/* Mobile cards */}
           <div className="grid min-w-0 grid-cols-1 gap-2 md:hidden">
-            {filtered.map((t) => {
+            {list.items.map((t) => {
               const overdue = isOverdue(t);
               return (
                 <div
@@ -353,17 +376,30 @@ export function TasksClient({
               );
             })}
           </div>
+
+          <LoadMore
+            shown={list.shown}
+            total={list.total}
+            hasMore={list.hasMore}
+            loading={list.loading}
+            onShowMore={list.showMore}
+            sentinelRef={list.sentinelRef}
+            initial={25}
+            unit="задач"
+          />
         </>
       )}
 
-      <TaskModal
-        open={modal.open}
-        onClose={() => setModal({ open: false, task: null })}
-        task={modal.task}
-        users={users}
-        counterparties={counterparties}
-        me={me}
-      />
+      {modal.open && (
+        <TaskModal
+          open={modal.open}
+          onClose={() => setModal({ open: false, task: null })}
+          task={modal.task}
+          users={users}
+          counterparties={counterparties}
+          me={me}
+        />
+      )}
     </div>
   );
 }
