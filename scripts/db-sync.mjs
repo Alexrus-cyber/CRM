@@ -51,7 +51,18 @@ const TABLES = [
     name: "tasks",
     columns: ["id", "title", "description", "assignee_id", "author_id", "counterparty_id", "deadline", "deadline_time", "accepted_at", "hours", "status", "priority", "completed_at", "closed_at", "created_at", "updated_at"],
   },
-  { name: "messages", columns: ["id", "sender_id", "recipient_id", "content", "created_at"] },
+  {
+    name: "messages",
+    columns: ["id", "sender_id", "recipient_id", "content", "content_lower", "created_at"],
+  },
+  {
+    name: "chat_reads",
+    columns: ["id", "user_id", "peer_id", "last_read_id", "updated_at"],
+  },
+  {
+    name: "message_attachments",
+    columns: ["id", "message_id", "name", "name_lower", "mime", "size", "data", "created_at"],
+  },
   { name: "task_exports", columns: ["id", "user_id", "task_id", "created_at"] },
 ];
 
@@ -61,7 +72,22 @@ function normalise(table, column, value) {
   if (value instanceof Date) {
     return column === "deadline" ? value.toISOString().slice(0, 10) : value.toISOString();
   }
-  if (["id", "user_id", "assignee_id", "author_id", "counterparty_id", "created_by_id", "sender_id", "recipient_id"].includes(column)) {
+  if (
+    [
+      "id",
+      "user_id",
+      "assignee_id",
+      "author_id",
+      "counterparty_id",
+      "created_by_id",
+      "sender_id",
+      "recipient_id",
+      "peer_id",
+      "last_read_id",
+      "message_id",
+      "size",
+    ].includes(column)
+  ) {
     return Number(value);
   }
   if (column === "hours") return Number(value);
@@ -95,6 +121,8 @@ function columnMigrations(dialect) {
   return [
     "alter table tasks add column deadline_time text",
     `alter table tasks add column accepted_at ${ts}`,
+    "alter table messages add column content_lower text not null default ''",
+    "alter table message_attachments add column name_lower text not null default ''",
   ];
 }
 
@@ -142,7 +170,9 @@ async function writePg(pool, data) {
   const client = await pool.connect();
   try {
     await client.query("begin");
-    await client.query("truncate table task_exports, messages, sessions, tasks, counterparties, users restart identity cascade");
+    await client.query(
+      "truncate table task_exports, message_attachments, chat_reads, messages, sessions, tasks, counterparties, users restart identity cascade",
+    );
     for (const table of TABLES) {
       for (const row of data[table.name] ?? []) {
         const values = table.columns.map((c) => normalise(table.name, c, row[c]));
