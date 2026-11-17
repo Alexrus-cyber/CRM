@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# next.js
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# local database / sqlite artefacts
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# env & logs
+.env
+.env*.local
+*.log
