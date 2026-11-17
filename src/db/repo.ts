@@ -82,6 +82,13 @@ export type TaskAccessRow = {
   closedAt: string | null;
 };
 
+export type ChatAttachmentMeta = {
+  id: number;
+  name: string;
+  mime: string;
+  size: number;
+};
+
 export type ChatMessage = {
   id: number;
   senderId: number;
@@ -91,6 +98,14 @@ export type ChatMessage = {
   senderName: string;
   senderColor: string;
   senderAvatar: string | null;
+  attachment: ChatAttachmentMeta | null;
+};
+
+export type ChatAttachmentRow = ChatAttachmentMeta & {
+  messageId: number;
+  senderId: number;
+  recipientId: number | null;
+  data: string;
 };
 
 /* ----------------------------- mapping ----------------------------- */
@@ -522,36 +537,193 @@ export async function messageCountsBySender(): Promise<Map<number, number>> {
   return new Map(rows.map((r) => [toNum(r.sender_id), toNum(r.c)]));
 }
 
-export async function listMessages(meId: number, peer: number, afterId: number): Promise<ChatMessage[]> {
-  const conversation = peer === 0
+/** Условие «это сообщение из переписки me ↔ peer» (peer = 0 — общий чат). */
+function conversationFilter(meId: number, peer: number) {
+  return peer === 0
     ? sql`m.recipient_id is null`
     : sql`((m.sender_id = ${meId} and m.recipient_id = ${peer}) or (m.sender_id = ${peer} and m.recipient_id = ${meId}))`;
+}
+
+const MESSAGE_SELECT = sql`m.id, m.sender_id, m.recipient_id, m.content, m.created_at,
+  u.name as sender_name, u.avatar_color as sender_color, u.avatar_url as sender_avatar,
+  a.id as attachment_id, a.name as attachment_name, a.mime as attachment_mime, a.size as attachment_size`;
+
+const MESSAGE_FROM = sql`from messages m
+  join users u on u.id = m.sender_id
+  left join message_attachments a on a.message_id = m.id`;
+
+function mapMessage(r: Raw): ChatMessage {
+  return {
+    id: toNum(r.id),
+    senderId: toNum(r.sender_id),
+    recipientId: r.recipient_id === null || r.recipient_id === undefined ? null : toNum(r.recipient_id),
+    content: String(r.content),
+    createdAt: toIso(r.created_at) ?? nowIso(),
+    senderName: String(r.sender_name ?? ""),
+    senderColor: String(r.sender_color ?? "#7c5cff"),
+    senderAvatar: (r.sender_avatar as string | null) ?? null,
+    attachment: r.attachment_id === null || r.attachment_id === undefined
+      ? null
+      : {
+          id: toNum(r.attachment_id),
+          name: String(r.attachment_name ?? "файл"),
+          mime: String(r.attachment_mime ?? "application/octet-stream"),
+          size: toNum(r.attachment_size),
+        },
+  };
+}
+
+export async function listMessages(meId: number, peer: number, afterId: number): Promise<ChatMessage[]> {
+  const conversation = conversationFilter(meId, peer);
   const filter = afterId > 0 ? sql`${conversation} and m.id > ${afterId}` : conversation;
-  const rows = await q(sql`
-    select m.id, m.sender_id, m.recipient_id, m.content, m.created_at,
-           u.name as sender_name, u.avatar_color as sender_color, u.avatar_url as sender_avatar
-    from messages m join users u on u.id = m.sender_id
-    where ${filter}
-    order by m.id desc limit 150`);
-  return rows
-    .map((r) => ({
-      id: toNum(r.id),
-      senderId: toNum(r.sender_id),
-      recipientId: r.recipient_id === null || r.recipient_id === undefined ? null : toNum(r.recipient_id),
-      content: String(r.content),
-      createdAt: toIso(r.created_at) ?? nowIso(),
-      senderName: String(r.sender_name ?? ""),
-      senderColor: String(r.sender_color ?? "#7c5cff"),
-      senderAvatar: (r.sender_avatar as string | null) ?? null,
-    }))
-    .reverse();
+  const rows = await q(sql`select ${MESSAGE_SELECT} ${MESSAGE_FROM} where ${filter} order by m.id desc limit 150`);
+  return rows.map(mapMessage).reverse();
+}
+
+/**
+ * Окно вокруг конкретного сообщения — для перехода к результату поиска.
+ * Возвращает до 60 сообщений до и после, чтобы контекст читался.
+ */
+export async function listMessagesAround(
+  meId: number,
+  peer: number,
+  messageId: number,
+): Promise<{ messages: ChatMessage[]; hasOlder: boolean; hasNewer: boolean }> {
+  const conversation = conversationFilter(meId, peer);
+  const before = await q(sql`
+    select ${MESSAGE_SELECT} ${MESSAGE_FROM}
+    where ${conversation} and m.id <= ${messageId}
+    order by m.id desc limit 60`);
+  const after = await q(sql`
+    select ${MESSAGE_SELECT} ${MESSAGE_FROM}
+    where ${conversation} and m.id > ${messageId}
+    order by m.id asc limit 60`);
+  const messages = [...before.map(mapMessage).reverse(), ...after.map(mapMessage)];
+  const minId = messages[0]?.id ?? 0;
+  const hasOlder = minId > 0
+    ? Boolean(await q1(sql`select 1 as ok ${MESSAGE_FROM} where ${conversation} and m.id < ${minId} limit 1`))
+    : false;
+  const maxId = messages.at(-1)?.id ?? 0;
+  const hasNewer = maxId > 0
+    ? Boolean(await q1(sql`select 1 as ok ${MESSAGE_FROM} where ${conversation} and m.id > ${maxId} limit 1`))
+    : false;
+  return { messages, hasOlder, hasNewer };
 }
 
 export async function insertMessage(senderId: number, recipientId: number | null, content: string): Promise<number> {
   const row = await q1<{ id: number }>(sql`
-    insert into messages (sender_id, recipient_id, content, created_at)
-    values (${senderId}, ${recipientId}, ${content}, ${nowIso()}) returning id`);
+    insert into messages (sender_id, recipient_id, content, content_lower, created_at)
+    values (${senderId}, ${recipientId}, ${content}, ${content.toLowerCase()}, ${nowIso()}) returning id`);
   return toNum(row?.id);
+}
+
+/** Вложение к сообщению. В БД лежит base64 — файл живёт вместе с базой. */
+export async function insertMessageAttachment(
+  messageId: number,
+  file: { name: string; mime: string; size: number; data: string },
+): Promise<number> {
+  const row = await q1<{ id: number }>(sql`
+    insert into message_attachments (message_id, name, name_lower, mime, size, data, created_at)
+    values (${messageId}, ${file.name}, ${file.name.toLowerCase()}, ${file.mime}, ${file.size}, ${file.data}, ${nowIso()}) returning id`);
+  return toNum(row?.id);
+}
+
+export async function getMessageAttachment(id: number): Promise<ChatAttachmentRow | null> {
+  const row = await q1(sql`
+    select a.id, a.message_id, a.name, a.mime, a.size, a.data, m.sender_id, m.recipient_id
+    from message_attachments a join messages m on m.id = a.message_id
+    where a.id = ${id} limit 1`);
+  if (!row) return null;
+  return {
+    id: toNum(row.id),
+    messageId: toNum(row.message_id),
+    name: String(row.name),
+    mime: String(row.mime),
+    size: toNum(row.size),
+    data: String(row.data),
+    senderId: toNum(row.sender_id),
+    recipientId: row.recipient_id === null || row.recipient_id === undefined ? null : toNum(row.recipient_id),
+  };
+}
+
+/* ------------------------- прочитанные ----------------------------- */
+
+/** Отметить переписку прочитанной до сообщения `lastReadId`. */
+export async function markChatRead(userId: number, peerId: number, lastReadId: number): Promise<void> {
+  if (lastReadId <= 0) return;
+  const existing = await q1<{ id: number; last_read_id: number }>(sql`
+    select id, last_read_id from chat_reads where user_id = ${userId} and peer_id = ${peerId} limit 1`);
+  if (!existing) {
+    await q(sql`
+      insert into chat_reads (user_id, peer_id, last_read_id, updated_at)
+      values (${userId}, ${peerId}, ${lastReadId}, ${nowIso()})`);
+    return;
+  }
+  if (toNum(existing.last_read_id) >= lastReadId) return;
+  await q(sql`update chat_reads set last_read_id = ${lastReadId}, updated_at = ${nowIso()} where id = ${toNum(existing.id)}`);
+}
+
+/** До какого сообщения собеседник дочитал переписку с нами. */
+export async function getPeerReadId(meId: number, peerId: number): Promise<number> {
+  const row = await q1<{ last_read_id: number }>(sql`
+    select last_read_id from chat_reads where user_id = ${peerId} and peer_id = ${meId} limit 1`);
+  return row ? toNum(row.last_read_id) : 0;
+}
+
+/** Кто и до какого сообщения дочитал общий чат (для «прочитали N»). */
+export async function listGeneralReaders(meId: number): Promise<Array<{ userId: number; lastReadId: number }>> {
+  const rows = await q(sql`
+    select user_id, last_read_id from chat_reads where peer_id = 0 and user_id <> ${meId}`);
+  return rows.map((r) => ({ userId: toNum(r.user_id), lastReadId: toNum(r.last_read_id) }));
+}
+
+/** Последний id в переписке — ограничитель для отметки «прочитано». */
+export async function maxConversationMessageId(meId: number, peer: number): Promise<number> {
+  const row = await q1<{ id: number | null }>(sql`
+    select max(m.id) as id ${MESSAGE_FROM} where ${conversationFilter(meId, peer)}`);
+  return row ? toNum(row.id) : 0;
+}
+
+/** Непрочитанные сообщения по перепискам: ключ 0 — общий чат. */
+export async function unreadCounts(meId: number): Promise<Record<string, number>> {
+  const rows = await q(sql`
+    select t.peer as peer, count(*) as c
+    from (
+      select case
+               when m.recipient_id is null then 0
+               when m.sender_id = ${meId} then m.recipient_id
+               else m.sender_id
+             end as peer,
+             m.id as id
+      from messages m
+      where m.sender_id <> ${meId}
+        and (m.recipient_id is null or m.recipient_id = ${meId})
+    ) t
+    left join chat_reads r on r.user_id = ${meId} and r.peer_id = t.peer
+    where t.id > coalesce(r.last_read_id, 0)
+    group by t.peer`);
+  const result: Record<string, number> = {};
+  for (const row of rows) result[String(toNum(row.peer))] = toNum(row.c);
+  return result;
+}
+
+/** Поиск по переписке: текст сообщений и имена вложений (нижний регистр — заранее). */
+export async function searchMessages(
+  meId: number,
+  peer: number,
+  query: string,
+  limit = 50,
+): Promise<ChatMessage[]> {
+  // Спецсимволы LIKE вырезаем: без них пустой запрос не должен совпадать со всем.
+  const clean = query.toLowerCase().replace(/[%_\\]/g, "").trim();
+  if (!clean) return [];
+  const needle = `%${clean}%`;
+  const rows = await q(sql`
+    select ${MESSAGE_SELECT} ${MESSAGE_FROM}
+    where ${conversationFilter(meId, peer)}
+      and (m.content_lower like ${needle} or a.name_lower like ${needle})
+    order by m.id desc limit ${limit}`);
+  return rows.map(mapMessage).reverse();
 }
 
 /* --------------------------- export journal ------------------------ */

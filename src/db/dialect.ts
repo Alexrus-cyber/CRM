@@ -99,6 +99,7 @@ const PG_DDL = [
     sender_id integer not null references users(id) on delete cascade,
     recipient_id integer references users(id) on delete cascade,
     content text not null,
+    content_lower text not null default '',
     created_at timestamptz not null default now()
   )`,
   `create index if not exists messages_created_idx on messages (created_at)`,
@@ -109,6 +110,25 @@ const PG_DDL = [
     created_at timestamptz not null default now()
   )`,
   `create unique index if not exists task_exports_user_task_uq on task_exports (user_id, task_id)`,
+  `create table if not exists chat_reads (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    peer_id integer not null default 0,
+    last_read_id integer not null default 0,
+    updated_at timestamptz not null default now()
+  )`,
+  `create unique index if not exists chat_reads_user_peer_uq on chat_reads (user_id, peer_id)`,
+  `create table if not exists message_attachments (
+    id serial primary key,
+    message_id integer not null references messages(id) on delete cascade,
+    name text not null,
+    name_lower text not null default '',
+    mime text not null,
+    size integer not null,
+    data text not null,
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists message_attachments_message_idx on message_attachments (message_id)`,
 ];
 
 /**
@@ -177,6 +197,7 @@ const SQLITE_DDL = [
     sender_id integer not null references users(id) on delete cascade,
     recipient_id integer references users(id) on delete cascade,
     content text not null,
+    content_lower text not null default '',
     created_at text not null
   )`,
   `create index if not exists messages_created_idx on messages (created_at)`,
@@ -187,6 +208,25 @@ const SQLITE_DDL = [
     created_at text not null
   )`,
   `create unique index if not exists task_exports_user_task_uq on task_exports (user_id, task_id)`,
+  `create table if not exists chat_reads (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    peer_id integer not null default 0,
+    last_read_id integer not null default 0,
+    updated_at text not null
+  )`,
+  `create unique index if not exists chat_reads_user_peer_uq on chat_reads (user_id, peer_id)`,
+  `create table if not exists message_attachments (
+    id integer primary key autoincrement,
+    message_id integer not null references messages(id) on delete cascade,
+    name text not null,
+    name_lower text not null default '',
+    mime text not null,
+    size integer not null,
+    data text not null,
+    created_at text not null
+  )`,
+  `create index if not exists message_attachments_message_idx on message_attachments (message_id)`,
 ];
 
 /* ------------------------------------------------------------------ */
@@ -342,6 +382,7 @@ async function init(): Promise<Executor> {
     await executor.exec(statement);
   }
   await migrateColumns(executor);
+  await backfillMessageSearch(executor);
   console.info(`[db] connected: ${executor.label}${executor.dialect === "sqlite" ? ` (${sqliteFile()})` : ""}`);
   return executor;
 }
@@ -356,6 +397,10 @@ async function migrateColumns(executor: Executor): Promise<void> {
   const statements = [
     `alter table tasks add column deadline_time text`,
     `alter table tasks add column accepted_at ${timestamp}`,
+    // Колонка для поиска по чату: lower() в SQLite не знает кириллицу,
+    // поэтому нормализуем текст в JS и ищем по готовой строке.
+    `alter table messages add column content_lower text not null default ''`,
+    `alter table message_attachments add column name_lower text not null default ''`,
   ];
   for (const statement of statements) {
     try {
@@ -363,6 +408,39 @@ async function migrateColumns(executor: Executor): Promise<void> {
     } catch (error) {
       const message = (error as Error).message ?? "";
       if (!/already exists|duplicate column/i.test(message)) throw error;
+    }
+  }
+}
+
+/**
+ * Однократное наполнение `messages.content_lower` и
+ * `message_attachments.name_lower` для записей, созданных до появления поиска.
+ * Дальше запрос ничего не находит и стоит копейки.
+ */
+async function backfillMessageSearch(executor: Executor): Promise<void> {
+  for (let batch = 0; batch < 20; batch += 1) {
+    const rows = await executor.all<{ id: number; content: string }>(sql`
+      select id, content from messages
+      where (content_lower is null or content_lower = '') and content <> ''
+      limit 200`);
+    if (rows.length) {
+      for (const row of rows) {
+        await executor.all(sql`update messages set content_lower = ${String(row.content).toLowerCase()} where id = ${row.id}`);
+      }
+      continue;
+    }
+    break;
+  }
+
+  // То же для имён вложений — по ним тоже ищем.
+  for (let batch = 0; batch < 20; batch += 1) {
+    const rows = await executor.all<{ id: number; name: string }>(sql`
+      select id, name from message_attachments
+      where (name_lower is null or name_lower = '') and name <> ''
+      limit 200`);
+    if (rows.length === 0) return;
+    for (const row of rows) {
+      await executor.all(sql`update message_attachments set name_lower = ${String(row.name).toLowerCase()} where id = ${row.id}`);
     }
   }
 }

@@ -135,11 +135,56 @@ export const messages = pgTable(
       onDelete: "cascade",
     }),
     content: text("content").notNull(),
+    /**
+     * Текст в нижнем регистре для поиска по чату: `lower()` в SQLite не знает
+     * кириллицу, поэтому нормализуем строку в приложении при вставке.
+     */
+    contentLower: text("content_lower").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
   },
   (t) => [index("messages_created_idx").on(t.createdAt)],
+);
+
+/**
+ * Курсор прочтения переписки: до какого сообщения человек дочитал.
+ * `peerId = 0` — общий чат, иначе — id собеседника.
+ */
+export const chatReads = pgTable(
+  "chat_reads",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    peerId: integer("peer_id").notNull().default(0),
+    lastReadId: integer("last_read_id").notNull().default(0),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [uniqueIndex("chat_reads_user_peer_uq").on(t.userId, t.peerId)],
+);
+
+/** Вложение сообщения: файл или картинка (base64 в БД). */
+export const messageAttachments = pgTable(
+  "message_attachments",
+  {
+    id: serial("id").primaryKey(),
+    messageId: integer("message_id")
+      .notNull()
+      .references(() => messages.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    nameLower: text("name_lower").notNull().default(""),
+    mime: text("mime").notNull(),
+    size: integer("size").notNull(),
+    data: text("data").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index("message_attachments_message_idx").on(t.messageId)],
 );
 
 /**

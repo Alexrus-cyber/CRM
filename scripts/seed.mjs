@@ -247,13 +247,20 @@ try {
   const minutesAgoIso = (minutes) => new Date(Date.now() - minutes * 60000).toISOString();
   let minutesAgo = 120;
   for (const [who, content] of msgs) {
-    await query("insert into messages (sender_id, content, created_at) values (?, ?, ?)", [U[who], content, minutesAgoIso(minutesAgo)]);
+    await query("insert into messages (sender_id, content, content_lower, created_at) values (?, ?, ?, ?)", [
+      U[who],
+      content,
+      content.toLowerCase(),
+      minutesAgoIso(minutesAgo),
+    ]);
     minutesAgo -= 15;
   }
-  await query("insert into messages (sender_id, recipient_id, content, created_at) values (?, ?, ?, ?)", [
+  const mariaText = "Привет! Посмотри, пожалуйста, нагрузку по команде на дашборде — Анна перегружена.";
+  await query("insert into messages (sender_id, recipient_id, content, content_lower, created_at) values (?, ?, ?, ?, ?)", [
     U.maria,
     U.admin,
-    "Привет! Посмотри, пожалуйста, нагрузку по команде на дашборде — Анна перегружена.",
+    mariaText,
+    mariaText.toLowerCase(),
     minutesAgoIso(5),
   ]);
 
