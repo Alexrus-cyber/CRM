@@ -333,6 +333,64 @@ export async function deleteCounterparty(id: number): Promise<void> {
   await q(sql`delete from counterparties where id = ${id}`);
 }
 
+export type CounterpartyRef = { id: number; name: string; kpp: string | null };
+
+/** Существующие контрагенты по списку ИНН (для импорта из Excel). */
+export async function findCounterpartiesByInns(inns: string[]): Promise<Map<string, CounterpartyRef>> {
+  const found = new Map<string, CounterpartyRef>();
+  const unique = [...new Set(inns.filter(Boolean))];
+  // Порции по 500 значений: у PostgreSQL лимит параметров, у SQLite — переменных.
+  const CHUNK = 500;
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    const chunk = unique.slice(i, i + CHUNK);
+    const rows = await q(sql`
+      select id, name, inn, kpp from counterparties
+      where inn in (${sql.join(chunk.map((value) => sql`${value}`), sql`, `)})`);
+    for (const row of rows) {
+      const inn = (row.inn as string | null) ?? null;
+      if (!inn) continue;
+      found.set(inn, {
+        id: toNum(row.id),
+        name: String(row.name),
+        kpp: (row.kpp as string | null) ?? null,
+      });
+    }
+  }
+  return found;
+}
+
+/** Массовая вставка контрагентов одной командой на порцию строк. */
+export async function insertCounterpartiesBulk(
+  rows: CounterpartyValues[],
+  createdById: number,
+): Promise<number> {
+  if (rows.length === 0) return 0;
+  const now = nowIso();
+  const CHUNK = 200;
+  let inserted = 0;
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const chunk = rows.slice(i, i + CHUNK);
+    const values = chunk.map(
+      (v) => sql`(${v.name}, ${v.phone}, ${v.email}, ${v.address}, ${v.inn}, ${v.kpp}, ${v.notes}, ${createdById}, ${now}, ${now})`,
+    );
+    const created = await q<{ id: number }>(sql`
+      insert into counterparties (name, phone, email, address, inn, kpp, notes, created_by_id, created_at, updated_at)
+      values ${sql.join(values, sql`, `)}
+      returning id`);
+    inserted += created.length;
+  }
+  return inserted;
+}
+
+/** Обновление из импорта: имя и КПП, остальные реквизиты не затираем. */
+export async function updateCounterpartyFromImport(
+  id: number,
+  name: string,
+  kpp: string | null,
+): Promise<void> {
+  await q(sql`update counterparties set name = ${name}, kpp = coalesce(${kpp}, kpp), updated_at = ${nowIso()} where id = ${id}`);
+}
+
 /* ------------------------------- tasks ----------------------------- */
 
 export async function listTasks(scopeUserId: number | null): Promise<TaskRow[]> {
