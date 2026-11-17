@@ -11,6 +11,7 @@ import {
   CalendarDays,
   Users,
   UserCircle,
+  Bot,
   LogOut,
   Moon,
   Sun,
@@ -27,6 +28,7 @@ const NAV = [
   { href: "/calendar", label: "Календарь", short: "Календарь", icon: CalendarDays },
   { href: "/counterparties", label: "Контрагенты", short: "Клиенты", icon: Building2 },
   { href: "/team", label: "Команда и чат", short: "Команда", icon: Users },
+  { href: "/ai", label: "Чат с ИИ", short: "ИИ", icon: Bot },
   { href: "/profile", label: "Профиль", short: "Профиль", icon: UserCircle },
 ];
 
@@ -144,7 +146,7 @@ export function Sidebar({ user, dbLabel }: { user: SidebarUser; dbLabel?: string
       </header>
 
       {/* Mobile bottom nav */}
-      <nav className="fixed inset-x-0 bottom-0 z-30 grid grid-cols-6 border-t border-border bg-sidebar/95 pb-[env(safe-area-inset-bottom)] backdrop-blur lg:hidden">
+      <nav className="fixed inset-x-0 bottom-0 z-30 grid grid-cols-7 border-t border-border bg-sidebar/95 pb-[env(safe-area-inset-bottom)] backdrop-blur lg:hidden">
         {NAV.map(({ href, label, short, icon: Icon }) => {
           const active = isActive(href);
           return (

@@ -100,3 +100,38 @@ export function PageSkeleton() {
     </div>
   );
 }
+
+/** Скелетон блока «Чат с ИИ»: панель настроек + лента + поле ввода. */
+export function AiChatSkeleton({ label = "Загружаем чат с ИИ..." }: { label?: string }) {
+  return (
+    <div className="space-y-4" role="status" aria-label={label}>
+      <div className="rounded-2xl border border-border bg-card p-3.5 sm:p-5">
+        <div className="h-3 w-1/3 animate-pulse rounded bg-card2" />
+        <div className="mt-2 h-2.5 w-2/3 animate-pulse rounded bg-card2/70" />
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          <div className="h-10 animate-pulse rounded-xl bg-card2/70" />
+          <div className="h-10 animate-pulse rounded-xl bg-card2/70" />
+        </div>
+      </div>
+      <div className="flex h-[480px] flex-col overflow-hidden rounded-2xl border border-border bg-card p-3.5 sm:h-[560px] sm:p-5">
+        <div className="h-3 w-1/4 animate-pulse rounded bg-card2" />
+        <div className="flex-1 space-y-3 py-4">
+          {Array.from({ length: 4 }).map((_, index) => (
+            <div
+              key={index}
+              className={cn(
+                "h-9 max-w-[70%] animate-pulse rounded-2xl bg-card2/70",
+                index % 2 === 1 && "ml-auto",
+              )}
+            />
+          ))}
+        </div>
+        <div className="h-10 animate-pulse rounded-xl bg-card2/70" />
+        <p className="mt-2 flex items-center justify-center gap-1.5 text-[11px] text-muted">
+          <Loader2 size={12} className="animate-spin" />
+          {label}
+        </p>
+      </div>
+    </div>
+  );
+}
