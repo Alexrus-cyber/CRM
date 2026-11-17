@@ -32,10 +32,11 @@ import {
   STATUS_ORDER,
   todayStr,
 } from "@/lib/utils";
-import { Avatar, Badge, Card, PageHeader, StatCard, StatusBadge } from "@/components/ui";
+import { Avatar, Badge, Card, PageHeader, StatCard } from "@/components/ui";
 import { DashboardFilters, PeopleBars, SimpleBars, StatusDonut, type PersonBar } from "@/components/DashboardCharts";
 import { Leaderboard, MyAchievementsCard } from "@/components/Achievements";
 import { TodayTimeline } from "@/components/TodayTimeline";
+import { RecentTasks } from "@/components/RecentTasks";
 import { formatTimeLabel, isOverdueByDay, needsAcceptance } from "@/lib/taskTime";
 
 export const dynamic = "force-dynamic";
@@ -162,6 +163,10 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
   const hour = Number(new Intl.DateTimeFormat("ru-RU", { hour: "numeric", hour12: false, timeZone: "Europe/Moscow" }).format(new Date()));
   const greeting = hour < 6 ? "Доброй ночи" : hour < 12 ? "Доброе утро" : hour < 18 ? "Добрый день" : "Добрый вечер";
   const scopeLabel = admin ? "Все задачи компании" : "Только ваши задачи";
+
+  // В блок «Последние задачи» отдаём только верхушку списка: клиентская часть
+  // рисует её порциями по 6, поэтому сортировать весь массив на клиенте незачем.
+  const recentTasks = [...tasks].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 30);
 
   return (
     <>
@@ -351,82 +356,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
           {tasks.length === 0 ? (
             <p className="py-8 text-center text-xs text-muted">Задач пока нет</p>
           ) : (
-            <>
-              <div className="hidden overflow-x-auto sm:block">
-                <table className="w-full table-fixed text-sm">
-                  <colgroup>
-                    <col className="w-[40%]" />
-                    <col className="w-[26%]" />
-                    <col className="w-[18%]" />
-                    <col className="w-[16%]" />
-                  </colgroup>
-                  <thead className="text-[11px] uppercase tracking-wide text-muted">
-                    <tr className="border-b border-border">
-                      <th className="py-2 pr-2 text-left font-semibold">Название</th>
-                      <th className="py-2 pr-2 text-left font-semibold">Исполнитель</th>
-                      <th className="py-2 pr-2 text-left font-semibold">Срок</th>
-                      <th className="py-2 text-left font-semibold">Статус</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {[...tasks]
-                      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-                      .slice(0, 8)
-                      .map((t) => (
-                        <tr key={t.id} className="border-b border-border/50 last:border-0">
-                          <td className="py-2 pr-2">
-                            <p className="truncate font-medium">{t.title}</p>
-                            <p className="truncate text-[11px] text-muted">
-                              {t.authorName}
-                              {t.counterpartyName ? ` · ${t.counterpartyName}` : ""}
-                            </p>
-                          </td>
-                          <td className="py-2 pr-2">
-                            <span className="flex min-w-0 items-center gap-2">
-                              <Avatar name={t.assigneeName} color={t.assigneeColor} url={t.assigneeAvatar} size={24} />
-                              <span className="truncate">{t.assigneeName}</span>
-                            </span>
-                          </td>
-                          <td className={cn("py-2 pr-2 whitespace-nowrap tabular-nums", OPEN_STATUSES.includes(t.status) && t.deadline < today && "text-red-500")}>
-                            {formatDate(t.deadline)}
-                            {t.deadlineTime && <span className="ml-1 text-muted">{formatTimeLabel(t.deadlineTime)}</span>}
-                          </td>
-                          <td className="py-2">
-                            <StatusBadge status={t.status} />
-                          </td>
-                        </tr>
-                      ))}
-                  </tbody>
-                </table>
-              </div>
-
-              <ul className="divide-y divide-border/60 sm:hidden">
-                {[...tasks]
-                  .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-                  .slice(0, 6)
-                  .map((t) => (
-                    <li key={t.id} className="py-2.5 first:pt-0 last:pb-0">
-                      <div className="flex items-start justify-between gap-2">
-                        <p className="min-w-0 flex-1 text-[13px] font-medium leading-snug sm:text-sm">{t.title}</p>
-                        <span className="shrink-0">
-                          <StatusBadge status={t.status} />
-                        </span>
-                      </div>
-                      <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted">
-                        <span className="flex items-center gap-1.5">
-                          <Avatar name={t.assigneeName} color={t.assigneeColor} url={t.assigneeAvatar} size={18} />
-                          <span className="truncate">{t.assigneeName}</span>
-                        </span>
-                        <span className={cn("tabular-nums", OPEN_STATUSES.includes(t.status) && t.deadline < today && "font-medium text-red-500")}>
-                          {formatDate(t.deadline)}
-                          {t.deadlineTime ? ` ${formatTimeLabel(t.deadlineTime)}` : ""}
-                        </span>
-                      </div>
-                      {t.counterpartyName && <p className="mt-1 truncate text-[11px] text-muted">{t.counterpartyName}</p>}
-                    </li>
-                  ))}
-              </ul>
-            </>
+            <RecentTasks tasks={recentTasks} today={today} />
           )}
         </Card>
       </div>

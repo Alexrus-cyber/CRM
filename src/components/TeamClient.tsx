@@ -9,6 +9,7 @@ import type { UserLite } from "@/lib/data";
 import { createUserAction } from "@/app/actions/users";
 import { cn, ROLE_LABELS, roleBadgeClass } from "@/lib/utils";
 import { Avatar, Badge, Button, Field, Input, Modal, Select } from "./ui";
+import { LoadMore, useProgressiveList } from "./lazy";
 
 export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: number; role: Role }; stats: Record<number, { open: number; done: number; points: number }> }) {
   const router = useRouter();
@@ -29,6 +30,9 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
       return [u.name, u.email, u.position, u.phone].some((v) => (v ?? "").toLowerCase().includes(s));
     });
   }, [users, q, roleFilter]);
+
+  // Карточки сотрудников рисуются порциями — команда может быть большой.
+  const list = useProgressiveList(filtered, { initial: 12, step: 12 });
 
   const submit = () => {
     setError(null);
@@ -60,7 +64,7 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
       </div>
 
       <div className="grid min-w-0 grid-cols-1 gap-2">
-        {filtered.map((u) => {
+        {list.items.map((u) => {
           const s = stats[u.id] ?? { open: 0, done: 0, points: 0 };
           return (
             <Link key={u.id} href={`/team/${u.id}`} className="card-hover flex min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-2xl border border-border bg-card p-3 sm:gap-3">
@@ -86,6 +90,17 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
         })}
         {filtered.length === 0 && <p className="rounded-xl border border-dashed border-border py-8 text-center text-xs text-muted">Никого не найдено</p>}
       </div>
+
+      <LoadMore
+        shown={list.shown}
+        total={list.total}
+        hasMore={list.hasMore}
+        loading={list.loading}
+        onShowMore={list.showMore}
+        sentinelRef={list.sentinelRef}
+        initial={12}
+        unit="сотрудников"
+      />
 
       <Modal
         open={open}

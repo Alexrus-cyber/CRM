@@ -3,7 +3,7 @@ import { getAchievementSummaries, getAllTasks, getUsers } from "@/lib/data";
 import { OPEN_STATUSES, FINISHED_STATUSES } from "@/lib/utils";
 import { PageHeader } from "@/components/ui";
 import { TeamList } from "@/components/TeamClient";
-import { ChatClient } from "@/components/ChatClient";
+import { LazyChat } from "@/components/LazyChat";
 
 export const dynamic = "force-dynamic";
 
@@ -27,7 +27,7 @@ export default async function TeamPage({ searchParams }: { searchParams: Promise
       <PageHeader title="Команда и чат" subtitle={`${users.length} участников · общий чат и личные сообщения`} />
       <div className="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-[400px_minmax(0,1fr)]">
         <div className="min-w-0"><TeamList users={users} me={{ id: user.id, role: user.role }} stats={stats} /></div>
-        <div className="min-w-0"><ChatClient users={users} meId={user.id} initialPeer={sp.chat ? Number(sp.chat) || 0 : 0} /></div>
+        <div className="min-w-0"><LazyChat users={users} meId={user.id} initialPeer={sp.chat ? Number(sp.chat) || 0 : 0} /></div>
       </div>
     </>
   );
