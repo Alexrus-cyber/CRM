@@ -11,6 +11,7 @@ import {
   type CounterpartyValues,
 } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
+import { publishLiveEvent } from "@/lib/events";
 import {
   INN_RE,
   KPP_RE,
@@ -64,10 +65,12 @@ export async function saveCounterpartyAction(input: CounterpartyInput): Promise<
   if (input.id) {
     await updateCounterparty(input.id, values);
     revalidatePath("/", "layout");
+    publishLiveEvent("counterparties", me.id);
     return { ok: true, id: input.id };
   }
   const id = await insertCounterparty(values, me.id);
   revalidatePath("/", "layout");
+  publishLiveEvent("counterparties", me.id);
   return { ok: true, id };
 }
 
@@ -76,6 +79,7 @@ export async function deleteCounterpartyAction(id: number): Promise<ActionResult
   if (!me || !isAdminRole(me.role)) return { ok: false, error: "Нет прав" };
   await deleteCounterparty(id);
   revalidatePath("/", "layout");
+  publishLiveEvent("counterparties", me.id);
   return { ok: true };
 }
 
@@ -180,6 +184,7 @@ export async function importCounterpartiesAction(input: {
 
   const inserted = await insertCounterpartiesBulk(toInsert, me.id);
   revalidatePath("/", "layout");
+  publishLiveEvent("counterparties", me.id);
 
   return {
     ok: true,

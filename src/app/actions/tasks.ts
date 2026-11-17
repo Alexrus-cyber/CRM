@@ -14,6 +14,7 @@ import {
 } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 import { isAdminRole, PRIORITY_ORDER, STATUS_ORDER } from "@/lib/utils";
+import { publishLiveEvent } from "@/lib/events";
 import { normalizeTime } from "@/lib/taskTime";
 import type { ActionResult } from "./users";
 
@@ -102,6 +103,7 @@ export async function saveTaskAction(input: TaskInput): Promise<ActionResult> {
       });
     }
     revalidatePath("/", "layout");
+  publishLiveEvent("tasks", me.id);
     return { ok: true, id: input.id };
   }
 
@@ -123,6 +125,7 @@ export async function saveTaskAction(input: TaskInput): Promise<ActionResult> {
     ...ts,
   });
   revalidatePath("/", "layout");
+  publishLiveEvent("tasks", me.id);
   return { ok: true, id };
 }
 
@@ -142,6 +145,7 @@ export async function setTaskStatusAction(id: number, status: TaskStatus): Promi
   const acceptedAt = existing.acceptedAt ?? (status !== "new" ? new Date().toISOString() : null);
   await setTaskStatusRow(id, { status, ...ts, acceptedAt });
   revalidatePath("/", "layout");
+  publishLiveEvent("tasks", me.id);
   return { ok: true, id };
 }
 
@@ -162,6 +166,7 @@ export async function rescheduleTaskAction(
   }
   await setTaskDeadlineAndTime(id, deadline, time === undefined ? existing.deadlineTime : time);
   revalidatePath("/", "layout");
+  publishLiveEvent("tasks", me.id);
   return { ok: true, id };
 }
 
@@ -177,6 +182,7 @@ export async function acceptTaskAction(id: number): Promise<ActionResult> {
   if (existing.acceptedAt) return { ok: true, id };
   await acceptTask(id);
   revalidatePath("/", "layout");
+  publishLiveEvent("tasks", me.id);
   return { ok: true, id };
 }
 
@@ -190,5 +196,6 @@ export async function deleteTaskAction(id: number): Promise<ActionResult> {
   }
   await deleteTask(id);
   revalidatePath("/", "layout");
+  publishLiveEvent("tasks", me.id);
   return { ok: true, id };
 }

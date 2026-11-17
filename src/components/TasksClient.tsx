@@ -128,7 +128,12 @@ export function TasksClient({
   }, [tasks, search, status, assignee, author, cp, priority, from, to, sort, today]);
 
   // Список рисуем порциями: на слабых ПК сотни строк не блокируют первый кадр.
-  const list = useProgressiveList(filtered, { initial: 25, step: 25 });
+  const list = useProgressiveList(filtered, {
+    initial: 25,
+    step: 25,
+    // Живое обновление не должно сворачивать список: сброс только по фильтрам.
+    resetKey: `${search}|${status}|${assignee}|${author}|${cp}|${priority}|${from}|${to}|${sort.key}|${sort.dir}`,
+  });
 
   // Модалка задачи грузится отдельным чанком; в простое подтягиваем его заранее,
   // чтобы первый клик по строке открывал задачу без задержки, но первый кадр

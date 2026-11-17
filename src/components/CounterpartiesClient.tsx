@@ -61,7 +61,12 @@ export function CounterpartiesClient({ items, isAdmin }: { items: CounterpartyRo
 
   // Таблица и карточки рисуются порциями: база может быть большой,
   // а на слабых ПК лишние строки в первом кадре заметно тормозят страницу.
-  const list = useProgressiveList(filtered, { initial: 30, step: 30 });
+  const list = useProgressiveList(filtered, {
+    initial: 30,
+    step: 30,
+    // Сбрасываем порцию только при смене фильтров, а не при обновлении данных.
+    resetKey: `${search}|${withTasks}|${sort.key}|${sort.dir}`,
+  });
 
   const openCreate = () => { setForm(empty); setError(null); setModal({ open: true }); };
   const openEdit = (c: CounterpartyRow, readonly = false) => {

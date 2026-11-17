@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { requireUser } from "@/lib/auth";
 import { getDbInfo } from "@/db/dialect";
 import { Sidebar } from "@/components/Sidebar";
+import { LiveUpdates } from "@/components/LiveUpdates";
 
 export const dynamic = "force-dynamic";
 
@@ -10,6 +11,8 @@ export default async function AppLayout({ children }: { children: ReactNode }) {
   const db = await getDbInfo();
   return (
     <div className="min-h-screen">
+      {/* Живые обновления: чужая задача появляется без перезагрузки страницы. */}
+      <LiveUpdates />
       <Sidebar
         user={{
           id: user.id,

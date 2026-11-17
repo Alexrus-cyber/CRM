@@ -32,7 +32,11 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
   }, [users, q, roleFilter]);
 
   // Карточки сотрудников рисуются порциями — команда может быть большой.
-  const list = useProgressiveList(filtered, { initial: 12, step: 12 });
+  const list = useProgressiveList(filtered, {
+    initial: 12,
+    step: 12,
+    resetKey: `${q}|${roleFilter}`,
+  });
 
   const submit = () => {
     setError(null);
