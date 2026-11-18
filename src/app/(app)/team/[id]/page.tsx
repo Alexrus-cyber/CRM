@@ -3,7 +3,10 @@ import { notFound } from "next/navigation";
 import { ArrowLeft, Mail, MessageCircle, Phone, Shield, Trophy, Briefcase, CalendarDays } from "lucide-react";
 import { requireUser } from "@/lib/auth";
 import { getAchievementSummaries, getAllTasks, getUserById, getUsers } from "@/lib/data";
-import { formatDate, dateToStr, isAdminRole, OPEN_STATUSES, ROLE_LABELS, roleBadgeClass, todayStr } from "@/lib/utils";
+import { getAiQuotaOverride, getAiUsage, listAiChats } from "@/db/repo";
+import { aiPolicyFor } from "@/lib/aiPolicy";
+import { AiUsageSummary } from "@/components/AiUsageSummary";
+import { formatDate, dateToStr, isCompanyRole, OPEN_STATUSES, ROLE_LABELS, roleBadgeClass, todayStr } from "@/lib/utils";
 import { Avatar, Badge, Button, Card, StatusBadge } from "@/components/ui";
 import { UserAchievementsPanel } from "@/components/Achievements";
 import { UserAdminControls } from "@/components/ProfileClient";
@@ -15,15 +18,23 @@ export default async function UserPage({ params }: { params: Promise<{ id: strin
   const { id } = await params;
   const userId = Number(id);
   if (!Number.isFinite(userId)) notFound();
-  const [user, users, allTasks] = await Promise.all([getUserById(userId), getUsers(), getAllTasks()]);
+  const [user, users, allTasks, aiUsage, aiOverride, aiChats] = await Promise.all([
+    getUserById(userId),
+    getUsers(),
+    getAllTasks(),
+    getAiUsage(userId),
+    getAiQuotaOverride(userId),
+    listAiChats(userId, 200),
+  ]);
   if (!user) notFound();
+  const aiPolicy = aiPolicyFor(user.role, aiOverride?.monthlyLimit ?? null);
   const summaries = await getAchievementSummaries(users, allTasks);
   const idx = summaries.findIndex((s) => s.user.id === userId);
   const summary = summaries[idx];
   const today = todayStr();
 
   // Non-admins only see tasks they share with this user
-  const visible = allTasks.filter((t) => isAdminRole(me.role) || t.assigneeId === me.id || t.authorId === me.id);
+  const visible = allTasks.filter((t) => isCompanyRole(me.role) || t.assigneeId === me.id || t.authorId === me.id);
   const userOpen = visible.filter((t) => t.assigneeId === userId && OPEN_STATUSES.includes(t.status)).sort((a, b) => a.deadline.localeCompare(b.deadline));
 
   return (
@@ -61,7 +72,22 @@ export default async function UserPage({ params }: { params: Promise<{ id: strin
           {summary && <UserAchievementsPanel summary={summary} rank={idx + 1} total={summaries.length} />}
         </div>
         <div className="space-y-4">
-          <UserAdminControls target={user} me={{ id: me.id, role: me.role }} />
+          <UserAdminControls
+            target={user}
+            me={{ id: me.id, role: me.role }}
+            aiQuota={{ used: aiUsage.month.total, limit: aiPolicy.monthlyTokens, override: aiOverride?.monthlyLimit ?? null }}
+          />
+          {isCompanyRole(me.role) && (
+            <AiUsageSummary
+              used={aiUsage.month.total}
+              limit={aiPolicy.monthlyTokens}
+              total={aiUsage.all.total}
+              perChat={aiPolicy.perChatTokens}
+              chats={aiChats.length}
+              override={aiOverride?.monthlyLimit ?? null}
+              summary={aiPolicy.summary}
+            />
+          )}
           <Card title={`Открытые задачи (${userOpen.length})`} subtitle="Текущая загрузка сотрудника" action={<Link href={`/tasks?assignee=${user.id}`} className="text-xs font-medium text-accent2 hover:underline">Все →</Link>}>
             {userOpen.length === 0 ? <p className="py-6 text-center text-xs text-muted">Нет открытых задач</p> : (
               <ul className="divide-y divide-border/50">

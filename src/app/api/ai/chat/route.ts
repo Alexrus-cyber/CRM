@@ -1,6 +1,18 @@
 import { getCurrentUser } from "@/lib/auth";
-import { getRagFolder, searchRagChunks } from "@/db/repo";
+import {
+  createAiChat,
+  getAiChat,
+  getAiQuotaOverride,
+  getAiUsage,
+  getRagFolder,
+  insertAiChatMessage,
+  recordAiUsage,
+  renameAiChat,
+  searchRagChunks,
+  type AiChatRow,
+} from "@/db/repo";
 import { formatRagContext } from "@/lib/rag";
+import { aiPolicyFor, formatTokenCount, reasoningAllowed, type AiRolePolicy } from "@/lib/aiPolicy";
 import {
   AI_DEFAULT_BASE_URL,
   AI_MAX_CONTEXT_MESSAGES,
@@ -8,6 +20,7 @@ import {
   aiEndpoint,
   normalizeBaseUrl,
   normalizeParams,
+  estimateTokens,
   type AiParams,
 } from "@/lib/ai";
 
@@ -22,6 +35,44 @@ const MAX_RAG_CONTEXT_CHARS = 12_000;
 const UPSTREAM_TIMEOUT_MS = 5 * 60 * 1000;
 
 type AiMessage = { role: "system" | "user" | "assistant"; content: unknown };
+
+type UsageTotals = { prompt: number; completion: number; total: number };
+
+/** Оценка промпта, если сервер не вернул usage: по символам сообщений. */
+function estimatePromptTokens(messages: AiMessage[]): number {
+  let total = 4;
+  for (const message of messages) {
+    if (typeof message.content === "string") {
+      total += estimateTokens(message.content) + 4;
+      continue;
+    }
+    if (Array.isArray(message.content)) {
+      for (const part of message.content as Array<{ type?: string; text?: string }>) {
+        if (part?.type === "text" && part.text) total += estimateTokens(part.text) + 3;
+        if (part?.type === "image_url") total += 600;
+      }
+      total += 4;
+    }
+  }
+  return total;
+}
+
+/** Текст последнего сообщения пользователя (для истории и авто-названия чата). */
+function lastUserContent(messages: AiMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
+    if (typeof message.content === "string") return message.content;
+    if (Array.isArray(message.content)) {
+      return (message.content as Array<{ type?: string; text?: string }>)
+        .filter((part) => part?.type === "text" && part.text)
+        .map((part) => part.text ?? "")
+        .join("\n");
+    }
+    return "";
+  }
+  return "";
+}
 
 type UpstreamChunk = {
   choices?: Array<{
@@ -144,6 +195,8 @@ export async function POST(req: Request) {
   let ragContext = "";
   let ragFolderId = 0;
   let ragQuery = "";
+  let chatId = 0;
+  let attachmentsJson = "[]";
   try {
     const raw = await req.text();
     if (raw.length > MAX_BODY_BYTES) {
@@ -155,17 +208,91 @@ export async function POST(req: Request) {
       ragContext?: unknown;
       ragFolderId?: unknown;
       ragQuery?: unknown;
+      chatId?: unknown;
+      attachments?: unknown;
     };
     params = normalizeParams(body.params);
     ragContext = typeof body.ragContext === "string" ? body.ragContext.slice(0, MAX_RAG_CONTEXT_CHARS) : "";
     ragFolderId = Number(body.ragFolderId ?? 0) || 0;
     ragQuery = typeof body.ragQuery === "string" ? body.ragQuery.slice(0, 4000) : "";
+    chatId = Number(body.chatId ?? 0) || 0;
+    if (Array.isArray(body.attachments)) {
+      attachmentsJson = JSON.stringify(
+        body.attachments
+          .slice(0, 8)
+          .map((item) => {
+            const meta = (item ?? {}) as { name?: unknown; kind?: unknown; size?: unknown; note?: unknown };
+            return {
+              name: String(meta.name ?? "").slice(0, 200),
+              kind: String(meta.kind ?? "text").slice(0, 20),
+              size: Number(meta.size ?? 0) || 0,
+              note: String(meta.note ?? "").slice(0, 200),
+            };
+          }),
+      ).slice(0, 4000);
+    }
     messages = (body.messages ?? []).filter(
       (m) => m && (m.role === "user" || m.role === "assistant" || m.role === "system"),
     );
   } catch {
     return Response.json({ error: "Некорректный запрос" }, { status: 400 });
   }
+
+  // ---- ограничения роли -------------------------------------------------
+  const override = await getAiQuotaOverride(me.id);
+  const policy: AiRolePolicy = aiPolicyFor(me.role, override?.monthlyLimit ?? null);
+
+  // Роль может не разрешать выбранный режим: молча приводим к ближайшему
+  // разрешённому (для менеджера/сотрудника это «коротко»), а не ломаем запрос.
+  let reasoningDowngraded = false;
+  if (!reasoningAllowed(policy, params.reasoning)) {
+    reasoningDowngraded = true;
+    params = {
+      ...params,
+      reasoning: policy.reasoning.includes("low") ? "low" : policy.reasoning[0],
+      thinkingBudget: null,
+    };
+  }
+
+  if (ragFolderId > 0 && !policy.rag) {
+    return Response.json(
+      { error: `RAG-папка недоступна для роли «${me.role}». Модель ответит без документов.` },
+      { status: 403 },
+    );
+  }
+
+  let chat: AiChatRow | null = null;
+  if (chatId > 0) {
+    chat = await getAiChat(me.id, chatId);
+    if (!chat) return Response.json({ error: "Чат не найден" }, { status: 404 });
+    if (policy.perChatTokens > 0 && chat.tokensTotal >= policy.perChatTokens) {
+      return Response.json(
+        {
+          error:
+            `В этом чате закончился лимит токенов (${formatTokenCount(chat.tokensTotal)} из ` +
+            `${formatTokenCount(policy.perChatTokens)}). Нажмите «Новый чат» — счётчик обнулится.`,
+        },
+        { status: 403 },
+      );
+    }
+  } else {
+    chat = await createAiChat(me.id);
+    chatId = chat.id;
+  }
+
+  const monthUsage = await getAiUsage(me.id);
+  if (policy.monthlyTokens !== null && monthUsage.month.total >= policy.monthlyTokens) {
+    return Response.json(
+      {
+        error:
+          `Месячный лимит токенов исчерпан (${formatTokenCount(monthUsage.month.total)} из ` +
+          `${formatTokenCount(policy.monthlyTokens)}). Расширить лимит на этот месяц может администратор.`,
+      },
+      { status: 403 },
+    );
+  }
+
+  const userMessage = lastUserContent(messages);
 
   // RAG: если выбрана сохранённая папка, ищем фрагменты по запросу пользователя.
   let ragHits = 0;
@@ -197,6 +324,58 @@ export async function POST(req: Request) {
     return Response.json({ error: "Пустой запрос" }, { status: 400 });
   }
   const trimmed = messages.slice(-AI_MAX_CONTEXT_MESSAGES);
+  const estimatedPrompt = estimatePromptTokens(trimmed);
+
+  /**
+   * Фиксирует ход в базе: сообщения, расход токенов, счётчик чата.
+   * Возвращает данные для финального SSE-события.
+   */
+  const finishTurn = async (answer: string, thinking: string, usage: UsageTotals | null) => {
+    const prompt = usage && usage.prompt > 0 ? usage.prompt : estimatedPrompt;
+    const completion = usage && usage.completion > 0 ? usage.completion : estimateTokens(answer);
+    const total = usage && usage.total > 0 ? usage.total : prompt + completion;
+    const summary = {
+      usage: { prompt, completion, total, estimated: !usage },
+      reasoningDowngraded,
+      chat: null as (AiChatRow & { tokensLeft: number; tokensLimit: number }) | null,
+      monthly: { used: 0, limit: policy.monthlyTokens, left: null as number | null },
+    };
+    try {
+      if (userMessage.trim() || attachmentsJson !== "[]") {
+        await insertAiChatMessage({ chatId, role: "user", content: userMessage, attachments: attachmentsJson });
+      }
+      if (answer.trim()) {
+        await insertAiChatMessage({
+          chatId,
+          role: "assistant",
+          content: answer,
+          reasoning: thinking,
+          tokens: total,
+          promptTokens: prompt,
+          completionTokens: completion,
+        });
+      }
+      if (chat && chat.title === "Новый чат" && userMessage.trim()) {
+        await renameAiChat(me.id, chatId, userMessage.trim().slice(0, 60));
+      }
+      const fresh = await recordAiUsage({ userId: me.id, chatId, prompt, completion });
+      summary.chat = fresh.chat
+        ? {
+            ...fresh.chat,
+            tokensLeft: Math.max(policy.perChatTokens - fresh.chat.tokensTotal, 0),
+            tokensLimit: policy.perChatTokens,
+          }
+        : null;
+      summary.monthly = {
+        used: fresh.month.total,
+        limit: policy.monthlyTokens,
+        left: policy.monthlyTokens === null ? null : Math.max(policy.monthlyTokens - fresh.month.total, 0),
+      };
+    } catch {
+      /* история не должна ломать ответ модели */
+    }
+    return summary;
+  };
 
   const timeout = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS);
   const signal = typeof AbortSignal.any === "function" ? AbortSignal.any([req.signal, timeout]) : timeout;
@@ -234,10 +413,12 @@ export async function POST(req: Request) {
   if (!upstream.body || !contentType.includes("text/event-stream")) {
     const body = await upstream.text();
     let text = "";
-    let usage: unknown = null;
+    let usage: UsageTotals | null = null;
+    let thinking = "";
     try {
       const parsed = JSON.parse(body) as UpstreamChunk;
       text = readDelta(parsed);
+      thinking = readReasoning(parsed);
       if (parsed.usage) {
         usage = {
           prompt: parsed.usage.prompt_tokens ?? 0,
@@ -252,11 +433,13 @@ export async function POST(req: Request) {
     if (!text) {
       return Response.json({ error: describeUpstreamError(upstream.status, body) }, { status: 502 });
     }
+    const summary = await finishTurn(text, thinking, usage);
     const single = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta: text })}\n\n`));
-        if (usage) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ usage })}\n\n`));
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true, ragHits })}\n\n`));
+        if (thinking) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ reasoning: thinking })}\n\n`));
+        if (usage) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ usage: summary.usage })}\n\n`));
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true, ragHits, ...summary })}\n\n`));
         controller.close();
       },
     });
@@ -270,6 +453,10 @@ export async function POST(req: Request) {
       let buffer = "";
       const push = (payload: unknown) =>
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+      let answer = "";
+      let thinking = "";
+      let usage: UsageTotals | null = null;
+      let recorded = false;
       try {
         for (;;) {
           const { done, value } = await reader.read();
@@ -287,27 +474,38 @@ export async function POST(req: Request) {
             try {
               const chunk = JSON.parse(payload) as UpstreamChunk;
               const delta = readDelta(chunk);
-              if (delta) push({ delta });
-              const thinking = readReasoning(chunk);
-              if (thinking) push({ reasoning: thinking });
+              if (delta) {
+                answer += delta;
+                push({ delta });
+              }
+              const reason = readReasoning(chunk);
+              if (reason) {
+                thinking += reason;
+                push({ reasoning: reason });
+              }
               if (chunk.usage && (chunk.usage.prompt_tokens || chunk.usage.completion_tokens)) {
-                push({
-                  usage: {
-                    prompt: chunk.usage.prompt_tokens ?? 0,
-                    completion: chunk.usage.completion_tokens ?? 0,
-                    total: chunk.usage.total_tokens ?? 0,
-                  },
-                });
+                usage = {
+                  prompt: chunk.usage.prompt_tokens ?? 0,
+                  completion: chunk.usage.completion_tokens ?? 0,
+                  total: chunk.usage.total_tokens ?? 0,
+                };
+                push({ usage });
               }
             } catch {
               /* служебные строки локальных серверов пропускаем */
             }
           }
         }
-        push({ done: true, ragHits });
+        recorded = true;
+        push({ done: true, ragHits, ...(await finishTurn(answer, thinking, usage)) });
       } catch (error) {
         push({ error: error instanceof Error ? error.message : "Поток прерван" });
-        push({ done: true });
+        if (!recorded) {
+          recorded = true;
+          push({ done: true, ...(await finishTurn(answer, thinking, usage)) });
+        } else {
+          push({ done: true });
+        }
       } finally {
         try {
           controller.close();

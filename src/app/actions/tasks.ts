@@ -13,7 +13,7 @@ import {
   updateTaskAsAssignee,
 } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
-import { isAdminRole, PRIORITY_ORDER, STATUS_ORDER } from "@/lib/utils";
+import { canManageData, PRIORITY_ORDER, STATUS_ORDER } from "@/lib/utils";
 import { publishLiveEvent } from "@/lib/events";
 import { normalizeTime } from "@/lib/taskTime";
 import type { ActionResult } from "./users";
@@ -64,7 +64,7 @@ export async function saveTaskAction(input: TaskInput): Promise<ActionResult> {
   if (input.id) {
     const existing = await getTaskAccess(input.id);
     if (!existing) return { ok: false, error: "Задача не найдена" };
-    const isOwner = isAdminRole(me.role) || existing.authorId === me.id;
+    const isOwner = canManageData(me.role) || existing.authorId === me.id;
     const isAssignee = existing.assigneeId === me.id;
     if (!isOwner && !isAssignee) return { ok: false, error: "Нет доступа к задаче" };
     if (input.status === "closed" && !isOwner && existing.status !== "closed") {
@@ -135,7 +135,7 @@ export async function setTaskStatusAction(id: number, status: TaskStatus): Promi
   if (!STATUS_ORDER.includes(status)) return { ok: false, error: "Некорректный статус" };
   const existing = await getTaskAccess(id);
   if (!existing) return { ok: false, error: "Задача не найдена" };
-  const isOwner = isAdminRole(me.role) || existing.authorId === me.id;
+  const isOwner = canManageData(me.role) || existing.authorId === me.id;
   const isAssignee = existing.assigneeId === me.id;
   if (!isOwner && !isAssignee) return { ok: false, error: "Нет доступа к задаче" };
   if (status === "closed" && !isOwner) {
@@ -161,7 +161,7 @@ export async function rescheduleTaskAction(
   if (deadlineTime && time === null) return { ok: false, error: "Некорректное время (ЧЧ:ММ)" };
   const existing = await getTaskAccess(id);
   if (!existing) return { ok: false, error: "Задача не найдена" };
-  if (!isAdminRole(me.role) && existing.authorId !== me.id) {
+  if (!canManageData(me.role) && existing.authorId !== me.id) {
     return { ok: false, error: "Перенести срок может только автор или администратор" };
   }
   await setTaskDeadlineAndTime(id, deadline, time === undefined ? existing.deadlineTime : time);
@@ -176,7 +176,7 @@ export async function acceptTaskAction(id: number): Promise<ActionResult> {
   if (!me) return { ok: false, error: "Не авторизован" };
   const existing = await getTaskAccess(id);
   if (!existing) return { ok: false, error: "Задача не найдена" };
-  if (!isAdminRole(me.role) && existing.assigneeId !== me.id && existing.authorId !== me.id) {
+  if (!canManageData(me.role) && existing.assigneeId !== me.id && existing.authorId !== me.id) {
     return { ok: false, error: "Принять задачу может только исполнитель" };
   }
   if (existing.acceptedAt) return { ok: true, id };
@@ -191,7 +191,7 @@ export async function deleteTaskAction(id: number): Promise<ActionResult> {
   if (!me) return { ok: false, error: "Не авторизован" };
   const existing = await getTaskAccess(id);
   if (!existing) return { ok: false, error: "Задача не найдена" };
-  if (!isAdminRole(me.role) && existing.authorId !== me.id) {
+  if (!canManageData(me.role) && existing.authorId !== me.id) {
     return { ok: false, error: "Удалить задачу может только автор или администратор" };
   }
   await deleteTask(id);

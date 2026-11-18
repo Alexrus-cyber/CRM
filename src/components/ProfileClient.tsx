@@ -2,13 +2,14 @@
 
 import { useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Camera, Check, KeyRound, Save, Shield, Trash2, X } from "lucide-react";
+import { Camera, Check, KeyRound, RotateCcw, Save, Shield, Trash2, X } from "lucide-react";
 import type { Role } from "@/db/schema";
 import type { UserLite } from "@/lib/data";
 import {
   adminResetPasswordAction,
   changePasswordAction,
   deleteUserAction,
+  setAiQuotaAction,
   updateProfileAction,
   updateUserRoleAction,
 } from "@/app/actions/users";
@@ -141,15 +142,35 @@ export function ProfileForm({ user }: { user: UserLite }) {
   );
 }
 
-export function UserAdminControls({ target, me }: { target: UserLite; me: { id: number; role: Role } }) {
+/** Роли, которые можно назначать из карточки сотрудника (главный админ один). */
+const ASSIGNABLE_ROLES: Role[] = ["admin", "developer", "manager", "consultant", "user"];
+
+export function UserAdminControls({
+  target,
+  me,
+  aiQuota,
+}: {
+  target: UserLite;
+  me: { id: number; role: Role };
+  /** Расход и лимит ИИ, чтобы администратор мог расширить месяц. */
+  aiQuota?: { used: number; limit: number | null; override: number | null };
+}) {
   const router = useRouter();
   const [pending, start] = useTransition();
   const [role, setRole] = useState<Role>(target.role);
   const [pw, setPw] = useState("");
+  const [quota, setQuota] = useState<string>(
+    aiQuota?.override ? String(aiQuota.override) : aiQuota?.limit ? String(aiQuota.limit + 1_000_000) : "1000000",
+  );
   const [notice, setNotice] = useState<{ msg: string; ok: boolean } | null>(null);
   const isSuper = me.role === "super_admin";
-  const canReset = isSuper || (me.role === "admin" && target.role === "user");
-  if (target.id === me.id || target.role === "super_admin" || (!isSuper && !canReset)) return null;
+  const isAdmin = isSuper || me.role === "admin";
+  const canManageTarget =
+    isSuper || ((me.role === "admin" || me.role === "manager") && (target.role === "user" || target.role === "consultant"));
+  const canReset = isAdmin && canManageTarget;
+  const canChangeRole = isSuper;
+  const canExtendQuota = isAdmin;
+  if (target.id === me.id || target.role === "super_admin" || (!canReset && !canChangeRole && !canExtendQuota)) return null;
 
   return (
     <Card title="Управление пользователем" subtitle="Доступно администраторам">
@@ -163,10 +184,7 @@ export function UserAdminControls({ target, me }: { target: UserLite; me: { id: 
                 onChange={(next) => setRole(next as Role)}
                 aria-label="Права доступа"
                 placeholder="Выберите роль"
-                options={[
-                  { value: "user", label: "Сотрудник" },
-                  { value: "admin", label: "Администратор" },
-                ]}
+                options={ASSIGNABLE_ROLES.map((value) => ({ value, label: ROLE_LABELS[value] }))}
               />
               <Button
                 variant="secondary"
@@ -185,6 +203,57 @@ export function UserAdminControls({ target, me }: { target: UserLite; me: { id: 
             </div>
             <p className="mt-1.5 text-[11px] text-muted">
               Текущая роль: <span className="font-medium text-text">{ROLE_LABELS[target.role]}</span>
+            </p>
+          </Field>
+        )}
+
+        {canExtendQuota && aiQuota && (
+          <Field label="Лимит ИИ на этот месяц, токенов">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <Input
+                type="number"
+                min={0}
+                step={100000}
+                value={quota}
+                onChange={(e) => setQuota(e.target.value)}
+                className="sm:flex-1"
+                placeholder="Например, 5000000"
+              />
+              <Button
+                variant="secondary"
+                className="w-full shrink-0 sm:w-auto"
+                disabled={pending || !quota || Number(quota) < 0}
+                onClick={() =>
+                  start(async () => {
+                    const r = await setAiQuotaAction(target.id, Number(quota));
+                    setNotice(r.ok ? { msg: `Лимит ИИ на месяц расширен до ${Number(quota).toLocaleString("ru-RU")}`, ok: true } : { msg: r.error, ok: false });
+                    if (r.ok) router.refresh();
+                  })
+                }
+              >
+                Продлить
+              </Button>
+              {aiQuota.override !== null && (
+                <Button
+                  variant="ghost"
+                  className="w-full shrink-0 sm:w-auto"
+                  disabled={pending}
+                  onClick={() =>
+                    start(async () => {
+                      const r = await setAiQuotaAction(target.id, null);
+                      setNotice(r.ok ? { msg: "Расширение снято — действует лимит роли", ok: true } : { msg: r.error, ok: false });
+                      if (r.ok) router.refresh();
+                    })
+                  }
+                >
+                  <RotateCcw size={13} /> Сбросить
+                </Button>
+              )}
+            </div>
+            <p className="mt-1.5 text-[11px] text-muted">
+              Потрачено в этом месяце: <b className="text-text">{aiQuota.used.toLocaleString("ru-RU")}</b> из{" "}
+              {aiQuota.limit === null ? "без лимита" : aiQuota.limit.toLocaleString("ru-RU")}
+              {aiQuota.override !== null && ` · расширено до ${aiQuota.override.toLocaleString("ru-RU")}`}.
             </p>
           </Field>
         )}

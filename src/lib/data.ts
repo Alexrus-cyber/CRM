@@ -17,7 +17,7 @@ import {
   type AchievementResult,
   type UserStats,
 } from "./achievements";
-import { dateToStr, isAdminRole } from "./utils";
+import { dateToStr, isCompanyRole } from "./utils";
 
 export type { CounterpartyRow, TaskRow, UserLite } from "@/db/repo";
 
@@ -33,9 +33,9 @@ export async function getCounterparties(): Promise<CounterpartyRow[]> {
   return repoListCounterparties();
 }
 
-/** Admins see everything, others only tasks they are author or assignee of. */
+/** Админы и менеджеры видят всё, остальные — только свои задачи. */
 export async function getVisibleTasks(user: SafeUser): Promise<TaskRow[]> {
-  return repoListTasks(isAdminRole(user.role) ? null : user.id);
+  return repoListTasks(isCompanyRole(user.role) ? null : user.id);
 }
 
 export async function getAllTasks(): Promise<TaskRow[]> {
@@ -47,7 +47,7 @@ export async function getTaskById(id: number): Promise<TaskRow | null> {
 }
 
 export function canSeeTask(user: SafeUser, t: { assigneeId: number; authorId: number }) {
-  return isAdminRole(user.role) || t.assigneeId === user.id || t.authorId === user.id;
+  return isCompanyRole(user.role) || t.assigneeId === user.id || t.authorId === user.id;
 }
 
 export function isTaskLate(t: TaskRow, today: string): boolean {

@@ -2,7 +2,7 @@ import * as XLSX from "xlsx";
 import { getCurrentUser } from "@/lib/auth";
 import { getVisibleTasks } from "@/lib/data";
 import { listExportedTaskIds, markTasksExported } from "@/db/repo";
-import { addBusinessDays, dateToStr, formatDate, formatDateTime, isAdminRole } from "@/lib/utils";
+import { addBusinessDays, dateToStr, formatDate, formatDateTime, canManageData } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
 
@@ -28,7 +28,7 @@ export async function GET(req: Request) {
     return Response.json({ error: "Требуется авторизация" }, { status: 401 });
   }
   // File export is a privileged operation: administrators only.
-  if (!isAdminRole(user.role)) {
+  if (!canManageData(user.role)) {
     return Response.json(
       { error: "Выгрузка доступна только администраторам" },
       { status: 403 },

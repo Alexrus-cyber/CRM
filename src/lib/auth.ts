@@ -105,6 +105,7 @@ export async function requireAdmin(): Promise<SafeUser> {
 
 export function canManageRole(actor: Role, target: Role) {
   if (actor === "super_admin") return true;
-  if (actor === "admin") return target === "user";
+  // Администратор и менеджер оперируют только рядовыми ролями.
+  if (actor === "admin" || actor === "manager") return target === "user" || target === "consultant";
   return false;
 }

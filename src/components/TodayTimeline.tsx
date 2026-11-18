@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { AlarmClock, Check, ChevronRight, CircleAlert, Clock, Hand, Sunrise } from "lucide-react";
+import { AlarmClock, Check, ChevronRight, CircleAlert, Clock, Hand, Sunrise, Users } from "lucide-react";
 import type { TaskRow } from "@/lib/data";
 import { acceptTaskAction, setTaskStatusAction } from "@/app/actions/tasks";
 import { CheckCircle } from "lucide-react";
@@ -18,12 +18,23 @@ import {
   needsAcceptance,
   scheduledAt,
 } from "@/lib/taskTime";
-import { PriorityBadge, StatusBadge } from "./ui";
+import { Avatar, PriorityBadge, StatusBadge } from "./ui";
 
 const currentHourKey = (now: Date) =>
   `${new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Moscow", hour: "2-digit", hour12: false }).format(now)}:00`;
 
-export function TodayTimeline({ tasks, meId, userName }: { tasks: TaskRow[]; meId: number; userName: string }) {
+export function TodayTimeline({
+  tasks,
+  meId,
+  userName,
+  showOthers = false,
+}: {
+  tasks: TaskRow[];
+  meId: number;
+  userName: string;
+  /** Админам и менеджерам показываем ещё и задачи коллег на сегодня. */
+  showOthers?: boolean;
+}) {
   const router = useRouter();
   const [pending, start] = useTransition();
   const [now, setNow] = useState(() => new Date());
@@ -36,7 +47,7 @@ export function TodayTimeline({ tasks, meId, userName }: { tasks: TaskRow[]; meI
 
   const today = todayStr();
 
-  const { mine, overdue, accept, acceptedToday, hours, noTime, hourKeys, todayCount } = useMemo(() => {
+  const { mine, overdue, accept, acceptedToday, hours, noTime, hourKeys, todayCount, othersToday } = useMemo(() => {
     const mine = tasks.filter((t) => t.assigneeId === meId && isOpenStatus(t.status));
     const overdueList = mine.filter((t) => isOverdueByDay(t.deadline, now));
     const todayList = mine
@@ -63,6 +74,13 @@ export function TodayTimeline({ tasks, meId, userName }: { tasks: TaskRow[]; meI
       noTime: grouped.get("Без времени") ?? [],
       hourKeys: keys,
       todayCount: todayList.length,
+      // Задачи коллег на сегодня — только для чтения, свои всегда идут первыми.
+      othersToday: tasks
+        .filter((t) => t.assigneeId !== meId && isOpenStatus(t.status) && t.deadline === today)
+        .sort(
+          (a, b) =>
+            scheduledAt(a.deadline, a.deadlineTime).getTime() - scheduledAt(b.deadline, b.deadlineTime).getTime(),
+        ),
     };
   }, [tasks, meId, now, today]);
 
@@ -274,6 +292,51 @@ export function TodayTimeline({ tasks, meId, userName }: { tasks: TaskRow[]; meI
           </div>
         )}
       </div>
+
+      {showOthers && (
+        <div className="mt-4 min-w-0 border-t border-border pt-3">
+          <p className="mb-1.5 flex flex-wrap items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted">
+            <Users size={12} /> Задачи коллег на сегодня ({othersToday.length})
+            <span className="font-normal normal-case tracking-normal">— свои всегда выше</span>
+          </p>
+          {othersToday.length === 0 ? (
+            <p className="rounded-xl border border-dashed border-border px-2.5 py-3 text-[11px] text-muted">
+              У коллег на сегодня открытых задач нет.
+            </p>
+          ) : (
+            <ul className="space-y-1.5">
+              {othersToday.slice(0, 30).map((t) => (
+                <li
+                  key={t.id}
+                  className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border border-border bg-card2/40 p-2"
+                >
+                  <span className="w-11 shrink-0 rounded-md bg-card2 px-1.5 py-0.5 text-center text-[10px] font-semibold tabular-nums text-muted">
+                    {formatTimeLabel(t.deadlineTime).slice(0, 5)}
+                  </span>
+                  <Avatar name={t.assigneeName} color={t.assigneeColor} url={t.assigneeAvatar} size={22} />
+                  <span className="min-w-0 max-w-[8rem] shrink-0 truncate text-[11px] text-muted">{t.assigneeName}</span>
+                  <p className="min-w-0 flex-1 truncate text-[12px] font-medium">{t.title}</p>
+                  {t.counterpartyName && (
+                    <span className="hidden max-w-[9rem] truncate text-[10px] text-muted sm:block">{t.counterpartyName}</span>
+                  )}
+                  <span className="shrink-0">
+                    <StatusBadge status={t.status} />
+                  </span>
+                  <Link
+                    href={`/team/${t.assigneeId}`}
+                    className="shrink-0 rounded-lg border border-border bg-card px-1.5 py-0.5 text-[10px] text-muted transition hover:text-text"
+                  >
+                    Профиль
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          )}
+          {othersToday.length > 30 && (
+            <p className="mt-1.5 text-[10px] text-muted">Показаны первые 30 из {othersToday.length} — остальные в разделе «Задачи».</p>
+          )}
+        </div>
+      )}
     </section>
   );
 }

@@ -12,6 +12,7 @@ import {
   FileText,
   FolderOpen,
   Gauge,
+  History,
   Image as ImageIcon,
   Loader2,
   MessageSquarePlus,
@@ -28,14 +29,13 @@ import {
 } from "lucide-react";
 import { Avatar, Badge, Button, Card, Field, Input } from "./ui";
 import { Combobox } from "./Combobox";
-import { cn, formatTime } from "@/lib/utils";
+import { cn, formatTime, ROLE_LABELS } from "@/lib/utils";
 import {
   AI_DEFAULT_BASE_URL,
   AI_DEFAULT_PARAMS,
   AI_MAX_FILE_BYTES,
   AI_MAX_FILES,
   AI_REASONING_MODES,
-  AI_STORAGE_HISTORY,
   AI_STORAGE_PARAMS,
   AI_STORAGE_SETTINGS,
   estimateMessagesTokens,
@@ -48,6 +48,8 @@ import {
 } from "@/lib/ai";
 import { extractFile, imageToDataUrl } from "@/lib/fileExtract";
 import { snippet, splitIntoChunks } from "@/lib/rag";
+import { formatTokenCount, type AiRolePolicy } from "@/lib/aiPolicy";
+import type { Role } from "@/db/schema";
 
 /* --------------------------------- типы --------------------------------- */
 
@@ -92,9 +94,29 @@ type RagFolder = {
 
 type RagHit = { path: string; text: string; score: number };
 
-const HISTORY_LIMIT = 40;
-const STORAGE_CHAT = "crm.ai.chat.v1";
+type ChatInfo = {
+  id: number;
+  title: string;
+  tokensTotal: number;
+  tokensPrompt: number;
+  tokensCompletion: number;
+  tokensLeft: number;
+  tokensLimit: number;
+  messagesCount: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type UsageInfo = {
+  role: Role;
+  policy: AiRolePolicy;
+  totals: { prompt: number; completion: number; total: number; events: number };
+  monthly: { used: number; limit: number | null; left: number | null };
+  chats: { count: number };
+};
+
 const STORAGE_RAG = "crm.ai.rag.v1";
+const STORAGE_CHAT = "crm.ai.chat.v1";
 
 /* ------------------------------- хранилище ------------------------------ */
 
@@ -126,16 +148,11 @@ function readParams(): AiParams {
   }
 }
 
-function readHistory(): Bubble[] {
-  if (typeof window === "undefined") return [];
+function parseAttachments(raw: string): AttachmentMeta[] {
   try {
-    const raw = window.localStorage.getItem(AI_STORAGE_HISTORY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as Bubble[];
+    const parsed = JSON.parse(raw) as AttachmentMeta[];
     if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((item) => item && typeof item.text === "string" && (item.role === "user" || item.role === "assistant"))
-      .map((item) => ({ ...item, reasoning: item.reasoning ?? "", attachments: item.attachments ?? [] }));
+    return parsed.filter((item) => item && typeof item.name === "string").slice(0, 8);
   } catch {
     return [];
   }
@@ -150,10 +167,6 @@ function readNumber(key: string, fallback: number): number {
   if (typeof window === "undefined") return fallback;
   const value = Number(window.localStorage.getItem(key) ?? "");
   return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-function readChatNo(): number {
-  return readNumber(STORAGE_CHAT, 1);
 }
 
 function readFolderId(): number {
@@ -226,17 +239,13 @@ export function AiChatClient({ userName }: { userName: string }) {
   const [settings, setSettings] = useState<AiSettings>(readSettings);
   const [params, setParams] = useState<AiParams>(readParams);
   const [showKey, setShowKey] = useState(false);
-  const [bubbles, setBubbles] = useState<Bubble[]>(readHistory);
-  const [chatNo, setChatNo] = useState<number>(readChatNo);
-  // После перезагрузки страницы счётчик контекста восстанавливаем по последнему ответу.
-  const [contextTokens, setContextTokens] = useState<number>(() => {
-    const restored = readHistory();
-    for (let index = restored.length - 1; index >= 0; index -= 1) {
-      const usage = restored[index].usage;
-      if (usage) return usage.total;
-    }
-    return 0;
-  });
+  const [bubbles, setBubbles] = useState<Bubble[]>([]);
+  const [chat, setChat] = useState<ChatInfo | null>(null);
+  const [chats, setChats] = useState<ChatInfo[]>([]);
+  const [usage, setUsage] = useState<UsageInfo | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(true);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [contextTokens, setContextTokens] = useState(0);
   const [text, setText] = useState("");
   const [pending, setPending] = useState<PendingFile[]>([]);
   const [extracting, setExtracting] = useState(0);
@@ -296,22 +305,6 @@ export function AiChatClient({ userName }: { userName: string }) {
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(AI_STORAGE_HISTORY, JSON.stringify(bubbles.slice(-HISTORY_LIMIT)));
-    } catch {
-      /* переполнение хранилища */
-    }
-  }, [bubbles]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_CHAT, String(chatNo));
-    } catch {
-      /* не критично */
-    }
-  }, [chatNo]);
-
-  useEffect(() => {
-    try {
       window.localStorage.setItem(STORAGE_RAG, String(folderId));
     } catch {
       /* не критично */
@@ -326,6 +319,201 @@ export function AiChatClient({ userName }: { userName: string }) {
   useEffect(() => () => {
     for (const url of previewsRef.current) URL.revokeObjectURL(url);
     previewsRef.current = [];
+  }, []);
+
+  /** Очистка выбранных файлов — нужна и при смене чата, поэтому объявлена выше. */
+  const clearPending = () => {
+    for (const url of previewsRef.current) URL.revokeObjectURL(url);
+    previewsRef.current = [];
+    setPending([]);
+  };
+
+  /* ------------------------ чаты и токены аккаунта ---------------------- */
+
+  const applyUsage = (data: UsageInfo | null) => {
+    if (!data) return;
+    setUsage(data);
+    // Роль могла не разрешать выбранный режим раздумий — приводим к допустимому.
+    setParams((prev) =>
+      data.policy.reasoning.includes(prev.reasoning)
+        ? prev
+        : { ...prev, reasoning: data.policy.reasoning.includes("low") ? "low" : data.policy.reasoning[0] },
+    );
+    if (!data.policy.rag) setFolderId(0);
+  };
+
+  const reloadUsage = async () => {
+    try {
+      const res = await fetch("/api/ai/usage", { cache: "no-store" });
+      if (!res.ok) return null;
+      const data = (await res.json()) as UsageInfo;
+      applyUsage(data);
+      return data;
+    } catch {
+      return null;
+    }
+  };
+
+  const reloadChats = async (): Promise<ChatInfo[]> => {
+    try {
+      const res = await fetch("/api/ai/chats", { cache: "no-store" });
+      if (!res.ok) return [];
+      const data = (await res.json()) as { chats?: ChatInfo[] };
+      const list = data.chats ?? [];
+      setChats(list);
+      return list;
+    } catch {
+      return [];
+    }
+  };
+
+  const openChat = async (id: number) => {
+    setHistoryBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/ai/chats/${id}`, { cache: "no-store" });
+      if (!res.ok) {
+        setError("Чат не найден — возможно, он удалён");
+        return;
+      }
+      const data = (await res.json()) as {
+        chat: ChatInfo;
+        messages: Array<{
+          id: number;
+          role: "user" | "assistant";
+          content: string;
+          reasoning: string;
+          attachments: string;
+          promptTokens: number;
+          completionTokens: number;
+          createdAt: string;
+        }>;
+      };
+      const restored: Bubble[] = data.messages.map((message) => ({
+        id: `m-${message.id}`,
+        role: message.role,
+        text: message.content,
+        reasoning: message.reasoning,
+        attachments: parseAttachments(message.attachments),
+        at: new Date(message.createdAt).getTime(),
+        usage:
+          message.role === "assistant" && (message.promptTokens || message.completionTokens)
+            ? {
+                prompt: message.promptTokens,
+                completion: message.completionTokens,
+                total: message.promptTokens + message.completionTokens,
+                estimated: false,
+              }
+            : undefined,
+      }));
+      setChat(data.chat);
+      setBubbles(restored);
+      contextRef.current = restored
+        .filter((bubble) => bubble.text.trim())
+        .map((bubble) => ({ role: bubble.role, content: bubble.text }));
+      const lastUsage = [...restored].reverse().find((bubble) => bubble.usage)?.usage;
+      setContextTokens(lastUsage?.total ?? 0);
+      setText("");
+      clearPending();
+      if (typeof window !== "undefined") {
+        try {
+          window.localStorage.setItem(STORAGE_CHAT, String(id));
+        } catch {
+          /* не критично */
+        }
+      }
+    } catch {
+      setError("Не удалось загрузить чат");
+    } finally {
+      setHistoryBusy(false);
+    }
+  };
+
+  const createChat = async (): Promise<ChatInfo | null> => {
+    setHistoryBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/ai/chats", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setError(data.error ?? "Не удалось создать чат");
+        return null;
+      }
+      const data = (await res.json()) as { chat: ChatInfo };
+      setChat(data.chat);
+      setChats((prev) => [data.chat, ...prev.filter((item) => item.id !== data.chat.id)]);
+      setBubbles([]);
+      contextRef.current = [];
+      setContextTokens(0);
+      setText("");
+      clearPending();
+      if (typeof window !== "undefined") {
+        try {
+          window.localStorage.setItem(STORAGE_CHAT, String(data.chat.id));
+        } catch {
+          /* не критично */
+        }
+      }
+      return data.chat;
+    } catch {
+      setError("Не удалось создать чат");
+      return null;
+    } finally {
+      setHistoryBusy(false);
+    }
+  };
+
+  const removeChat = async (id: number) => {
+    setError(null);
+    try {
+      const res = await fetch(`/api/ai/chats?id=${id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setError(data.error ?? "Не удалось удалить чат");
+        return;
+      }
+      const remaining = chats.filter((item) => item.id !== id);
+      setChats(remaining);
+      if (chat?.id === id) {
+        setChat(null);
+        setBubbles([]);
+        contextRef.current = [];
+        setContextTokens(0);
+        if (remaining.length > 0) await openChat(remaining[0].id);
+        else await createChat();
+      }
+      void reloadUsage();
+    } catch {
+      setError("Не удалось удалить чат");
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [usageRes, chatsRes] = await Promise.all([
+        fetch("/api/ai/usage", { cache: "no-store" }).catch(() => null),
+        fetch("/api/ai/chats", { cache: "no-store" }).catch(() => null),
+      ]);
+      if (cancelled) return;
+      if (usageRes?.ok) {
+        const data = (await usageRes.json()) as UsageInfo;
+        if (!cancelled) applyUsage(data);
+      }
+      if (chatsRes?.ok) {
+        const data = (await chatsRes.json()) as { chats?: ChatInfo[] };
+        const list = data.chats ?? [];
+        if (cancelled) return;
+        setChats(list);
+        const remembered = readNumber(STORAGE_CHAT, 0);
+        const target = list.find((item) => item.id === remembered) ?? list[0];
+        if (target) void openChat(target.id);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /* ------------------------- RAG: список папок -------------------------- */
@@ -590,12 +778,6 @@ export function AiChatClient({ userName }: { userName: string }) {
     setPending(pending.filter((item) => item.id !== id));
   };
 
-  const clearPending = () => {
-    for (const url of previewsRef.current) URL.revokeObjectURL(url);
-    previewsRef.current = [];
-    setPending([]);
-  };
-
   /* --------------------------------- чат -------------------------------- */
 
   const totals = bubbles.reduce(
@@ -614,15 +796,20 @@ export function AiChatClient({ userName }: { userName: string }) {
   const usedPercent = limit > 0 ? Math.min(100, Math.round((contextTokens / limit) * 100)) : 0;
   const overLimit = limit > 0 && contextTokens >= limit;
 
-  const newChat = () => {
+  const policy = usage?.policy ?? null;
+  const chatLimit = chat?.tokensLimit ?? policy?.perChatTokens ?? 0;
+  const chatLeft = chat ? Math.max(chatLimit - chat.tokensTotal, 0) : chatLimit;
+  const chatUsedPercent = chatLimit > 0 ? Math.min(100, Math.round(((chat?.tokensTotal ?? 0) / chatLimit) * 100)) : 0;
+  const chatExhausted = Boolean(chat && chatLimit > 0 && chat.tokensTotal >= chatLimit);
+  const monthLimit = usage?.monthly.limit ?? null;
+  const monthUsed = usage?.monthly.used ?? 0;
+  const monthLeft = usage?.monthly.left ?? null;
+  const monthExhausted = monthLimit !== null && monthUsed >= monthLimit;
+  const reasoningOptions = AI_REASONING_MODES.filter((mode) => policy?.reasoning.includes(mode.value) ?? true);
+
+  const newChat = async () => {
     if (streaming) abortRef.current?.abort();
-    contextRef.current = [];
-    setBubbles([]);
-    setChatNo((value) => value + 1);
-    setContextTokens(0);
-    setError(null);
-    setNotice(null);
-    setRagHits(null);
+    await createChat();
   };
 
   const send = async () => {
@@ -637,8 +824,26 @@ export function AiChatClient({ userName }: { userName: string }) {
       setError("Контекст заполнен: нажмите «Новый чат», чтобы начать заново и обнулить счётчик токенов.");
       return;
     }
+    if (chatExhausted) {
+      setError(
+        `В этом чате закончился лимит токенов (${formatTokenCount(chat?.tokensTotal ?? 0)} из ${formatTokenCount(chatLimit)}). Начните новый чат.`,
+      );
+      return;
+    }
+    if (monthExhausted) {
+      setError(
+        `Месячный лимит токенов исчерпан (${formatTokenCount(monthUsed)} из ${formatTokenCount(monthLimit)}). Расширить лимит может администратор.`,
+      );
+      return;
+    }
     setError(null);
     setNotice(null);
+
+    let activeChat = chat;
+    if (!activeChat) {
+      activeChat = await createChat();
+      if (!activeChat) return;
+    }
 
     const parts: Array<Record<string, unknown>> = [];
     const metas: AttachmentMeta[] = [];
@@ -690,16 +895,21 @@ export function AiChatClient({ userName }: { userName: string }) {
     clearPending();
     if (inputRef.current) inputRef.current.focus();
 
-    await runCompletion(replyId, question || "Опиши вложения.");
+    await runCompletion(replyId, question || "Опиши вложения.", activeChat.id, metas);
   };
 
-  const runCompletion = async (replyId: string, ragQueryText: string) => {
+  const runCompletion = async (
+    replyId: string,
+    ragQueryText: string,
+    chatId: number,
+    attachments: AttachmentMeta[],
+  ) => {
     const controller = new AbortController();
     abortRef.current = controller;
     setStreaming(true);
     let accumulated = "";
     let thinking = "";
-    let usage: Usage | null = null;
+    let turnUsage: Usage | null = null;
     let ragHits = 0;
 
     const promptEstimate = estimateMessagesTokens(contextRef.current) + (params.system ? estimateTokens(params.system) : 0);
@@ -719,7 +929,9 @@ export function AiChatClient({ userName }: { userName: string }) {
         body: JSON.stringify({
           messages: contextRef.current,
           params,
-          ragFolderId: folderId || 0,
+          chatId,
+          attachments,
+          ragFolderId: policy?.rag ? folderId || 0 : 0,
           ragQuery: ragQueryText,
         }),
         signal: controller.signal,
@@ -750,20 +962,35 @@ export function AiChatClient({ userName }: { userName: string }) {
           const data = JSON.parse(payload) as {
             delta?: string;
             reasoning?: string;
-            usage?: { prompt: number; completion: number; total: number };
+            usage?: { prompt: number; completion: number; total: number; estimated?: boolean };
             ragHits?: number;
             done?: boolean;
             error?: string;
+            chat?: ChatInfo | null;
+            monthly?: { used: number; limit: number | null; left: number | null };
           };
           if (data.error) throw new Error(data.error);
           if (typeof data.ragHits === "number") ragHits = data.ragHits;
           if (data.usage) {
-            usage = {
+            turnUsage = {
               prompt: data.usage.prompt,
               completion: data.usage.completion,
               total: data.usage.total || data.usage.prompt + data.usage.completion,
-              estimated: false,
+              estimated: Boolean(data.usage.estimated),
             };
+          }
+          if (data.chat) {
+            setChat(data.chat);
+            setChats((prev) =>
+              prev.map((item) => (item.id === data.chat?.id ? { ...item, ...data.chat } : item)),
+            );
+          }
+          if (data.monthly) {
+            setUsage((prev) =>
+              prev
+                ? { ...prev, monthly: data.monthly ?? prev.monthly, totals: { ...prev.totals, total: data.monthly?.used ?? prev.totals.total } }
+                : prev,
+            );
           }
           if (data.reasoning) {
             thinking += data.reasoning;
@@ -786,7 +1013,7 @@ export function AiChatClient({ userName }: { userName: string }) {
       }
 
       // Сервер не прислал usage — считаем сами и помечаем как оценку.
-      const finalUsage: Usage = usage ?? {
+      const finalUsage: Usage = turnUsage ?? {
         prompt: promptEstimate,
         completion: estimateTokens(accumulated),
         total: promptEstimate + estimateTokens(accumulated),
@@ -795,6 +1022,8 @@ export function AiChatClient({ userName }: { userName: string }) {
       patch({ usage: finalUsage, ragHits });
       // Следующий запрос пойдёт с промптом ≈ (промпт + ответ) этого хода.
       setContextTokens(finalUsage.total);
+      void reloadChats();
+      void reloadUsage();
       if (contextRef.current.length > 0) contextRef.current.push({ role: "assistant", content: accumulated });
     } catch (caught) {
       const aborted = controller.signal.aborted;
@@ -848,13 +1077,13 @@ export function AiChatClient({ userName }: { userName: string }) {
       return `### ${who} · ${new Date(bubble.at).toLocaleString("ru-RU")}${files}${usage}\n\n${bubble.text}${reasoning}`;
     });
     const header =
-      `# Стенограмма чата с ИИ №${chatNo}\n\nМодель: ${settings.model || "—"}\nСервер: ${settings.baseUrl}\n` +
+      `# Стенограмма чата с ИИ «${chat?.title ?? "Новый чат"}»\n\nМодель: ${settings.model || "—"}\nСервер: ${settings.baseUrl}\n` +
       `Токены: отправлено ${totals.prompt}, получено ${totals.completion}\nRAG: ${activeFolder ? activeFolder.name : "без папки"}\n\n`;
     const blob = new Blob([header + lines.join("\n\n---\n\n")], { type: "text/markdown;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `ai-chat-${chatNo}-${new Date().toISOString().slice(0, 10)}.md`;
+    link.download = `ai-chat-${chat?.id ?? 0}-${new Date().toISOString().slice(0, 10)}.md`;
     link.click();
     URL.revokeObjectURL(url);
   };
@@ -865,6 +1094,128 @@ export function AiChatClient({ userName }: { userName: string }) {
     <div className="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-[minmax(0,360px)_minmax(0,1fr)]">
       {/* ----------------------------- параметры ----------------------------- */}
       <div className="order-2 min-w-0 space-y-3 xl:order-1">
+        <Section
+          title="Токены аккаунта"
+          subtitle={usage ? `Роль: ${ROLE_LABELS[usage.role]}` : "Считаются по всем чатам в базе"}
+          icon={<Gauge size={14} className="text-emerald-500" />}
+          action={
+            <Badge className="border-border text-muted">
+              {usage ? formatTokenCount(usage.monthly.used) : "—"}
+            </Badge>
+          }
+        >
+          <div className="space-y-3">
+            {usage ? (
+              <>
+                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                  <div className="rounded-xl border border-border bg-card2/60 px-2 py-1.5">
+                    <p className="text-muted">Всего в аккаунте</p>
+                    <p className="text-sm font-semibold">{formatTokenCount(usage.totals.total)}</p>
+                  </div>
+                  <div className="rounded-xl border border-border bg-card2/60 px-2 py-1.5">
+                    <p className="text-muted">В этом месяце</p>
+                    <p className="text-sm font-semibold">{formatTokenCount(usage.monthly.used)}</p>
+                  </div>
+                </div>
+                <div>
+                  <div className="mb-1 flex items-center justify-between text-[11px] text-muted">
+                    <span>Месячный лимит</span>
+                    <span>
+                      {formatTokenCount(usage.monthly.used)} / {formatTokenCount(usage.monthly.limit)}
+                    </span>
+                  </div>
+                  {usage.monthly.limit !== null ? (
+                    <>
+                      <div className="h-1.5 overflow-hidden rounded-full bg-card2">
+                        <div
+                          className={cn(
+                            "h-full rounded-full transition-all",
+                            monthExhausted ? "bg-red-500" : monthUsed / usage.monthly.limit > 0.8 ? "bg-amber-500" : "bg-emerald-500",
+                          )}
+                          style={{
+                            width: `${Math.max(Math.min(100, Math.round((monthUsed / Math.max(usage.monthly.limit, 1)) * 100)), 2)}%`,
+                          }}
+                        />
+                      </div>
+                      <p className={cn("mt-1 text-[11px]", monthExhausted ? "text-red-500" : "text-muted")}>
+                        Осталось: {formatTokenCount(monthLeft)} · лимит расширяет только администратор
+                      </p>
+                    </>
+                  ) : (
+                    <p className="text-[11px] text-muted">Без месячного лимита — полный доступ</p>
+                  )}
+                </div>
+                <p className="text-[11px] text-muted">{usage.policy.summary}</p>
+                <div className="flex flex-wrap gap-1.5 text-[10px] text-muted">
+                  <Badge className="border-border text-muted">RAG: {usage.policy.rag ? "да" : "нет"}</Badge>
+                  <Badge className="border-border text-muted">Чатов: {usage.chats.count}</Badge>
+                  <Badge className="border-border text-muted">На чат: {formatTokenCount(usage.policy.perChatTokens)}</Badge>
+                </div>
+              </>
+            ) : (
+              <p className="text-[11px] text-muted">Загружаем счётчики…</p>
+            )}
+          </div>
+        </Section>
+
+        <Section
+          title="История чатов"
+          subtitle="Сколько токенов осталось в каждом чате"
+          icon={<History size={14} className="text-accent2" />}
+          action={
+            <Button variant="secondary" size="sm" onClick={() => void newChat()} disabled={historyBusy || streaming}>
+              <MessageSquarePlus size={13} />
+              Новый
+            </Button>
+          }
+        >
+          <div className="space-y-2">
+            {chats.length === 0 && <p className="text-[11px] text-muted">Чатов пока нет — создайте первый.</p>}
+            {chats.length > 0 && (
+              <div className="max-h-64 space-y-1.5 overflow-y-auto pr-0.5">
+                {chats.map((item) => {
+                  const active = item.id === chat?.id;
+                  const left = Math.max(item.tokensLimit - item.tokensTotal, 0);
+                  return (
+                    <div
+                      key={item.id}
+                      className={cn(
+                        "flex min-w-0 items-center gap-1.5 rounded-xl border px-2 py-1.5",
+                        active ? "border-accent/60 bg-accent/10" : "border-border bg-card2/40",
+                      )}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => void openChat(item.id)}
+                        className="min-w-0 flex-1 text-left"
+                        title={`Открыть чат «${item.title}»`}
+                      >
+                        <p className="truncate text-[11px] font-medium">{item.title}</p>
+                        <p className="truncate text-[10px] text-muted">
+                          {new Date(item.updatedAt).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                          {" · "}осталось {formatTokenCount(left)}
+                        </p>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void removeChat(item.id)}
+                        className="shrink-0 rounded p-1 text-muted transition hover:text-red-500"
+                        title="Удалить чат"
+                        aria-label={`Удалить чат «${item.title}»`}
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <p className="text-[11px] text-muted">
+              История хранится в базе за вашим аккаунтом: чаты и токены видны с любого устройства.
+            </p>
+          </div>
+        </Section>
+
         <Section
           title="Подключение"
           icon={<Sparkles size={14} className="text-accent2" />}
@@ -949,7 +1300,11 @@ export function AiChatClient({ userName }: { userName: string }) {
 
         <Section
           title="Раздумья модели"
-          subtitle="Если сервер не понимает эти параметры — выберите «По умолчанию»."
+          subtitle={
+            policy && !policy.reasoning.includes("high")
+              ? `Ваша роль: доступны только «без раздумий» и «коротко».`
+              : "Если сервер не понимает эти параметры — выберите «По умолчанию»."
+          }
           icon={<Brain size={14} className="text-accent2" />}
         >
           <div className="space-y-3">
@@ -958,7 +1313,7 @@ export function AiChatClient({ userName }: { userName: string }) {
               value={params.reasoning}
               onChange={(next) => updateParams({ reasoning: next as ReasoningMode })}
               placeholder="По умолчанию"
-              options={AI_REASONING_MODES.map((mode) => ({ value: mode.value, label: mode.label, hint: mode.hint }))}
+              options={reasoningOptions.map((mode) => ({ value: mode.value, label: mode.label, hint: mode.hint }))}
             />
             {reasoningMode && <p className="text-[11px] text-muted">{reasoningMode.hint}</p>}
             {params.reasoning === "budget" && (
@@ -994,9 +1349,33 @@ export function AiChatClient({ userName }: { userName: string }) {
           title="Контекст и токены"
           subtitle="Счётчик идёт по текущему чату; «Новый чат» обнуляет его."
           icon={<Gauge size={14} className="text-accent2" />}
-          action={<Badge className="border-border text-muted">≈{totalTokens} ток.</Badge>}
+          action={
+            <Badge className={cn("border-border", chatExhausted && "border-red-500/40 bg-red-500/10 text-red-500")}>
+              осталось {formatTokenCount(chatLeft)}
+            </Badge>
+          }
         >
           <div className="space-y-3">
+            <div className="rounded-xl border border-border bg-card2/60 px-2 py-1.5">
+              <div className="mb-1 flex items-center justify-between text-[11px]">
+                <span className="text-muted">Токены чата</span>
+                <span className={cn("font-medium", chatExhausted && "text-red-500")}>
+                  {formatTokenCount(chat?.tokensTotal ?? 0)} / {formatTokenCount(chatLimit)}
+                </span>
+              </div>
+              <div className="h-1.5 overflow-hidden rounded-full bg-card2">
+                <div
+                  className={cn(
+                    "h-full rounded-full transition-all",
+                    chatExhausted ? "bg-red-500" : chatUsedPercent > 80 ? "bg-amber-500" : "bg-emerald-500",
+                  )}
+                  style={{ width: `${Math.max(chatUsedPercent, 2)}%` }}
+                />
+              </div>
+              <p className="mt-1 text-[10px] text-muted">
+                {chat ? `Чат «${chat.title}»` : "Чат ещё не создан"} · «Новый чат» обнуляет счётчик
+              </p>
+            </div>
             <Field label="Лимит контекста модели, токенов (0 — не следить)">
               <Input
                 type="number"
@@ -1028,10 +1407,10 @@ export function AiChatClient({ userName }: { userName: string }) {
             )}
             <div className="grid grid-cols-2 gap-2 text-[11px] text-muted">
               <p>
-                Отправлено: <b className="text-text">{totals.prompt}</b>
+                Чат, отправлено: <b className="text-text">{totals.prompt}</b>
               </p>
               <p>
-                Получено: <b className="text-text">{totals.completion}</b>
+                Чат, получено: <b className="text-text">{totals.completion}</b>
               </p>
             </div>
             <p className="text-[11px] text-muted">
@@ -1146,14 +1525,33 @@ export function AiChatClient({ userName }: { userName: string }) {
 
         <Section
           title="RAG окружение"
-          subtitle="Папка хранится в базе и может быть любого размера."
+          subtitle={
+            policy && !policy.rag
+              ? "Для вашей роли RAG выключен — модель отвечает без документов."
+              : "Папка хранится в базе и может быть любого размера."
+          }
           icon={<FolderOpen size={14} className="text-accent2" />}
           action={
-            <Badge className={cn("border-border", activeFolder ? "bg-emerald-500/10 text-emerald-500" : "text-muted")}>
-              {activeFolder ? `${activeFolder.chunksCount} фрагм.` : "нет"}
+            <Badge
+              className={cn(
+                "border-border",
+                policy && !policy.rag
+                  ? "bg-red-500/10 text-red-500"
+                  : activeFolder
+                    ? "bg-emerald-500/10 text-emerald-500"
+                    : "text-muted",
+              )}
+            >
+              {policy && !policy.rag ? "недоступно" : activeFolder ? `${activeFolder.chunksCount} фрагм.` : "нет"}
             </Badge>
           }
         >
+          {policy && !policy.rag ? (
+            <p className="rounded-xl border border-border bg-card2/50 px-2.5 py-2 text-[11px] text-muted">
+              RAG-папки доступны администраторам, разработчикам и главному админу. Модель ответит только по переписке
+              и вложениям.
+            </p>
+          ) : (
           <div className="space-y-3">
             <input
               ref={dirRef}
@@ -1268,6 +1666,7 @@ export function AiChatClient({ userName }: { userName: string }) {
               </p>
             )}
           </div>
+          )}
         </Section>
 
         {error && (
@@ -1285,16 +1684,19 @@ export function AiChatClient({ userName }: { userName: string }) {
           className="h-full"
           title={
             <span className="flex flex-wrap items-center gap-2">
-              Чат №{chatNo}
+              {chat?.title ?? "Новый чат"}
               <Badge className="border-border text-muted">{settings.model.trim() || "модель не выбрана"}</Badge>
+              <Badge className={cn("border-border", chatExhausted ? "bg-red-500/10 text-red-500" : "text-muted")}>
+                осталось {formatTokenCount(chatLeft)}
+              </Badge>
               <Badge className="border-amber-500/40 bg-amber-500/10 text-amber-500">Harness</Badge>
               {activeFolder && <Badge className="border-emerald-500/40 bg-emerald-500/10 text-emerald-500">RAG</Badge>}
             </span>
           }
-          subtitle="История хранится в браузере; «Новый чат» начинает разговор и счётчик токенов заново."
+          subtitle="История хранится в базе аккаунта; «Новый чат» начинает разговор и счётчик токенов заново."
           action={
             <div className="flex items-center gap-1">
-              <Button variant="secondary" size="sm" onClick={newChat} title="Начать новый чат и обнулить счётчик">
+              <Button variant="secondary" size="sm" onClick={() => void newChat()} title="Начать новый чат и обнулить счётчик">
                 <MessageSquarePlus size={13} />
                 Новый чат
               </Button>
@@ -1311,7 +1713,7 @@ export function AiChatClient({ userName }: { userName: string }) {
                   <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-[#7c5cff] to-[#a78bfa] text-white">
                     <Bot size={20} />
                   </span>
-                  <p className="text-sm font-medium">Чат №{chatNo} готов к работе</p>
+                  <p className="text-sm font-medium">{chat?.title ?? "Новый чат"} готов к работе</p>
                   <p className="max-w-md text-xs text-muted">
                     Выберите модель, при желании папку RAG и тип раздумий. Можно приложить любые файлы до{" "}
                     {formatBytes(AI_MAX_FILE_BYTES)} — текст, docx/xlsx/pptx, pdf, картинки.
@@ -1406,13 +1808,35 @@ export function AiChatClient({ userName }: { userName: string }) {
               }}
               className="border-t border-border bg-card p-2.5 sm:p-3"
             >
+              {chatExhausted && (
+                <div className="mb-2 flex flex-wrap items-center gap-2 rounded-xl border border-red-500/40 bg-red-500/10 px-2.5 py-2 text-[11px] text-red-500">
+                  <AlertTriangle size={13} className="shrink-0" />
+                  <span className="min-w-0 flex-1">
+                    Лимит чата исчерпан ({formatTokenCount(chat?.tokensTotal ?? 0)} из {formatTokenCount(chatLimit)}).
+                    Начните новый чат — счётчик обнулится, история останется.
+                  </span>
+                  <Button type="button" variant="secondary" size="sm" onClick={() => void newChat()}>
+                    <MessageSquarePlus size={12} />
+                    Новый чат
+                  </Button>
+                </div>
+              )}
+              {monthExhausted && (
+                <div className="mb-2 flex flex-wrap items-center gap-2 rounded-xl border border-red-500/40 bg-red-500/10 px-2.5 py-2 text-[11px] text-red-500">
+                  <AlertTriangle size={13} className="shrink-0" />
+                  <span className="min-w-0 flex-1">
+                    Месячный лимит токенов исчерпан ({formatTokenCount(monthUsed)} из {formatTokenCount(monthLimit)}).
+                    Расширить лимит на этот месяц может администратор.
+                  </span>
+                </div>
+              )}
               {overLimit && (
                 <div className="mb-2 flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-[11px] text-amber-500">
                   <AlertTriangle size={13} className="shrink-0" />
                   <span className="min-w-0 flex-1">
                     Контекст заполнен (≈{contextTokens} из {limit} токенов). Начните новый чат — счётчик токенов обнулится.
                   </span>
-                  <Button type="button" variant="secondary" size="sm" onClick={newChat}>
+                  <Button type="button" variant="secondary" size="sm" onClick={() => void newChat()}>
                     <MessageSquarePlus size={12} />
                     Новый чат
                   </Button>
@@ -1476,7 +1900,12 @@ export function AiChatClient({ userName }: { userName: string }) {
                     <Square size={14} />
                   </Button>
                 ) : (
-                  <Button type="submit" size="icon" disabled={(!text.trim() && pending.length === 0) || overLimit} title="Отправить">
+                  <Button
+                    type="submit"
+                    size="icon"
+                    disabled={(!text.trim() && pending.length === 0) || overLimit || chatExhausted || monthExhausted}
+                    title="Отправить"
+                  >
                     <Send size={16} />
                   </Button>
                 )}
@@ -1490,9 +1919,13 @@ export function AiChatClient({ userName }: { userName: string }) {
                   <FolderOpen size={10} />
                   {activeFolder ? `${activeFolder.filesCount} файлов · до ${params.ragChunks} фрагм.` : "без RAG"}
                 </span>
-                <span className="flex items-center gap-1">
+                <span className={cn("flex items-center gap-1", chatExhausted && "text-red-500")}>
                   <Gauge size={10} />
-                  {totalTokens} ток. {limit > 0 ? `· ${contextTokens}/${limit}` : "· без лимита"}
+                  чат: осталось {formatTokenCount(chatLeft)} из {formatTokenCount(chatLimit)}
+                </span>
+                <span className={cn("flex items-center gap-1", monthExhausted && "text-red-500")}>
+                  месяц: {formatTokenCount(monthUsed)}
+                  {monthLimit !== null ? ` / ${formatTokenCount(monthLimit)}` : " / без лимита"}
                 </span>
                 {params.temperature !== null && <span>t={params.temperature}</span>}
                 {params.maxTokens !== null && <span>max={params.maxTokens}</span>}

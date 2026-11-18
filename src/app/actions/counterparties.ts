@@ -19,7 +19,7 @@ import {
   normalizeInn,
   normalizeKpp,
 } from "@/lib/counterpartyImport";
-import { isAdminRole } from "@/lib/utils";
+import { canManageData } from "@/lib/utils";
 import type { ActionResult } from "./users";
 
 export type CounterpartyInput = {
@@ -40,7 +40,7 @@ function clean(v?: string) {
 
 export async function saveCounterpartyAction(input: CounterpartyInput): Promise<ActionResult> {
   const me = await getCurrentUser();
-  if (!me || !isAdminRole(me.role)) {
+  if (!me || !canManageData(me.role)) {
     return { ok: false, error: "Создавать и редактировать контрагентов могут только администраторы" };
   }
   const name = input.name.trim();
@@ -76,7 +76,7 @@ export async function saveCounterpartyAction(input: CounterpartyInput): Promise<
 
 export async function deleteCounterpartyAction(id: number): Promise<ActionResult> {
   const me = await getCurrentUser();
-  if (!me || !isAdminRole(me.role)) return { ok: false, error: "Нет прав" };
+  if (!me || !canManageData(me.role)) return { ok: false, error: "Нет прав" };
   await deleteCounterparty(id);
   revalidatePath("/", "layout");
   publishLiveEvent("counterparties", me.id);
@@ -111,7 +111,7 @@ export async function importCounterpartiesAction(input: {
   updateExisting?: boolean;
 }): Promise<CounterpartyImportResult> {
   const me = await getCurrentUser();
-  if (!me || !isAdminRole(me.role)) {
+  if (!me || !canManageData(me.role)) {
     return { ok: false, error: "Загружать контрагентов из файла могут только администраторы" };
   }
 
