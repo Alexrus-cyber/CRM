@@ -22,10 +22,11 @@ export const AI_STORAGE_HISTORY = "crm.ai.history.v1";
 
 /** Сколько вложений можно приложить к одному вопросу. */
 export const AI_MAX_FILES = 4;
-/** Картинка уходит в модель как data-URL, поэтому ограничиваем размер. */
-export const AI_MAX_IMAGE_BYTES = 4 * 1024 * 1024;
-/** Текстовый файл целиком вставляется в промпт — тоже с потолком. */
-export const AI_MAX_TEXT_BYTES = 256 * 1024;
+/**
+ * Потолок на один файл. Тип не ограничиваем: текст, docx/xlsx/pptx, pdf, rtf
+ * и картинки разбираются в браузере, остальное уходит метаданными.
+ */
+export const AI_MAX_FILE_BYTES = 20 * 1024 * 1024;
 /** Сколько сообщений истории отправлять модели. */
 export const AI_MAX_CONTEXT_MESSAGES = 30;
 
@@ -99,6 +100,10 @@ export type AiParams = {
   sendThinkingFlag: boolean;
   /** Сколько фрагментов RAG подмешивать в контекст. */
   ragChunks: number;
+  /** Контекст модели в токенах: 0 — не следить за ним. */
+  contextLimit: number;
+  /** Просить у сервера usage в потоке (stream_options.include_usage). */
+  streamUsage: boolean;
 };
 
 export const AI_DEFAULT_PARAMS: AiParams = {
@@ -111,6 +116,8 @@ export const AI_DEFAULT_PARAMS: AiParams = {
   thinkingBudget: null,
   sendThinkingFlag: true,
   ragChunks: 6,
+  contextLimit: 8192,
+  streamUsage: true,
 };
 
 export const AI_STORAGE_PARAMS = "crm.ai.params.v1";
@@ -144,6 +151,37 @@ export function normalizeParams(raw: unknown): AiParams {
     reasoning,
     thinkingBudget: num(source.thinkingBudget, 64, 65536),
     sendThinkingFlag: source.sendThinkingFlag !== false,
-    ragChunks: num(source.ragChunks, 0, 20) ?? AI_DEFAULT_PARAMS.ragChunks,
+    ragChunks: num(source.ragChunks, 0, 50) ?? AI_DEFAULT_PARAMS.ragChunks,
+    contextLimit: num(source.contextLimit, 0, 1_000_000) ?? AI_DEFAULT_PARAMS.contextLimit,
+    streamUsage: source.streamUsage !== false,
   };
+}
+
+/**
+ * Грубая оценка токенов, когда сервер не вернул usage:
+ * латиница ≈ 4 символа на токен, кириллица — примерно 2,5.
+ */
+export function estimateTokens(text: string): number {
+  if (!text.trim()) return 0;
+  const cyrillic = (text.match(/[А-Яа-яЁё]/g) ?? []).length;
+  const rest = text.length - cyrillic;
+  return Math.ceil(cyrillic / 2.5 + rest / 4);
+}
+
+/** Оценка токенов всего контекста: строки и массивы частей сообщений. */
+export function estimateMessagesTokens(messages: Array<{ content: unknown }>): number {
+  let total = 4; // служебные токены на ответ
+  for (const message of messages) {
+    if (typeof message.content === "string") {
+      total += estimateTokens(message.content) + 4;
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content as Array<{ type?: string; text?: string; image_url?: { url?: string } }>) {
+        if (part?.type === "text" && part.text) total += estimateTokens(part.text) + 3;
+        // Картинка в vision-моделях обычно стоит 300–800 токенов в зависимости от размера.
+        if (part?.type === "image_url") total += 600;
+      }
+      total += 4;
+    }
+  }
+  return total;
 }

@@ -124,6 +124,14 @@ export function Combobox({
           value={displayValue}
           placeholder={selected ? selected.label : placeholder}
           onChange={(event) => startTyping(event.target.value)}
+          // Повторный клик по полю всегда раскрывает список целиком,
+          // даже если в поле что-то уже вписано или список закрыли по Esc.
+          onClick={() => {
+            if (open) return;
+            setOpen(true);
+            setQuery("");
+            setActive(0);
+          }}
           onFocus={() => {
             setOpen(true);
             setActive(0);
@@ -154,14 +162,14 @@ export function Combobox({
             }
           }}
           className={cn(
-            "w-full min-w-0 rounded-xl border border-border bg-card2 pr-8 text-text placeholder:text-muted/70 outline-none transition",
+            "w-full min-w-0 rounded-xl border border-border bg-card2 pr-12 text-text placeholder:text-muted/70 outline-none transition",
             "focus:border-accent focus:ring-2 focus:ring-[var(--ring)] disabled:opacity-60",
             size === "sm" ? "h-9 pl-2.5 text-xs" : "h-10 pl-3 text-sm",
             selected && !open && "text-text",
             inputClassName,
           )}
         />
-        <span className="pointer-events-none absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
+        <span className="absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
           {clearable && value !== "" && !disabled && (
             <button
               type="button"
@@ -170,16 +178,38 @@ export function Combobox({
               onClick={() => {
                 onChange("");
                 setQuery("");
+                setOpen(false);
                 inputRef.current?.focus();
               }}
-              className="pointer-events-auto rounded p-0.5 text-muted transition hover:text-text"
+              className="rounded p-0.5 text-muted transition hover:text-text"
               title={clearTitle}
               aria-label={clearTitle}
             >
               <X size={12} />
             </button>
           )}
-          <ChevronDown size={13} className={cn("text-muted transition-transform", open && "rotate-180")} />
+          <button
+            type="button"
+            tabIndex={-1}
+            disabled={disabled}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => {
+              if (open) {
+                setOpen(false);
+                setQuery("");
+              } else {
+                setOpen(true);
+                setQuery("");
+                setActive(0);
+                inputRef.current?.focus();
+              }
+            }}
+            className="rounded p-0.5 text-muted transition hover:text-text disabled:opacity-60"
+            title={open ? "Скрыть список" : "Показать список"}
+            aria-label={open ? "Скрыть список" : "Показать список"}
+          >
+            <ChevronDown size={13} className={cn("transition-transform", open && "rotate-180")} />
+          </button>
         </span>
       </div>
 

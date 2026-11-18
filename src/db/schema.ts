@@ -187,6 +187,63 @@ export const messageAttachments = pgTable(
   (t) => [index("message_attachments_message_idx").on(t.messageId)],
 );
 
+/** RAG-папка пользователя для блока «Чат с ИИ» (хранится в базе, без лимита). */
+export const aiRagFolders = pgTable(
+  "ai_rag_folders",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    filesCount: integer("files_count").notNull().default(0),
+    chunksCount: integer("chunks_count").notNull().default(0),
+    chars: integer("chars").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index("ai_rag_folders_user_idx").on(t.userId)],
+);
+
+/** Фрагмент текста из файла папки — единица поиска и контекста. */
+export const aiRagChunks = pgTable(
+  "ai_rag_chunks",
+  {
+    id: serial("id").primaryKey(),
+    folderId: integer("folder_id")
+      .notNull()
+      .references(() => aiRagFolders.id, { onDelete: "cascade" }),
+    path: text("path").notNull(),
+    chunkIndex: integer("chunk_index").notNull().default(0),
+    text: text("text").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index("ai_rag_chunks_folder_idx").on(t.folderId)],
+);
+
+/** Обратный индекс: основа слова → фрагмент и её частота (для BM25-поиска). */
+export const aiRagTerms = pgTable(
+  "ai_rag_terms",
+  {
+    id: serial("id").primaryKey(),
+    folderId: integer("folder_id")
+      .notNull()
+      .references(() => aiRagFolders.id, { onDelete: "cascade" }),
+    term: text("term").notNull(),
+    chunkId: integer("chunk_id")
+      .notNull()
+      .references(() => aiRagChunks.id, { onDelete: "cascade" }),
+    tf: integer("tf").notNull().default(1),
+  },
+  (t) => [index("ai_rag_terms_lookup_idx").on(t.folderId, t.term)],
+);
+
 /**
  * Per-user export journal: each closed task is downloaded once per person.
  * A unique (user_id, task_id) pair makes the "new only" export idempotent.
@@ -213,3 +270,4 @@ export type Counterparty = typeof counterparties.$inferSelect;
 export type Task = typeof tasks.$inferSelect;
 export type Message = typeof messages.$inferSelect;
 export type TaskExport = typeof taskExports.$inferSelect;
+export type AiRagFolder = typeof aiRagFolders.$inferSelect;
