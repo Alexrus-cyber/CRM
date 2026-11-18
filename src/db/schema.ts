@@ -19,7 +19,7 @@ import {
   uniqueIndex,
 } from "drizzle-orm/pg-core";
 
-export type Role = "super_admin" | "admin" | "user";
+export type Role = "super_admin" | "admin" | "developer" | "manager" | "consultant" | "user";
 export type TaskStatus =
   | "new"
   | "in_progress"
@@ -187,6 +187,90 @@ export const messageAttachments = pgTable(
   (t) => [index("message_attachments_message_idx").on(t.messageId)],
 );
 
+/** Чат с ИИ: сессия пользователя со своим счётчиком токенов. */
+export const aiChats = pgTable(
+  "ai_chats",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    title: text("title").notNull().default("Новый чат"),
+    tokensPrompt: integer("tokens_prompt").notNull().default(0),
+    tokensCompletion: integer("tokens_completion").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index("ai_chats_user_idx").on(t.userId, t.updatedAt)],
+);
+
+/** Сообщение чата с ИИ: текст, размышления и метаданные вложений. */
+export const aiChatMessages = pgTable(
+  "ai_chat_messages",
+  {
+    id: serial("id").primaryKey(),
+    chatId: integer("chat_id")
+      .notNull()
+      .references(() => aiChats.id, { onDelete: "cascade" }),
+    role: text("role").$type<"user" | "assistant">().notNull(),
+    content: text("content").notNull().default(""),
+    reasoning: text("reasoning").notNull().default(""),
+    /** JSON-массив {name, kind, size, note}. */
+    attachments: text("attachments").notNull().default("[]"),
+    tokens: integer("tokens").notNull().default(0),
+    promptTokens: integer("prompt_tokens").notNull().default(0),
+    completionTokens: integer("completion_tokens").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index("ai_chat_messages_chat_idx").on(t.chatId)],
+);
+
+/** Журнал расхода токенов: месячные лимиты и общий счётчик аккаунта. */
+export const aiUsageEvents = pgTable(
+  "ai_usage_events",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Чат-источник; без FK, чтобы удаление чата не стирало историю аккаунта. */
+    chatId: integer("chat_id").notNull().default(0),
+    promptTokens: integer("prompt_tokens").notNull().default(0),
+    completionTokens: integer("completion_tokens").notNull().default(0),
+    totalTokens: integer("total_tokens").notNull().default(0),
+    /** Месяц в формате YYYY-MM — по нему считаются квоты. */
+    month: text("month").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index("ai_usage_events_user_month_idx").on(t.userId, t.month)],
+);
+
+/** Расширение месячного лимита ИИ, которое выдаёт администратор. */
+export const aiQuotaOverrides = pgTable(
+  "ai_quota_overrides",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    month: text("month").notNull(),
+    monthlyLimit: integer("monthly_limit").notNull(),
+    createdBy: integer("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [uniqueIndex("ai_quota_overrides_user_month_uq").on(t.userId, t.month)],
+);
+
 /** RAG-папка пользователя для блока «Чат с ИИ» (хранится в базе, без лимита). */
 export const aiRagFolders = pgTable(
   "ai_rag_folders",
@@ -271,3 +355,7 @@ export type Task = typeof tasks.$inferSelect;
 export type Message = typeof messages.$inferSelect;
 export type TaskExport = typeof taskExports.$inferSelect;
 export type AiRagFolder = typeof aiRagFolders.$inferSelect;
+export type AiChat = typeof aiChats.$inferSelect;
+export type AiChatMessage = typeof aiChatMessages.$inferSelect;
+export type AiUsageEvent = typeof aiUsageEvents.$inferSelect;
+export type AiQuotaOverride = typeof aiQuotaOverrides.$inferSelect;

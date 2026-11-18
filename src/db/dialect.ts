@@ -139,6 +139,49 @@ const PG_DDL = [
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
   )`,
+  `create table if not exists ai_chats (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    title text not null default 'Новый чат',
+    tokens_prompt integer not null default 0,
+    tokens_completion integer not null default 0,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`,
+  `create index if not exists ai_chats_user_idx on ai_chats (user_id, updated_at)`,
+  `create table if not exists ai_chat_messages (
+    id serial primary key,
+    chat_id integer not null references ai_chats(id) on delete cascade,
+    role text not null,
+    content text not null default '',
+    reasoning text not null default '',
+    attachments text not null default '[]',
+    tokens integer not null default 0,
+    prompt_tokens integer not null default 0,
+    completion_tokens integer not null default 0,
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists ai_chat_messages_chat_idx on ai_chat_messages (chat_id)`,
+  `create table if not exists ai_usage_events (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    chat_id integer not null default 0,
+    prompt_tokens integer not null default 0,
+    completion_tokens integer not null default 0,
+    total_tokens integer not null default 0,
+    month text not null,
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists ai_usage_events_user_month_idx on ai_usage_events (user_id, month)`,
+  `create table if not exists ai_quota_overrides (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    month text not null,
+    monthly_limit integer not null,
+    created_by integer references users(id) on delete set null,
+    created_at timestamptz not null default now()
+  )`,
+  `create unique index if not exists ai_quota_overrides_user_month_uq on ai_quota_overrides (user_id, month)`,
   `create index if not exists ai_rag_folders_user_idx on ai_rag_folders (user_id)`,
   `create table if not exists ai_rag_chunks (
     id serial primary key,
@@ -265,7 +308,49 @@ const SQLITE_DDL = [
     created_at text not null,
     updated_at text not null
   )`,
-  `create index if not exists ai_rag_folders_user_idx on ai_rag_folders (user_id)`,
+  `create table if not exists ai_chats (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    title text not null default 'Новый чат',
+    tokens_prompt integer not null default 0,
+    tokens_completion integer not null default 0,
+    created_at text not null,
+    updated_at text not null
+  )`,
+  `create index if not exists ai_chats_user_idx on ai_chats (user_id, updated_at)`,
+  `create table if not exists ai_chat_messages (
+    id integer primary key autoincrement,
+    chat_id integer not null references ai_chats(id) on delete cascade,
+    role text not null,
+    content text not null default '',
+    reasoning text not null default '',
+    attachments text not null default '[]',
+    tokens integer not null default 0,
+    prompt_tokens integer not null default 0,
+    completion_tokens integer not null default 0,
+    created_at text not null
+  )`,
+  `create index if not exists ai_chat_messages_chat_idx on ai_chat_messages (chat_id)`,
+  `create table if not exists ai_usage_events (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    chat_id integer not null default 0,
+    prompt_tokens integer not null default 0,
+    completion_tokens integer not null default 0,
+    total_tokens integer not null default 0,
+    month text not null,
+    created_at text not null
+  )`,
+  `create index if not exists ai_usage_events_user_month_idx on ai_usage_events (user_id, month)`,
+  `create table if not exists ai_quota_overrides (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    month text not null,
+    monthly_limit integer not null,
+    created_by integer references users(id) on delete set null,
+    created_at text not null
+  )`,
+  `create unique index if not exists ai_quota_overrides_user_month_uq on ai_quota_overrides (user_id, month)`,
   `create table if not exists ai_rag_chunks (
     id integer primary key autoincrement,
     folder_id integer not null references ai_rag_folders(id) on delete cascade,

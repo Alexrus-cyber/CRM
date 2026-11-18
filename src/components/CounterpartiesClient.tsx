@@ -134,7 +134,7 @@ export function CounterpartiesClient({ items, isAdmin }: { items: CounterpartyRo
         )}
       </div>
 
-      <p className="text-xs text-muted">Найдено: <b className="text-text">{filtered.length}</b> из {items.length}{!isAdmin && " · Редактирование доступно только администраторам"}</p>
+      <p className="text-xs text-muted">Найдено: <b className="text-text">{filtered.length}</b> из {items.length}{!isAdmin && " · Редактирование доступно администраторам и менеджерам"}</p>
 
       {filtered.length === 0 ? (
         <EmptyState title="Контрагенты не найдены" hint={isAdmin ? "Добавьте первого контрагента" : "Попросите администратора добавить контрагента"} />

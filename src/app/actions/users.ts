@@ -3,12 +3,14 @@
 import { revalidatePath } from "next/cache";
 import type { Role } from "@/db/schema";
 import {
+  clearAiQuotaOverride,
   deleteUser,
   findUserIdByEmail,
   getPasswordHash,
   getRole,
   getUser,
   insertUser,
+  setAiQuotaOverride,
   setUserPassword,
   setUserRole,
   updateProfile,
@@ -20,11 +22,11 @@ import {
   verifyPassword,
 } from "@/lib/auth";
 import { publishLiveEvent } from "@/lib/events";
-import { isAdminRole } from "@/lib/utils";
+import { canManageTeam, canResetPasswords, isAdminRole } from "@/lib/utils";
 
 export type ActionResult = { ok: true; id?: number } | { ok: false; error: string };
 
-const ROLES: Role[] = ["super_admin", "admin", "user"];
+const ROLES: Role[] = ["super_admin", "admin", "developer", "manager", "consultant", "user"];
 
 export type CreateUserInput = {
   name: string;
@@ -37,7 +39,7 @@ export type CreateUserInput = {
 
 export async function createUserAction(input: CreateUserInput): Promise<ActionResult> {
   const me = await getCurrentUser();
-  if (!me || !isAdminRole(me.role)) return { ok: false, error: "Нет прав" };
+  if (!me || !canManageTeam(me.role)) return { ok: false, error: "Нет прав" };
   const role: Role = ROLES.includes(input.role) ? input.role : "user";
   if (role === "super_admin") return { ok: false, error: "Главный админ только один" };
   if (!canManageRole(me.role, role)) {
@@ -91,12 +93,34 @@ export async function deleteUserAction(userId: number): Promise<ActionResult> {
 
 export async function adminResetPasswordAction(userId: number, password: string): Promise<ActionResult> {
   const me = await getCurrentUser();
-  if (!me || !isAdminRole(me.role)) return { ok: false, error: "Нет прав" };
+  if (!me || !canResetPasswords(me.role)) return { ok: false, error: "Нет прав: пароли меняют администраторы" };
   const targetRole = await getRole(userId);
   if (!targetRole) return { ok: false, error: "Пользователь не найден" };
   if (userId !== me.id && !canManageRole(me.role, targetRole)) return { ok: false, error: "Нет прав на этого пользователя" };
   if (password.length < 6) return { ok: false, error: "Пароль минимум 6 символов" };
   await setUserPassword(userId, hashPassword(password));
+  return { ok: true };
+}
+
+/**
+ * Расширение месячного лимита ИИ на текущий месяц.
+ * Доступно только администратору: «диапазон» роли сам по себе не меняется.
+ */
+export async function setAiQuotaAction(userId: number, monthlyLimit: number | null): Promise<ActionResult> {
+  const me = await getCurrentUser();
+  if (!me || !isAdminRole(me.role)) return { ok: false, error: "Только администратор может расширить лимит ИИ" };
+  const targetRole = await getRole(userId);
+  if (!targetRole) return { ok: false, error: "Пользователь не найден" };
+  if (targetRole === "super_admin") return { ok: false, error: "Главному админу лимит не нужен" };
+
+  if (monthlyLimit === null) {
+    await clearAiQuotaOverride(userId);
+  } else {
+    if (!Number.isFinite(monthlyLimit) || monthlyLimit < 0) return { ok: false, error: "Некорректный лимит" };
+    await setAiQuotaOverride(userId, Math.round(monthlyLimit), me.id);
+  }
+  revalidatePath("/", "layout");
+  publishLiveEvent("users", me.id);
   return { ok: true };
 }
 

@@ -73,6 +73,9 @@ export const PRIORITY_BADGE: Record<TaskPriority, string> = {
 export const ROLE_LABELS: Record<Role, string> = {
   super_admin: "Главный админ",
   admin: "Администратор",
+  developer: "Разработчик",
+  manager: "Менеджер",
+  consultant: "Консультант",
   user: "Сотрудник",
 };
 
@@ -94,8 +97,32 @@ export const AVATAR_COLORS = [
   "#64748b",
 ];
 
+/** Полные администраторы: статистика компании, пароли, управление пользователями. */
 export function isAdminRole(role: Role) {
   return role === "admin" || role === "super_admin";
+}
+
+/** Кто видит статистику и задачи всей компании (админы и менеджеры). */
+export function isCompanyRole(role: Role) {
+  return role === "super_admin" || role === "admin" || role === "manager";
+}
+
+/** Кто может заводить сотрудников и менять роли (менеджер — только «сотрудник»/«консультант»). */
+export function canManageTeam(role: Role) {
+  return role === "super_admin" || role === "admin" || role === "manager";
+}
+
+/**
+ * Кто управляет рабочими данными (задачи, контрагенты, выгрузки):
+ * админы и менеджер — «менеджер почти как админ, но без паролей».
+ */
+export function canManageData(role: Role) {
+  return role === "super_admin" || role === "admin" || role === "manager";
+}
+
+/** Пароли меняет только администратор: менеджер этого не может. */
+export function canResetPasswords(role: Role) {
+  return role === "super_admin" || role === "admin";
 }
 
 export function initials(name: string) {
@@ -198,9 +225,18 @@ export function formatHours(h: number) {
 }
 
 export function roleBadgeClass(role: Role) {
-  return role === "super_admin"
-    ? "bg-amber-500/15 text-amber-500 border-amber-500/30"
-    : role === "admin"
-      ? "bg-violet-500/15 text-violet-400 border-violet-500/30"
-      : "bg-sky-500/15 text-sky-500 border-sky-500/30";
+  switch (role) {
+    case "super_admin":
+      return "bg-amber-500/15 text-amber-500 border-amber-500/30";
+    case "admin":
+      return "bg-violet-500/15 text-violet-400 border-violet-500/30";
+    case "manager":
+      return "bg-emerald-500/15 text-emerald-500 border-emerald-500/30";
+    case "developer":
+      return "bg-cyan-500/15 text-cyan-400 border-cyan-500/30";
+    case "consultant":
+      return "bg-fuchsia-500/15 text-fuchsia-400 border-fuchsia-500/30";
+    default:
+      return "bg-sky-500/15 text-sky-500 border-sky-500/30";
+  }
 }

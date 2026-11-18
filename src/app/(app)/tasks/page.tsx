@@ -1,7 +1,7 @@
 import { requireUser } from "@/lib/auth";
 import { getCounterparties, getUsers, getVisibleTasks } from "@/lib/data";
 import { lastExportAt, listExportedTaskIds } from "@/db/repo";
-import { isAdminRole } from "@/lib/utils";
+import { canManageData, isCompanyRole } from "@/lib/utils";
 import { PageHeader } from "@/components/ui";
 import { TasksClient } from "@/components/TasksClient";
 import type { TaskStatus } from "@/db/schema";
@@ -15,22 +15,24 @@ export default async function TasksPage({
 }) {
   const user = await requireUser();
   const sp = await searchParams;
-  const admin = isAdminRole(user.role);
+  const company = isCompanyRole(user.role);
+  // Менеджер управляет рабочими данными как админ, но не пользователями и паролями.
+  const canManage = canManageData(user.role);
   const [tasks, users, counterparties] = await Promise.all([
     getVisibleTasks(user),
     getUsers(),
     getCounterparties(),
   ]);
-  // Export journal is per person; only administrators can download files.
-  const exportedTaskIds = admin ? await listExportedTaskIds(user.id) : [];
-  const exportedAt = admin ? await lastExportAt(user.id) : null;
+  // Журнал выгрузок персональный: файлы скачивают админы и менеджеры.
+  const exportedTaskIds = canManage ? await listExportedTaskIds(user.id) : [];
+  const exportedAt = canManage ? await lastExportAt(user.id) : null;
 
   return (
     <>
       <PageHeader
         title="Задачи"
         subtitle={
-          admin
+          company
             ? "Все задачи компании. Нажмите на строку, чтобы открыть задачу."
             : "Ваши задачи: где вы исполнитель или автор."
         }
@@ -40,7 +42,7 @@ export default async function TasksPage({
         users={users}
         counterparties={counterparties.map((c) => ({ id: c.id, name: c.name }))}
         me={{ id: user.id, role: user.role }}
-        exportState={{ exportedTaskIds, lastExportAt: exportedAt, isAdmin: admin }}
+        exportState={{ exportedTaskIds, lastExportAt: exportedAt, isAdmin: canManage }}
         initialAssignee={sp.assignee ? Number(sp.assignee) : undefined}
         initialStatus={sp.status as TaskStatus | "open" | "overdue" | undefined}
       />

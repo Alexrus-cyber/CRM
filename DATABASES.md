@@ -144,6 +144,31 @@ SQLITE_PATH=./data/crm.sqlite
 пользователь. Картинки отдаются `inline` с `X-Content-Type-Options: nosniff`,
 остальное — `attachment` с именем в `filename*=UTF-8''...`.
 
+## Чат с ИИ: сессии, токены и лимиты
+
+Блок `/ai` теперь тоже живёт в базе — история чатов и расход токенов привязаны
+к аккаунту, а не к браузеру:
+
+* `ai_chats` — чат пользователя: `title` (автоназвание по первому вопросу),
+  `tokens_prompt` / `tokens_completion` (счётчик именно этого чата),
+  `created_at` / `updated_at`.
+* `ai_chat_messages` — сообщения чата: `role` (`user` / `assistant`), `content`,
+  `reasoning` (размышления модели), `attachments` (JSON с именами и типами
+  файлов), `tokens`, `prompt_tokens`, `completion_tokens`.
+* `ai_usage_events` — журнал расхода: одна строка на ход (`prompt_tokens`,
+  `completion_tokens`, `total_tokens`, `month = YYYY-MM`). По нему считаются
+  месячный лимит и общий счётчик аккаунта. `chat_id` тут без внешнего ключа:
+  удаление чата не должно стирать историю расхода аккаунта.
+* `ai_quota_overrides` — расширение месячного лимита, которое выдаёт
+  администратор: `user_id + month` уникальны, `monthly_limit` — новое значение
+  на этот месяц. Роль при этом не меняется.
+* `ai_rag_folders` / `ai_rag_chunks` / `ai_rag_terms` — RAG-папки: файлы,
+  фрагменты по ~900 символов и обратный индекс (основа слова → фрагмент).
+
+Индексы: `ai_chats (user_id, updated_at)`, `ai_chat_messages (chat_id)`,
+`ai_usage_events (user_id, month)`, `ai_quota_overrides (user_id, month)`.
+Все запросы фильтруются по `user_id` — чужой чат или папка отдают `404`.
+
 ## Особенности SQLite-драйвера
 
 `better-sqlite3` различает выражения, возвращающие строки, и «пишущие»

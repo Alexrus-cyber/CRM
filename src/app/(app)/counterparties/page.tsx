@@ -1,6 +1,6 @@
 import { requireUser } from "@/lib/auth";
 import { getCounterparties } from "@/lib/data";
-import { isAdminRole } from "@/lib/utils";
+import { canManageData } from "@/lib/utils";
 import { PageHeader } from "@/components/ui";
 import { CounterpartiesClient } from "@/components/CounterpartiesClient";
 
@@ -15,7 +15,7 @@ export default async function CounterpartiesPage() {
         title="Контрагенты"
         subtitle="База клиентов и партнёров: реквизиты, контакты и заметки"
       />
-      <CounterpartiesClient items={items} isAdmin={isAdminRole(user.role)} />
+      <CounterpartiesClient items={items} isAdmin={canManageData(user.role)} />
     </>
   );
 }

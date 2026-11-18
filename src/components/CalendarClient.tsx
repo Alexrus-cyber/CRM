@@ -17,7 +17,7 @@ import { ChevronLeft, ChevronRight, Plus, CheckCircle2, Lock, Trash2, Hand, Grip
 import type { Role, TaskStatus } from "@/db/schema";
 import type { TaskRow, UserLite } from "@/lib/data";
 import { deleteTaskAction, rescheduleTaskAction, setTaskStatusAction } from "@/app/actions/tasks";
-import { cn, formatDate, isAdminRole, OPEN_STATUSES, STATUS_COLORS, STATUS_LABELS, STATUS_ORDER, todayStr } from "@/lib/utils";
+import { cn, formatDate, canManageData, OPEN_STATUSES, STATUS_COLORS, STATUS_LABELS, STATUS_ORDER, todayStr } from "@/lib/utils";
 import { formatTimeLabel, nextHourTime, needsAcceptance, scheduledAt } from "@/lib/taskTime";
 import { Avatar, Button, PriorityBadge, StatusBadge } from "./ui";
 import { Combobox } from "./Combobox";
@@ -110,7 +110,7 @@ export function CalendarClient({
     });
   };
 
-  const canManage = (t: TaskRow) => isAdminRole(me.role) || t.authorId === me.id;
+  const canManage = (t: TaskRow) => canManageData(me.role) || t.authorId === me.id;
   const defaultTimeFor = (day: string) => (day === today ? nextHourTime() : "10:00");
 
   return (

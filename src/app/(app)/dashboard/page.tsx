@@ -25,7 +25,7 @@ import {
   FINISHED_STATUSES,
   formatDate,
   formatHours,
-  isAdminRole,
+  isCompanyRole,
   OPEN_STATUSES,
   PRIORITY_LABELS,
   PRIORITY_ORDER,
@@ -81,14 +81,14 @@ function TaskLine({ t, today }: { t: TaskRow; today: string }) {
 export default async function DashboardPage({ searchParams }: { searchParams: Promise<SP> }) {
   const user = await requireUser();
   const sp = await searchParams;
-  const admin = isAdminRole(user.role);
+  const admin = isCompanyRole(user.role);
   const today = todayStr();
 
   const [allVisible, users, counterparties] = await Promise.all([getVisibleTasks(user), getUsers(), getCounterparties()]);
 
   /**
    * Access scope:
-   *  - administrator (admin / super_admin) → вся статистика компании;
+   *  - администратор и менеджер → вся статистика компании;
    *  - сотрудник → только задачи, где он исполнитель.
    * Задачи, которые сотрудник поставил коллегам, в статистику не попадают:
    * для них есть отдельный счётчик «поставлено вами».
@@ -182,7 +182,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
       />
 
       <div className="mb-3 sm:mb-4">
-        <TodayTimeline tasks={allVisible} meId={user.id} userName={user.name} />
+        <TodayTimeline tasks={allVisible} meId={user.id} userName={user.name} showOthers={admin} />
       </div>
 
       <DashboardFilters

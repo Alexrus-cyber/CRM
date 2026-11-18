@@ -8,7 +8,7 @@ import type { TaskRow, UserLite } from "@/lib/data";
 import { acceptTaskAction, deleteTaskAction, saveTaskAction } from "@/app/actions/tasks";
 import {
   formatDateTime,
-  isAdminRole,
+  canManageData,
   PRIORITY_LABELS,
   PRIORITY_ORDER,
   STATUS_LABELS,
@@ -98,11 +98,11 @@ export function TaskModal({
   }, [open, task, defaultDeadline, defaultTime, me.id]);
 
   const isNew = !task;
-  const isOwner = isNew || isAdminRole(me.role) || task?.authorId === me.id;
+  const isOwner = isNew || canManageData(me.role) || task?.authorId === me.id;
   const canClose = isOwner;
   const canDelete = !isNew && isOwner;
   const canAccept = !!task && task.status === "new" && !task.acceptedAt &&
-    (isAdminRole(me.role) || task.assigneeId === me.id || task.authorId === me.id);
+    (canManageData(me.role) || task.assigneeId === me.id || task.authorId === me.id);
   const mustAccept = !!task && needsAcceptance(task, now);
 
   const availableStatuses = useMemo(

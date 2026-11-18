@@ -7,7 +7,7 @@ import { Mail, Phone, Plus, Search, Shield, UserPlus } from "lucide-react";
 import type { Role } from "@/db/schema";
 import type { UserLite } from "@/lib/data";
 import { createUserAction } from "@/app/actions/users";
-import { cn, ROLE_LABELS, roleBadgeClass } from "@/lib/utils";
+import { canManageTeam, cn, ROLE_LABELS, roleBadgeClass } from "@/lib/utils";
 import { Avatar, Badge, Button, Field, Input, Modal } from "./ui";
 import { Combobox } from "./Combobox";
 import { LoadMore, useProgressiveList } from "./lazy";
@@ -21,7 +21,12 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
   const [error, setError] = useState<string | null>(null);
   const [form, setForm] = useState({ name: "", email: "", password: "", role: "user" as Role, position: "", phone: "" });
 
-  const canCreate = me.role === "admin" || me.role === "super_admin";
+  const canCreate = canManageTeam(me.role);
+  // Главный админ заводит любые роли (кроме второго главного), остальные — рядовые.
+  const creatableRoles: Role[] =
+    me.role === "super_admin"
+      ? ["admin", "developer", "manager", "consultant", "user"]
+      : ["consultant", "user"];
 
   const filtered = useMemo(() => {
     const s = q.trim().toLowerCase();
@@ -68,6 +73,9 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
             { value: "all", label: "Все роли", hint: "без отбора" },
             { value: "super_admin", label: "Главный админ" },
             { value: "admin", label: "Администраторы" },
+            { value: "developer", label: "Разработчики" },
+            { value: "manager", label: "Менеджеры" },
+            { value: "consultant", label: "Консультанты" },
             { value: "user", label: "Сотрудники" },
           ]}
         />
@@ -136,10 +144,7 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
               value={form.role}
               onChange={(next) => setForm({ ...form, role: next as Role })}
               placeholder="Выберите роль"
-              options={[
-                { value: "user", label: "Сотрудник" },
-                ...(me.role === "super_admin" ? [{ value: "admin", label: "Администратор" }] : []),
-              ]}
+              options={creatableRoles.map((value) => ({ value, label: ROLE_LABELS[value] }))}
             />
           </Field>
           <Field label="Должность"><Input value={form.position} onChange={(e) => setForm({ ...form, position: e.target.value })} placeholder="Разработчик, менеджер..." /></Field>

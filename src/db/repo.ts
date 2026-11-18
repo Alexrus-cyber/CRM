@@ -762,6 +762,212 @@ export async function searchMessages(
   return rows.map(mapMessage).reverse();
 }
 
+/* --------------------------- чаты с ИИ и токены --------------------- */
+
+export type AiChatRow = {
+  id: number;
+  userId: number;
+  title: string;
+  tokensPrompt: number;
+  tokensCompletion: number;
+  tokensTotal: number;
+  messagesCount: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+function mapAiChat(row: Raw): AiChatRow {
+  const tokensPrompt = toNum(row.tokens_prompt);
+  const tokensCompletion = toNum(row.tokens_completion);
+  return {
+    id: toNum(row.id),
+    userId: toNum(row.user_id),
+    title: String(row.title ?? "Новый чат"),
+    tokensPrompt,
+    tokensCompletion,
+    tokensTotal: tokensPrompt + tokensCompletion,
+    messagesCount: toNum(row.messages_count),
+    createdAt: toIso(row.created_at) ?? nowIso(),
+    updatedAt: toIso(row.updated_at) ?? nowIso(),
+  };
+}
+
+export async function listAiChats(userId: number, limit = 50): Promise<AiChatRow[]> {
+  const rows = await q(sql`select c.id, c.user_id, c.title, c.tokens_prompt, c.tokens_completion,
+      c.created_at, c.updated_at,
+      (select count(*) from ai_chat_messages m where m.chat_id = c.id) as messages_count
+    from ai_chats c where c.user_id = ${userId} order by c.updated_at desc limit ${Math.max(1, Math.min(limit, 200))}`);
+  return rows.map(mapAiChat);
+}
+
+export async function getAiChat(userId: number, id: number): Promise<AiChatRow | null> {
+  const row = await q1(sql`select c.id, c.user_id, c.title, c.tokens_prompt, c.tokens_completion,
+      c.created_at, c.updated_at,
+      (select count(*) from ai_chat_messages m where m.chat_id = c.id) as messages_count
+    from ai_chats c where c.id = ${id} and c.user_id = ${userId} limit 1`);
+  return row ? mapAiChat(row) : null;
+}
+
+export async function createAiChat(userId: number, title = "Новый чат"): Promise<AiChatRow> {
+  const now = nowIso();
+  const row = await q1(sql`insert into ai_chats (user_id, title, tokens_prompt, tokens_completion, created_at, updated_at)
+    values (${userId}, ${title}, 0, 0, ${now}, ${now}) returning id`);
+  const id = toNum(row?.id);
+  return {
+    id,
+    userId,
+    title,
+    tokensPrompt: 0,
+    tokensCompletion: 0,
+    tokensTotal: 0,
+    messagesCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export async function renameAiChat(userId: number, id: number, title: string): Promise<boolean> {
+  const row = await q(sql`update ai_chats set title = ${title.slice(0, 120)}, updated_at = ${nowIso()}
+    where id = ${id} and user_id = ${userId} returning id`);
+  return row.length > 0;
+}
+
+export async function deleteAiChat(userId: number, id: number): Promise<boolean> {
+  const chat = await getAiChat(userId, id);
+  if (!chat) return false;
+  await q(sql`delete from ai_chat_messages where chat_id = ${id}`);
+  await q(sql`delete from ai_chats where id = ${id} and user_id = ${userId}`);
+  return true;
+}
+
+export type AiChatMessageRow = {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  reasoning: string;
+  attachments: string;
+  tokens: number;
+  promptTokens: number;
+  completionTokens: number;
+  createdAt: string;
+};
+
+export async function listAiChatMessages(chatId: number): Promise<AiChatMessageRow[]> {
+  const rows = await q(sql`select id, role, content, reasoning, attachments, tokens, prompt_tokens, completion_tokens, created_at
+    from ai_chat_messages where chat_id = ${chatId} order by id asc limit 400`);
+  return rows.map((row) => ({
+    id: toNum(row.id),
+    role: row.role === "assistant" ? "assistant" : "user",
+    content: String(row.content ?? ""),
+    reasoning: String(row.reasoning ?? ""),
+    attachments: String(row.attachments ?? "[]"),
+    tokens: toNum(row.tokens),
+    promptTokens: toNum(row.prompt_tokens),
+    completionTokens: toNum(row.completion_tokens),
+    createdAt: toIso(row.created_at) ?? nowIso(),
+  }));
+}
+
+export async function insertAiChatMessage(input: {
+  chatId: number;
+  role: "user" | "assistant";
+  content: string;
+  reasoning?: string;
+  attachments?: string;
+  tokens?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+}): Promise<number> {
+  const row = await q1(sql`insert into ai_chat_messages (chat_id, role, content, reasoning, attachments, tokens, prompt_tokens, completion_tokens, created_at)
+    values (${input.chatId}, ${input.role}, ${input.content}, ${input.reasoning ?? ""}, ${input.attachments ?? "[]"}, ${input.tokens ?? 0}, ${input.promptTokens ?? 0}, ${input.completionTokens ?? 0}, ${nowIso()})
+    returning id`);
+  return toNum(row?.id);
+}
+
+/** Месяц в формате YYYY-MM по часовому поясу приложения. */
+export function aiMonthKey(date = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Moscow",
+    year: "numeric",
+    month: "2-digit",
+  }).formatToParts(date);
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
+  return `${get("year")}-${get("month")}`;
+}
+
+export type AiUsageTotals = { prompt: number; completion: number; total: number; events: number };
+
+/** Общий и месячный расход токенов пользователя. */
+export async function getAiUsage(userId: number, month = aiMonthKey()): Promise<{ all: AiUsageTotals; month: AiUsageTotals }> {
+  const all = await q1(sql`select coalesce(sum(prompt_tokens), 0) as prompt, coalesce(sum(completion_tokens), 0) as completion,
+      coalesce(sum(total_tokens), 0) as total, count(*) as events
+    from ai_usage_events where user_id = ${userId}`);
+  const monthRow = await q1(sql`select coalesce(sum(prompt_tokens), 0) as prompt, coalesce(sum(completion_tokens), 0) as completion,
+      coalesce(sum(total_tokens), 0) as total, count(*) as events
+    from ai_usage_events where user_id = ${userId} and month = ${month}`);
+  const map = (row: Raw | null): AiUsageTotals => ({
+    prompt: toNum(row?.prompt),
+    completion: toNum(row?.completion),
+    total: toNum(row?.total),
+    events: toNum(row?.events),
+  });
+  return { all: map(all), month: map(monthRow) };
+}
+
+/** Записать расход хода и обновить счётчики чата. Возвращает актуальные суммы. */
+export async function recordAiUsage(input: {
+  userId: number;
+  chatId: number;
+  prompt: number;
+  completion: number;
+}): Promise<{ chat: AiChatRow | null; all: AiUsageTotals; month: AiUsageTotals }> {
+  const prompt = Math.max(0, Math.round(input.prompt));
+  const completion = Math.max(0, Math.round(input.completion));
+  const total = prompt + completion;
+  const month = aiMonthKey();
+  await q(sql`insert into ai_usage_events (user_id, chat_id, prompt_tokens, completion_tokens, total_tokens, month, created_at)
+    values (${input.userId}, ${input.chatId}, ${prompt}, ${completion}, ${total}, ${month}, ${nowIso()})`);
+  if (input.chatId > 0) {
+    await q(sql`update ai_chats set tokens_prompt = tokens_prompt + ${prompt}, tokens_completion = tokens_completion + ${completion},
+      updated_at = ${nowIso()} where id = ${input.chatId} and user_id = ${input.userId}`);
+  }
+  const usage = await getAiUsage(input.userId, month);
+  const chat = input.chatId > 0 ? await getAiChat(input.userId, input.chatId) : null;
+  return { chat, all: usage.all, month: usage.month };
+}
+
+export type AiQuotaOverrideRow = { userId: number; month: string; monthlyLimit: number };
+
+export async function getAiQuotaOverride(userId: number, month = aiMonthKey()): Promise<AiQuotaOverrideRow | null> {
+  const row = await q1(sql`select user_id, month, monthly_limit from ai_quota_overrides
+    where user_id = ${userId} and month = ${month} limit 1`);
+  if (!row) return null;
+  return { userId: toNum(row.user_id), month: String(row.month), monthlyLimit: toNum(row.monthly_limit) };
+}
+
+export async function setAiQuotaOverride(userId: number, monthlyLimit: number, createdBy: number, month = aiMonthKey()): Promise<void> {
+  const now = nowIso();
+  const existing = await getAiQuotaOverride(userId, month);
+  if (existing) {
+    await q(sql`update ai_quota_overrides set monthly_limit = ${Math.max(0, Math.round(monthlyLimit))}
+      where user_id = ${userId} and month = ${month}`);
+    return;
+  }
+  await q(sql`insert into ai_quota_overrides (user_id, month, monthly_limit, created_by, created_at)
+    values (${userId}, ${month}, ${Math.max(0, Math.round(monthlyLimit))}, ${createdBy}, ${now})`);
+}
+
+export async function clearAiQuotaOverride(userId: number, month = aiMonthKey()): Promise<void> {
+  await q(sql`delete from ai_quota_overrides where user_id = ${userId} and month = ${month}`);
+}
+
+/** Расход по всем сотрудникам за месяц — для админской сводки. */
+export async function listAiUsageByUser(month = aiMonthKey()): Promise<Array<{ userId: number; total: number }>> {
+  const rows = await q(sql`select user_id, coalesce(sum(total_tokens), 0) as total from ai_usage_events
+    where month = ${month} group by user_id`);
+  return rows.map((row) => ({ userId: toNum(row.user_id), total: toNum(row.total) }));
+}
+
 /* ------------------------------- RAG для ИИ ------------------------ */
 
 export type RagFolderRow = {
