@@ -64,6 +64,20 @@ const TABLES = [
     columns: ["id", "message_id", "name", "name_lower", "mime", "size", "data", "created_at"],
   },
   { name: "task_exports", columns: ["id", "user_id", "task_id", "created_at"] },
+  // Блок «Чат с ИИ»: история, расход токенов, квоты и RAG-индекс.
+  { name: "ai_rag_folders", columns: ["id", "user_id", "name", "files_count", "chunks_count", "chars", "created_at", "updated_at"] },
+  { name: "ai_rag_chunks", columns: ["id", "folder_id", "path", "chunk_index", "text", "created_at"] },
+  { name: "ai_rag_terms", columns: ["id", "folder_id", "term", "chunk_id", "tf"] },
+  { name: "ai_chats", columns: ["id", "user_id", "title", "tokens_prompt", "tokens_completion", "created_at", "updated_at"] },
+  {
+    name: "ai_chat_messages",
+    columns: ["id", "chat_id", "role", "content", "reasoning", "attachments", "tokens", "prompt_tokens", "completion_tokens", "created_at"],
+  },
+  {
+    name: "ai_usage_events",
+    columns: ["id", "user_id", "chat_id", "prompt_tokens", "completion_tokens", "total_tokens", "month", "created_at"],
+  },
+  { name: "ai_quota_overrides", columns: ["id", "user_id", "month", "monthly_limit", "created_by", "created_at"] },
 ];
 
 /** Normalise driver differences: Date -> ISO string, numeric strings -> number. */
@@ -76,6 +90,21 @@ function normalise(table, column, value) {
     [
       "id",
       "user_id",
+      "chat_id",
+      "folder_id",
+      "chunk_id",
+      "created_by",
+      "monthly_limit",
+      "tokens_prompt",
+      "tokens_completion",
+      "prompt_tokens",
+      "completion_tokens",
+      "total_tokens",
+      "tf",
+      "files_count",
+      "chunks_count",
+      "chars",
+      "chunk_index",
       "assignee_id",
       "author_id",
       "counterparty_id",
@@ -171,7 +200,9 @@ async function writePg(pool, data) {
   try {
     await client.query("begin");
     await client.query(
-      "truncate table task_exports, message_attachments, chat_reads, messages, sessions, tasks, counterparties, users restart identity cascade",
+      "truncate table ai_rag_terms, ai_rag_chunks, ai_rag_folders, ai_chat_messages, ai_chats, ai_usage_events, " +
+        "ai_quota_overrides, task_exports, message_attachments, chat_reads, messages, sessions, tasks, counterparties, users " +
+        "restart identity cascade",
     );
     for (const table of TABLES) {
       for (const row of data[table.name] ?? []) {
@@ -213,11 +244,31 @@ function writeSqlite(db, data) {
 
 function report(data) {
   for (const table of TABLES) {
-    console.log(`  ${table.name.padEnd(16)} ${String((data[table.name] ?? []).length).padStart(5)}`);
+    console.log(`  ${table.name.padEnd(20)} ${String((data[table.name] ?? []).length).padStart(5)}`);
   }
 }
 
+/**
+ * Страховка от расхождения: если в DDL появилась таблица, которой нет в TABLES,
+ * перенос молча потеряет её данные. Лучше предупредить и упасть.
+ */
+function checkTableCoverage() {
+  const covered = new Set(TABLES.map((table) => table.name));
+  const declared = new Set();
+  for (const statement of [...readDdl("sqlite"), ...readDdl("postgres")]) {
+    const match = statement.match(/create table if not exists (\w+)/i);
+    if (match) declared.add(match[1]);
+  }
+  const missing = [...declared].filter((name) => !covered.has(name));
+  if (missing.length > 0) {
+    console.warn(`[db-sync] таблицы без описания в TABLES: ${missing.join(", ")}`);
+    console.warn("[db-sync] их данные не перенесутся — добавьте колонки в TABLES");
+  }
+  return missing;
+}
+
 const command = process.argv[2] ?? "status";
+checkTableCoverage();
 
 if (command === "pg2sqlite") {
   const data = await withPg(dumpPg);
