@@ -573,11 +573,46 @@ function mapMessage(r: Raw): ChatMessage {
   };
 }
 
-export async function listMessages(meId: number, peer: number, afterId: number): Promise<ChatMessage[]> {
+/**
+ * Последние сообщения переписки (или всё, что новее `afterId`).
+ * Отдаём порциями: полная история в один ответ на большом чате — это лишние
+ * мегабайты и подвисание при отрисовке.
+ */
+export async function listMessages(
+  meId: number,
+  peer: number,
+  afterId: number,
+  limit = 30,
+): Promise<{ messages: ChatMessage[]; hasOlder: boolean }> {
   const conversation = conversationFilter(meId, peer);
   const filter = afterId > 0 ? sql`${conversation} and m.id > ${afterId}` : conversation;
-  const rows = await q(sql`select ${MESSAGE_SELECT} ${MESSAGE_FROM} where ${filter} order by m.id desc limit 150`);
-  return rows.map(mapMessage).reverse();
+  const rows = await q(sql`select ${MESSAGE_SELECT} ${MESSAGE_FROM} where ${filter} order by m.id desc limit ${limit}`);
+  const messages = rows.map(mapMessage).reverse();
+  const oldestId = messages[0]?.id ?? 0;
+  const hasOlder = oldestId > 0 && afterId === 0
+    ? Boolean(await q1(sql`select 1 as ok ${MESSAGE_FROM} where ${conversation} and m.id < ${oldestId} limit 1`))
+    : false;
+  return { messages, hasOlder };
+}
+
+/** Более ранняя страница переписки — для кнопки «Показать более ранние». */
+export async function listMessagesBefore(
+  meId: number,
+  peer: number,
+  beforeId: number,
+  limit = 30,
+): Promise<{ messages: ChatMessage[]; hasOlder: boolean }> {
+  const conversation = conversationFilter(meId, peer);
+  const rows = await q(sql`
+    select ${MESSAGE_SELECT} ${MESSAGE_FROM}
+    where ${conversation} and m.id < ${beforeId}
+    order by m.id desc limit ${limit}`);
+  const messages = rows.map(mapMessage).reverse();
+  const oldestId = messages[0]?.id ?? 0;
+  const hasOlder = oldestId > 0
+    ? Boolean(await q1(sql`select 1 as ok ${MESSAGE_FROM} where ${conversation} and m.id < ${oldestId} limit 1`))
+    : false;
+  return { messages, hasOlder };
 }
 
 /**

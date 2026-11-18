@@ -5,6 +5,7 @@ import {
   listGeneralReaders,
   listMessages,
   listMessagesAround,
+  listMessagesBefore,
   userExists,
 } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
@@ -29,6 +30,8 @@ export async function GET(req: Request) {
   const peer = Number(url.searchParams.get("peer") ?? 0) || 0;
   const after = Number(url.searchParams.get("after") ?? 0) || 0;
   const around = Number(url.searchParams.get("around") ?? 0) || 0;
+  const before = Number(url.searchParams.get("before") ?? 0) || 0;
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 30) || 30, 10), 100);
   if (peer === me.id) return Response.json({ error: "Нельзя писать самому себе" }, { status: 400 });
   if (peer !== 0 && !(await userExists(peer))) {
     return Response.json({ error: "Пользователь не найден" }, { status: 404 });
@@ -45,8 +48,13 @@ export async function GET(req: Request) {
     return Response.json({ messages, peerReadId, generalReaders, context: { hasOlder, hasNewer } });
   }
 
-  const messages = await listMessages(me.id, peer, after);
-  return Response.json({ messages, peerReadId, generalReaders });
+  if (before > 0) {
+    const { messages, hasOlder } = await listMessagesBefore(me.id, peer, before, limit);
+    return Response.json({ messages, hasOlder, peerReadId, generalReaders });
+  }
+
+  const { messages, hasOlder } = await listMessages(me.id, peer, after, limit);
+  return Response.json({ messages, hasOlder, peerReadId, generalReaders });
 }
 
 export async function POST(req: Request) {

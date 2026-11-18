@@ -25,7 +25,8 @@ import {
   normalizeTime,
   scheduledAt,
 } from "@/lib/taskTime";
-import { Button, Field, Input, Modal, Select, Textarea, Avatar, StatusBadge } from "./ui";
+import { Button, Field, Input, Modal, Textarea, Avatar, StatusBadge } from "./ui";
+import { Combobox } from "./Combobox";
 
 export type TaskModalProps = {
   open: boolean;
@@ -230,21 +231,33 @@ export function TaskModal({
           <Textarea value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Детали, ссылки, критерии приёмки..." />
         </Field>
         <Field label="Исполнитель *">
-          <Select value={assigneeId} onChange={(e) => setAssigneeId(Number(e.target.value))} disabled={!isOwner}>
-            {users.map((u) => (
-              <option key={u.id} value={u.id}>
-                {u.name}{u.id === me.id ? " (я)" : ""}{u.position ? ` — ${u.position}` : ""}
-              </option>
-            ))}
-          </Select>
+          <Combobox
+            aria-label="Исполнитель"
+            value={String(assigneeId)}
+            onChange={(next) => setAssigneeId(Number(next))}
+            disabled={!isOwner}
+            placeholder="Найдите сотрудника..."
+            options={users.map((u) => ({
+              value: String(u.id),
+              label: `${u.name}${u.id === me.id ? " (я)" : ""}`,
+              hint: u.position ?? undefined,
+            }))}
+          />
         </Field>
         <Field label="Контрагент">
-          <Select value={counterpartyId} onChange={(e) => setCounterpartyId(e.target.value === "" ? "" : Number(e.target.value))} disabled={!isOwner}>
-            <option value="">— Без контрагента —</option>
-            {counterparties.map((c) => (
-              <option key={c.id} value={c.id}>{c.name}</option>
-            ))}
-          </Select>
+          <Combobox
+            aria-label="Контрагент"
+            value={counterpartyId === "" ? "" : String(counterpartyId)}
+            onChange={(next) => setCounterpartyId(next === "" ? "" : Number(next))}
+            disabled={!isOwner}
+            clearable
+            clearTitle="Без контрагента"
+            placeholder="— Без контрагента —"
+            options={[
+              { value: "", label: "— Без контрагента —", hint: "внутренняя задача" },
+              ...counterparties.map((c) => ({ value: String(c.id), label: c.name })),
+            ]}
+          />
         </Field>
         <Field label="Дата *">
           <Input type="date" value={deadline} onChange={(e) => setDeadline(e.target.value)} disabled={!isOwner} />
@@ -269,18 +282,23 @@ export function TaskModal({
           <Input type="number" min={0} step={0.5} value={hours} onChange={(e) => setHours(e.target.value)} />
         </Field>
         <Field label="Статус">
-          <Select value={status} onChange={(e) => setStatus(e.target.value as TaskStatus)}>
-            {availableStatuses.map((s) => (
-              <option key={s} value={s}>{STATUS_LABELS[s]}</option>
-            ))}
-          </Select>
+          <Combobox
+            aria-label="Статус"
+            value={status}
+            onChange={(next) => setStatus(next as TaskStatus)}
+            placeholder="Выберите статус"
+            options={availableStatuses.map((s) => ({ value: s, label: STATUS_LABELS[s] }))}
+          />
         </Field>
         <Field label="Срочность" className="sm:col-span-2 sm:max-w-[240px]">
-          <Select value={priority} onChange={(e) => setPriority(e.target.value as TaskPriority)} disabled={!isOwner}>
-            {PRIORITY_ORDER.map((p) => (
-              <option key={p} value={p}>{PRIORITY_LABELS[p]}</option>
-            ))}
-          </Select>
+          <Combobox
+            aria-label="Срочность"
+            value={priority}
+            onChange={(next) => setPriority(next as TaskPriority)}
+            disabled={!isOwner}
+            placeholder="Выберите срочность"
+            options={PRIORITY_ORDER.map((p) => ({ value: p, label: PRIORITY_LABELS[p] }))}
+          />
         </Field>
       </div>
 

@@ -18,7 +18,8 @@ import { X } from "lucide-react";
 import type { UserLite } from "@/lib/data";
 import { PRIORITY_LABELS, PRIORITY_ORDER, STATUS_COLORS, STATUS_LABELS } from "@/lib/utils";
 import type { TaskStatus } from "@/db/schema";
-import { Button, Input, Select } from "./ui";
+import { Button, Input } from "./ui";
+import { Combobox } from "./Combobox";
 
 const tick = { fill: "var(--muted)", fontSize: 11 };
 
@@ -199,24 +200,52 @@ export function DashboardFilters({
       <Input type="date" value={values.to ?? ""} onChange={(e) => update({ to: e.target.value })} title="Срок по" />
       {showPeople && (
         <>
-          <Select value={values.assignee ?? ""} onChange={(e) => update({ assignee: e.target.value })}>
-            <option value="">Все исполнители</option>
-            {users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-          </Select>
-          <Select value={values.author ?? ""} onChange={(e) => update({ author: e.target.value })}>
-            <option value="">Все авторы</option>
-            {users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-          </Select>
+          <Combobox
+            aria-label="Исполнитель"
+            value={values.assignee ?? ""}
+            onChange={(next) => update({ assignee: next })}
+            placeholder="Все исполнители"
+            clearable
+            options={[
+              { value: "", label: "Все исполнители", hint: "без отбора" },
+              ...users.map((u) => ({ value: String(u.id), label: u.name, hint: u.position ?? undefined })),
+            ]}
+          />
+          <Combobox
+            aria-label="Автор"
+            value={values.author ?? ""}
+            onChange={(next) => update({ author: next })}
+            placeholder="Все авторы"
+            clearable
+            options={[
+              { value: "", label: "Все авторы", hint: "без отбора" },
+              ...users.map((u) => ({ value: String(u.id), label: u.name, hint: u.position ?? undefined })),
+            ]}
+          />
         </>
       )}
-      <Select value={values.counterparty ?? ""} onChange={(e) => update({ counterparty: e.target.value })}>
-        <option value="">Все контрагенты</option>
-        {counterparties.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-      </Select>
-      <Select value={values.priority ?? ""} onChange={(e) => update({ priority: e.target.value })}>
-        <option value="">Любая срочность</option>
-        {PRIORITY_ORDER.map((p) => <option key={p} value={p}>{PRIORITY_LABELS[p]}</option>)}
-      </Select>
+      <Combobox
+        aria-label="Контрагент"
+        value={values.counterparty ?? ""}
+        onChange={(next) => update({ counterparty: next })}
+        placeholder="Все контрагенты"
+        clearable
+        options={[
+          { value: "", label: "Все контрагенты", hint: "без отбора" },
+          ...counterparties.map((c) => ({ value: String(c.id), label: c.name })),
+        ]}
+      />
+      <Combobox
+        aria-label="Срочность"
+        value={values.priority ?? ""}
+        onChange={(next) => update({ priority: next })}
+        placeholder="Любая срочность"
+        clearable
+        options={[
+          { value: "", label: "Любая срочность", hint: "без отбора" },
+          ...PRIORITY_ORDER.map((priority) => ({ value: priority, label: PRIORITY_LABELS[priority] })),
+        ]}
+      />
       <div className="col-span-1 grid min-w-0 grid-cols-3 gap-1 min-[360px]:col-span-2 md:col-span-1">
         {presets.map((p) => (
           <button key={p.days} onClick={() => preset(p.days)} className="min-w-0 rounded-xl border border-border bg-card2 px-1 py-2 text-[10px] font-medium text-muted transition hover:text-text sm:text-[11px]">{p.label}</button>

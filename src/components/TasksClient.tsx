@@ -31,7 +31,8 @@ import {
   STATUS_ORDER,
   todayStr,
 } from "@/lib/utils";
-import { Avatar, Button, Input, PriorityBadge, Select, StatusBadge, EmptyState, Modal } from "./ui";
+import { Avatar, Button, Input, PriorityBadge, StatusBadge, EmptyState, Modal } from "./ui";
+import { Combobox } from "./Combobox";
 import { acceptTaskAction } from "@/app/actions/tasks";
 import { formatDateTime } from "@/lib/utils";
 import { LoadMore, useProgressiveList } from "./lazy";
@@ -199,30 +200,60 @@ export function TasksClient({
       </div>
 
       <div className="grid min-w-0 grid-cols-1 gap-2 rounded-2xl border border-border bg-card p-2.5 min-[360px]:grid-cols-2 sm:grid-cols-4 sm:p-3 lg:grid-cols-8">
-        <Select value={status} onChange={(e) => setStatus(e.target.value)}>
-          <option value="all">Все статусы</option>
-          <option value="open">Открытые</option>
-          <option value="overdue">Просроченные</option>
-          <option value="accept">Обязан взять</option>
-          {STATUS_ORDER.map((s) => <option key={s} value={s}>{STATUS_LABELS[s]}</option>)}
-        </Select>
-        <Select value={assignee} onChange={(e) => setAssignee(e.target.value)}>
-          <option value="all">Все исполнители</option>
-          {users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-        </Select>
-        <Select value={author} onChange={(e) => setAuthor(e.target.value)}>
-          <option value="all">Все авторы</option>
-          {users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-        </Select>
-        <Select value={cp} onChange={(e) => setCp(e.target.value)}>
-          <option value="all">Все контрагенты</option>
-          <option value="none">Без контрагента</option>
-          {counterparties.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-        </Select>
-        <Select value={priority} onChange={(e) => setPriority(e.target.value)}>
-          <option value="all">Любая срочность</option>
-          {PRIORITY_ORDER.map((p) => <option key={p} value={p}>{PRIORITY_LABELS[p]}</option>)}
-        </Select>
+        <Combobox
+          aria-label="Статус"
+          value={status}
+          onChange={setStatus}
+          placeholder="Все статусы"
+          options={[
+            { value: "all", label: "Все статусы", hint: "без отбора" },
+            { value: "open", label: "Открытые", hint: "в работе и новые" },
+            { value: "overdue", label: "Просроченные", hint: "срок прошёл" },
+            { value: "accept", label: "Обязан взять", hint: "ждут принятия" },
+            ...STATUS_ORDER.map((s) => ({ value: s, label: STATUS_LABELS[s] })),
+          ]}
+        />
+        <Combobox
+          aria-label="Исполнитель"
+          value={assignee}
+          onChange={setAssignee}
+          placeholder="Все исполнители"
+          options={[
+            { value: "all", label: "Все исполнители", hint: "без отбора" },
+            ...users.map((u) => ({ value: String(u.id), label: u.name, hint: u.position ?? undefined })),
+          ]}
+        />
+        <Combobox
+          aria-label="Автор"
+          value={author}
+          onChange={setAuthor}
+          placeholder="Все авторы"
+          options={[
+            { value: "all", label: "Все авторы", hint: "без отбора" },
+            ...users.map((u) => ({ value: String(u.id), label: u.name, hint: u.position ?? undefined })),
+          ]}
+        />
+        <Combobox
+          aria-label="Контрагент"
+          value={cp}
+          onChange={setCp}
+          placeholder="Все контрагенты"
+          options={[
+            { value: "all", label: "Все контрагенты", hint: "без отбора" },
+            { value: "none", label: "Без контрагента", hint: "внутренние задачи" },
+            ...counterparties.map((c) => ({ value: String(c.id), label: c.name })),
+          ]}
+        />
+        <Combobox
+          aria-label="Срочность"
+          value={priority}
+          onChange={setPriority}
+          placeholder="Любая срочность"
+          options={[
+            { value: "all", label: "Любая срочность", hint: "без отбора" },
+            ...PRIORITY_ORDER.map((p) => ({ value: p, label: PRIORITY_LABELS[p] })),
+          ]}
+        />
         <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} title="Срок с" />
         <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} title="Срок по" />
         <Button variant="ghost" onClick={reset} disabled={!hasFilters} className="justify-center">

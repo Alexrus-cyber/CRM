@@ -13,7 +13,8 @@ import {
   updateUserRoleAction,
 } from "@/app/actions/users";
 import { AVATAR_COLORS, cn, ROLE_LABELS } from "@/lib/utils";
-import { Avatar, Button, Card, Field, Input, Select, Textarea } from "./ui";
+import { Avatar, Button, Card, Field, Input, Textarea } from "./ui";
+import { Combobox } from "./Combobox";
 
 function Notice({ msg, ok }: { msg: string; ok: boolean }) {
   return (
@@ -156,15 +157,17 @@ export function UserAdminControls({ target, me }: { target: UserLite; me: { id: 
         {isSuper && (
           <Field label="Права доступа">
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <Select
-                value={role}
-                onChange={(e) => setRole(e.target.value as Role)}
+              <Combobox
                 className="sm:flex-1"
+                value={role}
+                onChange={(next) => setRole(next as Role)}
                 aria-label="Права доступа"
-              >
-                <option value="user">Сотрудник</option>
-                <option value="admin">Администратор</option>
-              </Select>
+                placeholder="Выберите роль"
+                options={[
+                  { value: "user", label: "Сотрудник" },
+                  { value: "admin", label: "Администратор" },
+                ]}
+              />
               <Button
                 variant="secondary"
                 className="w-full shrink-0 sm:w-auto"

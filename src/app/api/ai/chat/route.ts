@@ -5,6 +5,8 @@ import {
   aiAuthHeaders,
   aiEndpoint,
   normalizeBaseUrl,
+  normalizeParams,
+  type AiParams,
 } from "@/lib/ai";
 
 export const dynamic = "force-dynamic";
@@ -19,12 +21,37 @@ type AiMessage = { role: "system" | "user" | "assistant"; content: unknown };
 
 type UpstreamChunk = {
   choices?: Array<{
-    delta?: { content?: string | null; reasoning_content?: string | null };
-    message?: { content?: string | null };
+    delta?: { content?: string | null; reasoning_content?: string | null; reasoning?: string | null };
+    message?: { content?: string | null; reasoning_content?: string | null };
     finish_reason?: string | null;
   }>;
   error?: { message?: string };
 };
+
+/**
+ * Тело запроса к локальному серверу: параметры генерации передаём только когда
+ * они заданы — строгие сборки отвергают незнакомые поля, а не игнорируют их.
+ */
+function buildUpstreamBody(model: string, messages: AiMessage[], params: AiParams) {
+  const body: Record<string, unknown> = { model, messages, stream: true };
+  if (params.temperature !== null) body.temperature = params.temperature;
+  if (params.topP !== null) body.top_p = params.topP;
+  if (params.maxTokens !== null) body.max_tokens = params.maxTokens;
+  if (params.seed !== null) body.seed = params.seed;
+
+  if (params.reasoning !== "default") {
+    if (params.reasoning === "off") body.reasoning_effort = "none";
+    else if (params.reasoning === "budget") {
+      if (params.thinkingBudget) body.thinking_budget = params.thinkingBudget;
+      body.reasoning_effort = "high";
+    } else body.reasoning_effort = params.reasoning;
+
+    if (params.sendThinkingFlag) {
+      body.chat_template_kwargs = { enable_thinking: params.reasoning !== "off" };
+    }
+  }
+  return body;
+}
 
 function settingsFromRequest(req: Request) {
   const headerBase = req.headers.get("x-ai-base") ?? "";
@@ -47,17 +74,27 @@ function readDelta(chunk: UpstreamChunk): string {
   return choice.message?.content ?? "";
 }
 
+/** «Размышления» модели: разные серверы называют их reasoning_content или reasoning. */
+function readReasoning(chunk: UpstreamChunk): string {
+  const choice = chunk.choices?.[0];
+  return choice?.delta?.reasoning_content ?? choice?.delta?.reasoning ?? choice?.message?.reasoning_content ?? "";
+}
+
 function describeUpstreamError(status: number, body: string): string {
   const trimmed = body.trim();
+  const hint =
+    status === 400 || status === 422
+      ? " Если сервер не понимает параметры раздумий, выберите «По умолчанию» в блоке «Раздумья» или выключите chat_template_kwargs."
+      : "";
   if (trimmed) {
     try {
       const parsed = JSON.parse(trimmed) as UpstreamChunk;
       const message = parsed.error?.message;
-      if (message) return `Локальный сервер ответил ${status}: ${message}`;
+      if (message) return `Локальный сервер ответил ${status}: ${message}${hint}`;
     } catch {
       /* не JSON — покажем как есть, но коротко */
     }
-    return `Локальный сервер ответил ${status}: ${trimmed.slice(0, 300)}`;
+    return `Локальный сервер ответил ${status}: ${trimmed.slice(0, 300)}${hint}`;
   }
   return `Локальный сервер ответил ${status}`;
 }
@@ -75,18 +112,33 @@ export async function POST(req: Request) {
   }
 
   let messages: AiMessage[];
+  let params: AiParams = normalizeParams(null);
+  let ragContext = "";
   try {
     const raw = await req.text();
     if (raw.length > MAX_BODY_BYTES) {
       return Response.json({ error: "Слишком большой запрос: уменьшите вложение" }, { status: 413 });
     }
-    const body = JSON.parse(raw) as { messages?: AiMessage[] };
+    const body = JSON.parse(raw) as { messages?: AiMessage[]; params?: unknown; ragContext?: unknown };
+    params = normalizeParams(body.params);
+    ragContext = typeof body.ragContext === "string" ? body.ragContext.slice(0, 12_000) : "";
     messages = (body.messages ?? []).filter(
       (m) => m && (m.role === "user" || m.role === "assistant" || m.role === "system"),
     );
   } catch {
     return Response.json({ error: "Некорректный запрос" }, { status: 400 });
   }
+
+  // Системный промпт и найденные фрагменты RAG — первыми сообщениями.
+  const preamble: AiMessage[] = [];
+  if (params.system.trim()) preamble.push({ role: "system", content: params.system.trim() });
+  if (ragContext.trim()) {
+    preamble.push({
+      role: "system",
+      content: `Контекст из папки, выбранной пользователем (RAG). Опирайся на него, но не выдумывай то, чего в нём нет:\n\n${ragContext.trim()}`,
+    });
+  }
+  if (preamble.length > 0) messages = [...preamble, ...messages.filter((message) => message.role !== "system")];
   if (messages.length === 0) {
     return Response.json({ error: "Пустой запрос" }, { status: 400 });
   }
@@ -100,7 +152,7 @@ export async function POST(req: Request) {
     upstream = await fetch(aiEndpoint(baseUrl, "/chat/completions"), {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...aiAuthHeaders(apiKey) },
-      body: JSON.stringify({ model, messages: trimmed, stream: true }),
+      body: JSON.stringify(buildUpstreamBody(model, trimmed, params)),
       signal,
       cache: "no-store",
     });
@@ -173,6 +225,8 @@ export async function POST(req: Request) {
               const chunk = JSON.parse(payload) as UpstreamChunk;
               const delta = readDelta(chunk);
               if (delta) push({ delta });
+              const thinking = readReasoning(chunk);
+              if (thinking) push({ reasoning: thinking });
             } catch {
               /* служебные строки локальных серверов пропускаем */
             }
