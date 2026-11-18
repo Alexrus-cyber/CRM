@@ -19,7 +19,8 @@ import type { TaskRow, UserLite } from "@/lib/data";
 import { deleteTaskAction, rescheduleTaskAction, setTaskStatusAction } from "@/app/actions/tasks";
 import { cn, formatDate, isAdminRole, OPEN_STATUSES, STATUS_COLORS, STATUS_LABELS, STATUS_ORDER, todayStr } from "@/lib/utils";
 import { formatTimeLabel, nextHourTime, needsAcceptance, scheduledAt } from "@/lib/taskTime";
-import { Avatar, Button, PriorityBadge, Select, StatusBadge } from "./ui";
+import { Avatar, Button, PriorityBadge, StatusBadge } from "./ui";
+import { Combobox } from "./Combobox";
 import { TaskModal } from "./TaskModal";
 
 const WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
@@ -123,15 +124,31 @@ export function CalendarClient({
             <Button variant="ghost" size="sm" onClick={() => { const [y, m] = today.split("-").map(Number); setCursor(new Date(y, m - 1, 1)); setSelected(today); }}>Сегодня</Button>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Select value={assignee} onChange={(e) => setAssignee(e.target.value)} className="h-9 w-44 text-xs">
-              <option value="all">Все исполнители</option>
-              {users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-            </Select>
-            <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="h-9 w-36 text-xs">
-              <option value="all">Все статусы</option>
-              <option value="open">Открытые</option>
-              {STATUS_ORDER.map((s) => <option key={s} value={s}>{STATUS_LABELS[s]}</option>)}
-            </Select>
+            <Combobox
+              className="w-44"
+              size="sm"
+              aria-label="Исполнитель"
+              value={assignee}
+              onChange={setAssignee}
+              placeholder="Все исполнители"
+              options={[
+                { value: "all", label: "Все исполнители", hint: "без отбора" },
+                ...users.map((u) => ({ value: String(u.id), label: u.name, hint: u.position ?? undefined })),
+              ]}
+            />
+            <Combobox
+              className="w-36"
+              size="sm"
+              aria-label="Статус"
+              value={statusFilter}
+              onChange={setStatusFilter}
+              placeholder="Все статусы"
+              options={[
+                { value: "all", label: "Все статусы", hint: "без отбора" },
+                { value: "open", label: "Открытые", hint: "в работе и новые" },
+                ...STATUS_ORDER.map((status) => ({ value: status, label: STATUS_LABELS[status] })),
+              ]}
+            />
             <Button size="sm" onClick={() => setModal({ open: true, task: null, deadline: selected, time: defaultTimeFor(selected) })}><Plus size={14} /> Задача</Button>
           </div>
         </div>

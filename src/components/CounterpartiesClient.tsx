@@ -20,7 +20,8 @@ import {
   type ParsedCounterpartyRow,
 } from "@/lib/counterpartyImport";
 import { cn, formatDateTime } from "@/lib/utils";
-import { Badge, Button, EmptyState, Field, Input, Modal, Select, Textarea } from "./ui";
+import { Badge, Button, EmptyState, Field, Input, Modal, Textarea } from "./ui";
+import { Combobox } from "./Combobox";
 import { LoadMore, useProgressiveList } from "./lazy";
 
 type SortKey = "name" | "inn" | "email" | "phone" | "tasksCount" | "createdAt";
@@ -113,11 +114,18 @@ export function CounterpartiesClient({ items, isAdmin }: { items: CounterpartyRo
           <Search size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
           <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Поиск: название, ИНН, телефон, email, адрес, заметки..." className="pl-9" />
         </div>
-        <Select value={withTasks} onChange={(e) => setWithTasks(e.target.value)} className="w-44">
-          <option value="all">Все контрагенты</option>
-          <option value="with">С задачами</option>
-          <option value="without">Без задач</option>
-        </Select>
+        <Combobox
+          className="w-44"
+          aria-label="Задачи контрагента"
+          value={withTasks}
+          onChange={setWithTasks}
+          placeholder="Все контрагенты"
+          options={[
+            { value: "all", label: "Все контрагенты", hint: "без отбора" },
+            { value: "with", label: "С задачами", hint: "есть хотя бы одна" },
+            { value: "without", label: "Без задач", hint: "ни одной задачи" },
+          ]}
+        />
         {isAdmin && (
           <>
             <ImportPanel onImported={() => router.refresh()} />

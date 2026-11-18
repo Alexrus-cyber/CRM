@@ -1,4 +1,4 @@
-import { Bot } from "lucide-react";
+import { FlaskConical } from "lucide-react";
 import { requireUser } from "@/lib/auth";
 import { Badge, PageHeader } from "@/components/ui";
 import { LazyAiChat } from "@/components/LazyAiChat";
@@ -11,11 +11,11 @@ export default async function AiPage() {
     <>
       <PageHeader
         title="Чат с ИИ"
-        subtitle="Тестовый блок: вопросы к локальной модели, картинки и файлы"
+        subtitle="Тестовый harness: модель, тип раздумий, RAG-папка, файлы и картинки"
         action={
           <Badge className="border-amber-500/40 bg-amber-500/10 text-amber-500">
-            <Bot size={12} />
-            Тестовый режим
+            <FlaskConical size={12} />
+            Тестовый harness
           </Badge>
         }
       />

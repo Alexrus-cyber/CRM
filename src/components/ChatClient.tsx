@@ -1,10 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, CheckCheck, FileText, Hash, Paperclip, Search, Send, X } from "lucide-react";
+import { Check, CheckCheck, ChevronUp, FileText, Hash, Loader2, Paperclip, Search, Send, X } from "lucide-react";
 import type { UserLite } from "@/lib/data";
 import { cn, formatDate, formatTime, dateToStr } from "@/lib/utils";
 import { Avatar, Button } from "./ui";
+import { LoadMore, useProgressiveList } from "./lazy";
 
 type Attachment = { id: number; name: string; mime: string; size: number };
 
@@ -76,6 +77,8 @@ export function ChatClient({ users, meId, initialPeer = 0 }: { users: UserLite[]
   const [results, setResults] = useState<Msg[]>([]);
   const [searching, setSearching] = useState(false);
 
+  const [hasOlder, setHasOlder] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [context, setContext] = useState<{ hasOlder: boolean; hasNewer: boolean } | null>(null);
   const [highlightId, setHighlightId] = useState<number | null>(null);
 
@@ -104,6 +107,7 @@ export function ChatClient({ users, meId, initialPeer = 0 }: { users: UserLite[]
     setResults([]);
     setSearching(false);
     setContext(null);
+    setHasOlder(false);
     setHighlightId(null);
   }, []);
 
@@ -150,12 +154,18 @@ export function ChatClient({ users, meId, initialPeer = 0 }: { users: UserLite[]
     async (full: boolean) => {
       try {
         const after = full ? 0 : lastId.current;
-        const res = await fetch(`/api/chat?peer=${peer}&after=${after}`, { cache: "no-store" });
+        const res = await fetch(`/api/chat?peer=${peer}&after=${after}&limit=30`, { cache: "no-store" });
         if (!res.ok) return;
-        const data = (await res.json()) as { messages: Msg[]; peerReadId?: number; generalReaders?: Readers };
+        const data = (await res.json()) as {
+          messages: Msg[];
+          peerReadId?: number;
+          generalReaders?: Readers;
+          hasOlder?: boolean;
+        };
         if (full) {
           const list = applyMessages(data);
           setMsgs(list);
+          setHasOlder(Boolean(data.hasOlder));
           lastId.current = list.at(-1)?.id ?? 0;
           setContext(null);
           scrollDown();
@@ -174,6 +184,33 @@ export function ChatClient({ users, meId, initialPeer = 0 }: { users: UserLite[]
     },
     [peer, applyMessages, markRead],
   );
+
+  /** Догрузить более раннюю страницу, сохранив позицию прокрутки. */
+  const loadOlder = useCallback(async () => {
+    const first = msgs[0]?.id;
+    if (!first || loadingOlder || !hasOlder) return;
+    setLoadingOlder(true);
+    const node = listRef.current;
+    const previousHeight = node?.scrollHeight ?? 0;
+    const previousTop = node?.scrollTop ?? 0;
+    try {
+      const res = await fetch(`/api/chat?peer=${peer}&before=${first}&limit=30`, { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { messages: Msg[]; hasOlder?: boolean };
+      if (data.messages.length === 0) {
+        setHasOlder(false);
+        return;
+      }
+      setMsgs((prev) => [...data.messages.filter((m) => !prev.some((p) => p.id === m.id)), ...prev]);
+      setHasOlder(Boolean(data.hasOlder));
+      requestAnimationFrame(() => {
+        if (!listRef.current) return;
+        listRef.current.scrollTop = previousTop + (listRef.current.scrollHeight - previousHeight);
+      });
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [msgs, loadingOlder, hasOlder, peer]);
 
   // Загрузка переписки при смене собеседника + опрос новых сообщений.
   useEffect(() => {
@@ -345,6 +382,8 @@ export function ChatClient({ users, meId, initialPeer = 0 }: { users: UserLite[]
   const visibleOthers = needle
     ? others.filter((u) => `${u.name} ${u.position ?? ""} ${u.email}`.toLowerCase().includes(needle))
     : others;
+  // Список чатов тоже рисуем порциями: в большой команде он длинный.
+  const convList = useProgressiveList(visibleOthers, { initial: 8, step: 10, resetKey: peerFilter });
   const unreadFor = (id: number) => unread[String(id)] ?? 0;
   const totalUnread = Object.values(unread).reduce((sum, value) => sum + value, 0);
 
@@ -387,7 +426,7 @@ export function ChatClient({ users, meId, initialPeer = 0 }: { users: UserLite[]
             {unreadFor(0) > 0 && <UnreadBadge count={unreadFor(0)} />}
           </button>
           <p className="px-2 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wide text-muted">Личные</p>
-          {visibleOthers.map((u) => (
+          {convList.items.map((u) => (
             <button
               key={u.id}
               onClick={() => changePeer(u.id)}
@@ -404,6 +443,17 @@ export function ChatClient({ users, meId, initialPeer = 0 }: { users: UserLite[]
               {unreadFor(u.id) > 0 && <UnreadBadge count={unreadFor(u.id)} />}
             </button>
           ))}
+          <LoadMore
+            shown={convList.shown}
+            total={convList.total}
+            hasMore={convList.hasMore}
+            loading={convList.loading}
+            onShowMore={convList.showMore}
+            sentinelRef={convList.sentinelRef}
+            initial={8}
+            unit="чатов"
+            className="px-2 pb-1"
+          />
           {visibleOthers.length === 0 && (
             <p className="px-2 py-3 text-center text-[11px] text-muted">Никого не нашли</p>
           )}
@@ -520,6 +570,19 @@ export function ChatClient({ users, meId, initialPeer = 0 }: { users: UserLite[]
         )}
 
         <div ref={listRef} className="flex-1 space-y-3 overflow-y-auto px-3 py-3 sm:px-4 sm:py-4">
+          {hasOlder && !context && (
+            <div className="flex justify-center">
+              <button
+                type="button"
+                onClick={() => void loadOlder()}
+                disabled={loadingOlder}
+                className="flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[11px] text-muted transition hover:bg-card2 hover:text-text disabled:opacity-60"
+              >
+                {loadingOlder ? <Loader2 size={12} className="animate-spin" /> : <ChevronUp size={12} />}
+                {loadingOlder ? "Загружаем..." : "Показать более ранние"}
+              </button>
+            </div>
+          )}
           {loading && <p className="text-center text-xs text-muted">Загрузка...</p>}
           {!loading && msgs.length === 0 && (
             <p className="py-10 text-center text-xs text-muted">Сообщений пока нет. Напишите первым!</p>

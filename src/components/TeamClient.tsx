@@ -8,7 +8,8 @@ import type { Role } from "@/db/schema";
 import type { UserLite } from "@/lib/data";
 import { createUserAction } from "@/app/actions/users";
 import { cn, ROLE_LABELS, roleBadgeClass } from "@/lib/utils";
-import { Avatar, Badge, Button, Field, Input, Modal, Select } from "./ui";
+import { Avatar, Badge, Button, Field, Input, Modal } from "./ui";
+import { Combobox } from "./Combobox";
 import { LoadMore, useProgressiveList } from "./lazy";
 
 export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: number; role: Role }; stats: Record<number, { open: number; done: number; points: number }> }) {
@@ -33,8 +34,8 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
 
   // Карточки сотрудников рисуются порциями — команда может быть большой.
   const list = useProgressiveList(filtered, {
-    initial: 12,
-    step: 12,
+    initial: 8,
+    step: 8,
     resetKey: `${q}|${roleFilter}`,
   });
 
@@ -56,12 +57,20 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
           <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
           <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Поиск сотрудника..." className="h-9 pl-9 text-xs" />
         </div>
-        <Select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)} className="h-9 w-full min-w-0 text-xs sm:w-36">
-          <option value="all">Все роли</option>
-          <option value="super_admin">Главный админ</option>
-          <option value="admin">Администраторы</option>
-          <option value="user">Сотрудники</option>
-        </Select>
+        <Combobox
+          className="w-full sm:w-36"
+          size="sm"
+          aria-label="Роль"
+          value={roleFilter}
+          onChange={setRoleFilter}
+          placeholder="Все роли"
+          options={[
+            { value: "all", label: "Все роли", hint: "без отбора" },
+            { value: "super_admin", label: "Главный админ" },
+            { value: "admin", label: "Администраторы" },
+            { value: "user", label: "Сотрудники" },
+          ]}
+        />
         {canCreate && (
           <Button size="sm" className="w-full sm:w-auto" onClick={() => { setError(null); setOpen(true); }}><UserPlus size={14} /> Добавить</Button>
         )}
@@ -102,7 +111,7 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
         loading={list.loading}
         onShowMore={list.showMore}
         sentinelRef={list.sentinelRef}
-        initial={12}
+        initial={8}
         unit="сотрудников"
       />
 
@@ -122,10 +131,16 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
           <Field label="Email *"><Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="ivan@company.ru" /></Field>
           <Field label="Временный пароль *"><Input type="text" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="минимум 6 символов" /></Field>
           <Field label="Роль">
-            <Select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as Role })}>
-              <option value="user">Сотрудник</option>
-              {me.role === "super_admin" && <option value="admin">Администратор</option>}
-            </Select>
+            <Combobox
+              aria-label="Роль"
+              value={form.role}
+              onChange={(next) => setForm({ ...form, role: next as Role })}
+              placeholder="Выберите роль"
+              options={[
+                { value: "user", label: "Сотрудник" },
+                ...(me.role === "super_admin" ? [{ value: "admin", label: "Администратор" }] : []),
+              ]}
+            />
           </Field>
           <Field label="Должность"><Input value={form.position} onChange={(e) => setForm({ ...form, position: e.target.value })} placeholder="Разработчик, менеджер..." /></Field>
           <Field label="Телефон" className="sm:col-span-2"><Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} placeholder="+7 (999) 000-00-00" /></Field>
