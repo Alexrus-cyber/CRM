@@ -129,6 +129,34 @@ const PG_DDL = [
     created_at timestamptz not null default now()
   )`,
   `create index if not exists message_attachments_message_idx on message_attachments (message_id)`,
+  `create table if not exists ai_rag_folders (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    name text not null,
+    files_count integer not null default 0,
+    chunks_count integer not null default 0,
+    chars integer not null default 0,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`,
+  `create index if not exists ai_rag_folders_user_idx on ai_rag_folders (user_id)`,
+  `create table if not exists ai_rag_chunks (
+    id serial primary key,
+    folder_id integer not null references ai_rag_folders(id) on delete cascade,
+    path text not null,
+    chunk_index integer not null default 0,
+    text text not null,
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists ai_rag_chunks_folder_idx on ai_rag_chunks (folder_id)`,
+  `create table if not exists ai_rag_terms (
+    id serial primary key,
+    folder_id integer not null references ai_rag_folders(id) on delete cascade,
+    term text not null,
+    chunk_id integer not null references ai_rag_chunks(id) on delete cascade,
+    tf integer not null default 1
+  )`,
+  `create index if not exists ai_rag_terms_lookup_idx on ai_rag_terms (folder_id, term)`,
 ];
 
 /**
@@ -227,6 +255,34 @@ const SQLITE_DDL = [
     created_at text not null
   )`,
   `create index if not exists message_attachments_message_idx on message_attachments (message_id)`,
+  `create table if not exists ai_rag_folders (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    name text not null,
+    files_count integer not null default 0,
+    chunks_count integer not null default 0,
+    chars integer not null default 0,
+    created_at text not null,
+    updated_at text not null
+  )`,
+  `create index if not exists ai_rag_folders_user_idx on ai_rag_folders (user_id)`,
+  `create table if not exists ai_rag_chunks (
+    id integer primary key autoincrement,
+    folder_id integer not null references ai_rag_folders(id) on delete cascade,
+    path text not null,
+    chunk_index integer not null default 0,
+    text text not null,
+    created_at text not null
+  )`,
+  `create index if not exists ai_rag_chunks_folder_idx on ai_rag_chunks (folder_id)`,
+  `create table if not exists ai_rag_terms (
+    id integer primary key autoincrement,
+    folder_id integer not null references ai_rag_folders(id) on delete cascade,
+    term text not null,
+    chunk_id integer not null references ai_rag_chunks(id) on delete cascade,
+    tf integer not null default 1
+  )`,
+  `create index if not exists ai_rag_terms_lookup_idx on ai_rag_terms (folder_id, term)`,
 ];
 
 /* ------------------------------------------------------------------ */

@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import { nowIso, q, q1, toIso, toNum, toYmd } from "./dialect";
+import { tokenize } from "@/lib/rag";
 import type { Role, TaskPriority, TaskStatus } from "./schema";
 
 export type UserLite = {
@@ -759,6 +760,154 @@ export async function searchMessages(
       and (m.content_lower like ${needle} or a.name_lower like ${needle})
     order by m.id desc limit ${limit}`);
   return rows.map(mapMessage).reverse();
+}
+
+/* ------------------------------- RAG для ИИ ------------------------ */
+
+export type RagFolderRow = {
+  id: number;
+  userId: number;
+  name: string;
+  filesCount: number;
+  chunksCount: number;
+  chars: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+function mapRagFolder(row: Raw): RagFolderRow {
+  return {
+    id: toNum(row.id),
+    userId: toNum(row.user_id),
+    name: String(row.name ?? ""),
+    filesCount: toNum(row.files_count),
+    chunksCount: toNum(row.chunks_count),
+    chars: toNum(row.chars),
+    createdAt: toIso(row.created_at) ?? nowIso(),
+    updatedAt: toIso(row.updated_at) ?? nowIso(),
+  };
+}
+
+/** Папки RAG, загруженные пользователем. */
+export async function listRagFolders(userId: number): Promise<RagFolderRow[]> {
+  const rows = await q(sql`select id, user_id, name, files_count, chunks_count, chars, created_at, updated_at
+    from ai_rag_folders where user_id = ${userId} order by updated_at desc`);
+  return rows.map(mapRagFolder);
+}
+
+export async function getRagFolder(userId: number, id: number): Promise<RagFolderRow | null> {
+  const row = await q1(sql`select id, user_id, name, files_count, chunks_count, chars, created_at, updated_at
+    from ai_rag_folders where id = ${id} and user_id = ${userId} limit 1`);
+  return row ? mapRagFolder(row) : null;
+}
+
+export async function createRagFolder(userId: number, name: string): Promise<RagFolderRow> {
+  const now = nowIso();
+  const row = await q1(sql`insert into ai_rag_folders (user_id, name, files_count, chunks_count, chars, created_at, updated_at)
+    values (${userId}, ${name}, 0, 0, 0, ${now}, ${now}) returning id, user_id, name, files_count, chunks_count, chars, created_at, updated_at`);
+  return mapRagFolder(row ?? { id: 0, user_id: userId, name, files_count: 0, chunks_count: 0, chars: 0, created_at: now, updated_at: now });
+}
+
+export async function deleteRagFolder(userId: number, id: number): Promise<boolean> {
+  const folder = await getRagFolder(userId, id);
+  if (!folder) return false;
+  // Каскад в схеме есть, но SQLite включаем явно через удаление потомков.
+  await q(sql`delete from ai_rag_terms where folder_id = ${id}`);
+  await q(sql`delete from ai_rag_chunks where folder_id = ${id}`);
+  await q(sql`delete from ai_rag_folders where id = ${id} and user_id = ${userId}`);
+  return true;
+}
+
+/** Частоты основ фрагмента — то, что попадёт в обратный индекс. */
+export function ragTermFrequencies(text: string): Record<string, number> {
+  const terms: Record<string, number> = {};
+  for (const token of tokenize(text)) terms[token] = Math.min((terms[token] ?? 0) + 1, 50);
+  return terms;
+}
+
+/**
+ * Догрузка файлов в папку: клиент присылает уже нарезанные фрагменты.
+ * Размер порции ограничивает роут, а не эта функция — папка может расти
+ * сколько угодно запросов подряд.
+ */
+export async function addRagChunks(
+  folderId: number,
+  items: Array<{ path: string; chunks: string[] }>,
+): Promise<{ chunks: number; files: number; chars: number }> {
+  let added = 0;
+  for (const item of items) {
+    for (let index = 0; index < item.chunks.length; index += 1) {
+      const text = item.chunks[index];
+      if (!text.trim()) continue;
+      const row = await q1<{ id: number }>(sql`insert into ai_rag_chunks (folder_id, path, chunk_index, text, created_at)
+        values (${folderId}, ${item.path}, ${index}, ${text}, ${nowIso()}) returning id`);
+      const chunkId = toNum(row?.id);
+      const terms = ragTermFrequencies(`${item.path}\n${text}`);
+      const values = Object.entries(terms).map(([term, tf]) => sql`(${folderId}, ${term}, ${chunkId}, ${tf})`);
+      if (values.length > 0) {
+        await q(sql`insert into ai_rag_terms (folder_id, term, chunk_id, tf) values ${sql.join(values, sql`, `)}`);
+      }
+      added += 1;
+    }
+  }
+
+  const stats = await q1(sql`select count(*) as chunks, count(distinct path) as files, coalesce(sum(length(text)), 0) as chars
+    from ai_rag_chunks where folder_id = ${folderId}`);
+  const chunks = toNum(stats?.chunks);
+  const files = toNum(stats?.files);
+  const chars = toNum(stats?.chars);
+  await q(sql`update ai_rag_folders set chunks_count = ${chunks}, files_count = ${files}, chars = ${chars}, updated_at = ${nowIso()}
+    where id = ${folderId}`);
+  return { chunks: added, files, chars };
+}
+
+export type RagSearchHit = { path: string; text: string; score: number };
+
+/**
+ * Поиск по папке: BM25-подобный счёт по обратному индексу.
+ * Индекс в базе, поэтому размер папки ничем не ограничен, а запрос остаётся
+ * дешёвым: сначала выборка по (folder_id, term), потом сортировка в JS.
+ */
+export async function searchRagChunks(folderId: number, queryText: string, limit = 6): Promise<RagSearchHit[]> {
+  const terms = Array.from(new Set(tokenize(queryText))).slice(0, 24);
+  if (terms.length === 0) return [];
+  const termList = sql.join(terms.map((term) => sql`${term}`), sql`, `);
+
+  const totals = await q1(sql`select chunks_count as chunks from ai_rag_folders where id = ${folderId}`);
+  const totalChunks = Math.max(toNum(totals?.chunks), 1);
+
+  const dfRows = await q(sql`select term, count(*) as df from ai_rag_terms
+    where folder_id = ${folderId} and term in (${termList}) group by term`);
+  const df = new Map<string, number>();
+  for (const row of dfRows) df.set(String(row.term), toNum(row.df));
+  if (df.size === 0) return [];
+
+  const rows = await q(sql`select t.term, t.tf, c.id as chunk_id, c.path, c.text, length(c.text) as len
+    from ai_rag_terms t join ai_rag_chunks c on c.id = t.chunk_id
+    where t.folder_id = ${folderId} and t.term in (${termList})
+    limit 4000`);
+
+  const scored = new Map<number, { path: string; text: string; score: number; terms: Set<string> }>();
+  for (const row of rows) {
+    const chunkId = toNum(row.chunk_id);
+    const term = String(row.term);
+    const tf = toNum(row.tf);
+    const len = Math.max(toNum(row.len), 1);
+    const idf = Math.log(1 + totalChunks / Math.max(df.get(term) ?? 1, 1));
+    const weight = (Math.min(tf, 4) * idf) / Math.sqrt(len / 400);
+    const current = scored.get(chunkId);
+    if (current) {
+      current.score += weight;
+      current.terms.add(term);
+    } else {
+      scored.set(chunkId, { path: String(row.path), text: String(row.text), score: weight, terms: new Set([term]) });
+    }
+  }
+
+  return Array.from(scored.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(1, limit))
+    .map((hit) => ({ path: hit.path, text: hit.text, score: hit.score }));
 }
 
 /* --------------------------- export journal ------------------------ */

@@ -1,4 +1,6 @@
 import { getCurrentUser } from "@/lib/auth";
+import { getRagFolder, searchRagChunks } from "@/db/repo";
+import { formatRagContext } from "@/lib/rag";
 import {
   AI_DEFAULT_BASE_URL,
   AI_MAX_CONTEXT_MESSAGES,
@@ -12,8 +14,10 @@ import {
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-/** Потолок на тело запроса: история + картинки в data-URL. */
-const MAX_BODY_BYTES = 12 * 1024 * 1024;
+/** Потолок на тело запроса: история + картинки в data-URL (сжимаем в браузере). */
+const MAX_BODY_BYTES = 48 * 1024 * 1024;
+/** Сколько символов RAG-контекста максимум подмешиваем (≈4–5k токенов). */
+const MAX_RAG_CONTEXT_CHARS = 12_000;
 /** Страховка от «зависшего» локального сервера. */
 const UPSTREAM_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -25,6 +29,7 @@ type UpstreamChunk = {
     message?: { content?: string | null; reasoning_content?: string | null };
     finish_reason?: string | null;
   }>;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
   error?: { message?: string };
 };
 
@@ -38,6 +43,9 @@ function buildUpstreamBody(model: string, messages: AiMessage[], params: AiParam
   if (params.topP !== null) body.top_p = params.topP;
   if (params.maxTokens !== null) body.max_tokens = params.maxTokens;
   if (params.seed !== null) body.seed = params.seed;
+
+  // Некоторые сборки умеют отдавать usage прямо в потоке.
+  if (params.streamUsage) body.stream_options = { include_usage: true };
 
   if (params.reasoning !== "default") {
     if (params.reasoning === "off") body.reasoning_effort = "none";
@@ -64,6 +72,23 @@ function settingsFromRequest(req: Request) {
   return { baseUrl, apiKey, model };
 }
 
+/** Текст последнего сообщения пользователя — по нему ищем фрагменты RAG. */
+function lastUserText(messages: AiMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
+    if (typeof message.content === "string") return message.content;
+    if (Array.isArray(message.content)) {
+      return (message.content as Array<{ type?: string; text?: string }>)
+        .filter((part) => part?.type === "text" && part.text)
+        .map((part) => part.text ?? "")
+        .join("\n");
+    }
+    return "";
+  }
+  return "";
+}
+
 /** Разбор одного SSE-события OpenAI: нужен только текст ответа. */
 function readDelta(chunk: UpstreamChunk): string {
   const choice = chunk.choices?.[0];
@@ -82,8 +107,11 @@ function readReasoning(chunk: UpstreamChunk): string {
 
 function describeUpstreamError(status: number, body: string): string {
   const trimmed = body.trim();
-  const hint =
-    status === 400 || status === 422
+  const lower = body.toLowerCase();
+  const contextOverflow = /context|too many tokens|maximum|token limit|out of memory|превыш/i.test(lower);
+  const hint = contextOverflow
+    ? " Похоже, контекст модели закончился: нажмите «Новый чат», чтобы начать с чистого счётчика, или уменьшите число фрагментов RAG."
+    : status === 400 || status === 422
       ? " Если сервер не понимает параметры раздумий, выберите «По умолчанию» в блоке «Раздумья» или выключите chat_template_kwargs."
       : "";
   if (trimmed) {
@@ -114,19 +142,45 @@ export async function POST(req: Request) {
   let messages: AiMessage[];
   let params: AiParams = normalizeParams(null);
   let ragContext = "";
+  let ragFolderId = 0;
+  let ragQuery = "";
   try {
     const raw = await req.text();
     if (raw.length > MAX_BODY_BYTES) {
       return Response.json({ error: "Слишком большой запрос: уменьшите вложение" }, { status: 413 });
     }
-    const body = JSON.parse(raw) as { messages?: AiMessage[]; params?: unknown; ragContext?: unknown };
+    const body = JSON.parse(raw) as {
+      messages?: AiMessage[];
+      params?: unknown;
+      ragContext?: unknown;
+      ragFolderId?: unknown;
+      ragQuery?: unknown;
+    };
     params = normalizeParams(body.params);
-    ragContext = typeof body.ragContext === "string" ? body.ragContext.slice(0, 12_000) : "";
+    ragContext = typeof body.ragContext === "string" ? body.ragContext.slice(0, MAX_RAG_CONTEXT_CHARS) : "";
+    ragFolderId = Number(body.ragFolderId ?? 0) || 0;
+    ragQuery = typeof body.ragQuery === "string" ? body.ragQuery.slice(0, 4000) : "";
     messages = (body.messages ?? []).filter(
       (m) => m && (m.role === "user" || m.role === "assistant" || m.role === "system"),
     );
   } catch {
     return Response.json({ error: "Некорректный запрос" }, { status: 400 });
+  }
+
+  // RAG: если выбрана сохранённая папка, ищем фрагменты по запросу пользователя.
+  let ragHits = 0;
+  if (ragFolderId > 0 && params.ragChunks > 0 && !ragContext) {
+    const folder = await getRagFolder(me.id, ragFolderId);
+    if (folder) {
+      const query = ragQuery.trim() || lastUserText(messages);
+      if (query) {
+        const hits = await searchRagChunks(ragFolderId, query, params.ragChunks);
+        if (hits.length > 0) {
+          ragContext = formatRagContext(hits, MAX_RAG_CONTEXT_CHARS);
+          ragHits = hits.length;
+        }
+      }
+    }
   }
 
   // Системный промпт и найденные фрагменты RAG — первыми сообщениями.
@@ -180,9 +234,17 @@ export async function POST(req: Request) {
   if (!upstream.body || !contentType.includes("text/event-stream")) {
     const body = await upstream.text();
     let text = "";
+    let usage: unknown = null;
     try {
       const parsed = JSON.parse(body) as UpstreamChunk;
       text = readDelta(parsed);
+      if (parsed.usage) {
+        usage = {
+          prompt: parsed.usage.prompt_tokens ?? 0,
+          completion: parsed.usage.completion_tokens ?? 0,
+          total: parsed.usage.total_tokens ?? 0,
+        };
+      }
       if (!text) text = parsed.error?.message ?? "";
     } catch {
       text = body;
@@ -193,7 +255,8 @@ export async function POST(req: Request) {
     const single = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta: text })}\n\n`));
-        controller.enqueue(encoder.encode(`data: {"done":true}\n\n`));
+        if (usage) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ usage })}\n\n`));
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true, ragHits })}\n\n`));
         controller.close();
       },
     });
@@ -227,12 +290,21 @@ export async function POST(req: Request) {
               if (delta) push({ delta });
               const thinking = readReasoning(chunk);
               if (thinking) push({ reasoning: thinking });
+              if (chunk.usage && (chunk.usage.prompt_tokens || chunk.usage.completion_tokens)) {
+                push({
+                  usage: {
+                    prompt: chunk.usage.prompt_tokens ?? 0,
+                    completion: chunk.usage.completion_tokens ?? 0,
+                    total: chunk.usage.total_tokens ?? 0,
+                  },
+                });
+              }
             } catch {
               /* служебные строки локальных серверов пропускаем */
             }
           }
         }
-        push({ done: true });
+        push({ done: true, ragHits });
       } catch (error) {
         push({ error: error instanceof Error ? error.message : "Поток прерван" });
         push({ done: true });
