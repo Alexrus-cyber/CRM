@@ -3,6 +3,7 @@ import { requireUser } from "@/lib/auth";
 import { getDbInfo } from "@/db/dialect";
 import { Sidebar } from "@/components/Sidebar";
 import { LiveUpdates } from "@/components/LiveUpdates";
+import { MessageToasts } from "@/components/MessageToasts";
 
 export const dynamic = "force-dynamic";
 
@@ -13,6 +14,8 @@ export default async function AppLayout({ children }: { children: ReactNode }) {
     <div className="min-h-screen">
       {/* Живые обновления: чужая задача появляется без перезагрузки страницы. */}
       <LiveUpdates />
+      {/* Всплывающие уведомления о новых сообщениях — в правом нижнем углу. */}
+      <MessageToasts userId={user.id} />
       <Sidebar
         user={{
           id: user.id,

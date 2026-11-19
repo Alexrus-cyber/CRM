@@ -27,6 +27,7 @@ import {
 } from "@/lib/taskTime";
 import { Button, Field, Input, Modal, Textarea, Avatar, StatusBadge } from "./ui";
 import { Combobox } from "./Combobox";
+import { TaskChat } from "./TaskChat";
 
 export type TaskModalProps = {
   open: boolean;
@@ -322,6 +323,8 @@ export function TaskModal({
           <div>Исполнитель: <span className="text-text">{task.assigneeName}</span></div>
         </div>
       )}
+
+      {task && <TaskChat taskId={task.id} me={me} />}
 
       {!isOwner && (
         <p className="mt-3 text-xs text-muted">Вы исполнитель этой задачи: можно менять статус, часы и описание. Остальные поля редактирует автор или администратор.</p>

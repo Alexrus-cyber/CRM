@@ -110,6 +110,15 @@ const PG_DDL = [
     created_at timestamptz not null default now()
   )`,
   `create unique index if not exists task_exports_user_task_uq on task_exports (user_id, task_id)`,
+  `create table if not exists task_messages (
+    id serial primary key,
+    task_id integer not null references tasks(id) on delete cascade,
+    author_id integer not null references users(id) on delete cascade,
+    content text not null,
+    content_lower text not null default '',
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists task_messages_task_idx on task_messages (task_id, id)`,
   `create table if not exists chat_reads (
     id serial primary key,
     user_id integer not null references users(id) on delete cascade,
@@ -279,6 +288,15 @@ const SQLITE_DDL = [
     created_at text not null
   )`,
   `create unique index if not exists task_exports_user_task_uq on task_exports (user_id, task_id)`,
+  `create table if not exists task_messages (
+    id integer primary key autoincrement,
+    task_id integer not null references tasks(id) on delete cascade,
+    author_id integer not null references users(id) on delete cascade,
+    content text not null,
+    content_lower text not null default '',
+    created_at text not null
+  )`,
+  `create index if not exists task_messages_task_idx on task_messages (task_id, id)`,
   `create table if not exists chat_reads (
     id integer primary key autoincrement,
     user_id integer not null references users(id) on delete cascade,

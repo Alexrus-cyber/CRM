@@ -64,6 +64,8 @@ const TABLES = [
     columns: ["id", "message_id", "name", "name_lower", "mime", "size", "data", "created_at"],
   },
   { name: "task_exports", columns: ["id", "user_id", "task_id", "created_at"] },
+  // Быстрая переписка по задаче (блок «Задачи»).
+  { name: "task_messages", columns: ["id", "task_id", "author_id", "content", "content_lower", "created_at"] },
   // Блок «Чат с ИИ»: история, расход токенов, квоты и RAG-индекс.
   { name: "ai_rag_folders", columns: ["id", "user_id", "name", "files_count", "chunks_count", "chars", "created_at", "updated_at"] },
   { name: "ai_rag_chunks", columns: ["id", "folder_id", "path", "chunk_index", "text", "created_at"] },
@@ -201,7 +203,8 @@ async function writePg(pool, data) {
     await client.query("begin");
     await client.query(
       "truncate table ai_rag_terms, ai_rag_chunks, ai_rag_folders, ai_chat_messages, ai_chats, ai_usage_events, " +
-        "ai_quota_overrides, task_exports, message_attachments, chat_reads, messages, sessions, tasks, counterparties, users " +
+        "ai_quota_overrides, task_messages, task_exports, message_attachments, chat_reads, messages, sessions, tasks, " +
+        "counterparties, users " +
         "restart identity cascade",
     );
     for (const table of TABLES) {
