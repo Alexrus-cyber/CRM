@@ -88,3 +88,84 @@ export function formatRagContext(hits: RagHit[], maxChars = 12_000): string {
   }
   return parts.join("\n\n---\n\n");
 }
+
+/* --------------------------- полное окружение ---------------------------- */
+
+/**
+ * Страховка для режима «вся база»: больше этого в один запрос не отправляем,
+ * иначе локальный сервер можно случайно уронить гигантским промптом.
+ * Реальный ограничитель — контекст модели (`contextLimit` в настройках).
+ */
+export const RAG_FULL_MAX_CHARS = 2_000_000;
+
+/** Сколько символов текста в среднем приходится на токен (кириллица ≈ 2,5). */
+export const RAG_CHARS_PER_TOKEN = 2.4;
+
+/**
+ * Сколько символов RAG влезает в контекст модели.
+ *
+ * `contextLimit ≤ 0` — пользователь не следит за контекстом, отдаём страховочный
+ * потолок. Иначе считаем свободное место: контекст минус уже занятое историей и
+ * минус резерв под ответ.
+ */
+export function ragBudgetChars(contextLimit: number, usedTokens: number, reserveTokens = 0): number {
+  if (!Number.isFinite(contextLimit) || contextLimit <= 0) return RAG_FULL_MAX_CHARS;
+  const free = contextLimit - Math.max(0, usedTokens) - Math.max(0, reserveTokens);
+  return Math.min(RAG_FULL_MAX_CHARS, Math.max(0, Math.floor(free * RAG_CHARS_PER_TOKEN)));
+}
+
+export type FullRagContext = {
+  text: string;
+  /** Сколько символов контекста получилось. */
+  chars: number;
+  /** Сколько фрагментов вошло. */
+  used: number;
+  /** Что-то не влезло в бюджет. */
+  truncated: boolean;
+};
+
+/**
+ * Собирает контекст из ВСЕХ фрагментов папки (в переданном порядке), группируя
+ * соседние фрагменты одного файла под общим заголовком. Если бюджет кончился —
+ * остаток отбрасывается и `truncated = true`, чтобы интерфейс честно сказал,
+ * сколько фрагментов вошло.
+ */
+export function formatFullRagContext(chunks: RagHit[], maxChars = RAG_FULL_MAX_CHARS): FullRagContext {
+  const limit = Math.max(0, Math.floor(maxChars));
+  const runs: Array<{ path: string; texts: string[] }> = [];
+  for (const chunk of chunks) {
+    const last = runs[runs.length - 1];
+    if (last && last.path === chunk.path) last.texts.push(chunk.text);
+    else runs.push({ path: chunk.path, texts: [chunk.text] });
+  }
+
+  const parts: string[] = [];
+  let chars = 0;
+  let used = 0;
+  let truncated = false;
+
+  for (const run of runs) {
+    if (truncated) break;
+    const header = `Файл: ${run.path}\n`;
+    const separator = parts.length > 0 ? 2 : 0;
+    const body: string[] = [];
+    let runChars = 0;
+    for (const text of run.texts) {
+      const cost = (body.length > 0 ? 1 : 0) + text.length;
+      if (chars + separator + header.length + runChars + cost > limit) {
+        truncated = true;
+        break;
+      }
+      body.push(text);
+      runChars += cost;
+      used += 1;
+    }
+    if (body.length > 0) {
+      parts.push(`${header}${body.join("\n")}`);
+      chars += separator + header.length + runChars;
+    }
+  }
+
+  if (used < chunks.length) truncated = true;
+  return { text: parts.join("\n\n---\n\n"), chars, used, truncated };
+}
