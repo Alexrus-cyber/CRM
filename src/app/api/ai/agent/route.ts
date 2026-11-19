@@ -1,5 +1,6 @@
 import { getCurrentUser } from "@/lib/auth";
 import { normalizeBaseUrl } from "@/lib/ai";
+import { AGENT_MAX_STEPS, normalizeGenParams } from "@/lib/genParams";
 import { ROLE_LABELS } from "@/lib/utils";
 
 /**
@@ -50,7 +51,7 @@ export async function GET() {
 }
 
 type IncomingMessage = { role?: string; content?: string };
-type IncomingAttachment = { name?: string; text?: string; note?: string };
+type IncomingAttachment = { name?: string; text?: string; note?: string; image?: string };
 
 export async function POST(req: Request) {
   const me = await getCurrentUser();
@@ -63,6 +64,8 @@ export async function POST(req: Request) {
     | {
         messages?: IncomingMessage[];
         settings?: { baseUrl?: string; apiKey?: string; model?: string };
+        params?: unknown;
+        maxSteps?: number;
         attachments?: IncomingAttachment[];
       }
     | null;
@@ -75,20 +78,36 @@ export async function POST(req: Request) {
     return Response.json({ error: "Пустой запрос" }, { status: 400 });
   }
 
-  // Файлы уже распознаны в браузере — агенту нужен только текст.
+  // Файлы уже распознаны в браузере — агенту нужен только текст и, для
+  // картинок, data-URL: тогда vision-модель видит сам снимок.
   const attachments = (body?.attachments ?? [])
     .filter((item) => item && typeof item === "object")
     .slice(0, 5)
-    .map((item) => ({
-      name: String(item.name ?? "файл").slice(0, 120),
-      note: String(item.note ?? "").slice(0, 120),
-      text: String(item.text ?? "").slice(0, 30_000),
-    }));
+    .map((item) => {
+      const image = typeof item.image === "string" && item.image.startsWith("data:image/")
+        ? item.image.slice(0, 6_000_000)
+        : "";
+      return {
+        name: String(item.name ?? "файл").slice(0, 120),
+        note: String(item.note ?? "").slice(0, 120),
+        text: String(item.text ?? "").slice(0, 30_000),
+        ...(image ? { image } : {}),
+      };
+    });
+
+  // Раздумья и генерация — те же ручки, что в «Чате с моделью».
+  const params = normalizeGenParams(body?.params);
+  const maxSteps = Math.min(
+    AGENT_MAX_STEPS,
+    Math.max(1, Number.isFinite(body?.maxSteps) ? Number(body?.maxSteps) : AGENT_MAX_STEPS),
+  );
 
   const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl ?? "") ?? undefined;
   const payload = {
     messages,
     attachments,
+    params,
+    maxSteps,
     settings: {
       baseUrl,
       apiKey: (body?.settings?.apiKey ?? "").trim().slice(0, 400),

@@ -189,6 +189,19 @@ def extract_attachment_text(name: str, data: bytes, limit: int = 4000) -> str:
 
 # Заведомо текстовые модели: картинок не понимают, координаты «придумывают».
 # У DeepSeek картинки понимает deepseek-flash; deepseek-chat и deepseek-v4-pro — текст.
+MAX_STEPS_LIMIT = 500  # столько шагов разрешает и CRM, и интерфейс
+
+VERIFY_PROMPT = """Ты проверяешь результат действия бота на рабочем столе.
+Тебе дают описание действия, его результат и свежий скриншот. Посмотри на экран
+и реши, получилось ли задуманное: открылось ли нужное окно, появился ли текст,
+сработала ли кнопка.
+
+Ответь ТОЛЬКО одним JSON-объектом без пояснений и без markdown:
+{"ok": true, "note": "одна короткая фраза по-русски, что видно на экране"}
+
+ok=false — если действие не удалось, открылось не то окно, текст не появился
+или экран выглядит так же, как до действия."""
+
 TEXT_ONLY_MODELS = (
     "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro",
     "gpt-3.5", "llama-3.3", "mixtral",
@@ -397,6 +410,43 @@ def self_test() -> int:
     finally:
         globals()["pyautogui"], globals()["require_pyautogui"] = saved_mouse, saved_require
 
+    # Раздумья и генерация: поля запроса и вердикт проверки.
+    gen_payload: Dict[str, Any] = {}
+    probe.generation = {"reasoning": "budget", "thinking_budget": 2048,
+                        "temperature": 0.4, "top_p": 0.9, "max_tokens": 512,
+                        "seed": 7, "send_thinking_flag": True}
+    probe.apply_generation(gen_payload)
+    check("бюджет раздумий → reasoning_effort=high",
+          gen_payload.get("reasoning_effort") == "high"
+          and gen_payload.get("thinking_budget") == 2048)
+    check("temperature/top_p/max_tokens/seed в запросе",
+          gen_payload.get("temperature") == 0.4 and gen_payload.get("top_p") == 0.9
+          and gen_payload.get("max_tokens") == 512 and gen_payload.get("seed") == 7)
+    check("enable_thinking дублируется",
+          (gen_payload.get("chat_template_kwargs") or {}).get("enable_thinking") is True)
+
+    off_payload: Dict[str, Any] = {}
+    probe.generation = {"reasoning": "off", "send_thinking_flag": True}
+    probe.apply_generation(off_payload)
+    check("«без раздумий» → reasoning_effort=none",
+          off_payload.get("reasoning_effort") == "none"
+          and off_payload["chat_template_kwargs"]["enable_thinking"] is False)
+
+    default_payload: Dict[str, Any] = {"temperature": 0.2}
+    probe.generation = {"reasoning": "default"}
+    probe.apply_generation(default_payload)
+    check("«по умолчанию» ничего не добавляет",
+          default_payload.get("reasoning_effort") is None
+          and default_payload.get("chat_template_kwargs") is None)
+
+    check("вердикт без JSON → None", probe.parse_verdict("не json") is None)
+    verdict = probe.parse_verdict('```json\n{"ok": true, "note": "окно открылось"}\n```')
+    check("вердикт из ```-блока читается",
+          bool(verdict and verdict["ok"] and verdict["note"] == "окно открылось"))
+    false_verdict = probe.parse_verdict('{"ok": false, "note": "не видно"}')
+    check("вердикт ok=false читается", bool(false_verdict) and false_verdict["ok"] is False)
+
+    probe.generation = {}
     passed = sum(1 for item in checks if item)
     print("\n{}/{} проверок пройдено".format(passed, len(checks)))
     return 0 if passed == len(checks) else 1
@@ -505,7 +555,9 @@ class Operator:
                  dry_run: bool, assume_yes: bool, max_steps: int, delay: float,
                  poll: float, max_width: int, text_only: bool, key_hint: str = "",
                  offset_x: int = 0, offset_y: int = 0, vision_check: bool = True,
-                 vision_forced: bool = False, cursor_marker: bool = True) -> None:
+                 vision_forced: bool = False, cursor_marker: bool = True,
+                 generation: Optional[Dict[str, Any]] = None,
+                 verify_actions: bool = True) -> None:
         self.crm = Http(crm, token, kind="CRM")
         self.has_crm = bool(crm and token)
         self.model_http = Http(base_url, kind="модель", key_hint=key_hint)
@@ -527,27 +579,34 @@ class Operator:
         self.vision_ok: Optional[bool] = True if vision_forced else None
         self.cursor_marker = cursor_marker
         self.attachments_context = ""
+        # Раздумья и генерация: те же поля, что в «Чате с моделью».
+        self.generation = generation or {}
+        self.verify_actions = verify_actions
+        self.attachment_images: List[str] = []
         self.map_logged = False
         self.last_shot: Optional[Dict[str, Any]] = None
         self.history: List[str] = []
 
     # ------------------------------------------------------------- модель
-    def ask_model(self, prompt: str, screenshot: Optional[str]) -> Dict[str, Any]:
+    def ask_model(self, prompt: str, screenshot: Optional[str],
+                  extra_images: Optional[List[str]] = None) -> Dict[str, Any]:
         if not self.model:
             raise AgentError("Не указана модель: --model или --provider")
 
-        content: Any = prompt
+        parts: List[Dict[str, Any]] = []
         if screenshot and not self.text_only:
-            content = [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": screenshot}},
-            ]
+            parts.append({"type": "image_url", "image_url": {"url": screenshot}})
+        for image in (extra_images or [])[:3]:
+            if image.startswith("data:image/"):
+                parts.append({"type": "image_url", "image_url": {"url": image}})
+        content: Any = prompt if not parts else [{"type": "text", "text": prompt}, *parts]
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             *([] if not self.history else [{"role": "user", "content": "Что уже сделано:\n" + "\n".join(self.history[-8:])}]),
             {"role": "user", "content": content},
         ]
         payload = {"model": self.model, "messages": messages, "temperature": 0.2, "stream": False}
+        self.apply_generation(payload)
         headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
         try:
             data = self.model_http.call("POST", "/chat/completions", payload, timeout=180, headers=headers)
@@ -566,6 +625,114 @@ class Operator:
             raise AgentError("Модель вернула пустой ответ")
         text = str((choices[0].get("message") or {}).get("content") or "").strip()
         return self.parse_decision(text)
+
+    def apply_generation(self, payload: Dict[str, Any]) -> None:
+        """Подмешивает `--temperature`, `--reasoning` и остальные ручки в запрос.
+
+        Передаём только заданное: строгие сборки отвечают 400 на незнакомые поля.
+        """
+        gen = self.generation if isinstance(self.generation, dict) else {}
+        try:
+            if gen.get("temperature") is not None:
+                payload["temperature"] = max(0.0, min(2.0, float(gen["temperature"])))
+            if gen.get("top_p") is not None:
+                payload["top_p"] = max(0.0, min(1.0, float(gen["top_p"])))
+            if gen.get("max_tokens") is not None:
+                payload["max_tokens"] = int(gen["max_tokens"])
+            if gen.get("seed") is not None:
+                payload["seed"] = int(gen["seed"])
+        except (TypeError, ValueError):
+            pass
+
+        reasoning = str(gen.get("reasoning") or "default")
+        if reasoning not in ("default", "off", "low", "medium", "high", "budget"):
+            reasoning = "default"
+        if reasoning == "default":
+            return
+        if reasoning == "off":
+            payload["reasoning_effort"] = "none"
+        elif reasoning == "budget":
+            budget = gen.get("thinking_budget")
+            if budget:
+                try:
+                    payload["thinking_budget"] = int(budget)
+                except (TypeError, ValueError):
+                    pass
+            payload["reasoning_effort"] = "high"
+        else:
+            payload["reasoning_effort"] = reasoning
+        if gen.get("send_thinking_flag", True):
+            payload["chat_template_kwargs"] = {"enable_thinking": reasoning != "off"}
+
+    def parse_verdict(self, text: str) -> Optional[Dict[str, Any]]:
+        """Достаёт JSON-вердикт проверки из ответа модели (можно в ```-блоке)."""
+        raw = (text or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(raw[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        return {"ok": bool(data.get("ok")), "note": str(data.get("note") or "").strip()[:200]}
+
+    def verify_action(self, action: Dict[str, Any], result: str) -> Optional[Dict[str, Any]]:
+        """Скриншот после действия + вопрос модели: получилось ли?
+
+        Ошибка проверки не должна ломать задание: любая проблема возвращает None,
+        и бот просто идёт дальше по обычной логике.
+        """
+        if not self.verify_actions or self.text_only or not self.model:
+            return None
+        kind = str(action.get("type") or "")
+        if kind in ("wait", "finish", "make_file"):
+            return None
+        time.sleep(min(1.5, max(0.35, self.delay)))
+        try:
+            screenshot, _ = self.screenshot()
+        except Exception as error:  # noqa: BLE001
+            log("[!] проверка: не удалось снять экран ({})".format(error))
+            return None
+
+        payload_text = ("Действие: " + json.dumps(action, ensure_ascii=False)
+                        + "\nРезультат: " + result
+                        + '\n\nПосмотри на скриншот: получилось ли? Ответь JSON '
+                          '{"ok": true|false, "note": "что видно"}')
+        messages = [
+            {"role": "system", "content": VERIFY_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": payload_text},
+                {"type": "image_url", "image_url": {"url": screenshot}},
+            ]},
+        ]
+        payload: Dict[str, Any] = {"model": self.model, "messages": messages,
+                                   "temperature": 0, "max_tokens": 200, "stream": False}
+        self.apply_generation(payload)
+        payload["temperature"] = 0
+        headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
+        try:
+            data = self.model_http.call("POST", "/chat/completions", payload, timeout=120,
+                                        headers=headers)
+        except TaskCancelled:
+            raise
+        except AgentError as error:
+            log("[!] проверка действия не удалась: {}".format(error))
+            return None
+
+        choices = data.get("choices") or []
+        if not choices:
+            return None
+        text = str((choices[0].get("message") or {}).get("content") or "")
+        verdict = self.parse_verdict(text)
+        if verdict is None:
+            log("[!] проверка: модель ответила без JSON — пропускаю")
+        return verdict
 
     def probe_vision(self) -> Optional[bool]:
         """Видит ли модель картинки: просим прочитать число с тестовой плашки.
@@ -872,8 +1039,18 @@ class Operator:
                 blocks.append("--- {}: не удалось скачать ({}) ---".format(name, error))
                 continue
             text = extract_attachment_text(name, data)
-            log("  вложение: {} ({} Б, {} симв. текста)".format(name, len(data), len(text)))
-            blocks.append("--- {} ({} Б) ---\n{}".format(name, len(data), text))
+            mime = str(item.get("mime") or "")
+            is_image = mime.startswith("image/") or name.lower().endswith(
+                (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"))
+            if is_image and len(self.attachment_images) < 3 and len(data) <= 3_000_000:
+                self.attachment_images.append(
+                    "data:{};base64,{}".format(mime or "image/png",
+                                               base64.b64encode(data).decode("ascii")))
+                log("  вложение: {} ({} Б) — картинка, покажу модели".format(name, len(data)))
+            else:
+                log("  вложение: {} ({} Б, {} симв. текста)".format(name, len(data), len(text)))
+            placeholder = "[картинка приложена ниже]" if is_image else text
+            blocks.append("--- {} ({} Б) ---\n{}".format(name, len(data), placeholder))
         return "\n\n".join(blocks)
 
     def task_cancelled(self, task_id: Optional[int]) -> bool:
@@ -899,7 +1076,7 @@ class Operator:
         if self.attachments_context:
             self.report("info", "Прочитал вложения задания — учту их в шагах")
 
-        for index in range(max(1, max_steps)):
+        for index in range(min(MAX_STEPS_LIMIT, max(1, max_steps))):
             if self.task_cancelled(task_id):
                 log("Задание отменено в CRM — останавливаюсь, шаги больше не шлю.")
                 return False
@@ -929,7 +1106,8 @@ class Operator:
                 else:
                     parts.append('Вложения задания уже прочитаны на первом шаге.')
             step_prompt = "\n".join(parts)
-            decision = self.ask_model(step_prompt, screenshot)
+            decision = self.ask_model(step_prompt, screenshot,
+                                      self.attachment_images if index == 0 else None)
             action = decision["action"]
             thought = decision.get("thought") or ""
             log("Шаг {} | {} {}".format(index + 1, action.get("type"),
@@ -972,6 +1150,16 @@ class Operator:
                     log("  выполнено: " + result)
                     self.report("action", result, action)
                     self.history.append("шаг {}: {} → {}".format(index + 1, action.get("type"), result[:160]))
+
+                    # Проверяем результат по свежему скриншоту: бот не идёт
+                    # дальше «наугад», если клик не сработал.
+                    verdict = self.verify_action(action, result)
+                    if verdict is not None:
+                        note = verdict["note"] or ("получилось" if verdict["ok"] else "результата не видно")
+                        self.report("result", "{} {}".format("✅" if verdict["ok"] else "⚠️",
+                                                             note), action)
+                        self.history.append("проверка после {}: {} — {}".format(
+                            action.get("type"), "ок" if verdict["ok"] else "проблема", note))
                 except TaskCancelled:
                     raise
                 except Exception as error:  # noqa: BLE001
@@ -1022,7 +1210,7 @@ class Operator:
                 log("Жду задание в очереди…")
                 time.sleep(self.poll)
                 continue
-            limit = int(task.get("maxSteps") or 15)
+            limit = min(MAX_STEPS_LIMIT, max(1, int(task.get("maxSteps") or 15)))
             if self.max_steps_cap:
                 limit = min(limit, self.max_steps_cap)
             try:
@@ -1136,6 +1324,21 @@ def parse_args() -> argparse.Namespace:
                         help="не рисовать крестик курсора на скриншоте")
     parser.add_argument("--vision", action="store_true",
                         help="модель точно понимает картинки (deepseek-flash и т. п.): проверку пропустить")
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="temperature генерации (по умолчанию 0.2)")
+    parser.add_argument("--top-p", type=float, default=None, help="top_p генерации")
+    parser.add_argument("--max-tokens", type=int, default=None,
+                        help="предел токенов ответа модели")
+    parser.add_argument("--seed", type=int, default=None, help="seed генерации")
+    parser.add_argument("--reasoning", default="default",
+                        choices=["default", "off", "low", "medium", "high", "budget"],
+                        help="режим раздумий модели (reasoning_effort)")
+    parser.add_argument("--thinking-budget", type=int, default=None,
+                        help="бюджет раздумий в токенах для --reasoning budget")
+    parser.add_argument("--no-thinking-flag", action="store_true",
+                        help="не дублировать режим в chat_template_kwargs.enable_thinking")
+    parser.add_argument("--no-verify-actions", action="store_true",
+                        help="не проверять экран после каждого действия")
     parser.add_argument("--check", action="store_true",
                         help="проверить связь с CRM и токен (без экрана и модели)")
     parser.add_argument("--self-test", action="store_true", help="проверки без экрана и зависимостей")
@@ -1166,12 +1369,23 @@ def main() -> int:
 
     operator = Operator(
         crm=args.server, token=args.token, base_url=base_url, model=model, api_key=api_key,
-        dry_run=args.dry_run, assume_yes=args.yes, max_steps=max(0, args.max_steps),
+        dry_run=args.dry_run, assume_yes=args.yes,
+        max_steps=min(MAX_STEPS_LIMIT, max(0, args.max_steps)),
         delay=args.delay, poll=args.poll, max_width=args.max_width, text_only=args.text_only,
         key_hint=PROVIDERS.get(args.provider or "local", {}).get("key_env", ""),
         offset_x=args.offset_x, offset_y=args.offset_y,
         vision_check=not args.no_vision_check, vision_forced=args.vision,
         cursor_marker=not args.no_cursor_marker,
+        generation={
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_tokens": args.max_tokens,
+            "seed": args.seed,
+            "reasoning": args.reasoning,
+            "thinking_budget": args.thinking_budget,
+            "send_thinking_flag": not args.no_thinking_flag,
+        },
+        verify_actions=not args.no_verify_actions,
     )
     operator.current_task = None
 
@@ -1189,6 +1403,12 @@ def main() -> int:
             "или переменную {}; поле есть во вкладке «Оператор» → «Подключение».".format(key_hint))
     log("Режим: {}{}".format("DRY-RUN" if args.dry_run else "ИСПОЛНЕНИЕ",
                              " + подтверждения" if not args.yes else ""))
+    log("Генерация: раздумья {}, temperature {}, top_p {}, max_tokens {}, проверка после "
+        "действия {}".format(args.reasoning,
+                             args.temperature if args.temperature is not None else "по умолчанию",
+                             args.top_p if args.top_p is not None else "—",
+                             args.max_tokens if args.max_tokens is not None else "—",
+                             "выкл" if args.no_verify_actions else "вкл"))
     if not args.text_only:
         lowered = (model or "").lower()
         if args.vision:

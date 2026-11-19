@@ -17,8 +17,16 @@ import {
   X,
 } from "lucide-react";
 import { AI_DEFAULT_BASE_URL, AI_STORAGE_SETTINGS, formatBytes, type AiSettings } from "@/lib/ai";
+import { Input } from "@/components/ui";
 import { cn } from "@/lib/utils";
-import { useStoredJson } from "@/lib/useStoredValue";
+import { useStoredJson, useStoredNumber } from "@/lib/useStoredValue";
+import { GenSettings } from "./GenSettings";
+import {
+  AGENT_MAX_STEPS,
+  GEN_DEFAULT_PARAMS,
+  normalizeGenParams,
+  type GenParams,
+} from "@/lib/genParams";
 import { formatFileSize, readOperatorFiles, type OperatorAttachment } from "./operator/files";
 
 /**
@@ -40,6 +48,8 @@ type Turn = {
   files: AgentFile[];
   /** Что приложил пользователь в этом сообщении. */
   attached?: Array<{ name: string; size: number }>;
+  /** Размышления модели, если сервер их отдаёт. */
+  reasoning?: string;
   error?: string;
 };
 
@@ -87,14 +97,22 @@ export function AgentChat({ userName }: { userName: string }) {
     DEFAULT_SETTINGS,
     decodeSettings,
   );
+  const [params, setParams] = useStoredJson<GenParams>(
+    "crm.ai.agent.params.v1",
+    GEN_DEFAULT_PARAMS,
+    normalizeGenParams,
+  );
+  const [maxSteps, setMaxSteps] = useStoredNumber("crm.ai.agent.steps.v1", 20);
   const [health, setHealth] = useState<Health | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<OperatorAttachment[]>([]);
+  const [reading, setReading] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
   const counter = useRef(0);
 
   const nextId = () => {
@@ -154,7 +172,10 @@ export function AgentChat({ userName }: { userName: string }) {
     };
     const assistantId = nextId();
     const history = [...turns, userTurn];
-    setTurns([...history, { id: assistantId, role: "assistant", content: "", actions: [], files: [] }]);
+    setTurns([
+      ...history,
+      { id: assistantId, role: "assistant", content: "", actions: [], files: [], reasoning: "" },
+    ]);
     setRunning(true);
     setStatus("Отправляю агенту…");
     scrollDown();
@@ -170,10 +191,13 @@ export function AgentChat({ userName }: { userName: string }) {
         body: JSON.stringify({
           messages: history.map((t) => ({ role: t.role, content: t.content })),
           settings,
+          params,
+          maxSteps: Math.min(AGENT_MAX_STEPS, Math.max(1, maxSteps)),
           attachments: attachments.map((file) => ({
             name: file.name,
             note: file.note,
             text: file.text,
+            ...(file.image ? { image: file.image } : {}),
           })),
         }),
       });
@@ -215,6 +239,9 @@ export function AgentChat({ userName }: { userName: string }) {
 
           if (event === "status") {
             setStatus(String(data.text ?? ""));
+          } else if (event === "reasoning") {
+            patch((t) => ({ ...t, reasoning: String(data.text ?? "") }));
+            scrollDown();
           } else if (event === "text") {
             const reply = String(data.text ?? "");
             patch((t) => ({ ...t, content: reply }));
@@ -324,6 +351,29 @@ export function AgentChat({ userName }: { userName: string }) {
         </div>
       )}
 
+      <GenSettings
+        value={params}
+        onChange={setParams}
+        subtitle="Как модель думает и генерирует ответ. Пустое поле — параметр не передаём."
+      >
+        <label className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
+          Лимит шагов агента
+          <Input
+            type="number"
+            min={1}
+            max={AGENT_MAX_STEPS}
+            value={maxSteps}
+            onChange={(event) =>
+              setMaxSteps(Math.min(AGENT_MAX_STEPS, Math.max(1, Number(event.target.value) || 1)))
+            }
+            className="h-8 w-20 px-2 text-[11px]"
+          />
+          <span className="text-[10px]">
+            сколько раз агент может вызвать инструменты (до {AGENT_MAX_STEPS})
+          </span>
+        </label>
+      </GenSettings>
+
       <div className="rounded-2xl border border-border bg-card">
         <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 pt-3 text-[11px] text-muted">
           <label className="flex items-center gap-1.5">
@@ -422,6 +472,17 @@ export function AgentChat({ userName }: { userName: string }) {
                     </p>
                   ) : null}
 
+                  {turn.reasoning && turn.reasoning.trim() && (
+                    <details className="rounded-xl border border-border bg-card px-2 py-1.5 text-[11px]">
+                      <summary className="cursor-pointer text-muted">
+                        Размышления · {turn.reasoning.length} симв.
+                      </summary>
+                      <p className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap break-words text-muted">
+                        {turn.reasoning}
+                      </p>
+                    </details>
+                  )}
+
                   {turn.attached && turn.attached.length > 0 && (
                     <div className="flex flex-wrap gap-1">
                       {turn.attached.map((file) => (
@@ -503,26 +564,35 @@ export function AgentChat({ userName }: { userName: string }) {
             </div>
           )}
           <div className="flex min-w-0 items-end gap-2">
-            <label
-              className="flex h-10 w-10 shrink-0 cursor-pointer items-center justify-center rounded-xl border border-border bg-card2 text-muted transition hover:text-text"
-              title="Приложить файлы для анализа (до 5 по 10 МБ)"
-            >
-              <Paperclip size={14} />
-              <input
-                type="file"
-                multiple
-                hidden
-                onChange={(event) => {
-                  const list = event.target.files;
-                  event.target.value = "";
-                  if (!list || list.length === 0) return;
-                  void readOperatorFiles(attachments, list).then(({ files, errors }) => {
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              className="sr-only"
+              aria-label="Приложить файлы для анализа"
+              onChange={(event) => {
+                const list = event.target.files;
+                event.target.value = "";
+                if (!list || list.length === 0) return;
+                setReading(true);
+                void readOperatorFiles(attachments, list)
+                  .then(({ files, errors }) => {
                     setAttachments((prev) => [...prev, ...files]);
                     if (errors.length > 0) setError(errors[0]);
-                  });
-                }}
-              />
-            </label>
+                  })
+                  .finally(() => setReading(false));
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              disabled={running || reading}
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border bg-card2 text-muted transition hover:text-text disabled:opacity-40"
+              title="Приложить файлы для анализа (до 5 по 10 МБ)"
+              aria-label="Приложить файлы"
+            >
+              {reading ? <Loader2 size={14} className="animate-spin" /> : <Paperclip size={14} />}
+            </button>
             <textarea
               value={text}
               onChange={(e) => setText(e.target.value)}
