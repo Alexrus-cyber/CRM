@@ -15,9 +15,32 @@ export type OperatorProvider = {
   defaultModel: string;
   /** Нужен ли ключ: у локальной модели обычно нет. */
   needsKey: boolean;
-  /** Понимает ли модель картинки. Без зрения бот кликает вслепую. */
-  vision: boolean;
+  /** Модель по умолчанию понимает картинки (иначе бот кликает вслепую). */
+  visionByDefault: boolean;
+  /** Какую vision-модель предложить, если выбрана текстовая. */
+  visionModel: string;
 };
+
+/**
+ * Заведомо текстовые модели: картинку они не принимают и координаты
+ * «придумывают». Список — только для подсказки в интерфейсе: настоящую
+ * проверку делает бот при запуске (читает число с тестовой плашки), поэтому
+ * новая vision-модель провайдера здесь ничего не блокирует.
+ */
+export const TEXT_ONLY_MODEL_HINTS = [
+  "deepseek-chat",
+  "deepseek-reasoner",
+  "deepseek-v4-pro",
+  "gpt-3.5",
+  "llama-3.3",
+  "mixtral",
+];
+
+export function looksTextOnlyModel(model: string): boolean {
+  const value = (model || "").trim().toLowerCase();
+  if (!value) return false;
+  return TEXT_ONLY_MODEL_HINTS.some((hint) => value.includes(hint));
+}
 
 export const OPERATOR_PROVIDERS: OperatorProvider[] = [
   {
@@ -26,7 +49,8 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     keyEnv: "OPERATOR_API_KEY",
     defaultModel: "",
     needsKey: false,
-    vision: true,
+    visionByDefault: true,
+    visionModel: "Qwen/Qwen3-VL-8B-Instruct",
   },
   {
     id: "openai",
@@ -34,7 +58,8 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     keyEnv: "OPENAI_API_KEY",
     defaultModel: "gpt-4o-mini",
     needsKey: true,
-    vision: true,
+    visionByDefault: true,
+    visionModel: "gpt-4o-mini",
   },
   {
     id: "openrouter",
@@ -42,7 +67,8 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     keyEnv: "OPENROUTER_API_KEY",
     defaultModel: "qwen/qwen2.5-vl-72b-instruct",
     needsKey: true,
-    vision: true,
+    visionByDefault: true,
+    visionModel: "qwen/qwen2.5-vl-72b-instruct",
   },
   {
     id: "groq",
@@ -50,16 +76,18 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     keyEnv: "GROQ_API_KEY",
     defaultModel: "meta-llama/llama-4-scout-17b-16e-instruct",
     needsKey: true,
-    vision: true,
+    visionByDefault: true,
+    visionModel: "meta-llama/llama-4-scout-17b-16e-instruct",
   },
   {
     id: "deepseek",
     label: "DeepSeek",
     keyEnv: "DEEPSEEK_API_KEY",
-    defaultModel: "deepseek-chat",
+    // У DeepSeek картинки понимает deepseek-flash; deepseek-chat — только текст.
+    defaultModel: "deepseek-flash",
     needsKey: true,
-    // DeepSeek API пока принимает только текст: координаты она «придумывает».
-    vision: false,
+    visionByDefault: true,
+    visionModel: "deepseek-flash",
   },
   {
     id: "together",
@@ -67,7 +95,8 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     keyEnv: "TOGETHER_API_KEY",
     defaultModel: "Qwen/Qwen2.5-VL-72B-Instruct-Turbo",
     needsKey: true,
-    vision: true,
+    visionByDefault: true,
+    visionModel: "Qwen/Qwen2.5-VL-72B-Instruct-Turbo",
   },
   {
     id: "mistral",
@@ -75,7 +104,8 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     keyEnv: "MISTRAL_API_KEY",
     defaultModel: "pixtral-12b-2409",
     needsKey: true,
-    vision: true,
+    visionByDefault: true,
+    visionModel: "pixtral-12b-2409",
   },
 ];
 
