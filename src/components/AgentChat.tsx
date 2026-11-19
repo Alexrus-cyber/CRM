@@ -7,16 +7,19 @@ import {
   ExternalLink,
   FileText,
   Loader2,
+  Paperclip,
   PlayCircle,
   PlugZap,
   Send,
   Sparkles,
   Trash2,
   TriangleAlert,
+  X,
 } from "lucide-react";
 import { AI_DEFAULT_BASE_URL, AI_STORAGE_SETTINGS, formatBytes, type AiSettings } from "@/lib/ai";
 import { cn } from "@/lib/utils";
 import { useStoredJson } from "@/lib/useStoredValue";
+import { formatFileSize, readOperatorFiles, type OperatorAttachment } from "./operator/files";
 
 /**
  * Вкладка «Агент» блока ИИ (эксперимент, только главный админ).
@@ -35,6 +38,8 @@ type Turn = {
   content: string;
   actions: AgentAction[];
   files: AgentFile[];
+  /** Что приложил пользователь в этом сообщении. */
+  attached?: Array<{ name: string; size: number }>;
   error?: string;
 };
 
@@ -85,6 +90,7 @@ export function AgentChat({ userName }: { userName: string }) {
   const [health, setHealth] = useState<Health | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [text, setText] = useState("");
+  const [attachments, setAttachments] = useState<OperatorAttachment[]>([]);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -137,7 +143,15 @@ export function AgentChat({ userName }: { userName: string }) {
     if (!content || running) return;
     setError(null);
     setText("");
-    const userTurn: Turn = { id: nextId(), role: "user", content, actions: [], files: [] };
+    const attachedTurn = attachments.map((file) => ({ name: file.name, size: file.size }));
+    const userTurn: Turn = {
+      id: nextId(),
+      role: "user",
+      content,
+      actions: [],
+      files: [],
+      attached: attachedTurn,
+    };
     const assistantId = nextId();
     const history = [...turns, userTurn];
     setTurns([...history, { id: assistantId, role: "assistant", content: "", actions: [], files: [] }]);
@@ -156,8 +170,15 @@ export function AgentChat({ userName }: { userName: string }) {
         body: JSON.stringify({
           messages: history.map((t) => ({ role: t.role, content: t.content })),
           settings,
+          attachments: attachments.map((file) => ({
+            name: file.name,
+            note: file.note,
+            text: file.text,
+          })),
         }),
       });
+      // Файлы уже ушли в запросе — в следующем сообщении их быть не должно.
+      setAttachments([]);
 
       if (!res.ok || !res.body) {
         const data = (await res.json().catch(() => ({}))) as { error?: string };
@@ -401,6 +422,19 @@ export function AgentChat({ userName }: { userName: string }) {
                     </p>
                   ) : null}
 
+                  {turn.attached && turn.attached.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {turn.attached.map((file) => (
+                        <span
+                          key={file.name}
+                          className="flex items-center gap-1 rounded-lg border border-border bg-card px-1.5 py-0.5 text-[10px] text-muted"
+                        >
+                          <FileText size={10} /> {file.name} · {formatBytes(file.size)}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
                   {turn.actions.map((action, index) => (
                     <a
                       key={`${action.url}-${index}`}
@@ -448,7 +482,47 @@ export function AgentChat({ userName }: { userName: string }) {
             </p>
           )}
           {error && <p className="mb-2 text-[11px] text-red-500">{error}</p>}
+          {attachments.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-1">
+              {attachments.map((file) => (
+                <span
+                  key={`${file.name}-${file.size}`}
+                  className="flex items-center gap-1 rounded-lg border border-border bg-card2 px-1.5 py-0.5 text-[10px] text-muted"
+                >
+                  <FileText size={10} /> {file.name} · {formatFileSize(file.size)}
+                  <button
+                    type="button"
+                    onClick={() => setAttachments((prev) => prev.filter((item) => item !== file))}
+                    className="text-muted transition hover:text-red-500"
+                    aria-label={`Убрать ${file.name}`}
+                  >
+                    <X size={10} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <div className="flex min-w-0 items-end gap-2">
+            <label
+              className="flex h-10 w-10 shrink-0 cursor-pointer items-center justify-center rounded-xl border border-border bg-card2 text-muted transition hover:text-text"
+              title="Приложить файлы для анализа (до 5 по 10 МБ)"
+            >
+              <Paperclip size={14} />
+              <input
+                type="file"
+                multiple
+                hidden
+                onChange={(event) => {
+                  const list = event.target.files;
+                  event.target.value = "";
+                  if (!list || list.length === 0) return;
+                  void readOperatorFiles(attachments, list).then(({ files, errors }) => {
+                    setAttachments((prev) => [...prev, ...files]);
+                    if (errors.length > 0) setError(errors[0]);
+                  });
+                }}
+              />
+            </label>
             <textarea
               value={text}
               onChange={(e) => setText(e.target.value)}
@@ -488,7 +562,8 @@ export function AgentChat({ userName }: { userName: string }) {
             )}
           </div>
           <p className="mt-1.5 text-[10px] text-muted">
-            История агента не сохраняется в базе — это тестовый режим. Действия выполняются в вашем браузере.
+            Скрепка — файлы для анализа (до 5 по 10 МБ): агент прочитает их и ответит файлом,
+            если он нужен. История не сохраняется в базе — это тестовый режим.
           </p>
         </div>
       </div>

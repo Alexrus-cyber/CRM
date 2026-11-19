@@ -12,6 +12,7 @@ import {
   KeyRound,
   Loader2,
   MonitorCog,
+  Paperclip,
   Play,
   RefreshCw,
   Rocket,
@@ -21,6 +22,7 @@ import {
   Square,
   Terminal,
   TriangleAlert,
+  X,
 } from "lucide-react";
 import { Badge, Button, Card, EmptyState, Input, Textarea } from "@/components/ui";
 import { cn, formatDateTime, formatTime } from "@/lib/utils";
@@ -31,6 +33,7 @@ import {
   buildOperatorCommand,
   findProvider,
   looksTextOnlyModel,
+  providerBaseUrl,
 } from "@/lib/operatorCommand";
 import {
   ActionGlyph,
@@ -42,6 +45,8 @@ import {
   type OperatorEvent,
   type OperatorTask,
 } from "./operator/shared";
+import { PlannerChat } from "./operator/PlannerChat";
+import { formatFileSize, readOperatorFiles, type OperatorAttachment } from "./operator/files";
 
 /**
  * Вкладка «Оператор» блока ИИ — в стиле остальной Nova CRM.
@@ -101,6 +106,7 @@ export function OperatorPanel() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [runFilter, setRunFilter] = useState<string>("all");
   const [prompt, setPrompt] = useState("");
+  const [taskFiles, setTaskFiles] = useState<OperatorAttachment[]>([]);
   const [maxSteps, setMaxSteps] = useState(15);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -281,23 +287,44 @@ export function OperatorPanel() {
     }
   };
 
-  const createTask = async () => {
-    const text = prompt.trim();
-    if (!text || busy) return;
+  /**
+   * Ставит задание в очередь. Вызывается и из чата с действиями, и кнопкой
+   * «Перенести в выполнение» из планировщика — во втором случае план уже
+   * содержит уточнённые шаги, поэтому prompt приходит аргументом.
+   */
+  const createTask = async (planText?: string, planFiles?: OperatorAttachment[]) => {
+    const text = (planText ?? prompt).trim();
+    if (!text) throw new Error("Опишите задачу: пустой план выполнять нечего");
+    if (busy) throw new Error("Подождите: предыдущее задание ещё ставится в очередь");
+    const files = planFiles ?? taskFiles;
     setBusy(true);
     setError(null);
     try {
       const res = await fetch("/api/agent/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: text, maxSteps }),
+        body: JSON.stringify({
+          prompt: text,
+          maxSteps: Math.max(maxSteps, 1),
+          files: files.map((file) => ({
+            name: file.name,
+            mime: file.mime,
+            size: file.size,
+            data: file.data,
+          })),
+        }),
       });
-      const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
+      const data = (await res.json().catch(() => ({}))) as {
+        task?: OperatorTask;
+        error?: string;
+      };
       if (!res.ok || !data.task) {
-        setError(data.error ?? "Не удалось поставить задание");
-        return;
+        throw new Error(data.error ?? "Не удалось поставить задание");
       }
-      setPrompt("");
+      if (planText === undefined) {
+        setPrompt("");
+        setTaskFiles([]);
+      }
       setTasks((prev) => [data.task!, ...prev]);
       setSelectedId(data.task.id);
       setEvents([]);
@@ -305,6 +332,14 @@ export function OperatorPanel() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const attachToTask = async (list: FileList | null) => {
+    if (!list || list.length === 0) return;
+    setError(null);
+    const { files: added, errors } = await readOperatorFiles(taskFiles, list);
+    setTaskFiles((prev) => [...prev, ...added]);
+    if (errors.length > 0) setError(errors[0]);
   };
 
   const cancelTask = async (id: number) => {
@@ -433,58 +468,119 @@ export function OperatorPanel() {
             <MetricCard label="Файлы" value={files.length} hint="в открытом запуске" icon={<FileText size={12} />} />
           </div>
 
-          <Card
-            title="Что сделать на экране?"
-            subtitle="Опишите цель обычными словами — бот сам найдёт кнопки и поля"
-            action={
-              <Badge className="border-border text-muted">
-                <Sparkles size={11} /> шагов: до {maxSteps}
-              </Badge>
-            }
-          >
-            <Textarea
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              rows={3}
-              maxLength={2000}
-              placeholder="Например: открой блокнот, напиши план на день и сохрани в файл plan.docx"
+          {/* Два чата: сначала план, потом действия на компьютере */}
+          <div className="grid gap-3 lg:grid-cols-2">
+            <PlannerChat
+              providerLabel={providerMeta.label}
+              baseUrl={providerBaseUrl(provider)}
+              model={model.trim() || providerMeta.defaultModel}
+              apiKey={apiKey.trim()}
+              onOpenSetup={() => setTab("setup")}
+              onTransfer={(plan, planFiles) => createTask(plan, planFiles)}
             />
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {PRESETS.map((preset) => (
-                <button
-                  key={preset}
-                  type="button"
-                  onClick={() => setPrompt(preset)}
-                  className="max-w-full truncate rounded-lg border border-border bg-card2 px-2 py-1 text-[10px] text-muted transition hover:border-accent/50 hover:text-text"
+
+            <Card
+              title={
+                <span className="flex flex-wrap items-center gap-2">
+                  2. Выполнение
+                  <Badge className="border-border text-muted">
+                    <Play size={11} /> шагов: до {maxSteps}
+                  </Badge>
+                </span>
+              }
+              subtitle="Задание уходит в очередь: бот кликает по экрану и присылает шаги."
+              action={
+                <Badge className="border-border text-muted">
+                  <MonitorCog size={11} /> на вашем ПК
+                </Badge>
+              }
+            >
+              <Textarea
+                value={prompt}
+                onChange={(event) => setPrompt(event.target.value)}
+                rows={3}
+                maxLength={4000}
+                placeholder="План из чата слева или своя формулировка задачи"
+                className="text-[11px]"
+              />
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {PRESETS.map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => setPrompt(preset)}
+                    className="max-w-full truncate rounded-lg border border-border bg-card2 px-2 py-1 text-[10px] text-muted transition hover:border-accent/50 hover:text-text"
+                  >
+                    {preset}
+                  </button>
+                ))}
+              </div>
+
+              {taskFiles.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {taskFiles.map((file) => (
+                    <span
+                      key={`${file.name}-${file.size}`}
+                      className="flex items-center gap-1 rounded-lg border border-border bg-card2 px-1.5 py-0.5 text-[10px] text-muted"
+                    >
+                      {file.name} · {formatFileSize(file.size)}
+                      <button
+                        type="button"
+                        onClick={() => setTaskFiles((prev) => prev.filter((item) => item !== file))}
+                        className="text-muted transition hover:text-red-500"
+                        aria-label={`Убрать ${file.name}`}
+                      >
+                        <X size={10} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <label className="flex items-center gap-1.5 text-[11px] text-muted">
+                  Лимит шагов
+                  <Input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={maxSteps}
+                    onChange={(event) => setMaxSteps(Math.min(100, Math.max(1, Number(event.target.value) || 15)))}
+                    className="h-8 w-16 px-2 text-[11px]"
+                  />
+                </label>
+                <label
+                  className="flex cursor-pointer items-center gap-1 rounded-lg border border-border bg-card2 px-2 py-1 text-[10px] text-muted transition hover:text-text"
+                  title="Файлы (до 5 по 10 МБ) — бот прочитает текст и учтёт в плане"
                 >
-                  {preset}
-                </button>
-              ))}
-            </div>
-            <div className="mt-3 flex flex-wrap items-center gap-2">
-              <label className="flex items-center gap-1.5 text-[11px] text-muted">
-                Лимит шагов
-                <Input
-                  type="number"
-                  min={1}
-                  max={100}
-                  value={maxSteps}
-                  onChange={(event) => setMaxSteps(Math.min(100, Math.max(1, Number(event.target.value) || 15)))}
-                  className="h-8 w-16 px-2 text-[11px]"
-                />
-              </label>
-              <Button
-                size="sm"
-                onClick={() => void createTask()}
-                disabled={busy || prompt.trim().length === 0}
-                className="ml-auto"
-              >
-                {busy ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
-                В очередь
-              </Button>
-            </div>
-            {error && <p className="mt-2 text-[11px] text-red-500">{error}</p>}
-          </Card>
+                  <Paperclip size={11} /> файлы
+                  <input
+                    type="file"
+                    multiple
+                    hidden
+                    onChange={(event) => {
+                      void attachToTask(event.target.files);
+                      event.target.value = "";
+                    }}
+                  />
+                </label>
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    void createTask().catch((caught: unknown) =>
+                      setError(caught instanceof Error ? caught.message : "Не удалось поставить задание"),
+                    );
+                  }}
+                  disabled={busy || prompt.trim().length === 0}
+                  className="ml-auto"
+                >
+                  {busy ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
+                  В очередь
+                </Button>
+              </div>
+              {error && <p className="mt-2 text-[11px] text-red-500">{error}</p>}
+            </Card>
+          </div>
 
           {!activeTask ? (
             <EmptyState

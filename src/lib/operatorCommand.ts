@@ -13,6 +13,8 @@ export type OperatorProvider = {
   keyEnv: string;
   /** Модель по умолчанию — подставляется, если поле пустое. */
   defaultModel: string;
+  /** OpenAI-совместимый адрес: нужен чату-планировщику (бот берёт свой из скрипта). */
+  baseUrl: string;
   /** Нужен ли ключ: у локальной модели обычно нет. */
   needsKey: boolean;
   /** Модель по умолчанию понимает картинки (иначе бот кликает вслепую). */
@@ -48,6 +50,7 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     label: "Локальная модель (vLLM / LM Studio)",
     keyEnv: "OPERATOR_API_KEY",
     defaultModel: "",
+    baseUrl: "http://127.0.0.1:8000/v1",
     needsKey: false,
     visionByDefault: true,
     visionModel: "Qwen/Qwen3-VL-8B-Instruct",
@@ -57,6 +60,7 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     label: "OpenAI API",
     keyEnv: "OPENAI_API_KEY",
     defaultModel: "gpt-4o-mini",
+    baseUrl: "https://api.openai.com/v1",
     needsKey: true,
     visionByDefault: true,
     visionModel: "gpt-4o-mini",
@@ -66,6 +70,7 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     label: "OpenRouter",
     keyEnv: "OPENROUTER_API_KEY",
     defaultModel: "qwen/qwen2.5-vl-72b-instruct",
+    baseUrl: "https://openrouter.ai/api/v1",
     needsKey: true,
     visionByDefault: true,
     visionModel: "qwen/qwen2.5-vl-72b-instruct",
@@ -75,6 +80,7 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     label: "Groq",
     keyEnv: "GROQ_API_KEY",
     defaultModel: "meta-llama/llama-4-scout-17b-16e-instruct",
+    baseUrl: "https://api.groq.com/openai/v1",
     needsKey: true,
     visionByDefault: true,
     visionModel: "meta-llama/llama-4-scout-17b-16e-instruct",
@@ -85,6 +91,7 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     keyEnv: "DEEPSEEK_API_KEY",
     // У DeepSeek картинки понимает deepseek-flash; deepseek-chat — только текст.
     defaultModel: "deepseek-flash",
+    baseUrl: "https://api.deepseek.com/v1",
     needsKey: true,
     visionByDefault: true,
     visionModel: "deepseek-flash",
@@ -94,6 +101,7 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     label: "Together",
     keyEnv: "TOGETHER_API_KEY",
     defaultModel: "Qwen/Qwen2.5-VL-72B-Instruct-Turbo",
+    baseUrl: "https://api.together.xyz/v1",
     needsKey: true,
     visionByDefault: true,
     visionModel: "Qwen/Qwen2.5-VL-72B-Instruct-Turbo",
@@ -103,6 +111,7 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     label: "Mistral",
     keyEnv: "MISTRAL_API_KEY",
     defaultModel: "pixtral-12b-2409",
+    baseUrl: "https://api.mistral.ai/v1",
     needsKey: true,
     visionByDefault: true,
     visionModel: "pixtral-12b-2409",
@@ -111,6 +120,11 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
 
 export function findProvider(id: string): OperatorProvider {
   return OPERATOR_PROVIDERS.find((item) => item.id === id) ?? OPERATOR_PROVIDERS[0];
+}
+
+/** Адрес API провайдера для чата-планировщика. */
+export function providerBaseUrl(providerId: string): string {
+  return findProvider(providerId).baseUrl;
 }
 
 /** Имя переменной окружения с ключом для выбранного провайдера. */
