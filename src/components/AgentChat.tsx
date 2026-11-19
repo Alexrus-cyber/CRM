@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { AI_DEFAULT_BASE_URL, AI_STORAGE_SETTINGS, formatBytes, type AiSettings } from "@/lib/ai";
 import { cn } from "@/lib/utils";
+import { useStoredJson } from "@/lib/useStoredValue";
 
 /**
  * Вкладка «Агент» блока ИИ (эксперимент, только главный админ).
@@ -63,28 +64,24 @@ const EXAMPLES = [
   "Сделай CSV-файл с планом на неделю по продажам",
 ];
 
-function loadSettings(): AiSettings {
-  if (typeof window === "undefined") {
-    return { baseUrl: AI_DEFAULT_BASE_URL, apiKey: "", model: "" };
-  }
-  try {
-    const raw = localStorage.getItem(AI_STORAGE_SETTINGS);
-    if (raw) {
-      const parsed = JSON.parse(raw) as Partial<AiSettings>;
-      return {
-        baseUrl: String(parsed.baseUrl ?? AI_DEFAULT_BASE_URL),
-        apiKey: String(parsed.apiKey ?? ""),
-        model: String(parsed.model ?? ""),
-      };
-    }
-  } catch {
-    /* локальные настройки не читаются — берём значения по умолчанию */
-  }
-  return { baseUrl: AI_DEFAULT_BASE_URL, apiKey: "", model: "" };
+const DEFAULT_SETTINGS: AiSettings = { baseUrl: AI_DEFAULT_BASE_URL, apiKey: "", model: "" };
+
+/** Разбор сохранённых настроек — уже после гидратации, через useStoredJson. */
+function decodeSettings(raw: string): AiSettings {
+  const parsed = JSON.parse(raw) as Partial<AiSettings>;
+  return {
+    baseUrl: String(parsed.baseUrl ?? DEFAULT_SETTINGS.baseUrl),
+    apiKey: String(parsed.apiKey ?? ""),
+    model: String(parsed.model ?? ""),
+  };
 }
 
 export function AgentChat({ userName }: { userName: string }) {
-  const [settings, setSettings] = useState<AiSettings>(loadSettings);
+  const [settings, setSettings] = useStoredJson<AiSettings>(
+    AI_STORAGE_SETTINGS,
+    DEFAULT_SETTINGS,
+    decodeSettings,
+  );
   const [health, setHealth] = useState<Health | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [text, setText] = useState("");
@@ -101,11 +98,6 @@ export function AgentChat({ userName }: { userName: string }) {
 
   const saveSettings = (next: AiSettings) => {
     setSettings(next);
-    try {
-      localStorage.setItem(AI_STORAGE_SETTINGS, JSON.stringify(next));
-    } catch {
-      /* приватный режим — настройки живут до перезагрузки */
-    }
   };
 
   /** Состояние агента: жив ли Python-процесс и какие у него инструменты. */
