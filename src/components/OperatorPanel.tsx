@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   ClipboardCopy,
@@ -26,9 +26,9 @@ import {
 } from "lucide-react";
 import { Badge, Button, Card, EmptyState, Input, Textarea } from "@/components/ui";
 import { cn, formatDateTime, formatTime } from "@/lib/utils";
-import { useStoredJson, useStoredNumber } from "@/lib/useStoredValue";
+import { useStoredJson } from "@/lib/useStoredValue";
 import { GenSettings } from "./GenSettings";
-import { AGENT_MAX_STEPS, GEN_DEFAULT_PARAMS, normalizeGenParams, type GenParams } from "@/lib/genParams";
+import { AGENT_MAX_STEPS, GEN_DEFAULT_PARAMS, decodeGenParams, type GenParams } from "@/lib/genParams";
 import {
   OPERATOR_PROVIDERS,
   buildCommandWithKey,
@@ -86,6 +86,11 @@ const RUN_FILTERS = [
   { id: "done", label: "Готово" },
 ] as const;
 
+/** Флаг из localStorage: `useStoredJson` отдаёт строку JSON. */
+function decodeFlag(raw: string): boolean {
+  return raw === "true";
+}
+
 function statusFilterMatches(status: string, filter: string): boolean {
   if (filter === "all") return true;
   if (filter === "queued") return status === "queued" || status === "paused";
@@ -108,6 +113,7 @@ export function OperatorPanel() {
   const [events, setEvents] = useState<OperatorEvent[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [runFilter, setRunFilter] = useState<string>("all");
+  const taskFileRef = useRef<HTMLInputElement>(null);
   const [prompt, setPrompt] = useState("");
   const [taskFiles, setTaskFiles] = useState<OperatorAttachment[]>([]);
   const [maxSteps, setMaxSteps] = useState(15);
@@ -115,9 +121,15 @@ export function OperatorPanel() {
   const [genParams, setGenParams] = useStoredJson<GenParams>(
     "crm.ai.operator.params.v1",
     GEN_DEFAULT_PARAMS,
-    normalizeGenParams,
+    decodeGenParams,
   );
-  const [verifyActions, setVerifyActions] = useStoredNumber("crm.ai.operator.verify.v1", 1);
+  // Храним именно «выключено»: useStoredNumber не сохраняет 0 и переключатель
+  // нельзя было выключить.
+  const [verifyOff, setVerifyOff] = useStoredJson<boolean>(
+    "crm.ai.operator.verify.off.v1",
+    false,
+    decodeFlag,
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
@@ -344,8 +356,8 @@ export function OperatorPanel() {
     }
   };
 
-  const attachToTask = async (list: FileList | null) => {
-    if (!list || list.length === 0) return;
+  const attachToTask = async (list: FileList | File[]) => {
+    if (list.length === 0) return;
     setError(null);
     const { files: added, errors } = await readOperatorFiles(taskFiles, list);
     setTaskFiles((prev) => [...prev, ...added]);
@@ -412,7 +424,7 @@ export function OperatorPanel() {
       assumeYes,
       textOnly,
       gen: genParams,
-      verifyActions: verifyActions !== 0,
+      verifyActions: !verifyOff,
     }),
     [
       provider,
@@ -426,7 +438,7 @@ export function OperatorPanel() {
       assumeYes,
       textOnly,
       genParams,
-      verifyActions,
+      verifyOff,
     ],
   );
   const command = useMemo(() => buildOperatorCommand(commandOptions), [commandOptions]);
@@ -496,14 +508,15 @@ export function OperatorPanel() {
           <GenSettings
             value={genParams}
             onChange={setGenParams}
+            defaultOpen
             subtitle="Раздумья модели и параметры генерации. Действуют и на планировщик, и на команду запуска бота."
           >
             <div className="grid gap-2 sm:grid-cols-2">
               <label className="flex items-start gap-2 text-[11px] text-muted">
                 <input
                   type="checkbox"
-                  checked={verifyActions !== 0}
-                  onChange={(event) => setVerifyActions(event.target.checked ? 1 : 0)}
+                  checked={!verifyOff}
+                  onChange={(event) => setVerifyOff(!event.target.checked)}
                   className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[#7c5cff]"
                 />
                 <span>
@@ -511,11 +524,17 @@ export function OperatorPanel() {
                   бот делает скриншот и спрашивает модель, получилось ли. Надёжнее, но на один запрос к модели больше.
                 </span>
               </label>
-              <p className="text-[10px] leading-relaxed text-muted">
-                Настройки попадают в команду запуска флагами{" "}
-                <code className="font-mono">--temperature</code>, <code className="font-mono">--reasoning</code> и
-                другими: скопируйте её заново в «Подключении». Ключ API в CRM не сохраняется.
-              </p>
+              <div className="space-y-1.5">
+                <p className="text-[10px] leading-relaxed text-muted">
+                  Бот получает эти настройки флагами{" "}
+                  <code className="font-mono">--temperature</code>, <code className="font-mono">--reasoning</code> и
+                  другими. Скопируйте команду и перезапустите бота — ключ API в CRM не сохраняется.
+                </p>
+                <Button size="sm" variant="secondary" onClick={() => void copy(commandToCopy, "gen-command")}>
+                  <ClipboardCopy size={12} />
+                  {copied === "gen-command" ? "Команда скопирована" : "Скопировать команду с этими настройками"}
+                </Button>
+              </div>
             </div>
           </GenSettings>
 
@@ -603,21 +622,27 @@ export function OperatorPanel() {
                     className="h-8 w-16 px-2 text-[11px]"
                   />
                 </label>
-                <label
-                  className="flex cursor-pointer items-center gap-1 rounded-lg border border-border bg-card2 px-2 py-1 text-[10px] text-muted transition hover:text-text"
+                <input
+                  ref={taskFileRef}
+                  type="file"
+                  multiple
+                  className="sr-only"
+                  aria-label="Приложить файлы к заданию"
+                  onChange={(event) => {
+                    // Снимок до очистки: иначе браузер опустошает FileList.
+                    const list = Array.from(event.target.files ?? []);
+                    event.target.value = "";
+                    void attachToTask(list);
+                  }}
+                />
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => taskFileRef.current?.click()}
                   title="Файлы (до 5 по 10 МБ) — бот прочитает текст и учтёт в плане"
                 >
                   <Paperclip size={11} /> файлы
-                  <input
-                    type="file"
-                    multiple
-                    hidden
-                    onChange={(event) => {
-                      void attachToTask(event.target.files);
-                      event.target.value = "";
-                    }}
-                  />
-                </label>
+                </Button>
                 <Button
                   size="sm"
                   onClick={() => {

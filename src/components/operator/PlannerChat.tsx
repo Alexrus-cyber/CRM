@@ -100,8 +100,8 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
     }
   };
 
-  const attach = async (list: FileList | null) => {
-    if (!list || list.length === 0) return;
+  const attach = async (list: FileList | File[]) => {
+    if (list.length === 0) return;
     setError(null);
     const { files: added, errors } = await readOperatorFiles(files, list);
     setFiles((prev) => [...prev, ...added]);
@@ -247,8 +247,10 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
           multiple
           className="sr-only"
           onChange={(event) => {
-            void attach(event.target.files);
+            // Снимок до очистки: иначе браузер опустошает FileList.
+            const list = Array.from(event.target.files ?? []);
             event.target.value = "";
+            void attach(list);
           }}
         />
         <Button
