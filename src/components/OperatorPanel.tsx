@@ -14,6 +14,7 @@ import {
   RefreshCw,
   Rocket,
   Settings2,
+  ShieldCheck,
   Sparkles,
   Square,
   Terminal,
@@ -90,6 +91,11 @@ export function OperatorPanel() {
   const [tokenExists, setTokenExists] = useState<boolean | null>(null);
   const [tokenHint, setTokenHint] = useState<string | null>(null);
   const [freshToken, setFreshToken] = useState<string | null>(null);
+  const [tokenInput, setTokenInput] = useState("");
+  const [check, setCheck] = useState<{ state: "idle" | "busy" | "ok" | "fail"; text: string }>({
+    state: "idle",
+    text: "",
+  });
   const [tasks, setTasks] = useState<OperatorTask[]>([]);
   const [events, setEvents] = useState<OperatorEvent[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -229,9 +235,46 @@ export function OperatorPanel() {
         return;
       }
       setFreshToken(data.token);
+      setTokenInput(data.token);
+      setTokenHint(`…${data.token.slice(-6)}`);
+      setCheck({ state: "idle", text: "" });
       setTokenExists(true);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const checkConnection = async () => {
+    const value = (tokenInput.trim() || freshToken || "").trim();
+    if (!value) {
+      setCheck({ state: "fail", text: "Вставьте токен: он показывается один раз при создании." });
+      return;
+    }
+    setCheck({ state: "busy", text: "" });
+    try {
+      const res = await fetch("/api/agent/bot/whoami", {
+        headers: { "x-agent-token": value },
+        cache: "no-store",
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        owner?: { name?: string };
+        counts?: { queued?: number; running?: number };
+        error?: string;
+        hint?: string;
+      };
+      if (!res.ok) {
+        const text = [data.error, data.hint].filter(Boolean).join(" · ");
+        setCheck({ state: "fail", text: text || `CRM ответила HTTP ${res.status}` });
+        return;
+      }
+      setCheck({
+        state: "ok",
+        text: `Токен принят${data.owner?.name ? ` · ${data.owner.name}` : ""} · в очереди ${
+          data.counts?.queued ?? 0
+        }, в работе ${data.counts?.running ?? 0}`,
+      });
+    } catch {
+      setCheck({ state: "fail", text: "CRM не отвечает — проверьте адрес CRM в шаге 3." });
     }
   };
 
@@ -305,9 +348,11 @@ export function OperatorPanel() {
   const progress = activeTask ? Math.min(100, Math.round((activeTask.steps / Math.max(activeTask.maxSteps, 1)) * 100)) : 0;
   const finished = activeTask ? ["done", "failed", "cancelled"].includes(activeTask.status) : false;
 
+  const effectiveToken = (tokenInput.trim() || freshToken || "").trim();
+
   const command = useMemo(() => {
     const parts = ["python3 agent/desktop_operator.py", once ? "--once" : "--watch"];
-    parts.push("--token", freshToken ?? "ВАШ_ТОКЕН");
+    parts.push("--token", effectiveToken || "<токен из шага 1>");
     parts.push("--provider", provider);
     if (model.trim()) parts.push("--model", model.trim());
     if (server.trim() && server.trim() !== "http://localhost:3000") parts.push("--server", server.trim());
@@ -315,7 +360,7 @@ export function OperatorPanel() {
     if (assumeYes) parts.push("--yes");
     if (textOnly) parts.push("--text-only");
     return parts.join(" ");
-  }, [once, freshToken, provider, model, server, dryRun, assumeYes, textOnly]);
+  }, [once, effectiveToken, provider, model, server, dryRun, assumeYes, textOnly]);
 
   const visibleTasks = useMemo(
     () => tasks.filter((task) => statusFilterMatches(task.status, runFilter)),
@@ -483,15 +528,17 @@ export function OperatorPanel() {
                 {activeTask.status === "queued" && events.length === 0 && (
                   <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-muted">
                     <TriangleAlert size={13} className="text-amber-500" />
-                    Задание в очереди. Запустите бота с токеном —
-                    <button
-                      type="button"
-                      onClick={() => setTab("setup")}
-                      className="font-medium text-accent2 underline-offset-2 hover:underline"
-                    >
-                      команда запуска
-                    </button>
-                    .
+                    <span>
+                      Задание в очереди. Запустите бота с токеном —
+                      <button
+                        type="button"
+                        onClick={() => setTab("setup")}
+                        className="ml-1 font-medium text-accent2 underline-offset-2 hover:underline"
+                      >
+                        команда запуска
+                      </button>
+                      . Уже запускали? Проверьте токен кнопкой «Проверить связь».
+                    </span>
                   </div>
                 )}
 
@@ -669,6 +716,47 @@ export function OperatorPanel() {
                 </div>
               </div>
             )}
+
+            <div className="mt-3 rounded-xl border border-border bg-card2/50 p-2.5">
+              <p className="text-[10px] uppercase tracking-wide text-muted">Проверка токена</p>
+              <div className="mt-1.5 flex flex-col gap-2 sm:flex-row">
+                <Input
+                  value={tokenInput}
+                  onChange={(event) => {
+                    setTokenInput(event.target.value);
+                    setCheck({ state: "idle", text: "" });
+                  }}
+                  placeholder="crmop_… (вставьте токен целиком)"
+                  spellCheck={false}
+                  autoComplete="off"
+                  className="h-9 min-w-0 flex-1 font-mono text-[11px]"
+                />
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => void checkConnection()}
+                  disabled={check.state === "busy"}
+                >
+                  {check.state === "busy" ? <Loader2 size={13} className="animate-spin" /> : <ShieldCheck size={13} />}
+                  Проверить связь
+                </Button>
+              </div>
+              {check.state !== "idle" && check.state !== "busy" && (
+                <p
+                  className={cn(
+                    "mt-1.5 flex items-start gap-1.5 text-[10px] leading-relaxed",
+                    check.state === "ok" ? "text-emerald-500" : "text-red-500",
+                  )}
+                >
+                  {check.state === "ok" ? <Check size={11} className="mt-0.5 shrink-0" /> : <TriangleAlert size={11} className="mt-0.5 shrink-0" />}
+                  {check.text}
+                </p>
+              )}
+              <p className="mt-1.5 text-[10px] leading-relaxed text-muted">
+                Токен виден только при создании: вставьте сохранённый — проверим его и подставим в команду.
+                Маска вида «…abcdef» не подойдёт.
+              </p>
+            </div>
           </Card>
 
           <Card
@@ -734,7 +822,12 @@ export function OperatorPanel() {
                 <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted">
                   <Terminal size={11} /> терминал
                 </span>
-                <Button size="sm" variant="ghost" onClick={() => void copy(command, "command")}>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void copy(command, "command")}
+                  disabled={!effectiveToken}
+                >
                   {copied === "command" ? <Check size={12} /> : <Copy size={12} />}
                   {copied === "command" ? "скопировано" : "копировать"}
                 </Button>
@@ -742,9 +835,10 @@ export function OperatorPanel() {
               <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-card px-2.5 py-2 text-[11px] leading-relaxed">
                 {command}
               </pre>
-              {!freshToken && (
+              {!effectiveToken && (
                 <p className="mt-1.5 text-[10px] text-amber-500">
-                  Сначала создайте токен в шаге 1 — в команде появится реальное значение.
+                  Сначала создайте токен в шаге 1 или вставьте сохранённый в «Проверку токена» — команда
+                  с плейсхолдером CRM не примет.
                 </p>
               )}
             </div>

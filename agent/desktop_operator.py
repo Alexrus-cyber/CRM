@@ -17,11 +17,11 @@ CRM Desktop Operator — агент, который управляет рабо�
 
 Запуск:
     pip install -r agent/requirements.txt
-    python3 agent/operator.py --watch --token ТОКЕН --provider openrouter \
+    python3 agent/desktop_operator.py --watch --token ТОКЕН --provider openrouter \
         --model qwen/qwen2.5-vl-72b-instruct --api-key sk-...
 
-    python3 agent/operator.py --task "Открой блокнот и напиши план на день"
-    python3 agent/operator.py --self-test        # без экрана и зависимостей
+    python3 agent/desktop_operator.py --task "Открой блокнот и напиши план на день"
+    python3 agent/desktop_operator.py --self-test        # без экрана и зависимостей
 
 Опасные действия (удаление, покупки, переводы) спрашивают подтверждение;
 --yes отключает вопрос, --dry-run только планирует. Аварийная остановка —
@@ -139,6 +139,53 @@ def log(message: str) -> None:
     print(time.strftime("[%H:%M:%S] ") + str(message), flush=True)
 
 
+# Значения, которые остаются в команде, если токен не подставлен.
+TOKEN_PLACEHOLDERS = {
+    "ваш_токен", "ваш-токен", "токен", "token", "<токен>", "<token>", "tok", "...", "…",
+}
+
+
+def normalize_token(raw: str) -> str:
+    """Токен из терминала, буфера обмена или документации: без кавычек и переносов.
+
+    Частая причина отказа — скопированная маска «…abcdef» или токен, который
+    при вставке разбился на строки. Пробелы внутри токена недопустимы, поэтому
+    убираем их целиком.
+    """
+    token = (raw or "").strip()
+    token = token.strip('"').strip("'").strip()
+    token = token.strip("«»").strip()
+    return "".join(token.split())
+
+
+def mask_token(token: str) -> str:
+    if not token:
+        return "—"
+    if len(token) <= 12:
+        return "…" + token[-4:] if len(token) > 4 else "…"
+    return "{}…{}".format(token[:6], token[-4:])
+
+
+def token_problem(token: str) -> Optional[str]:
+    """Понятная причина, почему токен заведомо не подойдёт."""
+    if not token:
+        return ("Токен не задан. Создайте его во вкладке «Оператор» → «Подключение» "
+                "и передайте: --token crmop_…")
+    lowered = token.lower()
+    if lowered in TOKEN_PLACEHOLDERS:
+        return ("В команде остался плейсхолдер «{}». Подставьте настоящий токен из CRM."
+                .format(token))
+    if lowered.startswith("…") or lowered.startswith("..."):
+        return "Это маска из интерфейса, а не токен. Нужен полный токен, начинающийся с crmop_."
+    if "<" in token or ">" in token:
+        return ("Похоже, в команде остался плейсхолдер «{}» — вставьте настоящий токен из шага 1."
+                .format(token))
+    if not token.isascii():
+        return ("В токене есть нелатинские символы ({}). Скопируйте токен ещё раз — "
+                "он состоит только из латиницы, цифр и подчёркиваний.".format(mask_token(token)))
+    return None
+
+
 def require_pyautogui() -> None:
     if pyautogui is None:
         raise SystemExit(
@@ -237,9 +284,10 @@ def type_text(text: str) -> None:
 class Http:
     """Минимальный HTTP-клиент без внешних зависимостей."""
 
-    def __init__(self, base: str, token: str = "") -> None:
+    def __init__(self, base: str, token: str = "", kind: str = "CRM") -> None:
         self.base = (base or "").rstrip("/")
         self.token = token
+        self.kind = kind
 
     def call(self, method: str, path: str, payload: Optional[dict] = None,
              timeout: int = 180, headers: Optional[Dict[str, str]] = None) -> dict:
@@ -254,11 +302,28 @@ class Http:
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = response.read().decode("utf-8", "replace")
+        except ValueError as error:
+            raise AgentError(
+                "Запрос к {} не удался: в токене или адресе недопустимые символы ({}).".format(
+                    self.kind, error)
+            ) from error
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")[:400]
+            if error.code == 401 and self.kind == "модель":
+                raise AgentError(
+                    "Модель отклонила ключ API (401) на {}: проверьте --api-key или переменную "
+                    "окружения провайдера. Это не токен CRM.".format(self.base)
+                ) from error
             if error.code == 401:
-                raise AgentError("CRM отклонила токен агента. Создайте токен заново во вкладке «Оператор».") from error
-            raise AgentError("{} {} → HTTP {}: {}".format(method, path, error.code, detail)) from error
+                raise AgentError(
+                    "CRM отклонила токен агента (токен {}, сервер {}). Создайте токен заново "
+                    "во вкладке «Оператор» → «Подключение» и подставьте его целиком: "
+                    "python3 agent/desktop_operator.py --check --server {} --token crmop_…".format(
+                        mask_token(self.token), self.base, self.base)
+                ) from error
+            if error.code == 404 and path.endswith("/whoami"):
+                raise AgentError("В этой CRM нет маршрута /api/agent/bot/whoami — обновите CRM.") from error
+            raise AgentError("{} {} {} → HTTP {}: {}".format(self.kind, method, url, error.code, detail)) from error
         except urllib.error.URLError as error:
             raise AgentError("CRM недоступна ({}): {}".format(url, error.reason)) from error
         try:
@@ -271,9 +336,9 @@ class Operator:
     def __init__(self, crm: str, token: str, base_url: str, model: str, api_key: str,
                  dry_run: bool, assume_yes: bool, max_steps: int, delay: float,
                  poll: float, max_width: int, text_only: bool) -> None:
-        self.crm = Http(crm, token)
+        self.crm = Http(crm, token, kind="CRM")
         self.has_crm = bool(crm and token)
-        self.model_http = Http(base_url)
+        self.model_http = Http(base_url, kind="модель")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
@@ -582,6 +647,16 @@ class Operator:
             log("Для очереди нужны --server и --token. Либо запустите с --task \"…\".")
             return 2
         log("Сервер CRM: {}".format(self.crm.base))
+        log("Токен: {}".format(mask_token(self.crm.token)))
+        try:
+            who = self.crm.call("GET", "/api/agent/bot/whoami", timeout=30)
+            counts = who.get("counts") or {}
+            log("Связь с CRM есть: {} · в очереди {}".format(
+                (who.get("owner") or {}).get("email") or "владелец токена",
+                counts.get("queued", 0)))
+        except AgentError as error:
+            log("Ошибка: {}".format(error))
+            return 1
         while True:
             try:
                 data = self.crm.call("GET", "/api/agent/bot/next", timeout=30)
@@ -615,6 +690,35 @@ class Operator:
                 return 0
 
 
+def check_token(server: str, raw_token: str) -> int:
+    """`--check`: проверить связь с CRM и токен, ничего не выполняя на экране."""
+    token = normalize_token(raw_token)
+    server = (server or "").rstrip("/")
+    log("CRM: {}".format(server or "—"))
+    problem = token_problem(token)
+    if problem:
+        log("[!] " + problem)
+        return 2
+    log("Токен: {}".format(mask_token(token)))
+    if not token.startswith("crmop_"):
+        log("[!] Токен обычно начинается с crmop_ — проверьте, что скопирован он целиком")
+    try:
+        data = Http(server, token, kind="CRM").call("GET", "/api/agent/bot/whoami", timeout=30)
+    except AgentError as error:
+        log("[!] {}".format(error))
+        return 1
+    owner = data.get("owner") or {}
+    counts = data.get("counts") or {}
+    log("Токен принят: {} <{}>".format(owner.get("name") or "—", owner.get("email") or "—"))
+    log("Задания: в очереди {queued}, в работе {running}, готово {done}".format(
+        queued=counts.get("queued", 0), running=counts.get("running", 0), done=counts.get("done", 0)))
+    if not counts.get("queued") and not counts.get("running"):
+        log("Очередь пуста — поставьте задание на «Пульте» во вкладке «Оператор».")
+    else:
+        log("Можно запускать без --check: --once или --watch.")
+    return 0
+
+
 def resolve_provider(args: argparse.Namespace) -> Tuple[str, str, str]:
     preset = PROVIDERS.get(args.provider or "local", PROVIDERS["local"])
     base_url = args.base_url or preset["base_url"]
@@ -646,6 +750,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delay", type=float, default=0.8, help="пауза между шагами, сек")
     parser.add_argument("--poll", type=float, default=3.0, help="интервал опроса очереди, сек")
     parser.add_argument("--max-width", type=int, default=DEFAULT_MAX_WIDTH, help="макс. ширина скриншота")
+    parser.add_argument("--check", action="store_true",
+                        help="проверить связь с CRM и токен (без экрана и модели)")
     parser.add_argument("--self-test", action="store_true", help="проверки без экрана и зависимостей")
     return parser.parse_args()
 
@@ -654,6 +760,10 @@ def main() -> int:
     args = parse_args()
     if args.self_test:
         return self_test()
+
+    args.token = normalize_token(args.token)
+    if args.check:
+        return check_token(args.server, args.token)
 
     base_url, model, api_key = resolve_provider(args)
     enable_dpi_awareness()
@@ -665,6 +775,13 @@ def main() -> int:
         delay=args.delay, poll=args.poll, max_width=args.max_width, text_only=args.text_only,
     )
     operator.current_task = None
+
+    if args.watch or args.once:
+        problem = token_problem(args.token)
+        if problem:
+            log("[!] " + problem)
+            return 2
+        log("Токен CRM: {}".format(mask_token(args.token)))
 
     log("Модель: {} @ {}".format(model or "—", base_url))
     if not api_key and "127.0.0.1" not in base_url and "localhost" not in base_url:
