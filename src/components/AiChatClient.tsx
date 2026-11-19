@@ -49,6 +49,7 @@ import {
 import { extractFile, imageToDataUrl } from "@/lib/fileExtract";
 import { snippet, splitIntoChunks } from "@/lib/rag";
 import { formatTokenCount, type AiRolePolicy } from "@/lib/aiPolicy";
+import { useStoredJson, useStoredNumber } from "@/lib/useStoredValue";
 import type { Role } from "@/db/schema";
 
 /* --------------------------------- типы --------------------------------- */
@@ -120,32 +121,20 @@ const STORAGE_CHAT = "crm.ai.chat.v1";
 
 /* ------------------------------- хранилище ------------------------------ */
 
-function readSettings(): AiSettings {
-  const fallback: AiSettings = { baseUrl: AI_DEFAULT_BASE_URL, apiKey: "", model: "" };
-  if (typeof window === "undefined") return fallback;
-  try {
-    const raw = window.localStorage.getItem(AI_STORAGE_SETTINGS);
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw) as Partial<AiSettings>;
-    return {
-      baseUrl: parsed.baseUrl?.trim() || fallback.baseUrl,
-      apiKey: parsed.apiKey ?? "",
-      model: parsed.model ?? "",
-    };
-  } catch {
-    return fallback;
-  }
+const DEFAULT_SETTINGS: AiSettings = { baseUrl: AI_DEFAULT_BASE_URL, apiKey: "", model: "" };
+
+/** Разбор сохранённых настроек — вызывается уже после гидратации. */
+function decodeSettings(raw: string): AiSettings {
+  const parsed = JSON.parse(raw) as Partial<AiSettings>;
+  return {
+    baseUrl: parsed.baseUrl?.trim() || DEFAULT_SETTINGS.baseUrl,
+    apiKey: parsed.apiKey ?? "",
+    model: parsed.model ?? "",
+  };
 }
 
-function readParams(): AiParams {
-  if (typeof window === "undefined") return AI_DEFAULT_PARAMS;
-  try {
-    const raw = window.localStorage.getItem(AI_STORAGE_PARAMS);
-    if (!raw) return AI_DEFAULT_PARAMS;
-    return normalizeParams(JSON.parse(raw));
-  } catch {
-    return AI_DEFAULT_PARAMS;
-  }
+function decodeParams(raw: string): AiParams {
+  return normalizeParams(JSON.parse(raw));
 }
 
 function parseAttachments(raw: string): AttachmentMeta[] {
@@ -167,10 +156,6 @@ function readNumber(key: string, fallback: number): number {
   if (typeof window === "undefined") return fallback;
   const value = Number(window.localStorage.getItem(key) ?? "");
   return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-function readFolderId(): number {
-  return readNumber(STORAGE_RAG, 0);
 }
 
 /* ------------------------------- разметка ------------------------------- */
@@ -236,8 +221,12 @@ const ATTACHMENT_ICON: Record<AttKind, ReactNode> = {
 };
 
 export function AiChatClient({ userName }: { userName: string }) {
-  const [settings, setSettings] = useState<AiSettings>(readSettings);
-  const [params, setParams] = useState<AiParams>(readParams);
+  const [settings, setSettings] = useStoredJson<AiSettings>(
+    AI_STORAGE_SETTINGS,
+    DEFAULT_SETTINGS,
+    decodeSettings,
+  );
+  const [params, setParams] = useStoredJson<AiParams>(AI_STORAGE_PARAMS, AI_DEFAULT_PARAMS, decodeParams);
   const [showKey, setShowKey] = useState(false);
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
   const [chat, setChat] = useState<ChatInfo | null>(null);
@@ -258,7 +247,7 @@ export function AiChatClient({ userName }: { userName: string }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const [folders, setFolders] = useState<RagFolder[]>([]);
-  const [folderId, setFolderId] = useState<number>(readFolderId);
+  const [folderId, setFolderId] = useStoredNumber(STORAGE_RAG, 0);
   const [ragBusy, setRagBusy] = useState(false);
   const [ragProgress, setRagProgress] = useState<{ done: number; total: number; phase: "read" | "upload" } | null>(null);
   const [ragQuery, setRagQuery] = useState("");
@@ -286,30 +275,6 @@ export function AiChatClient({ userName }: { userName: string }) {
   };
 
   /* ----------------------------- сохранение ----------------------------- */
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(AI_STORAGE_SETTINGS, JSON.stringify(settings));
-    } catch {
-      /* приватный режим */
-    }
-  }, [settings]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(AI_STORAGE_PARAMS, JSON.stringify(params));
-    } catch {
-      /* не критично */
-    }
-  }, [params]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_RAG, String(folderId));
-    } catch {
-      /* не критично */
-    }
-  }, [folderId]);
 
   useEffect(() => {
     const node = listRef.current;
