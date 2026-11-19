@@ -284,10 +284,11 @@ def type_text(text: str) -> None:
 class Http:
     """Минимальный HTTP-клиент без внешних зависимостей."""
 
-    def __init__(self, base: str, token: str = "", kind: str = "CRM") -> None:
+    def __init__(self, base: str, token: str = "", kind: str = "CRM", key_hint: str = "") -> None:
         self.base = (base or "").rstrip("/")
         self.token = token
         self.kind = kind
+        self.key_hint = key_hint
 
     def call(self, method: str, path: str, payload: Optional[dict] = None,
              timeout: int = 180, headers: Optional[Dict[str, str]] = None) -> dict:
@@ -310,9 +311,11 @@ class Http:
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")[:400]
             if error.code == 401 and self.kind == "модель":
+                hint = " или переменную {}".format(self.key_hint) if self.key_hint else ""
                 raise AgentError(
-                    "Модель отклонила ключ API (401) на {}: проверьте --api-key или переменную "
-                    "окружения провайдера. Это не токен CRM.".format(self.base)
+                    "Модель отклонила ключ API (401) на {}: проверьте --api-key{} — ключ должен быть "
+                    "от выбранного провайдера. Во вкладке «Оператор» → «Подключение» есть поле "
+                    "«Ключ API». Это не токен CRM.".format(self.base, hint)
                 ) from error
             if error.code == 401:
                 raise AgentError(
@@ -325,7 +328,8 @@ class Http:
                 raise AgentError("В этой CRM нет маршрута /api/agent/bot/whoami — обновите CRM.") from error
             raise AgentError("{} {} {} → HTTP {}: {}".format(self.kind, method, url, error.code, detail)) from error
         except urllib.error.URLError as error:
-            raise AgentError("CRM недоступна ({}): {}".format(url, error.reason)) from error
+            raise AgentError("{} недоступна ({}): {}".format(
+                "Модель" if self.kind == "модель" else "CRM", url, error.reason)) from error
         try:
             return json.loads(body or "{}")
         except json.JSONDecodeError as error:
@@ -335,10 +339,10 @@ class Http:
 class Operator:
     def __init__(self, crm: str, token: str, base_url: str, model: str, api_key: str,
                  dry_run: bool, assume_yes: bool, max_steps: int, delay: float,
-                 poll: float, max_width: int, text_only: bool) -> None:
+                 poll: float, max_width: int, text_only: bool, key_hint: str = "") -> None:
         self.crm = Http(crm, token, kind="CRM")
         self.has_crm = bool(crm and token)
-        self.model_http = Http(base_url, kind="модель")
+        self.model_http = Http(base_url, kind="модель", key_hint=key_hint)
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
@@ -719,6 +723,28 @@ def check_token(server: str, raw_token: str) -> int:
     return 0
 
 
+def check_model(base_url: str, model: str, api_key: str, key_hint: str) -> int:
+    """Минимальный запрос к модели: ловим именно 401 по ключу, а не в задании."""
+    if not model:
+        log("[i] Модель не задана — проверку ключа пропускаю.")
+        return 0
+    headers = {"Authorization": "Bearer " + api_key} if api_key else {}
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "temperature": 0,
+    }
+    try:
+        Http(base_url, kind="модель", key_hint=key_hint).call(
+            "POST", "/chat/completions", payload, timeout=60, headers=headers)
+    except AgentError as error:
+        log("[!] {}".format(error))
+        return 1
+    log("Модель {} ответила: ключ принят.".format(model))
+    return 0
+
+
 def resolve_provider(args: argparse.Namespace) -> Tuple[str, str, str]:
     preset = PROVIDERS.get(args.provider or "local", PROVIDERS["local"])
     base_url = args.base_url or preset["base_url"]
@@ -763,7 +789,16 @@ def main() -> int:
 
     args.token = normalize_token(args.token)
     if args.check:
-        return check_token(args.server, args.token)
+        code = check_token(args.server, args.token)
+        if code != 0:
+            return code
+        base_url, model, api_key = resolve_provider(args)
+        preset = PROVIDERS.get(args.provider or "local", {})
+        key_hint = preset.get("key_env", "")
+        if not args.model and key_hint == "OPERATOR_API_KEY":
+            log("[i] Локальная модель: ключ не проверяю (добавьте --model, чтобы проверить и её).")
+            return 0
+        return check_model(base_url, model, api_key, key_hint)
 
     base_url, model, api_key = resolve_provider(args)
     enable_dpi_awareness()
@@ -773,6 +808,7 @@ def main() -> int:
         crm=args.server, token=args.token, base_url=base_url, model=model, api_key=api_key,
         dry_run=args.dry_run, assume_yes=args.yes, max_steps=max(0, args.max_steps),
         delay=args.delay, poll=args.poll, max_width=args.max_width, text_only=args.text_only,
+        key_hint=PROVIDERS.get(args.provider or "local", {}).get("key_env", ""),
     )
     operator.current_task = None
 
@@ -784,8 +820,10 @@ def main() -> int:
         log("Токен CRM: {}".format(mask_token(args.token)))
 
     log("Модель: {} @ {}".format(model or "—", base_url))
+    key_hint = PROVIDERS.get(args.provider or "local", {}).get("key_env", "")
     if not api_key and "127.0.0.1" not in base_url and "localhost" not in base_url:
-        log("[!] Ключ API не задан — облачный провайдер, скорее всего, ответит 401")
+        log("[!] Ключ API не задан — облачный провайдер ответит 401. Передайте --api-key sk-… "
+            "или переменную {}; поле есть во вкладке «Оператор» → «Подключение».".format(key_hint))
     log("Режим: {}{}".format("DRY-RUN" if args.dry_run else "ИСПОЛНЕНИЕ",
                              " + подтверждения" if not args.yes else ""))
     if not args.dry_run:

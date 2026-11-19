@@ -5,6 +5,8 @@ import {
   Check,
   ClipboardCopy,
   Copy,
+  Eye,
+  EyeOff,
   FileText,
   Inbox,
   KeyRound,
@@ -22,6 +24,13 @@ import {
 } from "lucide-react";
 import { Badge, Button, Card, EmptyState, Input, Textarea } from "@/components/ui";
 import { cn, formatDateTime, formatTime } from "@/lib/utils";
+import {
+  OPERATOR_PROVIDERS,
+  buildCommandWithKey,
+  buildEnvLine,
+  buildOperatorCommand,
+  findProvider,
+} from "@/lib/operatorCommand";
 import {
   ActionGlyph,
   ActionLink,
@@ -60,16 +69,6 @@ const PRESETS = [
   "Сделай таблицу расходов за неделю и сохрани в xlsx",
   "Открой почту и проверь новые письма",
 ];
-
-const PROVIDERS = [
-  { id: "local", label: "Локальная модель (vLLM / LM Studio)" },
-  { id: "openai", label: "OpenAI API" },
-  { id: "openrouter", label: "OpenRouter" },
-  { id: "groq", label: "Groq" },
-  { id: "deepseek", label: "DeepSeek" },
-  { id: "together", label: "Together" },
-  { id: "mistral", label: "Mistral" },
-] as const;
 
 const RUN_FILTERS = [
   { id: "all", label: "Все" },
@@ -110,6 +109,9 @@ export function OperatorPanel() {
   const [provider, setProvider] = useState<string>("local");
   const [model, setModel] = useState("");
   const [server, setServer] = useState("http://localhost:3000");
+  const [apiKey, setApiKey] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [keyMode, setKeyMode] = useState<"inline" | "env">("inline");
   const [once, setOnce] = useState(false);
   const [dryRun, setDryRun] = useState(false);
   const [assumeYes, setAssumeYes] = useState(false);
@@ -350,17 +352,25 @@ export function OperatorPanel() {
 
   const effectiveToken = (tokenInput.trim() || freshToken || "").trim();
 
-  const command = useMemo(() => {
-    const parts = ["python3 agent/desktop_operator.py", once ? "--once" : "--watch"];
-    parts.push("--token", effectiveToken || "<токен из шага 1>");
-    parts.push("--provider", provider);
-    if (model.trim()) parts.push("--model", model.trim());
-    if (server.trim() && server.trim() !== "http://localhost:3000") parts.push("--server", server.trim());
-    if (dryRun) parts.push("--dry-run");
-    if (assumeYes) parts.push("--yes");
-    if (textOnly) parts.push("--text-only");
-    return parts.join(" ");
-  }, [once, effectiveToken, provider, model, server, dryRun, assumeYes, textOnly]);
+  const providerMeta = findProvider(provider);
+  const commandOptions = useMemo(
+    () => ({
+      provider,
+      token: effectiveToken,
+      model,
+      server,
+      apiKey,
+      keyMode,
+      once,
+      dryRun,
+      assumeYes,
+      textOnly,
+    }),
+    [provider, effectiveToken, model, server, apiKey, keyMode, once, dryRun, assumeYes, textOnly],
+  );
+  const command = useMemo(() => buildOperatorCommand(commandOptions), [commandOptions]);
+  const commandToCopy = useMemo(() => buildCommandWithKey(commandOptions), [commandOptions]);
+  const envLine = keyMode === "env" && apiKey.trim() ? buildEnvLine(provider, apiKey) : "";
 
   const visibleTasks = useMemo(
     () => tasks.filter((task) => statusFilterMatches(task.status, runFilter)),
@@ -781,10 +791,14 @@ export function OperatorPanel() {
                 Провайдер
                 <select
                   value={provider}
-                  onChange={(event) => setProvider(event.target.value)}
+                  onChange={(event) => {
+                    const next = findProvider(event.target.value);
+                    setProvider(next.id);
+                    if (!model.trim() && next.defaultModel) setModel(next.defaultModel);
+                  }}
                   className="mt-1 h-9 w-full rounded-xl border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
                 >
-                  {PROVIDERS.map((item) => (
+                  {OPERATOR_PROVIDERS.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.label}
                     </option>
@@ -800,6 +814,62 @@ export function OperatorPanel() {
                   className="mt-1 h-9 text-[11px]"
                 />
               </label>
+              <div className="text-[11px] text-muted sm:col-span-2">
+                <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-2">
+                  <span>
+                    Ключ API{" "}
+                    <span className="text-[10px]">
+                      {providerMeta.needsKey ? `— обязателен для ${providerMeta.label}, нужен боту, не CRM` : "— локальной модели обычно не нужен"}
+                    </span>
+                  </span>
+                  <div className="flex shrink-0 gap-1">
+                    {(["inline", "env"] as const).map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setKeyMode(mode)}
+                        className={cn(
+                          "rounded-lg border px-1.5 py-0.5 text-[10px] transition",
+                          keyMode === mode
+                            ? "border-accent/40 bg-accent/15 text-text"
+                            : "border-border bg-card2 text-muted hover:text-text",
+                        )}
+                      >
+                        {mode === "inline" ? "--api-key" : providerMeta.keyEnv}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="mt-1 flex items-center gap-1.5">
+                  <Input
+                    type={showKey ? "text" : "password"}
+                    value={apiKey}
+                    onChange={(event) => setApiKey(event.target.value)}
+                    placeholder={providerMeta.needsKey ? "sk-… (ключ провайдера)" : "обычно не требуется"}
+                    spellCheck={false}
+                    autoComplete="off"
+                    className="h-9 min-w-0 flex-1 font-mono text-[11px]"
+                  />
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => setShowKey((value) => !value)}
+                    title={showKey ? "Скрыть ключ" : "Показать ключ"}
+                    aria-label={showKey ? "Скрыть ключ" : "Показать ключ"}
+                  >
+                    {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </Button>
+                </div>
+                {providerMeta.needsKey && !apiKey.trim() && (
+                  <p className="mt-1 text-[10px] text-amber-500">
+                    Без ключа {providerMeta.label} ответит 401 «Модель отклонила ключ API». Вставьте ключ
+                    или задайте переменную <code className="rounded bg-card2 px-1">{providerMeta.keyEnv}</code>.
+                  </p>
+                )}
+                <p className="mt-1 text-[10px] text-muted">
+                  Ключ не уходит в CRM и не сохраняется: он попадает только в текст команды в вашем браузере.
+                </p>
+              </div>
               <label className="text-[11px] text-muted">
                 Адрес CRM
                 <Input
@@ -825,7 +895,7 @@ export function OperatorPanel() {
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={() => void copy(command, "command")}
+                  onClick={() => void copy(commandToCopy, "command")}
                   disabled={!effectiveToken}
                 >
                   {copied === "command" ? <Check size={12} /> : <Copy size={12} />}
@@ -833,8 +903,14 @@ export function OperatorPanel() {
                 </Button>
               </div>
               <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-card px-2.5 py-2 text-[11px] leading-relaxed">
-                {command}
+                {envLine ? `${envLine}\n${command}` : command}
               </pre>
+              {keyMode === "env" && apiKey.trim() && (
+                <p className="mt-1.5 text-[10px] text-muted">
+                  Windows (cmd): <code className="rounded bg-card2 px-1">set {providerMeta.keyEnv}={apiKey.trim()}</code>{" "}
+                  отдельной строкой перед запуском.
+                </p>
+              )}
               {!effectiveToken && (
                 <p className="mt-1.5 text-[10px] text-amber-500">
                   Сначала создайте токен в шаге 1 или вставьте сохранённый в «Проверку токена» — команда
@@ -844,9 +920,10 @@ export function OperatorPanel() {
             </div>
 
             <p className="mt-2 text-[11px] text-muted">
-              Ключ облачного API передайте переменной окружения (<code className="rounded bg-card2 px-1">OPENROUTER_API_KEY</code>,
-              <code className="mx-1 rounded bg-card2 px-1">OPENAI_API_KEY</code> и т. п.) или флагом{" "}
-              <code className="rounded bg-card2 px-1">--api-key</code> — в CRM он не сохраняется.
+              Бот берёт ключ из <code className="rounded bg-card2 px-1">--api-key</code> или из переменной
+              окружения провайдера — оба варианта собираются выше. Перед запуском команду можно проверить
+              флагом <code className="rounded bg-card2 px-1">--check</code>: он покажет связь с CRM, не обращаясь
+              к модели.
             </p>
           </Card>
 
