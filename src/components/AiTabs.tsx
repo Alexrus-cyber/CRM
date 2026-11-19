@@ -39,7 +39,7 @@ export function AiTabs({ tabs }: { tabs: AiTab[] }) {
               className={cn(
                 "flex shrink-0 items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium transition",
                 selected
-                  ? "bg-gradient-to-r from-[#7c5cff]/25 to-transparent text-text ring-1 ring-[#7c5cff]/30"
+                  ? "bg-gradient-to-r from-accent/25 to-transparent text-text ring-1 ring-accent/30"
                   : "text-muted hover:bg-card2 hover:text-text",
               )}
               title={tab.hint}

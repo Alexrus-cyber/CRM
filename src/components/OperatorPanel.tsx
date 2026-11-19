@@ -1,91 +1,115 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  AlertTriangle,
-  CheckCircle2,
+  Check,
   ClipboardCopy,
-  Download,
+  Copy,
   FileText,
+  Inbox,
+  KeyRound,
   Loader2,
   MonitorCog,
   Play,
   RefreshCw,
+  Rocket,
+  Settings2,
+  Sparkles,
   Square,
   Terminal,
-  XCircle,
+  TriangleAlert,
 } from "lucide-react";
-import { cn, formatDateTime } from "@/lib/utils";
+import { Badge, Button, Card, EmptyState, Input, Textarea } from "@/components/ui";
+import { cn, formatDateTime, formatTime } from "@/lib/utils";
+import {
+  ActionGlyph,
+  ActionLink,
+  AgentFileCard,
+  describeAction,
+  MetricCard,
+  StatusChip,
+  type OperatorEvent,
+  type OperatorTask,
+} from "./operator/shared";
 
 /**
- * Вкладка «Оператор»: очередь заданий для бота, который управляет рабочим
- * столом пользователя (`agent/desktop_operator.py`).
+ * Вкладка «Оператор» блока ИИ — в стиле остальной Nova CRM.
  *
- * Здесь видно, что бот делает шаг за шагом, и сюда же приходят файлы, которые
- * он собрал, — скачиваются прямо из браузера. Сам бот работает на машине
- * пользователя и забирает задания по токену.
+ * Внутри три подвкладки:
+ *   • Пульт — поставить задание и смотреть, что бот делает шаг за шагом;
+ *   • Запуски — история заданий со статусами и фильтрами;
+ *   • Подключение — токен бота, установка зависимостей и готовые команды
+ *     запуска для локальной модели или облачного API.
+ *
+ * Сам бот живёт на компьютере пользователя (`agent/desktop_operator.py`),
+ * сюда он присылает шаги и файлы.
  */
 
-type AgentTask = {
-  id: number;
-  prompt: string;
-  status: string;
-  maxSteps: number;
-  steps: number;
-  summary: string;
-  createdAt: string;
-  updatedAt: string;
-};
+const SUBTABS = [
+  { id: "desk", label: "Пульт", icon: MonitorCog, hint: "новое задание и ход выполнения" },
+  { id: "runs", label: "Запуски", icon: Inbox, hint: "история заданий" },
+  { id: "setup", label: "Подключение", icon: Settings2, hint: "токен и запуск бота" },
+] as const;
 
-type AgentEvent = {
-  id: number;
-  kind: string;
-  text: string;
-  action: string;
-  fileName: string;
-  fileMime: string;
-  fileSize: number;
-  hasFile: boolean;
-  createdAt: string;
-};
+type SubTab = (typeof SUBTABS)[number]["id"];
 
-const STATUS: Record<string, { label: string; className: string }> = {
-  queued: { label: "в очереди", className: "bg-amber-500/15 text-amber-500" },
-  running: { label: "выполняется", className: "bg-accent/20 text-accent2" },
-  done: { label: "готово", className: "bg-emerald-500/15 text-emerald-500" },
-  failed: { label: "ошибка", className: "bg-red-500/15 text-red-500" },
-  cancelled: { label: "отменено", className: "bg-card2 text-muted" },
-};
+const PRESETS = [
+  "Открой блокнот, напиши план на день и сохрани в файл plan.docx",
+  "Открой YouTube и включи видео про космос",
+  "Сделай таблицу расходов за неделю и сохрани в xlsx",
+  "Открой почту и проверь новые письма",
+];
 
-const KIND_ICON: Record<string, typeof FileText> = {
-  thought: MonitorCog,
-  action: Play,
-  result: CheckCircle2,
-  error: XCircle,
-  file: FileText,
-  info: CheckCircle2,
-};
+const PROVIDERS = [
+  { id: "local", label: "Локальная модель (vLLM / LM Studio)" },
+  { id: "openai", label: "OpenAI API" },
+  { id: "openrouter", label: "OpenRouter" },
+  { id: "groq", label: "Groq" },
+  { id: "deepseek", label: "DeepSeek" },
+  { id: "together", label: "Together" },
+  { id: "mistral", label: "Mistral" },
+] as const;
 
-function formatSize(bytes: number) {
-  if (bytes < 1024) return `${bytes} Б`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 102.4) / 10} КБ`;
-  return `${Math.round(bytes / 104857.6) / 10} МБ`;
+const RUN_FILTERS = [
+  { id: "all", label: "Все" },
+  { id: "queued", label: "В очереди" },
+  { id: "running", label: "Выполняются" },
+  { id: "done", label: "Готово" },
+] as const;
+
+function statusFilterMatches(status: string, filter: string): boolean {
+  if (filter === "all") return true;
+  if (filter === "queued") return status === "queued" || status === "paused";
+  if (filter === "running") return status === "running";
+  if (filter === "done") return status === "done";
+  return true;
 }
 
 export function OperatorPanel() {
+  const [tab, setTab] = useState<SubTab>("desk");
   const [tokenExists, setTokenExists] = useState<boolean | null>(null);
-  const [hint, setHint] = useState<string | null>(null);
+  const [tokenHint, setTokenHint] = useState<string | null>(null);
   const [freshToken, setFreshToken] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
-  const [tasks, setTasks] = useState<AgentTask[]>([]);
-  const [openId, setOpenId] = useState<number | null>(null);
-  const [events, setEvents] = useState<AgentEvent[]>([]);
+  const [tasks, setTasks] = useState<OperatorTask[]>([]);
+  const [events, setEvents] = useState<OperatorEvent[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [runFilter, setRunFilter] = useState<string>("all");
   const [prompt, setPrompt] = useState("");
   const [maxSteps, setMaxSteps] = useState(15);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const [copied, setCopied] = useState<string | null>(null);
+
+  // Параметры для сборки команды запуска.
+  const [provider, setProvider] = useState<string>("local");
+  const [model, setModel] = useState("");
+  const [server, setServer] = useState("http://localhost:3000");
+  const [once, setOnce] = useState(false);
+  const [dryRun, setDryRun] = useState(false);
+  const [assumeYes, setAssumeYes] = useState(false);
+  const [textOnly, setTextOnly] = useState(false);
+
+  /* ------------------------------ загрузка ------------------------------ */
 
   const fetchToken = useCallback(async (): Promise<{ exists: boolean; hint: string | null } | null> => {
     try {
@@ -98,11 +122,11 @@ export function OperatorPanel() {
     }
   }, []);
 
-  const fetchTasks = useCallback(async (): Promise<AgentTask[] | null> => {
+  const fetchTasks = useCallback(async (): Promise<OperatorTask[] | null> => {
     try {
       const res = await fetch("/api/agent/tasks", { cache: "no-store" });
       if (!res.ok) return null;
-      const data = (await res.json()) as { tasks?: AgentTask[] };
+      const data = (await res.json()) as { tasks?: OperatorTask[] };
       return data.tasks ?? [];
     } catch {
       return null;
@@ -110,11 +134,11 @@ export function OperatorPanel() {
   }, []);
 
   const fetchTask = useCallback(
-    async (id: number): Promise<{ task: AgentTask | null; events: AgentEvent[] } | null> => {
+    async (id: number): Promise<{ task: OperatorTask | null; events: OperatorEvent[] } | null> => {
       try {
         const res = await fetch(`/api/agent/tasks/${id}`, { cache: "no-store" });
         if (!res.ok) return null;
-        const data = (await res.json()) as { task?: AgentTask; events?: AgentEvent[] };
+        const data = (await res.json()) as { task?: OperatorTask; events?: OperatorEvent[] };
         return { task: data.task ?? null, events: data.events ?? [] };
       } catch {
         return null;
@@ -123,62 +147,76 @@ export function OperatorPanel() {
     [],
   );
 
-  const refreshTasks = useCallback(async () => {
-    const list = await fetchTasks();
-    if (list) setTasks(list);
-  }, [fetchTasks]);
-
-  const refreshTask = useCallback(
-    async (id: number) => {
-      const data = await fetchTask(id);
-      if (!data) return;
-      setEvents(data.events);
-      if (data.task) setTasks((prev) => prev.map((t) => (t.id === id ? data.task! : t)));
-    },
-    [fetchTask],
-  );
-
-  // Первичная загрузка: токен и очередь.
   useEffect(() => {
     let alive = true;
     void Promise.all([fetchToken(), fetchTasks()]).then(([token, list]) => {
       if (!alive) return;
       if (token) {
         setTokenExists(token.exists);
-        setHint(token.hint);
+        setTokenHint(token.hint);
       }
       if (list) setTasks(list);
-      setLoading(false);
     });
     return () => {
       alive = false;
     };
   }, [fetchToken, fetchTasks]);
 
-  // Очередь и открытое задание обновляются сами, пока вкладка видима.
+  const activeTask = useMemo(
+    () => tasks.find((task) => task.id === selectedId) ?? tasks[0] ?? null,
+    [tasks, selectedId],
+  );
+  const activeId = activeTask?.id ?? null;
+
+  // Очередь обновляется сама: бот работает в фоне.
   useEffect(() => {
     const timer = window.setInterval(() => {
       if (document.visibilityState !== "visible") return;
-      void refreshTasks();
-      if (openId) void refreshTask(openId);
-    }, 3000);
+      void fetchTasks().then((list) => {
+        if (list) setTasks(list);
+      });
+    }, 3500);
     return () => window.clearInterval(timer);
-  }, [refreshTasks, refreshTask, openId]);
+  }, [fetchTasks]);
 
-  // Открыли задание — загружаем шаги и прокручиваем к последнему.
+  // Открытое задание: шаги подтягиваются на лету.
   useEffect(() => {
-    if (!openId) return;
+    if (!activeId || tab !== "desk") return;
     let alive = true;
-    void fetchTask(openId).then((data) => {
+    void fetchTask(activeId).then((data) => {
       if (!alive || !data) return;
       setEvents(data.events);
-      if (data.task) setTasks((prev) => prev.map((t) => (t.id === openId ? data.task! : t)));
-      bottomRef.current?.scrollIntoView({ block: "nearest" });
+      if (data.task) {
+        setTasks((prev) => prev.map((task) => (task.id === activeId ? data.task! : task)));
+      }
     });
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      void fetchTask(activeId).then((data) => {
+        if (!data) return;
+        setEvents(data.events);
+        if (data.task) {
+          setTasks((prev) => prev.map((task) => (task.id === activeId ? data.task! : task)));
+        }
+      });
+    }, 2500);
     return () => {
       alive = false;
+      window.clearInterval(timer);
     };
-  }, [openId, fetchTask]);
+  }, [activeId, tab, fetchTask]);
+
+  /* ------------------------------ действия ------------------------------ */
+
+  const copy = async (value: string, key: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(key);
+      window.setTimeout(() => setCopied(null), 2000);
+    } catch {
+      setError("Браузер не разрешил доступ к буферу обмена — скопируйте вручную");
+    }
+  };
 
   const createToken = async () => {
     setBusy(true);
@@ -192,20 +230,8 @@ export function OperatorPanel() {
       }
       setFreshToken(data.token);
       setTokenExists(true);
-      setCopied(false);
     } finally {
       setBusy(false);
-    }
-  };
-
-  const copyToken = async () => {
-    if (!freshToken) return;
-    try {
-      await navigator.clipboard.writeText(freshToken);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      /* браузер запретил буфер обмена — токен виден на экране */
     }
   };
 
@@ -220,15 +246,16 @@ export function OperatorPanel() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: text, maxSteps }),
       });
-      const data = (await res.json().catch(() => ({}))) as { task?: AgentTask; error?: string };
+      const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
       if (!res.ok || !data.task) {
         setError(data.error ?? "Не удалось поставить задание");
         return;
       }
       setPrompt("");
       setTasks((prev) => [data.task!, ...prev]);
-      setOpenId(data.task.id);
+      setSelectedId(data.task.id);
       setEvents([]);
+      setTab("desk");
     } finally {
       setBusy(false);
     }
@@ -240,226 +267,638 @@ export function OperatorPanel() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "cancel" }),
     });
-    if (res.ok) {
-      setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status: "cancelled" } : t)));
-      if (openId === id) void refreshTask(id);
+    if (!res.ok) {
+      setError("Не удалось отменить задание");
+      return;
     }
+    setTasks((prev) => prev.map((task) => (task.id === id ? { ...task, status: "cancelled" } : task)));
   };
 
-  const runCommand = freshToken
-    ? `python3 agent/desktop_operator.py --watch --token ${freshToken} --provider local`
-    : `python3 agent/desktop_operator.py --watch --token ТОКЕН --provider local`;
+  /* ------------------------------- выводы ------------------------------- */
+
+  const counts = useMemo(
+    () => ({
+      all: tasks.length,
+      queued: tasks.filter((task) => task.status === "queued" || task.status === "paused").length,
+      running: tasks.filter((task) => task.status === "running").length,
+      done: tasks.filter((task) => task.status === "done").length,
+    }),
+    [tasks],
+  );
+
+  const files = useMemo(() => events.filter((event) => event.kind === "file"), [events]);
+  const currentAction = useMemo(
+    () => [...events].reverse().find((event) => event.kind === "action" && event.action) ?? null,
+    [events],
+  );
+  const currentThought = useMemo(() => {
+    const index = currentAction ? events.findIndex((event) => event.id === currentAction.id) : -1;
+    if (index <= 0) return "";
+    for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+      if (events[cursor].kind === "thought" && events[cursor].text) return events[cursor].text;
+      if (events[cursor].kind === "action") break;
+    }
+    return "";
+  }, [events, currentAction]);
+
+  const parsedAction = describeAction(currentAction?.action ?? "");
+  const progress = activeTask ? Math.min(100, Math.round((activeTask.steps / Math.max(activeTask.maxSteps, 1)) * 100)) : 0;
+  const finished = activeTask ? ["done", "failed", "cancelled"].includes(activeTask.status) : false;
+
+  const command = useMemo(() => {
+    const parts = ["python3 agent/desktop_operator.py", once ? "--once" : "--watch"];
+    parts.push("--token", freshToken ?? "ВАШ_ТОКЕН");
+    parts.push("--provider", provider);
+    if (model.trim()) parts.push("--model", model.trim());
+    if (server.trim() && server.trim() !== "http://localhost:3000") parts.push("--server", server.trim());
+    if (dryRun) parts.push("--dry-run");
+    if (assumeYes) parts.push("--yes");
+    if (textOnly) parts.push("--text-only");
+    return parts.join(" ");
+  }, [once, freshToken, provider, model, server, dryRun, assumeYes, textOnly]);
+
+  const visibleTasks = useMemo(
+    () => tasks.filter((task) => statusFilterMatches(task.status, runFilter)),
+    [tasks, runFilter],
+  );
 
   return (
     <div className="space-y-3">
-      <div className="rounded-2xl border border-accent/30 bg-accent/5 p-3 text-[11px]">
-        <p className="flex items-center gap-1.5 text-xs font-semibold">
-          <MonitorCog size={14} className="text-accent2" /> Оператор рабочего стола
-        </p>
-        <p className="mt-1 text-muted">
-          Бот запускается на вашем компьютере, видит экран и выполняет задания: клики, ввод текста,
-          открытие сайтов и создание файлов (docx, xlsx, csv, md, html, svg, zip). Файлы, которые он
-          сделал, появляются здесь — скачиваются прямо из браузера.
-        </p>
-      </div>
-
-      <div className="rounded-2xl border border-border bg-card p-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <p className="text-xs font-semibold">1. Токен бота</p>
-          <span
-            className={cn(
-              "rounded-md px-1.5 py-0.5 text-[10px] font-medium",
-              tokenExists ? "bg-emerald-500/15 text-emerald-500" : "bg-amber-500/15 text-amber-500",
-            )}
-          >
-            {tokenExists === null ? "проверяю…" : tokenExists ? `создан ·${hint ?? ""}` : "не создан"}
-          </span>
-          <button
-            type="button"
-            onClick={() => void createToken()}
-            disabled={busy}
-            className="ml-auto flex items-center gap-1.5 rounded-lg border border-border bg-card2 px-2 py-1 text-[11px] font-medium transition hover:border-accent/60 disabled:opacity-50"
-          >
-            {busy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-            {tokenExists ? "Обновить токен" : "Создать токен"}
-          </button>
-        </div>
-
-        {freshToken && (
-          <div className="mt-2 rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-2">
-            <p className="text-[10px] text-muted">Токен показывается один раз — сохраните его в команде:</p>
-            <div className="mt-1 flex items-center gap-2">
-              <code className="min-w-0 flex-1 truncate rounded-lg bg-card2 px-2 py-1 text-[11px]">{freshToken}</code>
+      {/* Подвкладки оператора */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div
+          role="tablist"
+          aria-label="Разделы оператора"
+          className="flex gap-1 overflow-x-auto rounded-xl border border-border bg-card p-1"
+        >
+          {SUBTABS.map((item) => {
+            const Icon = item.icon;
+            const active = item.id === tab;
+            return (
               <button
+                key={item.id}
                 type="button"
-                onClick={() => void copyToken()}
-                className="flex items-center gap-1 rounded-lg border border-border bg-card px-2 py-1 text-[10px] transition hover:text-accent2"
+                role="tab"
+                aria-selected={active}
+                title={item.hint}
+                onClick={() => setTab(item.id)}
+                className={cn(
+                  "flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition",
+                  active ? "bg-accent/15 text-text ring-1 ring-accent/30" : "text-muted hover:bg-card2 hover:text-text",
+                )}
               >
-                <ClipboardCopy size={11} /> {copied ? "скопировано" : "копировать"}
+                <Icon size={13} />
+                {item.label}
               </button>
-            </div>
-          </div>
-        )}
-
-        <div className="mt-2 space-y-1.5">
-          <p className="flex items-center gap-1.5 text-[11px] text-muted">
-            <Terminal size={11} /> Запуск на компьютере:
-          </p>
-          <pre className="overflow-x-auto rounded-lg bg-card2 px-2 py-1.5 text-[11px]">pip install -r agent/requirements.txt</pre>
-          <pre className="overflow-x-auto rounded-lg bg-card2 px-2 py-1.5 text-[11px]">{runCommand}</pre>
-          <p className="text-[10px] text-muted">
-            Модель: локальная (<code>--provider local</code>) или облачная (<code>--provider openai</code>,
-            <code> openrouter</code>, <code>groq</code>, <code>deepseek</code>, <code>together</code>,
-            <code> mistral</code>) — ключ передаётся боту и в CRM не сохраняется.
-          </p>
+            );
+          })}
         </div>
-      </div>
-
-      <div className="rounded-2xl border border-border bg-card p-3">
-        <p className="text-xs font-semibold">2. Новое задание</p>
-        <textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          rows={2}
-          placeholder="Например: открой блокнот, напиши план на день и сохрани в файл plan.docx"
-          className="mt-2 max-h-32 min-h-16 w-full resize-y rounded-xl border border-border bg-card2 px-3 py-2 text-xs outline-none focus:border-accent focus:ring-2 focus:ring-[var(--ring)]"
-        />
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          <label className="flex items-center gap-1.5 text-[11px] text-muted">
-            Лимит шагов
-            <input
-              type="number"
-              min={1}
-              max={100}
-              value={maxSteps}
-              onChange={(e) => setMaxSteps(Math.min(100, Math.max(1, Number(e.target.value) || 15)))}
-              className="h-7 w-16 rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
-            />
-          </label>
+        <Badge className="border-border text-muted">
+          <Terminal size={11} /> desktop_operator.py
+        </Badge>
+        {tokenExists === false && (
           <button
             type="button"
-            onClick={() => void createTask()}
-            disabled={busy || prompt.trim().length === 0}
-            className="ml-auto flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[11px] font-medium text-white transition disabled:opacity-40"
+            onClick={() => setTab("setup")}
+            className="ml-auto flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] font-medium text-amber-500"
           >
-            {busy ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
-            В очередь
+            <KeyRound size={11} /> токен не создан
           </button>
-        </div>
-        {error && <p className="mt-1.5 text-[11px] text-red-500">{error}</p>}
+        )}
       </div>
 
-      <div className="rounded-2xl border border-border bg-card">
-        <p className="border-b border-border px-3 py-2 text-xs font-semibold">3. Задания и файлы</p>
-        {loading ? (
-          <p className="flex items-center gap-1.5 px-3 py-3 text-[11px] text-muted">
-            <Loader2 size={12} className="animate-spin" /> Загружаю…
-          </p>
-        ) : tasks.length === 0 ? (
-          <p className="px-3 py-3 text-[11px] text-muted">
-            Пока пусто. Создайте токен, запустите бота и поставьте первое задание.
-          </p>
-        ) : (
-          <div className="divide-y divide-border">
-            {tasks.map((task) => {
-              const status = STATUS[task.status] ?? STATUS.queued;
-              const open = openId === task.id;
-              return (
-                <div key={task.id}>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setOpenId(open ? null : task.id);
-                      setEvents([]);
-                    }}
-                    className="flex w-full items-start gap-2 px-3 py-2 text-left transition hover:bg-card2/60"
-                  >
-                    <span className="mt-0.5 text-[10px] text-muted">#{task.id}</span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-xs font-medium">{task.prompt}</span>
-                      <span className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10px] text-muted">
-                        <span className={cn("rounded px-1 py-0.5 font-medium", status.className)}>{status.label}</span>
-                        <span>
-                          шагов: {task.steps}/{task.maxSteps}
-                        </span>
-                        <span>{formatDateTime(task.createdAt)}</span>
-                      </span>
-                    </span>
-                    {(task.status === "queued" || task.status === "running") && (
-                      <span
-                        role="button"
-                        tabIndex={0}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void cancelTask(task.id);
-                        }}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            e.stopPropagation();
-                            void cancelTask(task.id);
-                          }
-                        }}
-                        className="rounded-md border border-border px-1.5 py-1 text-[10px] text-muted transition hover:text-red-500"
-                        title="Отменить задание"
-                      >
-                        <Square size={10} />
-                      </span>
-                    )}
-                  </button>
+      {/* Пульт */}
+      {tab === "desk" && (
+        <div className="space-y-3">
+          <div className="grid gap-2 grid-cols-2 lg:grid-cols-4">
+            <MetricCard label="В очереди" value={counts.queued} hint="ждёт бота" icon={<Inbox size={12} />} />
+            <MetricCard label="В работе" value={counts.running} hint="выполняется сейчас" icon={<Loader2 size={12} />} />
+            <MetricCard label="Готово" value={counts.done} hint="из последних запусков" icon={<Check size={12} />} />
+            <MetricCard label="Файлы" value={files.length} hint="в открытом запуске" icon={<FileText size={12} />} />
+          </div>
 
-                  {open && (
-                    <div className="space-y-1.5 bg-card2/40 px-3 py-2">
+          <Card
+            title="Что сделать на экране?"
+            subtitle="Опишите цель обычными словами — бот сам найдёт кнопки и поля"
+            action={
+              <Badge className="border-border text-muted">
+                <Sparkles size={11} /> шагов: до {maxSteps}
+              </Badge>
+            }
+          >
+            <Textarea
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value)}
+              rows={3}
+              maxLength={2000}
+              placeholder="Например: открой блокнот, напиши план на день и сохрани в файл plan.docx"
+            />
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {PRESETS.map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => setPrompt(preset)}
+                  className="max-w-full truncate rounded-lg border border-border bg-card2 px-2 py-1 text-[10px] text-muted transition hover:border-accent/50 hover:text-text"
+                >
+                  {preset}
+                </button>
+              ))}
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <label className="flex items-center gap-1.5 text-[11px] text-muted">
+                Лимит шагов
+                <Input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={maxSteps}
+                  onChange={(event) => setMaxSteps(Math.min(100, Math.max(1, Number(event.target.value) || 15)))}
+                  className="h-8 w-16 px-2 text-[11px]"
+                />
+              </label>
+              <Button
+                size="sm"
+                onClick={() => void createTask()}
+                disabled={busy || prompt.trim().length === 0}
+                className="ml-auto"
+              >
+                {busy ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
+                В очередь
+              </Button>
+            </div>
+            {error && <p className="mt-2 text-[11px] text-red-500">{error}</p>}
+          </Card>
+
+          {!activeTask ? (
+            <EmptyState
+              title="Запусков пока нет"
+              hint="Поставьте первое задание — бот заберёт его из очереди, как только вы его запустите."
+            />
+          ) : (
+            <div className="space-y-3">
+              <Card
+                title={
+                  <span className="flex flex-wrap items-center gap-2">
+                    Запуск #{activeTask.id}
+                    <StatusChip status={activeTask.status} />
+                    <span className="text-[10px] font-normal text-muted">
+                      {formatDateTime(activeTask.createdAt)}
+                    </span>
+                  </span>
+                }
+                subtitle={activeTask.prompt}
+                action={
+                  !finished ? (
+                    <Button size="sm" variant="danger" onClick={() => void cancelTask(activeTask.id)}>
+                      <Square size={12} /> Остановить
+                    </Button>
+                  ) : (
+                    <Badge className="border-border text-muted">
+                      <Check size={11} /> {activeTask.status === "done" ? "выполнено" : "завершено"}
+                    </Badge>
+                  )
+                }
+              >
+                <div className="flex items-center gap-2 text-[10px] text-muted">
+                  <span>
+                    шаг {activeTask.steps}/{activeTask.maxSteps}
+                  </span>
+                  <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-card2">
+                    <div
+                      className={cn(
+                        "h-full rounded-full transition-all",
+                        activeTask.status === "failed"
+                          ? "bg-red-500"
+                          : activeTask.status === "done"
+                            ? "bg-emerald-500"
+                            : "bg-accent",
+                      )}
+                      style={{ width: `${Math.max(progress, 2)}%` }}
+                    />
+                  </div>
+                  {activeTask.summary && <span className="truncate">{activeTask.summary}</span>}
+                </div>
+
+                {activeTask.status === "queued" && events.length === 0 && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-muted">
+                    <TriangleAlert size={13} className="text-amber-500" />
+                    Задание в очереди. Запустите бота с токеном —
+                    <button
+                      type="button"
+                      onClick={() => setTab("setup")}
+                      className="font-medium text-accent2 underline-offset-2 hover:underline"
+                    >
+                      команда запуска
+                    </button>
+                    .
+                  </div>
+                )}
+
+                <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)]">
+                  {/* Текущий шаг */}
+                  <div className="min-w-0 rounded-xl border border-border bg-card2/60 p-3">
+                    <p className="text-[10px] uppercase tracking-wide text-muted">Текущий шаг</p>
+                    {parsedAction ? (
+                      <div className="mt-2 space-y-2">
+                        <div className="flex items-start gap-2">
+                          <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-accent/30 bg-accent/10 text-accent2">
+                            <ActionGlyph type={parsedAction.type} size={14} />
+                          </span>
+                          <div className="min-w-0">
+                            <p className="text-xs font-medium leading-snug">{parsedAction.title}</p>
+                            {currentThought && (
+                              <p className="mt-1 line-clamp-3 text-[11px] leading-relaxed text-muted">{currentThought}</p>
+                            )}
+                          </div>
+                        </div>
+                        {currentAction?.text && currentAction.text !== parsedAction.title && (
+                          <p className="rounded-lg bg-card px-2 py-1.5 text-[11px] text-emerald-500">
+                            → {currentAction.text}
+                          </p>
+                        )}
+                        {parsedAction.json && (
+                          <details className="rounded-lg border border-border bg-card">
+                            <summary className="cursor-pointer px-2 py-1 text-[10px] text-muted">action.json</summary>
+                            <pre className="max-h-40 overflow-auto border-t border-border px-2 py-1.5 text-[10px] leading-relaxed text-muted">
+                              {parsedAction.json}
+                            </pre>
+                          </details>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="mt-2 text-[11px] leading-relaxed text-muted">
+                        {activeTask.status === "queued"
+                          ? "Бот ещё не забрал задание — шаги появятся здесь."
+                          : "Шагов пока нет."}
+                      </p>
+                    )}
+
+                    {files.length > 0 && (
+                      <div className="mt-3 space-y-1.5">
+                        <p className="text-[10px] uppercase tracking-wide text-muted">Файлы задания</p>
+                        {files.map((file) => (
+                          <AgentFileCard key={file.id} event={file} compact />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Лента шагов */}
+                  <div className="flex min-w-0 max-h-[420px] flex-col overflow-hidden rounded-xl border border-border bg-card2/40">
+                    <div className="flex items-center justify-between border-b border-border px-3 py-2">
+                      <p className="text-[10px] uppercase tracking-wide text-muted">Лента действий</p>
+                      <span className="text-[10px] text-muted">{events.length} записей</span>
+                    </div>
+                    <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto p-2">
                       {events.length === 0 ? (
-                        <p className="text-[11px] text-muted">
-                          Пока нет шагов. Если бот не запущен — скопируйте команду выше и запустите её.
+                        <p className="px-1 py-6 text-center text-[11px] text-muted">
+                          Здесь появятся мысль модели, действие и результат по каждому кадру.
                         </p>
                       ) : (
-                        events.map((event) => {
-                          const Icon = KIND_ICON[event.kind] ?? AlertTriangle;
-                          return (
-                            <div key={event.id} className="flex items-start gap-2 text-[11px]">
-                              <Icon
-                                size={12}
-                                className={cn(
-                                  "mt-0.5 shrink-0",
-                                  event.kind === "error"
-                                    ? "text-red-500"
-                                    : event.kind === "file"
-                                      ? "text-emerald-500"
-                                      : "text-muted",
-                                )}
-                              />
-                              <div className="min-w-0 flex-1">
-                                {event.kind === "file" && event.hasFile ? (
-                                  <a
-                                    href={`/api/agent/file/${event.id}`}
-                                    className="flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 font-medium text-emerald-500 transition hover:bg-emerald-500/20"
-                                  >
-                                    <FileText size={12} />
-                                    <span className="min-w-0 flex-1 truncate">{event.fileName}</span>
-                                    <span className="text-[10px] text-muted">{formatSize(event.fileSize)}</span>
-                                    <Download size={11} />
-                                  </a>
-                                ) : (
-                                  <p className={cn("whitespace-pre-wrap break-words", event.kind === "error" && "text-red-500")}>
-                                    {event.text || event.action}
-                                  </p>
-                                )}
-                                <p className="text-[9px] text-muted">{formatDateTime(event.createdAt)}</p>
-                              </div>
-                            </div>
-                          );
-                        })
+                        events.map((event) => (
+                          <EventRow key={event.id} event={event} />
+                        ))
                       )}
-                      {task.summary && <p className="text-[10px] text-muted">Итог: {task.summary}</p>}
-                      <div ref={bottomRef} />
                     </div>
-                  )}
+                  </div>
                 </div>
-              );
-            })}
-          </div>
+              </Card>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Запуски */}
+      {tab === "runs" && (
+        <Card
+          title="Запуски"
+          subtitle="Все задания бота — от новых к старым"
+          action={
+            <div className="flex flex-wrap gap-1">
+              {RUN_FILTERS.map((filter) => (
+                <button
+                  key={filter.id}
+                  type="button"
+                  onClick={() => setRunFilter(filter.id)}
+                  className={cn(
+                    "rounded-lg border px-2 py-1 text-[10px] transition",
+                    runFilter === filter.id
+                      ? "border-accent/40 bg-accent/15 text-text"
+                      : "border-border bg-card2 text-muted hover:text-text",
+                  )}
+                >
+                  {filter.label}
+                </button>
+              ))}
+            </div>
+          }
+        >
+          {visibleTasks.length === 0 ? (
+            <p className="py-6 text-center text-[11px] text-muted">Ничего не найдено под этот фильтр.</p>
+          ) : (
+            <div className="divide-y divide-border">
+              {visibleTasks.map((task) => (
+                <button
+                  key={task.id}
+                  type="button"
+                  onClick={() => {
+                    setSelectedId(task.id);
+                    setEvents([]);
+                    setTab("desk");
+                  }}
+                  className={cn(
+                    "flex w-full items-start gap-2 px-1 py-2 text-left transition hover:bg-card2/60",
+                    task.id === activeTask?.id && "bg-accent/5",
+                  )}
+                >
+                  <span className="mt-0.5 text-[10px] text-muted">#{task.id}</span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs font-medium">{task.prompt}</span>
+                    <span className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10px] text-muted">
+                      <StatusChip status={task.status} />
+                      <span>
+                        шагов {task.steps}/{task.maxSteps}
+                      </span>
+                      <span>{formatDateTime(task.createdAt)}</span>
+                      {task.summary && <span className="truncate">· {task.summary}</span>}
+                    </span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </Card>
+      )}
+
+      {/* Подключение */}
+      {tab === "setup" && (
+        <div className="space-y-3">
+          <Card
+            title="1. Токен бота"
+            subtitle="Один токен на аккаунт — по нему бот забирает свои задания"
+            action={
+              <Badge
+                className={cn(
+                  "border",
+                  tokenExists ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-500" : "border-amber-500/40 bg-amber-500/10 text-amber-500",
+                )}
+              >
+                <KeyRound size={11} />
+                {tokenExists === null ? "проверяю…" : tokenExists ? `создан ·${tokenHint ?? ""}` : "не создан"}
+              </Badge>
+            }
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <Button size="sm" variant={tokenExists ? "secondary" : "primary"} onClick={() => void createToken()} disabled={busy}>
+                {busy ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+                {tokenExists ? "Обновить токен" : "Создать токен"}
+              </Button>
+              <span className="text-[10px] text-muted">старый токен перестанет работать сразу</span>
+            </div>
+
+            {freshToken && (
+              <div className="mt-3 rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-2.5">
+                <p className="text-[10px] text-muted">Токен показывается один раз — сохраните его в команде из шага 3.</p>
+                <div className="mt-1.5 flex items-center gap-2">
+                  <code className="min-w-0 flex-1 truncate rounded-lg bg-card2 px-2 py-1.5 text-[11px]">{freshToken}</code>
+                  <Button size="sm" variant="ghost" onClick={() => void copy(freshToken, "token")}>
+                    {copied === "token" ? <Check size={12} /> : <ClipboardCopy size={12} />}
+                    {copied === "token" ? "скопировано" : "копировать"}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </Card>
+
+          <Card
+            title="2. Установка зависимостей"
+            subtitle="Нужны один раз: pyautogui делает скриншоты и клики, Pillow сжимает кадр"
+          >
+            <pre className="overflow-x-auto rounded-xl bg-card2 px-3 py-2 text-[11px]">
+              pip install -r agent/requirements.txt
+            </pre>
+            <p className="mt-2 text-[11px] text-muted">
+              Linux: дополнительно <code className="rounded bg-card2 px-1">sudo apt install python3-tk scrot</code>. macOS:
+              разрешите терминалу «Запись экрана» и «Универсальный доступ».
+            </p>
+          </Card>
+
+          <Card
+            title="3. Команда запуска"
+            subtitle="Соберите её под свою модель — локальную или облачную"
+          >
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="text-[11px] text-muted">
+                Провайдер
+                <select
+                  value={provider}
+                  onChange={(event) => setProvider(event.target.value)}
+                  className="mt-1 h-9 w-full rounded-xl border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
+                >
+                  {PROVIDERS.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-[11px] text-muted">
+                Модель (необязательно)
+                <Input
+                  value={model}
+                  onChange={(event) => setModel(event.target.value)}
+                  placeholder="например, qwen/qwen2.5-vl-72b-instruct"
+                  className="mt-1 h-9 text-[11px]"
+                />
+              </label>
+              <label className="text-[11px] text-muted">
+                Адрес CRM
+                <Input
+                  value={server}
+                  onChange={(event) => setServer(event.target.value)}
+                  placeholder="http://localhost:3000"
+                  className="mt-1 h-9 text-[11px]"
+                />
+              </label>
+              <div className="flex flex-wrap items-end gap-2 text-[11px] text-muted">
+                <FlagToggle label="один запуск" checked={once} onChange={setOnce} />
+                <FlagToggle label="только план" checked={dryRun} onChange={setDryRun} />
+                <FlagToggle label="без вопросов" checked={assumeYes} onChange={setAssumeYes} />
+                <FlagToggle label="без скриншотов" checked={textOnly} onChange={setTextOnly} />
+              </div>
+            </div>
+
+            <div className="mt-3 rounded-xl border border-border bg-card2 p-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted">
+                  <Terminal size={11} /> терминал
+                </span>
+                <Button size="sm" variant="ghost" onClick={() => void copy(command, "command")}>
+                  {copied === "command" ? <Check size={12} /> : <Copy size={12} />}
+                  {copied === "command" ? "скопировано" : "копировать"}
+                </Button>
+              </div>
+              <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-card px-2.5 py-2 text-[11px] leading-relaxed">
+                {command}
+              </pre>
+              {!freshToken && (
+                <p className="mt-1.5 text-[10px] text-amber-500">
+                  Сначала создайте токен в шаге 1 — в команде появится реальное значение.
+                </p>
+              )}
+            </div>
+
+            <p className="mt-2 text-[11px] text-muted">
+              Ключ облачного API передайте переменной окружения (<code className="rounded bg-card2 px-1">OPENROUTER_API_KEY</code>,
+              <code className="mx-1 rounded bg-card2 px-1">OPENAI_API_KEY</code> и т. п.) или флагом{" "}
+              <code className="rounded bg-card2 px-1">--api-key</code> — в CRM он не сохраняется.
+            </p>
+          </Card>
+
+          <Card title="4. Как это работает" subtitle="Коротко о том, что происходит дальше">
+            <ol className="space-y-1.5 text-[11px] text-muted">
+              <li className="flex gap-2">
+                <span className="font-semibold text-text">1.</span> Вы ставите задание на «Пульте» — оно попадает в очередь.
+              </li>
+              <li className="flex gap-2">
+                <span className="font-semibold text-text">2.</span> Бот забирает его по токену, делает скриншот и спрашивает модель.
+              </li>
+              <li className="flex gap-2">
+                <span className="font-semibold text-text">3.</span> Каждое действие (клик, ввод, файл) появляется в «Ленте действий».
+              </li>
+              <li className="flex gap-2">
+                <span className="font-semibold text-text">4.</span> Файлы, которые собрал бот, скачиваются прямо из карточки.
+              </li>
+            </ol>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <Button size="sm" variant="secondary" onClick={() => setTab("desk")}>
+                <Rocket size={13} /> К заданиям
+              </Button>
+              <span className="text-[10px] text-muted">
+                Аварийная остановка: уведите мышь в левый верхний угол экрана.
+              </span>
+            </div>
+          </Card>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* --------------------------- вспомогательные --------------------------- */
+
+/** Адрес из action.json — только для ссылки «открыть». */
+function urlFromAction(raw: string): string | null {
+  try {
+    const data = JSON.parse(raw) as { url?: unknown };
+    return typeof data.url === "string" ? data.url : null;
+  } catch {
+    return null;
+  }
+}
+
+function FlagToggle({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(!checked)}
+      aria-pressed={checked}
+      className={cn(
+        "flex items-center gap-1.5 rounded-lg border px-2 py-1.5 text-[10px] transition",
+        checked ? "border-accent/40 bg-accent/15 text-text" : "border-border bg-card2 text-muted hover:text-text",
+      )}
+    >
+      <span
+        className={cn(
+          "flex h-3 w-3 items-center justify-center rounded border",
+          checked ? "border-accent bg-accent text-white" : "border-border",
         )}
+      >
+        {checked && <Check size={8} />}
+      </span>
+      {label}
+    </button>
+  );
+}
+
+function EventRow({ event }: { event: OperatorEvent }) {
+  if (event.kind === "file") {
+    return (
+      <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-1.5">
+        <AgentFileCard event={event} compact />
+        <p className="mt-1 px-1 text-[9px] text-muted">{formatTime(event.createdAt)}</p>
+      </div>
+    );
+  }
+
+  const parsed = describeAction(event.action);
+  const iconType = parsed?.type ?? (event.kind === "error" ? "error" : "info");
+  const title =
+    parsed?.title ||
+    (event.kind === "thought"
+      ? "Мысль модели"
+      : event.kind === "error"
+        ? "Ошибка"
+        : event.kind === "info"
+          ? "Служебное сообщение"
+          : "Действие");
+
+  return (
+    <div className="rounded-lg border border-border bg-card px-2 py-1.5">
+      <div className="flex items-start gap-2">
+        <span
+          className={cn(
+            "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md",
+            event.kind === "error" ? "bg-red-500/10 text-red-500" : "bg-card2 text-muted",
+          )}
+        >
+          {event.kind === "thought" ? (
+            <Sparkles size={11} />
+          ) : event.kind === "error" ? (
+            <TriangleAlert size={11} />
+          ) : (
+            <ActionGlyph type={iconType} size={11} />
+          )}
+        </span>
+        <div className="min-w-0 flex-1">
+          {parsed && event.kind === "action" && (
+            <p className="text-[11px] font-medium leading-snug">{title}</p>
+          )}
+          {event.text && event.text !== title && (
+            <p
+              className={cn(
+                "text-[11px] leading-relaxed",
+                event.kind === "action" ? "text-emerald-500" : "text-muted",
+                event.kind !== "action" && !parsed && "line-clamp-4",
+              )}
+            >
+              {event.text}
+            </p>
+          )}
+          {parsed?.json && event.kind === "action" && (
+            <details className="mt-1">
+              <summary className="cursor-pointer text-[9px] text-muted">action.json</summary>
+              <pre className="mt-1 max-h-32 overflow-auto rounded bg-card2 px-1.5 py-1 text-[9px] leading-relaxed text-muted">
+                {parsed.json}
+              </pre>
+            </details>
+          )}
+          {event.kind === "action" && parsed?.type === "open_url" && urlFromAction(event.action) && (
+            <div className="mt-1">
+              <ActionLink url={urlFromAction(event.action)!} />
+            </div>
+          )}
+        </div>
+        <span className="shrink-0 text-[9px] text-muted">{formatTime(event.createdAt)}</span>
       </div>
     </div>
   );

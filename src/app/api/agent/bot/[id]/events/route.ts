@@ -19,15 +19,20 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   }
 
   const body = (await req.json().catch(() => null)) as
-    | { kind?: string; text?: string; action?: string; status?: string; summary?: string }
+    | { kind?: string; text?: string; action?: unknown; status?: string; summary?: string }
     | null;
+
+  // action обычно приходит готовой JSON-строкой, но объект тоже принимаем.
+  const action = body?.action;
+  const actionText =
+    typeof action === "string" ? action : action && typeof action === "object" ? JSON.stringify(action) : "";
 
   const kind = String(body?.kind ?? "info");
   await addAgentEvent({
     taskId: task.id,
     kind: KINDS.has(kind) ? kind : "info",
     text: String(body?.text ?? "").slice(0, 8000),
-    action: String(body?.action ?? "").slice(0, 4000),
+    action: actionText.slice(0, 4000),
   });
 
   if (kind === "action") await bumpAgentTaskStep(task.id);
