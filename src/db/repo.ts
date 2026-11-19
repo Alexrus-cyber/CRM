@@ -1367,7 +1367,20 @@ export async function addRagChunks(
   return { chunks: added, files, chars };
 }
 
-export type RagSearchHit = { path: string; text: string; score: number };
+export type RagSearchHit = { id: number; path: string; text: string; score: number };
+
+export type RagChunkRow = { id: number; path: string; text: string };
+
+/**
+ * Все фрагменты папки в документном порядке — для режима «вся база», где в
+ * контекст уходит не топ-N, а весь индекс (насколько позволяет контекст модели).
+ * `limit` — страховка от гигантских папок, а не смысловое ограничение.
+ */
+export async function listRagChunks(folderId: number, limit = 50_000): Promise<RagChunkRow[]> {
+  const rows = await q(sql`select id, path, text from ai_rag_chunks
+    where folder_id = ${folderId} order by path, chunk_index, id limit ${Math.max(1, Math.floor(limit))}`);
+  return rows.map((row) => ({ id: toNum(row.id), path: String(row.path), text: String(row.text) }));
+}
 
 /**
  * Поиск по папке: BM25-подобный счёт по обратному индексу.
@@ -1393,7 +1406,7 @@ export async function searchRagChunks(folderId: number, queryText: string, limit
     where t.folder_id = ${folderId} and t.term in (${termList})
     limit 4000`);
 
-  const scored = new Map<number, { path: string; text: string; score: number; terms: Set<string> }>();
+  const scored = new Map<number, { id: number; path: string; text: string; score: number; terms: Set<string> }>();
   for (const row of rows) {
     const chunkId = toNum(row.chunk_id);
     const term = String(row.term);
@@ -1406,14 +1419,20 @@ export async function searchRagChunks(folderId: number, queryText: string, limit
       current.score += weight;
       current.terms.add(term);
     } else {
-      scored.set(chunkId, { path: String(row.path), text: String(row.text), score: weight, terms: new Set([term]) });
+      scored.set(chunkId, {
+        id: chunkId,
+        path: String(row.path),
+        text: String(row.text),
+        score: weight,
+        terms: new Set([term]),
+      });
     }
   }
 
   return Array.from(scored.values())
     .sort((a, b) => b.score - a.score)
     .slice(0, Math.max(1, limit))
-    .map((hit) => ({ path: hit.path, text: hit.text, score: hit.score }));
+    .map((hit) => ({ id: hit.id, path: hit.path, text: hit.text, score: hit.score }));
 }
 
 /* --------------------------- export journal ------------------------ */

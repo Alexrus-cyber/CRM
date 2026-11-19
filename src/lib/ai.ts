@@ -100,6 +100,11 @@ export type AiParams = {
   sendThinkingFlag: boolean;
   /** Сколько фрагментов RAG подмешивать в контекст. */
   ragChunks: number;
+  /**
+   * «Вся база»: отправлять модели весь индекс папки, а не топ-N фрагментов.
+   * Объём упирается только в контекст модели (`contextLimit`).
+   */
+  ragFull: boolean;
   /** Контекст модели в токенах: 0 — не следить за ним. */
   contextLimit: number;
   /** Просить у сервера usage в потоке (stream_options.include_usage). */
@@ -116,6 +121,7 @@ export const AI_DEFAULT_PARAMS: AiParams = {
   thinkingBudget: null,
   sendThinkingFlag: true,
   ragChunks: 6,
+  ragFull: false,
   contextLimit: 8192,
   streamUsage: true,
 };
@@ -152,6 +158,7 @@ export function normalizeParams(raw: unknown): AiParams {
     thinkingBudget: num(source.thinkingBudget, 64, 65536),
     sendThinkingFlag: source.sendThinkingFlag !== false,
     ragChunks: num(source.ragChunks, 0, 50) ?? AI_DEFAULT_PARAMS.ragChunks,
+    ragFull: source.ragFull === true,
     contextLimit: num(source.contextLimit, 0, 1_000_000) ?? AI_DEFAULT_PARAMS.contextLimit,
     streamUsage: source.streamUsage !== false,
   };

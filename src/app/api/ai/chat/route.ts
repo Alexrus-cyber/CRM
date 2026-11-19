@@ -6,12 +6,13 @@ import {
   getAiUsage,
   getRagFolder,
   insertAiChatMessage,
+  listRagChunks,
   recordAiUsage,
   renameAiChat,
   searchRagChunks,
   type AiChatRow,
 } from "@/db/repo";
-import { formatRagContext } from "@/lib/rag";
+import { formatFullRagContext, formatRagContext, ragBudgetChars, type FullRagContext } from "@/lib/rag";
 import { aiPolicyFor, formatTokenCount, reasoningAllowed, type AiRolePolicy } from "@/lib/aiPolicy";
 import {
   AI_DEFAULT_BASE_URL,
@@ -29,8 +30,10 @@ export const runtime = "nodejs";
 
 /** Потолок на тело запроса: история + картинки в data-URL (сжимаем в браузере). */
 const MAX_BODY_BYTES = 48 * 1024 * 1024;
-/** Сколько символов RAG-контекста максимум подмешиваем (≈4–5k токенов). */
+/** Сколько символов RAG-контекста максимум подмешиваем в обычном режиме (≈4–5k токенов). */
 const MAX_RAG_CONTEXT_CHARS = 12_000;
+/** Сколько токенов оставляем модели на ответ в режиме «вся база». */
+const RAG_FULL_RESERVE_TOKENS = 1_024;
 /** Страховка от «зависшего» локального сервера. */
 const UPSTREAM_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -295,12 +298,46 @@ export async function POST(req: Request) {
   const userMessage = lastUserContent(messages);
 
   // RAG: если выбрана сохранённая папка, ищем фрагменты по запросу пользователя.
+  // В режиме «вся база» берём весь индекс и упираемся только в контекст модели.
   let ragHits = 0;
-  if (ragFolderId > 0 && params.ragChunks > 0 && !ragContext) {
+  let ragFull: (FullRagContext & { total: number; budgetChars: number; contextLimit: number }) | null = null;
+  if (ragFolderId > 0 && (params.ragFull || params.ragChunks > 0) && !ragContext) {
     const folder = await getRagFolder(me.id, ragFolderId);
     if (folder) {
       const query = ragQuery.trim() || lastUserText(messages);
-      if (query) {
+      if (params.ragFull) {
+        const chunks = await listRagChunks(ragFolderId);
+        if (chunks.length > 0) {
+          // Сначала самое релевантное вопросу, потом остальное в документном
+          // порядке: если контекст не резиновый, обрезка отрежет хвост, а не суть.
+          const relevant = query ? await searchRagChunks(ragFolderId, query, chunks.length) : [];
+          const seen = new Set<number>();
+          const ordered: Array<{ id: number; path: string; text: string; score: number }> = [];
+          for (const hit of relevant) {
+            if (seen.has(hit.id)) continue;
+            seen.add(hit.id);
+            ordered.push(hit);
+          }
+          for (const chunk of chunks) {
+            if (seen.has(chunk.id)) continue;
+            seen.add(chunk.id);
+            ordered.push({ ...chunk, score: 0 });
+          }
+
+          // Сколько уже занято: история без системного промпта + сам промпт.
+          const usedTokens =
+            estimatePromptTokens(messages.filter((message) => message.role !== "system")) +
+            (params.system.trim() ? estimateTokens(params.system) : 0);
+          const reserve = params.maxTokens ?? RAG_FULL_RESERVE_TOKENS;
+          const budgetChars = ragBudgetChars(params.contextLimit, usedTokens, reserve);
+          const packed = formatFullRagContext(ordered, budgetChars);
+          if (packed.used > 0) {
+            ragContext = packed.text;
+            ragHits = packed.used;
+            ragFull = { ...packed, total: ordered.length, budgetChars, contextLimit: params.contextLimit };
+          }
+        }
+      } else if (query) {
         const hits = await searchRagChunks(ragFolderId, query, params.ragChunks);
         if (hits.length > 0) {
           ragContext = formatRagContext(hits, MAX_RAG_CONTEXT_CHARS);
@@ -439,7 +476,9 @@ export async function POST(req: Request) {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta: text })}\n\n`));
         if (thinking) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ reasoning: thinking })}\n\n`));
         if (usage) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ usage: summary.usage })}\n\n`));
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true, ragHits, ...summary })}\n\n`));
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ done: true, ragHits, ragFull, ...summary })}\n\n`),
+        );
         controller.close();
       },
     });
@@ -497,7 +536,7 @@ export async function POST(req: Request) {
           }
         }
         recorded = true;
-        push({ done: true, ragHits, ...(await finishTurn(answer, thinking, usage)) });
+        push({ done: true, ragHits, ragFull, ...(await finishTurn(answer, thinking, usage)) });
       } catch (error) {
         push({ error: error instanceof Error ? error.message : "Поток прерван" });
         if (!recorded) {

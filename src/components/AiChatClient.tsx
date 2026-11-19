@@ -47,7 +47,7 @@ import {
   type ReasoningMode,
 } from "@/lib/ai";
 import { extractFile, imageToDataUrl } from "@/lib/fileExtract";
-import { snippet, splitIntoChunks } from "@/lib/rag";
+import { RAG_CHARS_PER_TOKEN, snippet, splitIntoChunks } from "@/lib/rag";
 import { formatTokenCount, type AiRolePolicy } from "@/lib/aiPolicy";
 import { useStoredJson, useStoredNumber } from "@/lib/useStoredValue";
 import type { Role } from "@/db/schema";
@@ -69,6 +69,8 @@ type Bubble = {
   at: number;
   error?: boolean;
   ragHits?: number;
+  /** Режим «вся база»: сколько фрагментов вошло и сколько всего было. */
+  ragFull?: RagFullStats | null;
   usage?: Usage;
 };
 
@@ -94,6 +96,15 @@ type RagFolder = {
 };
 
 type RagHit = { path: string; text: string; score: number };
+
+type RagFullStats = {
+  used: number;
+  total: number;
+  chars: number;
+  truncated: boolean;
+  budgetChars: number;
+  contextLimit: number;
+};
 
 type ChatInfo = {
   id: number;
@@ -876,6 +887,7 @@ export function AiChatClient({ userName }: { userName: string }) {
     let thinking = "";
     let turnUsage: Usage | null = null;
     let ragHits = 0;
+    let ragFull: RagFullStats | null = null;
 
     const promptEstimate = estimateMessagesTokens(contextRef.current) + (params.system ? estimateTokens(params.system) : 0);
 
@@ -929,6 +941,7 @@ export function AiChatClient({ userName }: { userName: string }) {
             reasoning?: string;
             usage?: { prompt: number; completion: number; total: number; estimated?: boolean };
             ragHits?: number;
+            ragFull?: RagFullStats | null;
             done?: boolean;
             error?: string;
             chat?: ChatInfo | null;
@@ -936,6 +949,7 @@ export function AiChatClient({ userName }: { userName: string }) {
           };
           if (data.error) throw new Error(data.error);
           if (typeof data.ragHits === "number") ragHits = data.ragHits;
+          if (data.ragFull) ragFull = data.ragFull;
           if (data.usage) {
             turnUsage = {
               prompt: data.usage.prompt,
@@ -978,13 +992,15 @@ export function AiChatClient({ userName }: { userName: string }) {
       }
 
       // Сервер не прислал usage — считаем сами и помечаем как оценку.
+      // Оценка промпта учитывает и RAG-контекст: в режиме «вся база» он весит больше всего.
+      const ragPromptTokens = ragFull ? Math.round(ragFull.chars / RAG_CHARS_PER_TOKEN) : 0;
       const finalUsage: Usage = turnUsage ?? {
-        prompt: promptEstimate,
+        prompt: promptEstimate + ragPromptTokens,
         completion: estimateTokens(accumulated),
-        total: promptEstimate + estimateTokens(accumulated),
+        total: promptEstimate + ragPromptTokens + estimateTokens(accumulated),
         estimated: true,
       };
-      patch({ usage: finalUsage, ragHits });
+      patch({ usage: finalUsage, ragHits, ragFull });
       // Следующий запрос пойдёт с промптом ≈ (промпт + ответ) этого хода.
       setContextTokens(finalUsage.total);
       void reloadChats();
@@ -1458,9 +1474,23 @@ export function AiChatClient({ userName }: { userName: string }) {
                     max={50}
                     step={1}
                     value={params.ragChunks}
+                    disabled={params.ragFull}
                     onChange={(event) => updateParams({ ragChunks: Math.max(0, Math.floor(Number(event.target.value) || 0)) })}
-                    className="h-9 text-xs"
+                    className="h-9 text-xs disabled:opacity-50"
                   />
+                  <label className="mt-1.5 flex items-start gap-2 text-[11px] text-muted">
+                    <input
+                      type="checkbox"
+                      checked={params.ragFull}
+                      onChange={(event) => updateParams({ ragFull: event.target.checked })}
+                      className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[#7c5cff]"
+                    />
+                    <span>
+                      Вся база: отдавать модели <b>весь индекс</b> папки, без ограничения фрагментов. Объём упрётся
+                      только в контекст модели ({params.contextLimit > 0 ? `${params.contextLimit} токенов` : "не отслеживается"}) —
+                      остальное честно отбрасывается с пометкой в ответе.
+                    </span>
+                  </label>
                 </Field>
                 <label className="col-span-2 flex items-start gap-2 text-[11px] text-muted">
                   <input
@@ -1618,8 +1648,19 @@ export function AiChatClient({ userName }: { userName: string }) {
                   </div>
                 )}
                 <p className="text-[11px] text-muted">
-                  На каждый вопрос из базы достаются до {params.ragChunks} фрагментов (~900 символов каждый). Индекс
-                  хранится в базе за вашим пользователем, поэтому ограничения на размер папки нет.
+                  {params.ragFull ? (
+                    <>
+                      В контекст уходит <b>весь индекс папки</b> (~{Math.round(activeFolder?.chars ? activeFolder.chars / 1000 : 0)} тыс.
+                      символов, {activeFolder?.chunksCount ?? 0} фрагментов). Если весь текст не влезает в контекст модели,
+                      бот отдаст самое релевантное вопросу и скажет, сколько фрагментов вошло.
+                    </>
+                  ) : (
+                    <>
+                      На каждый вопрос из базы достаются до {params.ragChunks} фрагментов (~900 символов каждый). Включите
+                      «Вся база», чтобы отдавать весь индекс без ограничения фрагментов.
+                    </>
+                  )}{" "}
+                  Индекс хранится в базе за вашим пользователем, поэтому ограничения на размер папки нет.
                 </p>
               </>
             )}
@@ -1748,9 +1789,20 @@ export function AiChatClient({ userName }: { userName: string }) {
                       )}
                       <div className={cn("mt-1 flex items-center justify-end gap-1.5 text-[10px]", mine ? "text-white/70" : "text-muted/80")}>
                         {!mine && (bubble.ragHits ?? 0) > 0 && (
-                          <span className="flex items-center gap-0.5" title="Фрагментов RAG в контексте">
+                          <span
+                            className={cn("flex items-center gap-0.5", bubble.ragFull?.truncated && "text-amber-500")}
+                            title={
+                              bubble.ragFull
+                                ? `Вся база: ${bubble.ragFull.used} из ${bubble.ragFull.total} фрагментов ` +
+                                  `(${Math.round(bubble.ragFull.chars / 1024)} КБ). ` +
+                                  (bubble.ragFull.truncated
+                                    ? `Не влезло в контекст модели${bubble.ragFull.contextLimit > 0 ? ` (${bubble.ragFull.contextLimit} токенов)` : ""} — отдано самое релевантное.`
+                                    : "Весь индекс отправлен модели.")
+                                : "Фрагментов RAG в контексте"
+                            }
+                          >
                             <FolderOpen size={10} />
-                            {bubble.ragHits}
+                            {bubble.ragFull ? `${bubble.ragFull.used}/${bubble.ragFull.total}` : bubble.ragHits}
                           </span>
                         )}
                         {bubble.usage && (
