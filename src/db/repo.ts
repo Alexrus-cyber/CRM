@@ -870,6 +870,198 @@ export async function deleteTaskMessage(id: number): Promise<void> {
   await q(sql`delete from task_messages where id = ${id}`);
 }
 
+/* ---------------------- агент-оператор рабочего стола --------------- */
+
+export type AgentTaskRow = {
+  id: number;
+  userId: number;
+  prompt: string;
+  status: string;
+  maxSteps: number;
+  steps: number;
+  summary: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AgentEventRow = {
+  id: number;
+  taskId: number;
+  kind: string;
+  text: string;
+  action: string;
+  fileName: string;
+  fileMime: string;
+  fileSize: number;
+  hasFile: boolean;
+  createdAt: string;
+};
+
+function mapAgentTask(r: Raw): AgentTaskRow {
+  return {
+    id: toNum(r.id),
+    userId: toNum(r.user_id),
+    prompt: String(r.prompt ?? ""),
+    status: String(r.status ?? "queued"),
+    maxSteps: toNum(r.max_steps),
+    steps: toNum(r.steps),
+    summary: String(r.summary ?? ""),
+    createdAt: toIso(r.created_at) ?? nowIso(),
+    updatedAt: toIso(r.updated_at) ?? nowIso(),
+  };
+}
+
+export async function getAgentToken(userId: number): Promise<string | null> {
+  const row = await q1(sql`select token from agent_tokens where user_id = ${userId} limit 1`);
+  return row ? String(row.token) : null;
+}
+
+export async function saveAgentToken(userId: number, token: string): Promise<void> {
+  const existing = await q1<{ id: number }>(sql`select id from agent_tokens where user_id = ${userId} limit 1`);
+  if (existing) {
+    await q(sql`update agent_tokens set token = ${token} where user_id = ${userId}`);
+    return;
+  }
+  await q(sql`insert into agent_tokens (user_id, token, created_at) values (${userId}, ${token}, ${nowIso()})`);
+}
+
+/** Владелец токена — по нему бот получает доступ к своим задачам. */
+export async function findAgentTokenOwner(token: string): Promise<number | null> {
+  if (!token) return null;
+  const row = await q1(sql`select user_id from agent_tokens where token = ${token} limit 1`);
+  return row ? toNum(row.user_id) : null;
+}
+
+export async function createAgentTask(userId: number, prompt: string, maxSteps: number): Promise<AgentTaskRow> {
+  const now = nowIso();
+  const row = await q1<{ id: number }>(sql`
+    insert into agent_tasks (user_id, prompt, status, max_steps, steps, summary, created_at, updated_at)
+    values (${userId}, ${prompt}, 'queued', ${maxSteps}, 0, '', ${now}, ${now}) returning id`);
+  const id = toNum(row?.id);
+  return {
+    id,
+    userId,
+    prompt,
+    status: "queued",
+    maxSteps,
+    steps: 0,
+    summary: "",
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export async function listAgentTasks(userId: number, limit = 12): Promise<AgentTaskRow[]> {
+  const rows = await q(sql`
+    select id, user_id, prompt, status, max_steps, steps, summary, created_at, updated_at
+    from agent_tasks where user_id = ${userId} order by id desc limit ${limit}`);
+  return rows.map(mapAgentTask);
+}
+
+export async function getAgentTask(userId: number, id: number): Promise<AgentTaskRow | null> {
+  const row = await q1(sql`
+    select id, user_id, prompt, status, max_steps, steps, summary, created_at, updated_at
+    from agent_tasks where id = ${id} and user_id = ${userId} limit 1`);
+  return row ? mapAgentTask(row) : null;
+}
+
+/** Задача глазами бота: без привязки к пользователю, доступ уже проверен токеном. */
+export async function getAgentTaskForBot(id: number, userId: number): Promise<AgentTaskRow | null> {
+  return getAgentTask(userId, id);
+}
+
+/**
+ * Забрать следующее задание из очереди. Статус меняем условным `update`,
+ * чтобы два запущенных бота не взяли одну и ту же задачу.
+ */
+export async function claimAgentTask(userId: number): Promise<AgentTaskRow | null> {
+  const row = await q1<{ id: number }>(sql`
+    select id from agent_tasks where user_id = ${userId} and status = 'queued' order by id asc limit 1`);
+  if (!row) return null;
+  const id = toNum(row.id);
+  const now = nowIso();
+  const taken = await q1<{ id: number }>(sql`
+    update agent_tasks set status = 'running', updated_at = ${now}
+    where id = ${id} and status = 'queued' returning id`);
+  if (!taken) return null;
+  return getAgentTask(userId, id);
+}
+
+export async function setAgentTaskStatus(
+  id: number,
+  userId: number,
+  status: string,
+  summary?: string,
+): Promise<void> {
+  const now = nowIso();
+  if (summary === undefined) {
+    await q(sql`update agent_tasks set status = ${status}, updated_at = ${now} where id = ${id} and user_id = ${userId}`);
+    return;
+  }
+  await q(sql`
+    update agent_tasks set status = ${status}, summary = ${summary}, updated_at = ${now}
+    where id = ${id} and user_id = ${userId}`);
+}
+
+export async function bumpAgentTaskStep(id: number): Promise<void> {
+  await q(sql`update agent_tasks set steps = steps + 1, updated_at = ${nowIso()} where id = ${id}`);
+}
+
+export async function addAgentEvent(input: {
+  taskId: number;
+  kind: string;
+  text?: string;
+  action?: string;
+  fileName?: string;
+  fileMime?: string;
+  fileSize?: number;
+  fileData?: string;
+}): Promise<number> {
+  const row = await q1<{ id: number }>(sql`
+    insert into agent_events (task_id, kind, text, action, file_name, file_mime, file_size, file_data, created_at)
+    values (${input.taskId}, ${input.kind}, ${input.text ?? ""}, ${input.action ?? ""},
+            ${input.fileName ?? ""}, ${input.fileMime ?? ""}, ${input.fileSize ?? 0}, ${input.fileData ?? ""},
+            ${nowIso()}) returning id`);
+  return toNum(row?.id);
+}
+
+/** События задачи без base64-данных файлов — их отдаём отдельным маршрутом. */
+export async function listAgentEvents(taskId: number, limit = 200): Promise<AgentEventRow[]> {
+  const rows = await q(sql`
+    select id, task_id, kind, text, action, file_name, file_mime, file_size, created_at,
+      case when file_data = '' then 0 else 1 end as has_file
+    from agent_events where task_id = ${taskId} order by id asc limit ${limit}`);
+  return rows.map((r) => ({
+    id: toNum(r.id),
+    taskId: toNum(r.task_id),
+    kind: String(r.kind ?? "info"),
+    text: String(r.text ?? ""),
+    action: String(r.action ?? ""),
+    fileName: String(r.file_name ?? ""),
+    fileMime: String(r.file_mime ?? ""),
+    fileSize: toNum(r.file_size),
+    hasFile: toNum(r.has_file) === 1,
+    createdAt: toIso(r.created_at) ?? nowIso(),
+  }));
+}
+
+export async function getAgentEventFile(
+  eventId: number,
+): Promise<{ name: string; mime: string; data: string; userId: number; taskId: number } | null> {
+  const row = await q1(sql`
+    select e.file_name, e.file_mime, e.file_data, t.user_id, e.task_id
+    from agent_events e join agent_tasks t on t.id = e.task_id
+    where e.id = ${eventId} and e.file_data <> '' limit 1`);
+  if (!row) return null;
+  return {
+    name: String(row.file_name ?? "файл"),
+    mime: String(row.file_mime ?? "application/octet-stream"),
+    data: String(row.file_data ?? ""),
+    userId: toNum(row.user_id),
+    taskId: toNum(row.task_id),
+  };
+}
+
 /* --------------------------- чаты с ИИ и токены --------------------- */
 
 export type AiChatRow = {

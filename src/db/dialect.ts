@@ -119,6 +119,37 @@ const PG_DDL = [
     created_at timestamptz not null default now()
   )`,
   `create index if not exists task_messages_task_idx on task_messages (task_id, id)`,
+  `create table if not exists agent_tokens (
+    id serial primary key,
+    user_id integer not null unique references users(id) on delete cascade,
+    token text not null unique,
+    created_at timestamptz not null default now()
+  )`,
+  `create table if not exists agent_tasks (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    prompt text not null,
+    status text not null default 'queued',
+    max_steps integer not null default 15,
+    steps integer not null default 0,
+    summary text not null default '',
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`,
+  `create index if not exists agent_tasks_status_idx on agent_tasks (status, id)`,
+  `create table if not exists agent_events (
+    id serial primary key,
+    task_id integer not null references agent_tasks(id) on delete cascade,
+    kind text not null,
+    text text not null default '',
+    action text not null default '',
+    file_name text not null default '',
+    file_mime text not null default '',
+    file_size integer not null default 0,
+    file_data text not null default '',
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists agent_events_task_idx on agent_events (task_id, id)`,
   `create table if not exists chat_reads (
     id serial primary key,
     user_id integer not null references users(id) on delete cascade,
@@ -297,6 +328,37 @@ const SQLITE_DDL = [
     created_at text not null
   )`,
   `create index if not exists task_messages_task_idx on task_messages (task_id, id)`,
+  `create table if not exists agent_tokens (
+    id integer primary key autoincrement,
+    user_id integer not null unique references users(id) on delete cascade,
+    token text not null unique,
+    created_at text not null
+  )`,
+  `create table if not exists agent_tasks (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    prompt text not null,
+    status text not null default 'queued',
+    max_steps integer not null default 15,
+    steps integer not null default 0,
+    summary text not null default '',
+    created_at text not null,
+    updated_at text not null
+  )`,
+  `create index if not exists agent_tasks_status_idx on agent_tasks (status, id)`,
+  `create table if not exists agent_events (
+    id integer primary key autoincrement,
+    task_id integer not null references agent_tasks(id) on delete cascade,
+    kind text not null,
+    text text not null default '',
+    action text not null default '',
+    file_name text not null default '',
+    file_mime text not null default '',
+    file_size integer not null default 0,
+    file_data text not null default '',
+    created_at text not null
+  )`,
+  `create index if not exists agent_events_task_idx on agent_events (task_id, id)`,
   `create table if not exists chat_reads (
     id integer primary key autoincrement,
     user_id integer not null references users(id) on delete cascade,

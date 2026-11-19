@@ -22,3 +22,6 @@ data/
 agent/workspace/
 __pycache__/
 *.pyc
+
+# локальные файлы агента-оператора
+agent/files/
