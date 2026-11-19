@@ -25,3 +25,8 @@ __pycache__/
 
 # локальные файлы агента-оператора
 agent/files/
+
+# PyInstaller
+dist/
+build/
+launcher/wheels/
