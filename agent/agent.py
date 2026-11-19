@@ -18,16 +18,18 @@
     AGENT_MODEL       модель                         (берётся из запроса)
     AGENT_API_KEY     ключ, если сервер его требует
     AGENT_WORKSPACE   папка для файлов агента        (./agent/workspace)
-    AGENT_MAX_STEPS   сколько шагов «модель → инструмент» разрешено (6)
+    AGENT_MAX_STEPS   сколько шагов «модель → инструмент» разрешено (500);
+                      интерфейс может попросить меньше через maxSteps
     AGENT_TIMEOUT     таймаут одного запроса к модели, сек (180)
 
 Протокол (SSE, каждое событие — одна строка `data: {...}`):
     event: status  {"text": "..."}                     — что делает агент
     event: action  {"type":"open_url","url":...,"label":...}
     event: action  {"type":"file","name":...,"mime":...,"size":...,"data":<base64>}
+    event: reasoning {"text": "..."}                   — размышления модели
     event: text    {"text": "..."}                     — ответ модели
     event: error   {"error": "..."}
-    event: done    {"steps": N, "files": N, "actions": N}
+    event: done    {"steps": N, "files": N, "actions": N, "maxSteps": N}
 """
 
 from __future__ import annotations
@@ -52,7 +54,8 @@ PORT = int(os.environ.get("AGENT_PORT", "8899"))
 BASE_URL = os.environ.get("AGENT_BASE_URL", "http://127.0.0.1:8888/v1").rstrip("/")
 MODEL = os.environ.get("AGENT_MODEL", "")
 API_KEY = os.environ.get("AGENT_API_KEY", "")
-MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "6"))
+MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "500"))
+MAX_STEPS_LIMIT = 500
 TIMEOUT = int(os.environ.get("AGENT_TIMEOUT", "180"))
 
 WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", Path(__file__).resolve().parent / "workspace"))
@@ -250,12 +253,61 @@ def chat_url(base_url: str) -> str:
     return base + ("/chat/completions" if base.endswith("/v1") else "/v1/chat/completions")
 
 
+def apply_generation(payload: Dict[str, Any], params: Dict[str, Any]) -> None:
+    """Раздумья и генерация из интерфейса — те же поля, что у «Чата с моделью».
+
+    Передаём только заданное: строгие сборки отвечают 400 на незнакомые поля.
+    """
+    if not isinstance(params, dict):
+        return
+
+    def number(key: str) -> Optional[float]:
+        raw = params.get(key)
+        if raw is None or raw == "":
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    temperature = number("temperature")
+    if temperature is not None:
+        payload["temperature"] = max(0.0, min(2.0, temperature))
+    top_p = number("topP")
+    if top_p is not None:
+        payload["top_p"] = max(0.0, min(1.0, top_p))
+    max_tokens = number("maxTokens")
+    if max_tokens is not None:
+        payload["max_tokens"] = int(max_tokens)
+    seed = params.get("seed")
+    if isinstance(seed, (int, float)):
+        payload["seed"] = int(seed)
+
+    reasoning = str(params.get("reasoning") or "default")
+    if reasoning not in ("default", "off", "low", "medium", "high", "budget"):
+        reasoning = "default"
+    if reasoning == "default":
+        return
+    if reasoning == "off":
+        payload["reasoning_effort"] = "none"
+    elif reasoning == "budget":
+        budget = number("thinkingBudget")
+        if budget:
+            payload["thinking_budget"] = int(budget)
+        payload["reasoning_effort"] = "high"
+    else:
+        payload["reasoning_effort"] = reasoning
+    if params.get("sendThinkingFlag", True):
+        payload["chat_template_kwargs"] = {"enable_thinking": reasoning != "off"}
+
+
 def call_model(
     base_url: str,
     api_key: str,
     model: str,
     messages: List[Dict[str, Any]],
     use_tools: bool,
+    params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "model": model or MODEL,
@@ -263,6 +315,7 @@ def call_model(
         "temperature": 0.3,
         "stream": False,
     }
+    apply_generation(payload, params or {})
     if use_tools:
         payload["tools"] = TOOLS
         payload["tool_choice"] = "auto"
@@ -421,6 +474,12 @@ class Handler(BaseHTTPRequestHandler):
         api_key = str(settings.get("apiKey") or API_KEY)
         model = str(settings.get("model") or MODEL)
         context = body.get("context") or {}
+        params = body.get("params") or {}
+        try:
+            steps_limit = int(body.get("maxSteps") or MAX_STEPS)
+        except (TypeError, ValueError):
+            steps_limit = MAX_STEPS
+        steps_limit = max(1, min(MAX_STEPS_LIMIT, steps_limit))
 
         incoming = body.get("messages") or []
         if not isinstance(incoming, list) or not incoming:
@@ -441,7 +500,9 @@ class Handler(BaseHTTPRequestHandler):
                 system += "\n\nКонтекст CRM:\n" + "\n".join(f"- {line}" for line in facts)
 
         # Вложения приходят текстом: браузер уже распознал docx/xlsx/pdf.
+        # Картинки — data-URL: их увидит vision-модель.
         attachment_block = ""
+        images: List[Dict[str, Any]] = []
         attachments = body.get("attachments") or []
         if isinstance(attachments, list) and attachments:
             blocks = []
@@ -452,7 +513,12 @@ class Handler(BaseHTTPRequestHandler):
                 note = str(item.get("note") or "").strip()
                 text = str(item.get("text") or "").strip()[:MAX_ATTACHMENT_CHARS]
                 header = "--- {} ---".format(name + (" · " + note if note else ""))
-                blocks.append(header + "\n" + (text or "[содержимое недоступно]"))
+                image = item.get("image")
+                has_image = isinstance(image, str) and image.startswith("data:image/") and len(images) < 3
+                if has_image:
+                    images.append({"type": "image_url", "image_url": {"url": image}})
+                placeholder = "[картинка приложена ниже]" if has_image else "[содержимое недоступно]"
+                blocks.append(header + "\n" + (text or placeholder))
             if blocks:
                 attachment_block = ("\n\nФайлы от пользователя (текст распознан в браузере):\n"
                                     + "\n\n".join(blocks))
@@ -463,28 +529,49 @@ class Handler(BaseHTTPRequestHandler):
             content = str(item.get("content") or "")[:8000]
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
-        if attachment_block:
+        if attachment_block or images:
             # Прикладываем файлы к последнему сообщению пользователя.
             for message in reversed(messages):
                 if message["role"] == "user":
-                    message["content"] = message["content"] + attachment_block
+                    text_content = message["content"] + attachment_block
+                    message["content"] = (
+                        [{"type": "text", "text": text_content}, *images] if images else text_content
+                    )
                     break
+
+        def strip_images() -> None:
+            """Модель без зрения: оставляем только текст, картинки убираем."""
+            for item in messages:
+                content = item.get("content")
+                if isinstance(content, list):
+                    item["content"] = "\n".join(
+                        part.get("text", "") for part in content if part.get("type") == "text"
+                    )
 
         use_tools = True
         steps = 0
         files = 0
         actions = 0
         final_text = ""
+        thinking = ""
 
-        while steps < MAX_STEPS:
+        while steps < steps_limit:
             steps += 1
             self.write(sse({"text": "Думаю…" if steps == 1 else f"Шаг {steps}: уточняю план…"}, "status"))
 
             try:
-                data = call_model(base_url, api_key, model, messages, use_tools)
+                data = call_model(base_url, api_key, model, messages, use_tools, params)
             except AgentError as error:
+                detail = str(error).lower()
+                # Модель текстовая: картинку она не принимает — читаем только текст.
+                if images and ("image" in detail or "vision" in detail or "modality" in detail):
+                    log("модель не принимает картинки — читаю только текст вложений")
+                    self.write(sse({"text": "Модель не принимает картинки — читаю текст файла"}, "status"))
+                    strip_images()
+                    images = []
+                    continue
                 # Сервер не умеет function calling — переходим на JSON-протокол.
-                if use_tools and ("tools" in str(error).lower() or "400" in str(error)):
+                if use_tools and ("tools" in detail or "400" in detail):
                     log("function calling недоступен, включаю JSON-протокол")
                     use_tools = False
                     messages[0]["content"] = SYSTEM_PROMPT + TEXT_PROTOCOL_NOTE
@@ -496,6 +583,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise AgentError("Модель вернула пустой ответ")
             message = choices[0].get("message") or {}
             content = str(message.get("content") or "")
+            reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "").strip()
+            if reasoning:
+                thinking += ("\n\n" if thinking else "") + reasoning
+                self.write(sse({"text": thinking}, "reasoning"))
             tool_calls = message.get("tool_calls") or []
 
             if not tool_calls:
@@ -570,7 +661,8 @@ class Handler(BaseHTTPRequestHandler):
             final_text = "Сделал максимум шагов. Уточните задачу, если нужно продолжение."
 
         self.write(sse({"text": final_text}, "text"))
-        self.write(sse({"steps": steps, "files": files, "actions": actions}, "done"))
+        self.write(sse({"steps": steps, "files": files, "actions": actions,
+                        "maxSteps": steps_limit}, "done"))
 
 
 class Server(ThreadingHTTPServer):

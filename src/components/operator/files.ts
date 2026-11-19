@@ -1,6 +1,7 @@
 "use client";
 
-import { extractFile } from "@/lib/fileExtract";
+import { extractFile, imageToDataUrl } from "@/lib/fileExtract";
+import { isImageMime } from "@/lib/ai";
 
 /** Вложение задания оператора: текст для модели + байты для бота. */
 export type OperatorAttachment = {
@@ -13,6 +14,8 @@ export type OperatorAttachment = {
   note: string;
   /** base64 без префикса — для отправки вместе с заданием боту. */
   data: string;
+  /** Картинка как data-URL: vision-модель увидит её, а не только имя. */
+  image?: string;
 };
 
 /** Ограничения совпадают с сервером: 5 файлов по 10 МБ. */
@@ -37,19 +40,43 @@ export function formatFileSize(bytes: number): string {
   return `${Math.round(bytes / 104857.6) / 10} МБ`;
 }
 
-/** Читает файл один раз: текст для модели и base64 для задания. */
+/**
+ * Читает файл один раз: текст для модели и base64 для задания.
+ *
+ * Ошибка распознавания не должна мешать прикрепить файл: если разбор не
+ * удался, вложение всё равно добавляется — с пометкой «содержимое не
+ * читается». Так «прикрепить» работает для любого типа и размера в пределах
+ * лимита, а не только для тех, что умеет `extractFile`.
+ */
 export async function readOperatorFile(file: File): Promise<OperatorAttachment> {
   if (file.size > OPERATOR_MAX_FILE_BYTES) {
     throw new Error(`«${file.name}» больше 10 МБ — такие файлы бот не принимает`);
   }
-  const [extracted, data] = await Promise.all([extractFile(file), readBase64(file)]);
+  const data = await readBase64(file);
+  let text = "";
+  let note = "содержимое не читается";
+  let image: string | undefined;
+  try {
+    if (isImageMime(file.type) || /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name)) {
+      const compressed = await imageToDataUrl(file);
+      image = compressed.dataUrl;
+      note = `изображение · ${compressed.note} · vision-модель увидит картинку`;
+    } else {
+      const extracted = await extractFile(file);
+      text = extracted.text;
+      note = extracted.note;
+    }
+  } catch (error) {
+    note = `не удалось распознать: ${error instanceof Error ? error.message : "неизвестная ошибка"}`.slice(0, 160);
+  }
   return {
     name: file.name || "файл",
     mime: file.type || "application/octet-stream",
     size: file.size,
-    text: extracted.text,
-    note: extracted.note,
+    text,
+    note,
     data,
+    ...(image ? { image } : {}),
   };
 }
 

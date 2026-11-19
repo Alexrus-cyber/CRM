@@ -26,6 +26,9 @@ import {
 } from "lucide-react";
 import { Badge, Button, Card, EmptyState, Input, Textarea } from "@/components/ui";
 import { cn, formatDateTime, formatTime } from "@/lib/utils";
+import { useStoredJson, useStoredNumber } from "@/lib/useStoredValue";
+import { GenSettings } from "./GenSettings";
+import { AGENT_MAX_STEPS, GEN_DEFAULT_PARAMS, normalizeGenParams, type GenParams } from "@/lib/genParams";
 import {
   OPERATOR_PROVIDERS,
   buildCommandWithKey,
@@ -108,6 +111,13 @@ export function OperatorPanel() {
   const [prompt, setPrompt] = useState("");
   const [taskFiles, setTaskFiles] = useState<OperatorAttachment[]>([]);
   const [maxSteps, setMaxSteps] = useState(15);
+  // Раздумья и генерация: общие для планировщика и команды запуска бота.
+  const [genParams, setGenParams] = useStoredJson<GenParams>(
+    "crm.ai.operator.params.v1",
+    GEN_DEFAULT_PARAMS,
+    normalizeGenParams,
+  );
+  const [verifyActions, setVerifyActions] = useStoredNumber("crm.ai.operator.verify.v1", 1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
@@ -401,8 +411,23 @@ export function OperatorPanel() {
       dryRun,
       assumeYes,
       textOnly,
+      gen: genParams,
+      verifyActions: verifyActions !== 0,
     }),
-    [provider, effectiveToken, model, server, apiKey, keyMode, once, dryRun, assumeYes, textOnly],
+    [
+      provider,
+      effectiveToken,
+      model,
+      server,
+      apiKey,
+      keyMode,
+      once,
+      dryRun,
+      assumeYes,
+      textOnly,
+      genParams,
+      verifyActions,
+    ],
   );
   const command = useMemo(() => buildOperatorCommand(commandOptions), [commandOptions]);
   const commandToCopy = useMemo(() => buildCommandWithKey(commandOptions), [commandOptions]);
@@ -468,10 +493,37 @@ export function OperatorPanel() {
             <MetricCard label="Файлы" value={files.length} hint="в открытом запуске" icon={<FileText size={12} />} />
           </div>
 
+          <GenSettings
+            value={genParams}
+            onChange={setGenParams}
+            subtitle="Раздумья модели и параметры генерации. Действуют и на планировщик, и на команду запуска бота."
+          >
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="flex items-start gap-2 text-[11px] text-muted">
+                <input
+                  type="checkbox"
+                  checked={verifyActions !== 0}
+                  onChange={(event) => setVerifyActions(event.target.checked ? 1 : 0)}
+                  className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[#7c5cff]"
+                />
+                <span>
+                  Анализировать экран <strong className="font-medium text-text">после каждого действия</strong>:
+                  бот делает скриншот и спрашивает модель, получилось ли. Надёжнее, но на один запрос к модели больше.
+                </span>
+              </label>
+              <p className="text-[10px] leading-relaxed text-muted">
+                Настройки попадают в команду запуска флагами{" "}
+                <code className="font-mono">--temperature</code>, <code className="font-mono">--reasoning</code> и
+                другими: скопируйте её заново в «Подключении». Ключ API в CRM не сохраняется.
+              </p>
+            </div>
+          </GenSettings>
+
           {/* Два чата: сначала план, потом действия на компьютере */}
           <div className="grid gap-3 lg:grid-cols-2">
             <PlannerChat
               providerLabel={providerMeta.label}
+              params={genParams}
               baseUrl={providerBaseUrl(provider)}
               model={model.trim() || providerMeta.defaultModel}
               apiKey={apiKey.trim()}
@@ -543,9 +595,11 @@ export function OperatorPanel() {
                   <Input
                     type="number"
                     min={1}
-                    max={100}
+                    max={AGENT_MAX_STEPS}
                     value={maxSteps}
-                    onChange={(event) => setMaxSteps(Math.min(100, Math.max(1, Number(event.target.value) || 15)))}
+                    onChange={(event) =>
+                      setMaxSteps(Math.min(AGENT_MAX_STEPS, Math.max(1, Number(event.target.value) || 15)))
+                    }
                     className="h-8 w-16 px-2 text-[11px]"
                   />
                 </label>
@@ -1130,6 +1184,7 @@ function EventRow({ event }: { event: OperatorEvent }) {
   }
 
   const parsed = describeAction(event.action);
+  const checkPassed = event.kind === "result" && event.text.startsWith("✅");
   const iconType = parsed?.type ?? (event.kind === "error" ? "error" : "info");
   const title =
     parsed?.title ||
@@ -1137,9 +1192,11 @@ function EventRow({ event }: { event: OperatorEvent }) {
       ? "Мысль модели"
       : event.kind === "error"
         ? "Ошибка"
-        : event.kind === "info"
-          ? "Служебное сообщение"
-          : "Действие");
+        : event.kind === "result"
+          ? checkPassed ? "Проверка: получилось" : "Проверка: результат под вопросом"
+          : event.kind === "info"
+            ? "Служебное сообщение"
+            : "Действие");
 
   return (
     <div className="rounded-lg border border-border bg-card px-2 py-1.5">
@@ -1147,21 +1204,36 @@ function EventRow({ event }: { event: OperatorEvent }) {
         <span
           className={cn(
             "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md",
-            event.kind === "error" ? "bg-red-500/10 text-red-500" : "bg-card2 text-muted",
+            event.kind === "error"
+              ? "bg-red-500/10 text-red-500"
+              : event.kind === "result"
+                ? checkPassed
+                  ? "bg-emerald-500/10 text-emerald-500"
+                  : "bg-amber-500/10 text-amber-500"
+                : "bg-card2 text-muted",
           )}
         >
           {event.kind === "thought" ? (
             <Sparkles size={11} />
           ) : event.kind === "error" ? (
             <TriangleAlert size={11} />
+          ) : event.kind === "result" ? (
+            checkPassed ? <Check size={11} /> : <TriangleAlert size={11} />
           ) : (
             <ActionGlyph type={iconType} size={11} />
           )}
         </span>
         <div className="min-w-0 flex-1">
-          {parsed && event.kind === "action" && (
-            <p className="text-[11px] font-medium leading-snug">{title}</p>
-          )}
+          {(parsed && event.kind === "action") || event.kind === "result" ? (
+            <p
+              className={cn(
+                "text-[11px] font-medium leading-snug",
+                event.kind === "result" && (checkPassed ? "text-emerald-500" : "text-amber-500"),
+              )}
+            >
+              {title}
+            </p>
+          ) : null}
           {event.text && event.text !== title && (
             <p
               className={cn(

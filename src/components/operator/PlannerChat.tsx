@@ -5,6 +5,7 @@ import { ArrowRight, Loader2, Paperclip, Send, Sparkles, TriangleAlert, X } from
 import { Badge, Button, Card, Textarea } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import { formatFileSize, readOperatorFiles, type OperatorAttachment } from "./files";
+import type { GenParams } from "@/lib/genParams";
 
 /**
  * Первый чат на «Пульте»: планировщик.
@@ -19,6 +20,7 @@ export type PlanMessage = {
   role: "user" | "assistant";
   text: string;
   files: Array<{ name: string; size: number }>;
+  reasoning?: string;
 };
 
 type Props = {
@@ -26,11 +28,12 @@ type Props = {
   model: string;
   apiKey: string;
   providerLabel: string;
+  params: GenParams;
   onTransfer: (prompt: string, files: OperatorAttachment[]) => Promise<void>;
   onOpenSetup: () => void;
 };
 
-export function PlannerChat({ baseUrl, model, apiKey, providerLabel, onTransfer, onOpenSetup }: Props) {
+export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onTransfer, onOpenSetup }: Props) {
   const [messages, setMessages] = useState<PlanMessage[]>([]);
   const [text, setText] = useState("");
   const [files, setFiles] = useState<OperatorAttachment[]>([]);
@@ -74,15 +77,22 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, onTransfer,
         body: JSON.stringify({
           messages: history.map((message) => ({ role: message.role, content: message.text })),
           files: files.map((file) => ({ name: file.name, text: file.text, note: file.note })),
-          settings: { baseUrl, apiKey, model },
+          settings: { baseUrl, apiKey, model, params },
         }),
       });
-      const data = (await res.json().catch(() => ({}))) as { reply?: string; error?: string };
+      const data = (await res.json().catch(() => ({}))) as {
+        reply?: string;
+        reasoning?: string;
+        error?: string;
+      };
       if (!res.ok || !data.reply) {
         setError(data.error ?? "Планировщик не ответил");
         return;
       }
-      setMessages((prev) => [...prev, { id: nextId(), role: "assistant", text: data.reply!, files: [] }]);
+      setMessages((prev) => [
+        ...prev,
+        { id: nextId(), role: "assistant", text: data.reply!, files: [], reasoning: data.reasoning },
+      ]);
     } catch {
       setError("CRM не отвечает — проверьте соединение");
     } finally {
@@ -175,6 +185,16 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, onTransfer,
                   ))}
                 </p>
               )}
+              {message.reasoning && message.reasoning.trim() && (
+                <details className="mt-1 rounded-lg border border-border bg-card2 px-1.5 py-1 text-[10px]">
+                  <summary className="cursor-pointer text-muted">
+                    Размышления · {message.reasoning.length} симв.
+                  </summary>
+                  <p className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap break-words text-muted">
+                    {message.reasoning}
+                  </p>
+                </details>
+              )}
               {message.role === "assistant" && (
                 <div className="mt-1.5 flex justify-end">
                   <Button
@@ -225,7 +245,7 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, onTransfer,
           ref={fileRef}
           type="file"
           multiple
-          hidden
+          className="sr-only"
           onChange={(event) => {
             void attach(event.target.files);
             event.target.value = "";

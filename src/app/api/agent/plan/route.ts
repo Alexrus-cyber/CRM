@@ -1,5 +1,6 @@
 import { getCurrentUser } from "@/lib/auth";
 import { normalizeBaseUrl } from "@/lib/ai";
+import { applyGenParams, normalizeGenParams } from "@/lib/genParams";
 
 /**
  * Планировщик оператора: `POST /api/agent/plan`.
@@ -55,7 +56,7 @@ export async function POST(req: Request) {
     | {
         messages?: Array<{ role?: string; content?: string }>;
         files?: IncomingFile[];
-        settings?: { baseUrl?: string; apiKey?: string; model?: string };
+        settings?: { baseUrl?: string; apiKey?: string; model?: string; params?: unknown };
       }
     | null;
 
@@ -96,13 +97,16 @@ export async function POST(req: Request) {
     }
   }
 
-  const payload = {
+  const payload: Record<string, unknown> = {
     model,
     messages: [{ role: "system", content: PLAN_PROMPT }, ...messages],
     temperature: 0.3,
     max_tokens: 1200,
     stream: false,
   };
+  // Настройки «Раздумья и генерация» с вкладки «Оператор»: значения из
+  // интерфейса важнее дефолтов, иначе планировщик думает иначе, чем бот.
+  applyGenParams(payload, normalizeGenParams(body?.settings?.params));
 
   try {
     const res = await fetch(`${baseUrl}/chat/completions`, {
@@ -125,11 +129,13 @@ export async function POST(req: Request) {
       return Response.json({ error: `${hint} HTTP ${res.status}: ${raw.slice(0, 300)}` }, { status: 502 });
     }
     const data = JSON.parse(raw) as {
-      choices?: Array<{ message?: { content?: unknown } }>;
+      choices?: Array<{ message?: { content?: unknown; reasoning_content?: unknown; reasoning?: unknown } }>;
     };
-    const reply = String(data.choices?.[0]?.message?.content ?? "").trim();
+    const message = data.choices?.[0]?.message ?? {};
+    const reply = String(message.content ?? "").trim();
+    const reasoning = String(message.reasoning_content ?? message.reasoning ?? "").trim();
     if (!reply) return Response.json({ error: "Модель вернула пустой ответ" }, { status: 502 });
-    return Response.json({ reply });
+    return Response.json({ reply, ...(reasoning ? { reasoning } : {}) });
   } catch (error) {
     const message = error instanceof Error ? error.message : "нет связи";
     return Response.json({ error: `Не удалось связаться с моделью: ${message}` }, { status: 502 });

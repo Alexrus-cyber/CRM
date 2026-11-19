@@ -1,5 +1,6 @@
 import { addAgentEvent, createAgentTask, listAgentTasks } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
+import { AGENT_MAX_STEPS } from "@/lib/genParams";
 
 /** Очередь заданий для бота-оператора рабочего стола. */
 export const dynamic = "force-dynamic";
@@ -49,7 +50,7 @@ export async function POST(req: Request) {
     files.push({ name, mime, data, size: bytes.length });
   }
 
-  const maxSteps = Math.min(Math.max(Number(body?.maxSteps ?? 15) || 15, 1), 100);
+  const maxSteps = Math.min(Math.max(Number(body?.maxSteps ?? 15) || 15, 1), AGENT_MAX_STEPS);
   const task = await createAgentTask(me.id, prompt, maxSteps);
 
   for (const file of files) {

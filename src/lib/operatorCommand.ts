@@ -132,6 +132,8 @@ export function keyEnvName(providerId: string): string {
   return findProvider(providerId).keyEnv;
 }
 
+import { genParamsFlags, type GenParams } from "./genParams";
+
 export type CommandOptions = {
   provider: string;
   token?: string;
@@ -144,6 +146,10 @@ export type CommandOptions = {
   dryRun?: boolean;
   assumeYes?: boolean;
   textOnly?: boolean;
+  /** Раздумья и генерация с вкладки «Оператор» — передаются боту флагами. */
+  gen?: GenParams;
+  /** Проверять результат после каждого действия (по умолчанию да). */
+  verifyActions?: boolean;
 };
 
 /** Команда запуска бота — ровно те флаги, которые понимает скрипт. */
@@ -161,6 +167,9 @@ export function buildOperatorCommand(options: CommandOptions): string {
 
   const key = (options.apiKey ?? "").trim();
   if (key && options.keyMode !== "env") parts.push("--api-key", key);
+
+  if (options.gen) parts.push(...genParamsFlags(options.gen));
+  if (options.verifyActions === false) parts.push("--no-verify-actions");
 
   if (options.dryRun) parts.push("--dry-run");
   if (options.assumeYes) parts.push("--yes");
