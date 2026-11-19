@@ -18,6 +18,7 @@ import os
 import runpy
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -166,6 +167,55 @@ def self_test() -> int:
     check("папка агентов найдена", bundle.agents_dir().is_dir())
     check("скрипт оператора на месте", (bundle.agents_dir() / "desktop_operator.py").is_file())
     check("скрипт агента на месте", (bundle.agents_dir() / "agent.py").is_file())
+    child_env = bundle.child_env({"AGENT_MODEL": "m"})
+    check("агент получает свою временную папку",
+          child_env.get("TEMP") == str(bundle.runtime_temp_dir())
+          and child_env.get("TMP") == child_env.get("TEMP")
+          and child_env.get("AGENT_MODEL") == "m")
+    info = bundle.runtime_info()
+    check("среда запуска описана", info["режим"] == "исходники" and info["запись во временную папку"] == "ок")
+    check("однофайловый режим в исходниках не определяется", bundle.is_onefile() is False)
+    check("подсказка про код -1 говорит про onedir/tmpdir",
+          "onedir" in runner.exit_hint(-1) and "tmpdir" in runner.exit_hint(4294967295))
+    check("для успешного кода подсказки нет", runner.exit_hint(0) == "")
+
+    # Проверяем ветку «однофайловая сборка → дочерний процесс переиспользует runtime».
+    had_meipass = getattr(sys, "_MEIPASS", None)
+    original_onefile = bundle.is_onefile
+    try:
+        bundle.is_onefile = lambda: True  # type: ignore[assignment]
+        sys._MEIPASS = str(bundle.agents_dir())  # type: ignore[attr-defined]
+        reuse = bundle.child_env({})
+        plain = bundle.child_env({}, reuse_runtime=False)
+        check("onefile: дочерний процесс переиспользует распакованный runtime",
+              reuse.get("_PYI_APPLICATION_HOME_DIR") == str(bundle.agents_dir())
+              and reuse.get("_PYI_PARENT_PROCESS_LEVEL") == "1"
+              and reuse.get("_PYI_ARCHIVE_FILE") == sys.executable)
+        check("onefile: вторая попытка запуска не навязывает _PYI_*",
+              "_PYI_APPLICATION_HOME_DIR" not in plain)
+    finally:
+        bundle.is_onefile = original_onefile  # type: ignore[assignment]
+        if had_meipass is None:
+            try:
+                delattr(sys, "_MEIPASS")
+            except AttributeError:
+                pass
+        else:
+            sys._MEIPASS = had_meipass  # type: ignore[attr-defined]
+
+    build = __import__("launcher.build_exe", fromlist=["build_parser"]).build_parser()
+    check("сборка по умолчанию — папкой", build.parse_args([]).onefile is False)
+    check("флаг --onefile и --tmpdir разбираются",
+          build.parse_args(["--onefile", "--tmpdir", "D:/tmp"]).onefile is True
+          and build.parse_args(["--tmpdir", "D:/tmp"]).tmpdir == "D:/tmp")
+
+    failing = runner.AgentRun(agent_id="t", command=[sys.executable, "-c", "raise SystemExit(3)"],
+                              cwd=Path("."), env={})
+    failing.start()
+    deadline = time.time() + 30
+    while failing.is_running() and time.time() < deadline:
+        time.sleep(0.05)
+    check("код завершения процесса запоминается", failing.exit_code == 3)
     check("префикс запуска содержит --run-agent",
           "--run-agent" in bundle.run_agent_args(Path("x.py"), ["--watch"]))
 

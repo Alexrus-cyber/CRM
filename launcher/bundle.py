@@ -11,12 +11,26 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Mapping, Tuple
 
 
 def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
+
+
+def is_onefile() -> bool:
+    """Однофайловая сборка: runtime распакован во временную папку `_MEIxxxx`."""
+    if not is_frozen():
+        return False
+    meipass = getattr(sys, "_MEIPASS", "")
+    if not meipass:
+        return False
+    try:
+        return Path(meipass).resolve().parent != Path(sys.executable).resolve().parent
+    except OSError:
+        return True
 
 
 def bundle_root() -> Path:
@@ -57,6 +71,86 @@ def run_agent_args(script: Path, args: List[str]) -> List[str]:
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+# --------------------------------------------------------------------------
+# среда запуска агента
+# --------------------------------------------------------------------------
+
+def runtime_temp_dir() -> Path:
+    """Своя папка для временных файлов: TEMP пользователя может быть недоступен."""
+    from launcher import settings as settings_mod
+
+    return settings_mod.config_dir() / "tmp"
+
+
+def prepare_temp_dir() -> Tuple[Path, str]:
+    """Готовит временную папку и проверяет, что в неё можно писать.
+
+    Возвращает (папка, пустая строка при успехе | текст ошибки).
+    """
+    candidate = runtime_temp_dir()
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / "write-probe.tmp"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return candidate, ""
+    except OSError as error:
+        try:
+            fallback = Path(tempfile.gettempdir())
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback, f"своя папка недоступна ({error}), использую {fallback}"
+        except OSError as inner:
+            return candidate, f"нет доступа ни к {candidate}, ни к {fallback}: {inner}"
+
+
+def child_env(extra: Mapping[str, str] | None = None, reuse_runtime: bool = True) -> Dict[str, str]:
+    """Окружение дочернего процесса агента.
+
+    Две вещи, без которых однофайловая сборка ломается:
+
+    * `TEMP`/`TMP`/`TMPDIR` — своя writable-папка. Если системный TEMP закрыт
+      политикой, антивирусом или переполнен, bootloader пишет
+      «Could not create temporary directory!» и агент умирает с кодом -1.
+    * `_PYI_APPLICATION_HOME_DIR` и `_PYI_PARENT_PROCESS_LEVEL` — подсказка
+      bootloader'у, что мы запускаем *свою же* программу: тогда дочерний процесс
+      переиспользует уже распакованный runtime и НЕ пытается распаковываться
+      заново (именно эта повторная распаковка и падала).
+    """
+    env: Dict[str, str] = dict(os.environ)
+    for key, value in (extra or {}).items():
+        if value is None:
+            continue
+        env[str(key)] = str(value)
+
+    temp_dir, _problem = prepare_temp_dir()
+    for key in ("TMP", "TEMP", "TMPDIR"):
+        env[key] = str(temp_dir)
+
+    meipass = getattr(sys, "_MEIPASS", "")
+    if reuse_runtime and is_onefile() and meipass and Path(meipass).is_dir():
+        env.setdefault("_PYI_APPLICATION_HOME_DIR", meipass)
+        env.setdefault("_PYI_PARENT_PROCESS_LEVEL", "1")
+        env.setdefault("_PYI_ARCHIVE_FILE", sys.executable)
+    return env
+
+
+def runtime_info() -> Dict[str, str]:
+    """Сводка о среде запуска — для «Проверить окружение» и диагностики."""
+    temp_dir, problem = prepare_temp_dir()
+    meipass = str(getattr(sys, "_MEIPASS", ""))
+    return {
+        "режим": "исходники" if not is_frozen() else ("onefile" if is_onefile() else "onedir"),
+        "исполняемый файл": sys.executable,
+        "_MEIPASS": meipass or "—",
+        "_MEIPASS существует": "да" if meipass and Path(meipass).is_dir() else "нет",
+        "временная папка агента": str(temp_dir),
+        "запись во временную папку": "ок" if not problem else problem,
+        "TEMP системы": os.environ.get("TEMP") or os.environ.get("TMP") or "—",
+        "_PYI_APPLICATION_HOME_DIR": os.environ.get("_PYI_APPLICATION_HOME_DIR", "—"),
+        "_PYI_PARENT_PROCESS_LEVEL": os.environ.get("_PYI_PARENT_PROCESS_LEVEL", "—"),
+    }
 
 
 def open_folder(path: Path) -> None:
