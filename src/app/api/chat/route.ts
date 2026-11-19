@@ -9,6 +9,7 @@ import {
   userExists,
 } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
+import { publishChatMessage } from "@/lib/events";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -104,6 +105,16 @@ export async function POST(req: Request) {
       data: buffer.toString("base64"),
     });
   }
+
+  // Всплывающее уведомление у получателя (общий чат — у всех, кроме автора).
+  publishChatMessage({
+    messageId: id,
+    senderId: me.id,
+    senderName: me.name,
+    senderColor: me.avatarColor,
+    recipientId,
+    preview: (content || (file ? `Вложение: ${file.name}` : "Новое сообщение")).slice(0, 160),
+  });
 
   return Response.json({ ok: true, id });
 }

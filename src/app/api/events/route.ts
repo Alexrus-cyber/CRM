@@ -55,6 +55,13 @@ export async function GET(req: Request) {
       send(": connected\n\n");
 
       unsubscribe = subscribeLiveEvents((event) => {
+        // Личные сообщения уходят только адресату: чужие тексты в браузер
+        // другого сотрудника попадать не должны.
+        if (event.scope === "chat" && event.chat) {
+          const chat = event.chat;
+          if (chat.senderId === user.id) return;
+          if (chat.recipientId !== null && chat.recipientId !== user.id) return;
+        }
         send(`event: update\ndata: ${JSON.stringify(event)}\n\n`);
       });
 

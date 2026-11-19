@@ -42,6 +42,8 @@ export type TaskRow = {
   counterpartyName: string | null;
   counterpartyInn: string | null;
   counterpartyKpp: string | null;
+  /** Сколько сообщений в быстрой переписке по задаче. */
+  messagesCount: number;
 };
 
 export type CounterpartyRow = {
@@ -134,7 +136,8 @@ const TASK_SELECT = sql`t.id, t.title, t.description, t.assignee_id, t.author_id
   t.deadline, t.deadline_time, t.accepted_at, t.hours, t.status, t.priority, t.completed_at, t.closed_at, t.created_at, t.updated_at,
   a.name as assignee_name, a.avatar_color as assignee_color, a.avatar_url as assignee_avatar,
   au.name as author_name, au.avatar_color as author_color, au.avatar_url as author_avatar,
-  c.name as counterparty_name, c.inn as counterparty_inn, c.kpp as counterparty_kpp`;
+  c.name as counterparty_name, c.inn as counterparty_inn, c.kpp as counterparty_kpp,
+  (select count(*) from task_messages tm where tm.task_id = t.id) as messages_count`;
 
 const TASK_FROM = sql`from tasks t
   join users a on a.id = t.assignee_id
@@ -168,6 +171,7 @@ function mapTask(r: Raw): TaskRow {
     counterpartyName: (r.counterparty_name as string | null) ?? null,
     counterpartyInn: (r.counterparty_inn as string | null) ?? null,
     counterpartyKpp: (r.counterparty_kpp as string | null) ?? null,
+    messagesCount: toNum(r.messages_count),
   };
 }
 
@@ -760,6 +764,110 @@ export async function searchMessages(
       and (m.content_lower like ${needle} or a.name_lower like ${needle})
     order by m.id desc limit ${limit}`);
   return rows.map(mapMessage).reverse();
+}
+
+/** Верхняя граница id сообщений — точка отсчёта для уведомлений. */
+export async function maxMessageId(): Promise<number> {
+  const row = await q1<{ id: number | null }>(sql`select max(id) as id from messages`);
+  return row ? toNum(row.id) : 0;
+}
+
+export type ChatNotificationRow = {
+  id: number;
+  senderId: number;
+  senderName: string;
+  senderColor: string;
+  recipientId: number | null;
+  preview: string;
+  createdAt: string;
+};
+
+/**
+ * Новые сообщения, адресованные мне (личные и общий чат), начиная с `afterId`.
+ * Используется всплывающими уведомлениями: сами сообщения читает чат, а здесь
+ * нужен только короткий текст-превью.
+ */
+export async function listNewMessagesFor(meId: number, afterId: number, limit = 5): Promise<ChatNotificationRow[]> {
+  const rows = await q(sql`
+    select m.id, m.sender_id, m.recipient_id, m.content, m.created_at,
+      u.name as sender_name, u.avatar_color as sender_color,
+      a.name as attachment_name
+    from messages m
+    join users u on u.id = m.sender_id
+    left join message_attachments a on a.message_id = m.id
+    where m.id > ${afterId}
+      and m.sender_id <> ${meId}
+      and (m.recipient_id is null or m.recipient_id = ${meId})
+    order by m.id asc
+    limit ${limit}`);
+  return rows.map((r) => {
+    const text = String(r.content ?? "").replace(/\s+/g, " ").trim();
+    const attachment = r.attachment_name ? String(r.attachment_name) : "";
+    const preview = text || (attachment ? `Вложение: ${attachment}` : "Новое сообщение");
+    return {
+      id: toNum(r.id),
+      senderId: toNum(r.sender_id),
+      senderName: String(r.sender_name ?? ""),
+      senderColor: String(r.sender_color ?? "#7c5cff"),
+      recipientId: r.recipient_id === null || r.recipient_id === undefined ? null : toNum(r.recipient_id),
+      preview: preview.length > 160 ? `${preview.slice(0, 160)}…` : preview,
+      createdAt: toIso(r.created_at) ?? nowIso(),
+    };
+  });
+}
+
+/* ----------------------- переписка по задаче ------------------------ */
+
+export type TaskMessageRow = {
+  id: number;
+  taskId: number;
+  authorId: number;
+  authorName: string;
+  authorColor: string;
+  authorAvatar: string | null;
+  content: string;
+  createdAt: string;
+};
+
+/** Сколько сообщений допускается в одной переписке по задаче. */
+export const TASK_MESSAGE_MAX = 2000;
+
+export async function listTaskMessages(taskId: number, limit = 300): Promise<TaskMessageRow[]> {
+  const rows = await q(sql`
+    select m.id, m.task_id, m.author_id, m.content, m.created_at,
+      u.name as author_name, u.avatar_color as author_color, u.avatar_url as author_avatar
+    from task_messages m
+    join users u on u.id = m.author_id
+    where m.task_id = ${taskId}
+    order by m.id asc
+    limit ${limit}`);
+  return rows.map((r) => ({
+    id: toNum(r.id),
+    taskId: toNum(r.task_id),
+    authorId: toNum(r.author_id),
+    authorName: String(r.author_name ?? ""),
+    authorColor: String(r.author_color ?? "#7c5cff"),
+    authorAvatar: (r.author_avatar as string | null) ?? null,
+    content: String(r.content ?? ""),
+    createdAt: toIso(r.created_at) ?? nowIso(),
+  }));
+}
+
+export async function insertTaskMessage(taskId: number, authorId: number, content: string): Promise<number> {
+  const row = await q1<{ id: number }>(sql`
+    insert into task_messages (task_id, author_id, content, content_lower, created_at)
+    values (${taskId}, ${authorId}, ${content}, ${content.toLowerCase()}, ${nowIso()}) returning id`);
+  return toNum(row?.id);
+}
+
+export async function getTaskMessageAuthor(id: number): Promise<{ id: number; taskId: number; authorId: number } | null> {
+  const row = await q1(sql`select id, task_id, author_id from task_messages where id = ${id} limit 1`);
+  if (!row) return null;
+  return { id: toNum(row.id), taskId: toNum(row.task_id), authorId: toNum(row.author_id) };
+}
+
+export async function deleteTaskMessage(id: number): Promise<void> {
+  await q(sql`delete from task_messages where id = ${id}`);
 }
 
 /* --------------------------- чаты с ИИ и токены --------------------- */

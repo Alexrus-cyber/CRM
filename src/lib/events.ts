@@ -15,13 +15,29 @@
  * подписчиков.
  */
 
-export type LiveScope = "tasks" | "counterparties" | "users";
+export type LiveScope = "tasks" | "counterparties" | "users" | "chat";
+
+/**
+ * Данные нового сообщения чата — из них клиент собирает всплывающее
+ * уведомление. Для личных сообщений событие уходит только получателю
+ * (фильтр в `/api/events`), общий чат видят все.
+ */
+export type ChatEventPayload = {
+  messageId: number;
+  senderId: number;
+  senderName: string;
+  senderColor: string;
+  recipientId: number | null;
+  preview: string;
+};
 
 export type LiveEvent = {
   scope: LiveScope;
   /** Кто изменил данные — клиенту это не обязательно, но удобно для отладки. */
   actorId?: number;
   at: number;
+  /** Заполняется только для `scope: "chat"`. */
+  chat?: ChatEventPayload;
 };
 
 type Listener = (event: LiveEvent) => void;
@@ -35,9 +51,7 @@ function listeners(): Set<Listener> {
   return globalForEvents.__crmLiveListeners;
 }
 
-/** Сообщить всем открытым вкладкам, что сущность изменилась. */
-export function publishLiveEvent(scope: LiveScope, actorId?: number): void {
-  const event: LiveEvent = { scope, actorId, at: Date.now() };
+function emit(event: LiveEvent): void {
   for (const listener of listeners()) {
     try {
       listener(event);
@@ -45,6 +59,16 @@ export function publishLiveEvent(scope: LiveScope, actorId?: number): void {
       // Оборванное соединение не должно ломать саму операцию записи.
     }
   }
+}
+
+/** Сообщить всем открытым вкладкам, что сущность изменилась. */
+export function publishLiveEvent(scope: LiveScope, actorId?: number): void {
+  emit({ scope, actorId, at: Date.now() });
+}
+
+/** Новое сообщение в чате — повод показать уведомление получателю. */
+export function publishChatMessage(payload: ChatEventPayload): void {
+  emit({ scope: "chat", actorId: payload.senderId, at: Date.now(), chat: payload });
 }
 
 /** Подписка для SSE-потока. Возвращает функцию отписки. */

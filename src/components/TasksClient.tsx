@@ -16,6 +16,7 @@ import {
   ShieldAlert,
   AlarmClock,
   Hand,
+  MessageSquare,
 } from "lucide-react";
 import type { Role, TaskPriority, TaskStatus } from "@/db/schema";
 import type { TaskRow, UserLite } from "@/lib/data";
@@ -306,7 +307,18 @@ export function TasksClient({
                             {overdue && <AlertTriangle size={14} className="shrink-0 text-red-500" />}
                             <div>
                               <p className="font-medium leading-tight">{t.title}</p>
-                              <p className="text-[11px] text-muted">#{t.id}</p>
+                              <p className="flex items-center gap-1.5 text-[11px] text-muted">
+                                #{t.id}
+                                {t.messagesCount > 0 && (
+                                  <span
+                                    className="inline-flex items-center gap-0.5 rounded-md bg-accent/15 px-1 py-0.5 text-[9px] font-semibold text-accent2"
+                                    title="Сообщений в переписке по задаче"
+                                  >
+                                    <MessageSquare size={9} />
+                                    {t.messagesCount}
+                                  </span>
+                                )}
+                              </p>
                             </div>
                           </div>
                         </td>
@@ -390,6 +402,12 @@ export function TasksClient({
                     <span className={cn(overdue && "font-medium text-red-500")}>{formatTaskMoment(t.deadline, t.deadlineTime)}</span>
                     <span>{formatHours(t.hours)}</span>
                     {t.counterpartyName && <span>· {t.counterpartyName}</span>}
+                    {t.messagesCount > 0 && (
+                      <span className="inline-flex items-center gap-0.5 rounded-md bg-accent/15 px-1 py-0.5 text-[9px] font-semibold text-accent2">
+                        <MessageSquare size={9} />
+                        {t.messagesCount}
+                      </span>
+                    )}
                   </div>
                   <div className="mt-2 flex min-w-0 flex-wrap items-center gap-2 text-xs">
                     <Avatar name={t.assigneeName} color={t.assigneeColor} url={t.assigneeAvatar} size={22} />

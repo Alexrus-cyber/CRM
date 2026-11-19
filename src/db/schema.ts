@@ -349,10 +349,35 @@ export const taskExports = pgTable(
   (t) => [uniqueIndex("task_exports_user_task_uq").on(t.userId, t.taskId)],
 );
 
+/**
+ * Быстрая переписка по задаче: короткие сообщения участников, а не большой
+ * чат. Живёт вместе с задачей (удаление задачи удаляет и обсуждение).
+ */
+export const taskMessages = pgTable(
+  "task_messages",
+  {
+    id: serial("id").primaryKey(),
+    taskId: integer("task_id")
+      .notNull()
+      .references(() => tasks.id, { onDelete: "cascade" }),
+    authorId: integer("author_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    content: text("content").notNull(),
+    /** Нижний регистр — для поиска без `lower()` (SQLite не знает кириллицу). */
+    contentLower: text("content_lower").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index("task_messages_task_idx").on(t.taskId, t.id)],
+);
+
 export type User = typeof users.$inferSelect;
 export type Counterparty = typeof counterparties.$inferSelect;
 export type Task = typeof tasks.$inferSelect;
 export type Message = typeof messages.$inferSelect;
+export type TaskMessage = typeof taskMessages.$inferSelect;
 export type TaskExport = typeof taskExports.$inferSelect;
 export type AiRagFolder = typeof aiRagFolders.$inferSelect;
 export type AiChat = typeof aiChats.$inferSelect;
