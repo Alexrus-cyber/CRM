@@ -801,6 +801,7 @@ export function OperatorPanel() {
                   {OPERATOR_PROVIDERS.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.label}
+                      {item.vision ? "" : " · без зрения"}
                     </option>
                   ))}
                 </select>
@@ -886,6 +887,17 @@ export function OperatorPanel() {
                 <FlagToggle label="без скриншотов" checked={textOnly} onChange={setTextOnly} />
               </div>
             </div>
+
+            {!providerMeta.vision && (
+              <div className="mt-2 flex items-start gap-1.5 rounded-xl border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-[10px] leading-relaxed text-amber-500">
+                <TriangleAlert size={12} className="mt-0.5 shrink-0" />
+                <span>
+                  {providerMeta.label} принимает только текст: экран бот не увидит и будет промахиваться
+                  по кнопкам, а текст может уйти не в то окно. Для работы по скриншоту выберите OpenAI,
+                  OpenRouter, Groq, Together, Mistral или локальную Qwen3-VL.
+                </span>
+              </div>
+            )}
 
             <div className="mt-3 rounded-xl border border-border bg-card2 p-2.5">
               <div className="flex items-center justify-between gap-2">

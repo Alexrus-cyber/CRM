@@ -15,6 +15,15 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   const body = (await req.json().catch(() => null)) as { status?: string; summary?: string } | null;
   const status = ["done", "failed", "cancelled"].includes(String(body?.status)) ? String(body?.status) : "done";
+
+  // Отменённое задание нельзя «завершить» как failed: пользователь уже нажал
+  // «Остановить», и бот должен просто выйти, а не переписывать статус.
+  if (task.status === "cancelled" && status !== "cancelled") {
+    return Response.json(
+      { ok: false, cancelled: true, error: "Задание отменено пользователем" },
+      { status: 409 },
+    );
+  }
   const summary = String(body?.summary ?? "").slice(0, 4000);
 
   await setAgentTaskStatus(task.id, ownerId, status, summary);

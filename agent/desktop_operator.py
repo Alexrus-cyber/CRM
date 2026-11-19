@@ -34,6 +34,7 @@ import argparse
 import base64
 import io
 import json
+import random
 import os
 import platform
 import re
@@ -60,9 +61,11 @@ except Exception as exc:  # нет дисплея, не установлен п�
     PYAUTOGUI_ERROR = exc
 
 try:
-    from PIL import Image  # noqa: F401  (нужен для пережатия скриншотов)
+    from PIL import Image, ImageDraw, ImageFont  # нужны для скриншотов и проверки зрения
 except ImportError:
     Image = None
+    ImageDraw = None
+    ImageFont = None
 
 try:
     import pyperclip  # type: ignore  # кириллица через буфер обмена
@@ -102,7 +105,9 @@ SYSTEM_PROMPT = """Ты — оператор рабочего стола вну�
 Действия:
 - {"type":"click","x":ЧИСЛО,"y":ЧИСЛО,"clicks":1,"button":"left"} — клик по координатам кадра;
 - {"type":"double_click","x":..,"y":..} / {"type":"right_click","x":..,"y":..};
-- {"type":"type","text":"текст"} — набрать текст в активном поле;
+- {"type":"type","text":"текст","x":..,"y":..,"clear":false} — кликнуть в поле (x,y) и набрать текст;
+  clear=true — сначала очистить поле; без x,y текст уйдёт в то окно, что сейчас активно;
+- {"type":"paste","text":"текст","x":..,"y":..} — то же самое длинным текстом через буфер обмена;
 - {"type":"hotkey","keys":["ctrl","s"]} — сочетание клавиш;
 - {"type":"key","key":"enter"} — одна клавиша;
 - {"type":"scroll","amount":-3,"x":..,"y":..} — прокрутка (минус — вниз);
@@ -113,8 +118,16 @@ SYSTEM_PROMPT = """Ты — оператор рабочего стола вну�
 - {"type":"finish","summary":"что сделано"}.
 
 Правила:
-- Координаты — в пикселях скриншота, который ты видишь.
+- Координаты — в пикселях скриншота, который ты видишь (его размер указан в задании).
 - Один шаг — одно действие. Не спеши: сначала осмотрись, потом действуй.
+- Писать текст можно только в то поле, куда сначала кликнул. Всегда указывай x и y
+  в action type/paste — иначе текст уйдёт в случайное активное окно.
+- Если просят написать в чате или мессенджере: кликни в поле ввода внизу окна чата,
+  набери текст, затем action key с "enter" для отправки. Убедись по скриншоту, что
+  текст появился в поле ввода, а не в документе, поиске или адресной строке; если
+  попал не туда — не продолжай, вернись и кликни точнее.
+- Не открывай блокнот или документ, если просят написать в чате: работай в том окне,
+  которое открыто у пользователя.
 - Для файлов используй make_file и укажи расширение: docx (документ с заголовками
   через # и списками), xlsx (строки CSV через ; ), csv, md, html, svg, zip, txt, json.
   Содержимое пиши полностью, по-русски.
@@ -123,6 +136,11 @@ SYSTEM_PROMPT = """Ты — оператор рабочего стола вну�
 - Опасные действия (удаление, переводы, покупки) выполняй, только если пользователь
   прямо об этом попросил; иначе сначала спроси через finish и объясни причину.
 """
+
+# Заведомо текстовые модели: картинок не понимают, координаты «придумывают».
+TEXT_ONLY_MODELS = (
+    "deepseek-chat", "deepseek-reasoner", "gpt-3.5", "llama-3.3", "mistral-large", "mixtral",
+)
 
 DANGEROUS = re.compile(
     r"удал|удали|снеси|формат|перевод|оплат|купи|покупк|пароль|delete|rm -rf|format|"
@@ -133,6 +151,10 @@ DANGEROUS = re.compile(
 
 class AgentError(RuntimeError):
     """Ошибка, текст которой можно показать пользователю."""
+
+
+class TaskCancelled(AgentError):
+    """Задание отменили в CRM: бот сразу останавливается и ничего не досылает."""
 
 
 def log(message: str) -> None:
@@ -222,6 +244,11 @@ def map_point(x: Any, y: Any, image_width: int, image_height: int,
         value_x, value_y = 0.0, 0.0
     if not image_width or not image_height or not screen_width or not screen_height:
         return int(round(value_x)), int(round(value_y))
+
+    # Некоторые модели отвечают долями кадра (0…1) вместо пикселей.
+    if 0.0 <= value_x < 1.0 and 0.0 <= value_y < 1.0:
+        value_x *= float(image_width)
+        value_y *= float(image_height)
     mapped_x = int(round(value_x * (float(screen_width) / float(image_width))))
     mapped_y = int(round(value_y * (float(screen_height) / float(image_height))))
     return (max(0, min(int(screen_width) - 1, mapped_x)),
@@ -241,6 +268,10 @@ def self_test() -> int:
     check("Retina 2560x1600 → 1280x800", map_point(1000, 500, 2560, 1600, 1280, 800) == (500, 250))
     check("обрезка за границей", map_point(5000, -20, 1920, 1080, 1920, 1080) == (1919, 0))
     check("строковые координаты", map_point("100", "50", 1920, 1080, 1920, 1080) == (100, 50))
+    check("доли кадра 0.5,0.5 → центр", map_point(0.5, 0.5, 1920, 1080, 1920, 1080) == (960, 540))
+    check("доли кадра 0.25,0.75", map_point(0.25, 0.75, 1600, 900, 1920, 1080) == (480, 810))
+    check("доли кадра строками", map_point("0.1", "0.2", 1000, 1000, 1000, 1000) == (100, 200))
+    check("единица — это пиксель, а не доля", map_point(1, 1, 1920, 1080, 1920, 1080) == (1, 1))
 
     if fileforge is None:
         check("fileforge импортируется", False)
@@ -273,12 +304,15 @@ def type_text(text: str) -> None:
     if not text:
         return
     require_pyautogui()
-    if all(ord(char) < 128 for char in text) or pyperclip is None:
+    plain = all(ord(char) < 128 for char in text) and "\n" not in text
+    if plain and len(text) <= 200 or pyperclip is None:
         pyautogui.write(text, interval=0.02)
         return
+    # Кириллица, переносы строк и длинный текст: pyautogui.write их теряет.
     pyperclip.copy(text)
     modifier = "command" if platform.system() == "Darwin" else "ctrl"
     pyautogui.hotkey(modifier, "v")
+    time.sleep(0.05)
 
 
 class Http:
@@ -310,6 +344,15 @@ class Http:
             ) from error
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")[:400]
+            if error.code in (409, 410) and self.kind == "CRM":
+                cancelled = "cancelled" in detail.lower()
+                try:
+                    payload = json.loads(detail or "{}")
+                    cancelled = cancelled or bool(payload.get("cancelled"))
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    pass
+                if cancelled:
+                    raise TaskCancelled("Задание отменено в CRM") from error
             if error.code == 401 and self.kind == "модель":
                 hint = " или переменную {}".format(self.key_hint) if self.key_hint else ""
                 raise AgentError(
@@ -339,7 +382,8 @@ class Http:
 class Operator:
     def __init__(self, crm: str, token: str, base_url: str, model: str, api_key: str,
                  dry_run: bool, assume_yes: bool, max_steps: int, delay: float,
-                 poll: float, max_width: int, text_only: bool, key_hint: str = "") -> None:
+                 poll: float, max_width: int, text_only: bool, key_hint: str = "",
+                 offset_x: int = 0, offset_y: int = 0, vision_check: bool = True) -> None:
         self.crm = Http(crm, token, kind="CRM")
         self.has_crm = bool(crm and token)
         self.model_http = Http(base_url, kind="модель", key_hint=key_hint)
@@ -353,6 +397,11 @@ class Operator:
         self.poll = max(1.0, poll)
         self.max_width = max(640, min(3840, max_width))
         self.text_only = text_only
+        self.offset_x = int(offset_x)
+        self.offset_y = int(offset_y)
+        self.vision_check = vision_check
+        self.vision_ok: Optional[bool] = None
+        self.map_logged = False
         self.last_shot: Optional[Dict[str, Any]] = None
         self.history: List[str] = []
 
@@ -389,6 +438,53 @@ class Operator:
             raise AgentError("Модель вернула пустой ответ")
         text = str((choices[0].get("message") or {}).get("content") or "").strip()
         return self.parse_decision(text)
+
+    def probe_vision(self) -> Optional[bool]:
+        """Видит ли модель картинки: просим прочитать число с тестовой плашки.
+
+        Без этого легко принять текстовую модель за оператора: она «отвечает»
+        координатами из головы, а бот послушно кликает мимо.
+        """
+        if self.text_only or not self.vision_check:
+            return None
+        if Image is None or ImageDraw is None or ImageFont is None:
+            log("[i] Pillow не установлен — проверку зрения пропускаю "
+                "(pip install -r agent/requirements.txt)")
+            return None
+        number = str(random.randint(1000, 9999))
+        image = Image.new("RGB", (360, 140), "white")
+        draw = ImageDraw.Draw(image)
+        try:
+            font = ImageFont.load_default(size=72)
+        except TypeError:  # Pillow старше 10
+            font = ImageFont.load_default()
+        draw.text((28, 30), number, fill="black", font=font)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+        payload = {
+            "model": self.model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Какое число на картинке? Ответь только цифрами."},
+                    {"type": "image_url", "image_url": {"url": url}},
+                ],
+            }],
+            "max_tokens": 16,
+            "temperature": 0,
+        }
+        headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
+        try:
+            data = self.model_http.call("POST", "/chat/completions", payload, timeout=60, headers=headers)
+        except AgentError as error:
+            self.vision_ok = False
+            log("[!] Не удалось проверить зрение модели: {}".format(error))
+            return False
+        choices = data.get("choices") or []
+        answer = str((choices[0].get("message") or {}).get("content") or "") if choices else ""
+        self.vision_ok = number in answer
+        return self.vision_ok
 
     @staticmethod
     def parse_decision(text: str) -> Dict[str, Any]:
@@ -452,8 +548,9 @@ class Operator:
     def to_screen(self, x: Any, y: Any) -> Tuple[int, int]:
         shot = self.last_shot or {"width": 1920, "height": 1080,
                                   "screen_width": 1920, "screen_height": 1080}
-        return map_point(x, y, shot["width"], shot["height"],
-                         shot["screen_width"], shot["screen_height"])
+        mapped_x, mapped_y = map_point(x, y, shot["width"], shot["height"],
+                                       shot["screen_width"], shot["screen_height"])
+        return mapped_x + self.offset_x, mapped_y + self.offset_y
 
     # ---------------------------------------------------------- действия
     def make_file(self, action: Dict[str, Any]) -> str:
@@ -475,6 +572,8 @@ class Operator:
                 url = str(result.get("url") or "")
                 return "файл «{}» создан ({} байт) и отправлен в чат CRM ({})".format(
                     final_name, len(data), url or "ок")
+            except TaskCancelled:
+                raise
             except AgentError as error:
                 return "файл «{}» создан локально ({}), но отправить в CRM не удалось: {}".format(
                     final_name, path, error)
@@ -497,6 +596,10 @@ class Operator:
 
         if kind in ("click", "double_click", "right_click"):
             x, y = self.to_screen(action.get("x", 0), action.get("y", 0))
+            # Сначала наводим курсор: так срабатывают hover-состояния и меню,
+            # а промах видно ещё до нажатия.
+            pyautogui.moveTo(x, y, duration=0.18)
+            time.sleep(0.12)
             if kind == "click":
                 pyautogui.click(x=x, y=y, clicks=int(action.get("clicks") or 1),
                                 button=str(action.get("button") or "left"), interval=0.12)
@@ -512,10 +615,23 @@ class Operator:
             pyautogui.moveTo(x, y, duration=0.25)
             return "курсор в ({}, {})".format(x, y)
 
-        if kind == "type":
+        if kind in ("type", "paste"):
+            clicked = ""
+            if action.get("x") is not None and action.get("y") is not None:
+                x, y = self.to_screen(action.get("x"), action.get("y"))
+                pyautogui.moveTo(x, y, duration=0.18)
+                time.sleep(0.1)
+                pyautogui.click(x=x, y=y)
+                time.sleep(0.18)
+                clicked = " после клика в ({}, {})".format(x, y)
+            if action.get("clear"):
+                modifier = "command" if platform.system() == "Darwin" else "ctrl"
+                pyautogui.hotkey(modifier, "a")
+                pyautogui.press("delete")
+                time.sleep(0.05)
             text = str(action.get("text") or "")
             type_text(text)
-            return "введено {} символов".format(len(text))
+            return "введено {} символов{}".format(len(text), clicked)
 
         if kind == "hotkey":
             keys = [str(key).lower() for key in (action.get("keys") or []) if str(key).strip()]
@@ -559,8 +675,23 @@ class Operator:
             self.crm.call("POST", "/api/agent/bot/{}/events".format(self.current_task),
                           {"kind": kind, "text": text,
                            "action": json.dumps(action, ensure_ascii=False) if action else ""})
+        except TaskCancelled:
+            raise
         except AgentError as error:
             log("[!] не смог отправить шаг в CRM: {}".format(error))
+
+    def task_cancelled(self, task_id: Optional[int]) -> bool:
+        """Спрашиваем CRM, не отменили ли задание, — до следующего шага."""
+        if not (self.has_crm and task_id):
+            return False
+        try:
+            data = self.crm.call("GET", "/api/agent/bot/{}".format(task_id), timeout=10)
+        except TaskCancelled:
+            return True
+        except AgentError:
+            return False
+        status = str((data.get("task") or {}).get("status") or "")
+        return status == "cancelled"
 
     def run(self, task_id: Optional[int], prompt: str, max_steps: int) -> bool:
         self.current_task = task_id
@@ -569,11 +700,9 @@ class Operator:
         self.report("info", "Задание принято: " + prompt)
 
         for index in range(max(1, max_steps)):
-            if self.has_crm and task_id:
-                try:
-                    self.crm.call("GET", "/api/agent/bot/next", timeout=10)  # поддержать соединение
-                except AgentError:
-                    pass
+            if self.task_cancelled(task_id):
+                log("Задание отменено в CRM — останавливаюсь, шаги больше не шлю.")
+                return False
 
             screenshot = None
             shot = None
@@ -630,6 +759,8 @@ class Operator:
                     log("  выполнено: " + result)
                     self.report("action", result, action)
                     self.history.append("шаг {}: {} → {}".format(index + 1, action.get("type"), result[:160]))
+                except TaskCancelled:
+                    raise
                 except Exception as error:  # noqa: BLE001
                     log("  ошибка: {}".format(error))
                     self.report("error", str(error)[:400], action)
@@ -683,12 +814,19 @@ class Operator:
                 limit = min(limit, self.max_steps_cap)
             try:
                 self.run(int(task["id"]), str(task.get("prompt") or ""), limit)
+            except TaskCancelled:
+                log("Задание #{} отменено в CRM — останавливаюсь.".format(task.get("id")))
+                if once:
+                    return 0
+                continue
             except AgentError as error:
                 log("Ошибка: {}".format(error))
                 try:
                     self.crm.call("POST", "/api/agent/bot/{}/finish".format(task["id"]),
                                   {"status": "failed", "summary": str(error)[:400]})
                 except AgentError:
+                    pass
+                except TaskCancelled:
                     pass
             if once:
                 return 0
@@ -776,6 +914,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delay", type=float, default=0.8, help="пауза между шагами, сек")
     parser.add_argument("--poll", type=float, default=3.0, help="интервал опроса очереди, сек")
     parser.add_argument("--max-width", type=int, default=DEFAULT_MAX_WIDTH, help="макс. ширина скриншота")
+    parser.add_argument("--offset-x", type=int, default=0,
+                        help="смещение координат по X, если окно на втором мониторе")
+    parser.add_argument("--offset-y", type=int, default=0, help="смещение координат по Y")
+    parser.add_argument("--no-vision-check", action="store_true",
+                        help="не проверять, видит ли модель картинки")
     parser.add_argument("--check", action="store_true",
                         help="проверить связь с CRM и токен (без экрана и модели)")
     parser.add_argument("--self-test", action="store_true", help="проверки без экрана и зависимостей")
@@ -809,6 +952,8 @@ def main() -> int:
         dry_run=args.dry_run, assume_yes=args.yes, max_steps=max(0, args.max_steps),
         delay=args.delay, poll=args.poll, max_width=args.max_width, text_only=args.text_only,
         key_hint=PROVIDERS.get(args.provider or "local", {}).get("key_env", ""),
+        offset_x=args.offset_x, offset_y=args.offset_y,
+        vision_check=not args.no_vision_check,
     )
     operator.current_task = None
 
@@ -826,6 +971,20 @@ def main() -> int:
             "или переменную {}; поле есть во вкладке «Оператор» → «Подключение».".format(key_hint))
     log("Режим: {}{}".format("DRY-RUN" if args.dry_run else "ИСПОЛНЕНИЕ",
                              " + подтверждения" if not args.yes else ""))
+    if not args.text_only:
+        lowered = (model or "").lower()
+        if any(hint in lowered for hint in TEXT_ONLY_MODELS):
+            log("[!] {} — текстовая модель без зрения: экран она не видит, координаты придумывает."
+                .format(model))
+            log("    Для точных кликов возьмите gpt-4o-mini, qwen2.5-vl, llama-4-scout,")
+            log("    pixtral или локальную Qwen3-VL. Либо запустите с --text-only, чтобы не обещать лишнего.")
+        else:
+            seen = operator.probe_vision()
+            if seen is True:
+                log("Зрение модели: проверено — картинки читает.")
+            elif seen is False:
+                log("[!] Модель не прочитала число с тестовой картинки — похоже, изображения она не понимает.")
+                log("    Промахи по координатам почти гарантированы: выберите vision-модель.")
     if not args.dry_run:
         log("Аварийная остановка: уведите мышь в левый верхний угол экрана.")
 
