@@ -79,3 +79,22 @@ python3 agent/desktop_operator.py --self-test
 уметь смотреть картинки (vision): например `gpt-4o-mini`, `qwen/qwen2.5-vl-72b-instruct`,
 `Qwen/Qwen3-VL-8B-Instruct` на vLLM. Если модель не принимает скриншот, оператор
 сам переходит в текстовый режим и предупреждает об этом.
+
+## Настольный запускатор (`launcher/`)
+
+Чтобы не держать два окна терминала, оба агента можно запускать из одного окна:
+`launcher/` — приложение на Python (tkinter), которое собирается в **один exe**.
+
+```bash
+python -m launcher                 # окно: список агентов, настройки модели, журнал
+python -m launcher --self-test     # 42 проверки без экрана
+python launcher/build_exe.py       # dist/CRM Agents.exe
+```
+
+Внутри exe уже лежат Python, tkinter, сами агенты и их зависимости
+(Pillow, pyautogui, pyperclip), поэтому пользователю ничего устанавливать не
+нужно. Агентов приложение запускает тем же exe в режиме
+`--run-agent agents/desktop_operator.py …` — отдельный интерпретатор не требуется.
+
+Подробности, флаги сборки и формат `agents.json` для своих агентов —
+[`launcher/README.md`](../launcher/README.md).
