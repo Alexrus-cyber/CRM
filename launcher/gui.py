@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 
 from launcher import APP_NAME, APP_VERSION, deps
 from launcher import bundle, commands
+from launcher import runner as runner_module
 from launcher import settings as settings_mod
 from launcher.catalog import PROVIDER_PRESETS, REASONING_MODES, AgentSpec, Field, load_catalog
 from launcher.runner import AgentRun
@@ -37,6 +38,9 @@ class LauncherApp:
         self.agents = load_catalog(settings_mod.config_dir() / "agents.json")
         self.spec: AgentSpec = self._initial_spec()
         self.run: AgentRun | None = None
+        self._stopped_by_user = False
+        self._retried = False
+        self._last_launch: tuple[Path, List[str], Dict[str, str], Path] | None = None
         self.field_vars: Dict[str, Any] = {}
         self.choice_maps: Dict[str, Dict[str, str]] = {}
         self._drain_after_id: str | None = None
@@ -412,6 +416,19 @@ class LauncherApp:
             else:
                 return
 
+        info = bundle.runtime_info()
+        if info["_MEIPASS существует"] == "нет" and bundle.is_frozen():
+            messagebox.showerror(
+                APP_NAME,
+                "Не удалось распаковать встроенный runtime (нет папки _MEIxxxx).\n\n"
+                "Обычно это однофайловая сборка, которой запретили писать во временную папку.\n"
+                "Что сделать: собрать папкой (`python launcher/build_exe.py --onedir`) "
+                "или указать свою папку (`--tmpdir D:\\crm-temp`), проверить TEMP и антивирус.",
+            )
+            return
+        if info["запись во временную папку"] != "ок":
+            self._log("внимание: " + info["запись во временную папку"])
+
         warnings = commands.validate(self.spec, self.settings, bundle.agents_dir())
         if warnings:
             text = "\n".join(f"• {item}" for item in warnings)
@@ -428,13 +445,28 @@ class LauncherApp:
         env = commands.agent_env(self.spec, self.settings)
         cwd = commands.working_dir(self.spec, self.settings, bundle.agents_dir(), settings_mod.workspace_dir())
         bundle.ensure_dir(cwd)
-        command = bundle.run_agent_args(script, args)
+        self._last_launch = (script, args, env, cwd)
+        self._retried = False
+        self._spawn(reuse_runtime=True)
 
-        self._log("")
-        self._log(f"▶ {self.spec.title}")
-        self._log("  " + commands.describe_command([script.name, *args], env))
+    def _spawn(self, reuse_runtime: bool) -> None:
+        """Запуск агента; `reuse_runtime=False` — вторая попытка без _PYI_* подсказок."""
+        if self._last_launch is None:
+            return
+        script, args, env, cwd = self._last_launch
+        command = bundle.run_agent_args(script, args)
+        if reuse_runtime:
+            self._log("")
+            self._log(f"▶ {self.spec.title}")
+            self._log("  " + commands.describe_command([script.name, *args], env))
         try:
-            run = AgentRun(agent_id=self.spec.id, command=command, cwd=cwd, env=self._plain_env(env))
+            run = AgentRun(
+                agent_id=self.spec.id,
+                command=command,
+                cwd=cwd,
+                env=bundle.child_env({key: value for key, value in env.items() if value},
+                                     reuse_runtime=reuse_runtime),
+            )
             run.start()
         except OSError as error:
             self._log(f"не удалось запустить: {error}")
@@ -442,15 +474,27 @@ class LauncherApp:
             return
 
         self.run = run
+        self._stopped_by_user = False
         self.run_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status_var.set(f"● {self.spec.title} — работает (PID {run.pid()})")
         self._schedule_drain()
-        self._maybe_open_url()
+        self.root.after(2500, self._watch_early_exit)
+        if reuse_runtime:
+            self._maybe_open_url()
 
-    def _plain_env(self, env: Dict[str, str]) -> Dict[str, str]:
-        merged = {key: value for key, value in env.items() if value}
-        return merged
+    def _watch_early_exit(self) -> None:
+        """Bootloader может умереть сразу с кодом -1: пробуем второй вариант запуска."""
+        run = self.run
+        if run is None or self._stopped_by_user or self._retried:
+            return
+        if run.is_running():
+            return
+        if run.exit_code not in (-1, 4294967295):
+            return
+        self._retried = True
+        self._log("bootloader не смог переиспользовать runtime — пробую обычный запуск")
+        self._spawn(reuse_runtime=False)
 
     def _maybe_open_url(self) -> None:
         if not self.spec.open_url:
@@ -465,6 +509,7 @@ class LauncherApp:
     def stop_agent(self) -> None:
         if self.run is None:
             return
+        self._stopped_by_user = True
         self._log("останавливаю агента…")
         self.run.stop()
         self._log("агент остановлен")
@@ -488,12 +533,23 @@ class LauncherApp:
                 self.status_var.set(f"● {self.spec.title} — работает (PID {run.pid()}) · {run.uptime_text()}")
                 self._schedule_drain()
                 return
+            self._report_exit(run)
             self._finish_run()
         self._drain_after_id = None
 
     # ------------------------------------------------------------------
     # журнал и служебные действия
     # ------------------------------------------------------------------
+    def _report_exit(self, run: AgentRun) -> None:
+        """Понятное объяснение, если агент умер не «сам по себе»."""
+        if self._stopped_by_user or run.exit_code in (None, 0):
+            return
+        hint = runner_module.exit_hint(run.exit_code)
+        if not hint:
+            return
+        self._log("подсказка: " + hint)
+        messagebox.showwarning(APP_NAME, hint)
+
     def _log(self, text: str) -> None:
         self.log.configure(state="normal")
         self.log.insert("end", text.rstrip() + "\n")
@@ -512,7 +568,12 @@ class LauncherApp:
         self.collect()
         lines = [f"Версия: {APP_NAME} {APP_VERSION}", f"Агенты: {bundle.agents_dir()}",
                  f"Настройки: {settings_mod.config_path()}"]
+        lines += [f"{key}: {value}" for key, value in bundle.runtime_info().items()]
         lines += deps.report(self.spec.id)
+        info = bundle.runtime_info()
+        if info["запись во временную папку"] != "ок":
+            lines.append("Внимание: " + info["запись во временную папку"])
+
         warnings = commands.validate(self.spec, self.settings, bundle.agents_dir())
         lines.append("Замечания: " + ("; ".join(warnings) if warnings else "нет"))
         for line in lines:

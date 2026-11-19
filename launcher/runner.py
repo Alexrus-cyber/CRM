@@ -22,6 +22,33 @@ from typing import Dict, List, Mapping, Sequence
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
+# Коды, которыми «стреляет» bootloader PyInstaller или Windows, и что это значит.
+EXIT_HINTS = {
+    -1: (
+        "bootloader не смог запустить встроенный runtime (обычно «Could not create "
+        "temporary directory!»). Соберите папкой: python launcher/build_exe.py "
+        "(режим onedir), либо укажите writable-папку: --tmpdir D:\\crm-temp, "
+        "либо проверьте TEMP и антивирус."
+    ),
+    -1073741819: "аварийное завершение процесса (access violation) — чаще всего конфликт DLL или антивирус.",
+    -1073741515: "не найдена DLL: соберите exe на той же Windows-разрядности и без «голых» зависимостей.",
+    -1073741571: "переполнение стека — проверьте слишком большие вложения или вложенные вызовы агента.",
+}
+
+
+def exit_hint(code: int | None) -> str:
+    """Человеческое объяснение для кода выхода (с учётом беззнаковой маски)."""
+    if code is None:
+        return ""
+    normalized = code
+    if normalized > 2 ** 31:
+        normalized -= 2 ** 32
+    if normalized in EXIT_HINTS:
+        return EXIT_HINTS[normalized]
+    if normalized == 0:
+        return ""
+    return f"агент завершился с кодом {code}. Полный вывод — выше в журнале."
+
 
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
@@ -50,6 +77,7 @@ class AgentRun:
     env: Mapping[str, str]
     started_at: float = field(default_factory=time.time)
     process: subprocess.Popen | None = None
+    exit_code: int | None = None
     lines: List[str] = field(default_factory=list)
     _queue: "queue.Queue[str | None]" = field(default_factory=queue.Queue)
 
@@ -89,6 +117,7 @@ class AgentRun:
             pass
         finally:
             code = process.wait()
+            self.exit_code = code
             self.lines.append(f"— агент завершился с кодом {code} —")
             self._queue.put(f"— агент завершился с кодом {code} —")
             self._queue.put(None)

@@ -217,6 +217,9 @@ def validate(spec: AgentSpec, settings: LaunchSettings, agents_dir: Path) -> Lis
     model = model_settings(settings)
     values = settings.values_for(spec)
 
+    if model["max_tokens"] and model["max_tokens"] > 32768:
+        warnings.append("max_tokens больше 32768 — большинство серверов такой ответ не отдадут.")
+
     if "model" in spec.requires:
         if not model["base_url"]:
             warnings.append("Не указан адрес API модели — агент возьмёт значение по умолчанию.")

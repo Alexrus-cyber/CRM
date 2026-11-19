@@ -29,13 +29,21 @@ def run(command: list[str]) -> None:
     subprocess.run(command, check=True, cwd=REPO)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Собрать CRM Agents в один exe")
+def build_parser() -> argparse.ArgumentParser:
+    """Флаги сборки (вынесены отдельно, чтобы проверять их в self-test)."""
+    parser = argparse.ArgumentParser(description="Собрать CRM Agents")
     parser.add_argument("--no-install", action="store_true", help="не ставить зависимости")
     parser.add_argument("--wheels", action="store_true",
                         help="скачать колёса в launcher/wheels для офлайн-доустановки")
-    parser.add_argument("--onedir", action="store_true", help="собрать папкой (быстрее запускается)")
-    args = parser.parse_args(argv)
+    parser.add_argument("--onefile", action="store_true",
+                        help="один файл (по умолчанию папка: агенты запускаются без пересборки runtime)")
+    parser.add_argument("--tmpdir", default="", metavar="ПАПКА",
+                        help="куда распаковывать runtime однофайловой сборки (по умолчанию — TEMP)")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     if not SPEC.is_file():
         print(f"не найден {SPEC}", file=sys.stderr)
@@ -58,10 +66,14 @@ def main(argv: list[str] | None = None) -> int:
         ]
         run([sys.executable, "-m", "pip", "download", "-d", str(wheels), *packages])
 
-    mode = "папкой" if args.onedir else "одним файлом"
+    onefile = bool(args.onefile)
+    mode = "одним файлом" if onefile else "папкой"
     print(f"\nсборка ({mode}) — это может занять несколько минут…")
     # --onefile/--onedir нельзя передавать вместе с .spec: режим задаём переменной.
-    os.environ["CRM_LAUNCHER_ONEDIR"] = "1" if args.onedir else "0"
+    os.environ["CRM_LAUNCHER_ONEDIR"] = "0" if onefile else "1"
+    if args.tmpdir:
+        os.environ["CRM_LAUNCHER_RUNTIME_TMPDIR"] = os.path.abspath(args.tmpdir)
+        print(f"runtime будет распаковываться в {args.tmpdir}")
     try:
         run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", str(SPEC)])
     except subprocess.CalledProcessError as error:
@@ -71,7 +83,12 @@ def main(argv: list[str] | None = None) -> int:
         return error.returncode or 1
 
     dist = REPO / "dist"
-    candidates = [dist / "CRM Agents.exe", dist / "CRM Agents"]
+    candidates = [
+        dist / "CRM Agents" / "CRM Agents.exe",
+        dist / "CRM Agents" / "CRM Agents",
+        dist / "CRM Agents.exe",
+        dist / "CRM Agents",
+    ]
     found = next((path for path in candidates if path.exists()), None)
     if found is None:
         print("сборка завершилась, но файл не найден — смотрите вывод PyInstaller", file=sys.stderr)
@@ -81,6 +98,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nготово: {found}  ({size_mb:.1f} МБ)")
     if sys.platform.startswith("win"):
         print("Запуск: двойной клик по exe. Python и pip на машине не нужны.")
+        if onefile:
+            print(
+                "Внимание: однофайловая сборка запускает агентов повторным запуском себя же "
+                "и распаковывает runtime. Если Windows не даёт писать в TEMP, будет ошибка "
+                "«Could not create temporary directory!». Надёжнее: без --onefile или с --tmpdir."
+            )
     if shutil.which("codesign") and sys.platform == "darwin":
         print("macOS: подпишите сборку (codesign), иначе Gatekeeper будет ругаться.")
     return 0

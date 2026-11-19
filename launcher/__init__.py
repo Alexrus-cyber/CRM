@@ -10,4 +10,4 @@
 """
 
 APP_NAME = "CRM Agents"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
