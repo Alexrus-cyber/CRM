@@ -50,6 +50,7 @@ export async function GET() {
 }
 
 type IncomingMessage = { role?: string; content?: string };
+type IncomingAttachment = { name?: string; text?: string; note?: string };
 
 export async function POST(req: Request) {
   const me = await getCurrentUser();
@@ -59,7 +60,11 @@ export async function POST(req: Request) {
   }
 
   const body = (await req.json().catch(() => null)) as
-    | { messages?: IncomingMessage[]; settings?: { baseUrl?: string; apiKey?: string; model?: string } }
+    | {
+        messages?: IncomingMessage[];
+        settings?: { baseUrl?: string; apiKey?: string; model?: string };
+        attachments?: IncomingAttachment[];
+      }
     | null;
 
   const messages = (body?.messages ?? [])
@@ -70,9 +75,20 @@ export async function POST(req: Request) {
     return Response.json({ error: "Пустой запрос" }, { status: 400 });
   }
 
+  // Файлы уже распознаны в браузере — агенту нужен только текст.
+  const attachments = (body?.attachments ?? [])
+    .filter((item) => item && typeof item === "object")
+    .slice(0, 5)
+    .map((item) => ({
+      name: String(item.name ?? "файл").slice(0, 120),
+      note: String(item.note ?? "").slice(0, 120),
+      text: String(item.text ?? "").slice(0, 30_000),
+    }));
+
   const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl ?? "") ?? undefined;
   const payload = {
     messages,
+    attachments,
     settings: {
       baseUrl,
       apiKey: (body?.settings?.apiKey ?? "").trim().slice(0, 400),

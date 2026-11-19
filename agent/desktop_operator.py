@@ -44,6 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -119,6 +120,8 @@ SYSTEM_PROMPT = """Ты — оператор рабочего стола вну�
 
 Правила:
 - Координаты — в пикселях скриншота, который ты видишь (его размер указан в задании).
+- Текущее положение курсора отмечено на скриншоте красным крестиком. Если он не
+  там, куда нужно кликнуть, — сначала переведи его (action move), затем кликай.
 - Один шаг — одно действие. Не спеши: сначала осмотрись, потом действуй.
 - Писать текст можно только в то поле, куда сначала кликнул. Всегда указывай x и y
   в action type/paste — иначе текст уйдёт в случайное активное окно.
@@ -136,6 +139,53 @@ SYSTEM_PROMPT = """Ты — оператор рабочего стола вну�
 - Опасные действия (удаление, переводы, покупки) выполняй, только если пользователь
   прямо об этом попросил; иначе сначала спроси через finish и объясни причину.
 """
+
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml", ".html", ".htm",
+    ".css", ".js", ".ts", ".tsx", ".py", ".sql", ".log", ".ini", ".toml", ".svg",
+}
+ZIP_TEXT = {
+    ".docx": ("word/document.xml",),
+    ".xlsx": ("xl/sharedStrings.xml", "xl/worksheets/sheet1.xml"),
+    ".pptx": ("ppt/slides/slide1.xml",),
+}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+
+def extract_attachment_text(name: str, data: bytes, limit: int = 4000) -> str:
+    """Текст вложения для модели: txt/csv/md читаем, docx/xlsx — из XML, PDF — нет.
+
+    Бот работает без внешних библиотек, поэтому «офисные» форматы разбираем как
+    zip с XML — этого достаточно для плана действий.
+    """
+    lowered = (name or "").lower()
+    extension = "." + lowered.rsplit(".", 1)[-1] if "." in lowered else ""
+    if extension in IMAGE_EXTENSIONS:
+        return "[изображение: содержимое показать не могу, ориентируйся по имени файла]"
+    if extension == ".pdf":
+        return "[PDF: содержимое не извлекается без сторонних библиотек]"
+    if extension in ZIP_TEXT:
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                parts = []
+                for entry in ZIP_TEXT[extension]:
+                    if entry in archive.namelist():
+                        xml = archive.read(entry).decode("utf-8", "replace")
+                        parts.append(re.sub(r"<[^>]+>", " ", xml))
+                text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+                return text[:limit] or "[пустой документ]"
+        except (zipfile.BadZipFile, KeyError, OSError):
+            return "[не удалось прочитать архив]"
+    if extension in TEXT_EXTENSIONS or not extension:
+        try:
+            return data.decode("utf-8", "replace")[:limit]
+        except Exception:  # noqa: BLE001
+            return "[не удалось прочитать как текст]"
+    try:
+        return data.decode("utf-8", "replace")[:limit]
+    except Exception:  # noqa: BLE001
+        return "[двоичный файл: содержимое недоступно]"
+
 
 # Заведомо текстовые модели: картинок не понимают, координаты «придумывают».
 # У DeepSeek картинки понимает deepseek-flash; deepseek-chat и deepseek-v4-pro — текст.
@@ -297,6 +347,56 @@ def self_test() -> int:
             except Exception as error:  # noqa: BLE001
                 check("{} ({} )".format(name, error), False)
 
+    # Вложения: текст читаем сами, без внешних библиотек.
+    check("вложение txt читается", "привет" in extract_attachment_text("a.txt", "привет".encode()))
+    check("вложение csv читается", "1;2" in extract_attachment_text("a.csv", "a;b\n1;2".encode()))
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("word/document.xml", "<w:t>План дня</w:t>")
+    check("вложение docx читается", "План дня" in extract_attachment_text("a.docx", buffer.getvalue()))
+    check("вложение png помечается",
+          "изображение" in extract_attachment_text("a.png", b"\x89PNG"))
+    check("вложение pdf помечается", "PDF" in extract_attachment_text("a.pdf", b"%PDF-1.4"))
+
+    # Проверка курсора: клик отменяется, если курсор не там, куда его вели.
+    class FakeMouse:
+        def __init__(self, drift: int) -> None:
+            self.drift = drift
+            self.pos = (0, 0)
+
+        def size(self) -> Tuple[int, int]:
+            return (1920, 1080)
+
+        def moveTo(self, x: int, y: int, duration: float = 0) -> None:
+            self.pos = (x + self.drift, y + self.drift)
+
+        def position(self) -> Tuple[int, int]:
+            return self.pos
+
+    probe = Operator(crm="", token="", base_url="http://localhost", model="m", api_key="",
+                     dry_run=True, assume_yes=True, max_steps=1, delay=0, poll=1,
+                     max_width=1280, text_only=True)
+    saved_mouse, saved_require = globals().get("pyautogui"), globals().get("require_pyautogui")
+    try:
+        globals()["pyautogui"] = FakeMouse(0)
+        globals()["require_pyautogui"] = lambda: None
+        probe.ensure_cursor(500, 300)
+        check("курсор встал в точку", globals()["pyautogui"].position() == (500, 300))
+        globals()["pyautogui"] = FakeMouse(10)
+        try:
+            probe.ensure_cursor(500, 300)
+            check("промах курсора отменяет клик", False)
+        except AgentError as error:
+            check("промах курсора отменяет клик", "отменён" in str(error))
+        globals()["pyautogui"] = FakeMouse(0)
+        try:
+            probe.ensure_cursor(5000, 300)
+            check("клик вне экрана отменяется", False)
+        except AgentError:
+            check("клик вне экрана отменяется", True)
+    finally:
+        globals()["pyautogui"], globals()["require_pyautogui"] = saved_mouse, saved_require
+
     passed = sum(1 for item in checks if item)
     print("\n{}/{} проверок пройдено".format(passed, len(checks)))
     return 0 if passed == len(checks) else 1
@@ -382,12 +482,30 @@ class Http:
             raise AgentError("CRM вернула не JSON") from error
 
 
+    def download(self, path: str, timeout: int = 60) -> bytes:
+        """Скачать двоичный файл (вложение задания) с тем же токеном."""
+        url = path if path.startswith("http") else self.base + path
+        request = urllib.request.Request(url, method="GET")
+        if self.token:
+            request.add_header("x-agent-token", self.token)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")[:200]
+            if error.code == 401:
+                raise AgentError("CRM отклонила токен агента при скачивании вложения") from error
+            raise AgentError("GET {} → HTTP {}: {}".format(path, error.code, detail)) from error
+        except urllib.error.URLError as error:
+            raise AgentError("CRM недоступна ({}): {}".format(url, error.reason)) from error
+
+
 class Operator:
     def __init__(self, crm: str, token: str, base_url: str, model: str, api_key: str,
                  dry_run: bool, assume_yes: bool, max_steps: int, delay: float,
                  poll: float, max_width: int, text_only: bool, key_hint: str = "",
                  offset_x: int = 0, offset_y: int = 0, vision_check: bool = True,
-                 vision_forced: bool = False) -> None:
+                 vision_forced: bool = False, cursor_marker: bool = True) -> None:
         self.crm = Http(crm, token, kind="CRM")
         self.has_crm = bool(crm and token)
         self.model_http = Http(base_url, kind="модель", key_hint=key_hint)
@@ -407,6 +525,8 @@ class Operator:
         self.vision_forced = vision_forced
         # --vision: считаем модель зрячей и не переключаем её в текстовый режим.
         self.vision_ok: Optional[bool] = True if vision_forced else None
+        self.cursor_marker = cursor_marker
+        self.attachments_context = ""
         self.map_logged = False
         self.last_shot: Optional[Dict[str, Any]] = None
         self.history: List[str] = []
@@ -529,6 +649,24 @@ class Operator:
         if image.mode != "RGB":
             image = image.convert("RGB")
 
+        # Красный крестик в точке курсора: модель видит, где он сейчас, и не
+        # кликает «наугад» после промаха.
+        if self.cursor_marker and pyautogui is not None and ImageDraw is not None:
+            try:
+                cursor_x, cursor_y = pyautogui.position()
+                scale_x = image.size[0] / float(raw_width or image.size[0])
+                scale_y = image.size[1] / float(raw_height or image.size[1])
+                mark_x = int(cursor_x * scale_x)
+                mark_y = int(cursor_y * scale_y)
+                if 0 <= mark_x < image.size[0] and 0 <= mark_y < image.size[1]:
+                    draw = ImageDraw.Draw(image)
+                    draw.line([(mark_x - 16, mark_y), (mark_x + 16, mark_y)], fill=(255, 0, 0), width=2)
+                    draw.line([(mark_x, mark_y - 16), (mark_x, mark_y + 16)], fill=(255, 0, 0), width=2)
+                    draw.ellipse([(mark_x - 5, mark_y - 5), (mark_x + 5, mark_y + 5)],
+                                 outline=(255, 0, 0), width=2)
+            except Exception:  # noqa: BLE001 — метка не должна ломать шаг
+                pass
+
         quality = 72
         encoded = ""
         while quality >= 40:
@@ -587,6 +725,28 @@ class Operator:
                     final_name, path, error)
         return "файл «{}» создан локально: {}".format(final_name, path)
 
+    def ensure_cursor(self, x: int, y: int) -> None:
+        """Ставим курсор и проверяем, что он действительно там.
+
+        Иногда pyautogui «теряет» точку: масштаб, второй монитор, окно поверх.
+        Лучше отменить клик с понятной ошибкой, чем открыть чужое приложение.
+        """
+        require_pyautogui()
+        width, height = pyautogui.size()
+        if not (0 <= int(x) < int(width) and 0 <= int(y) < int(height)):
+            raise AgentError("точка ({}, {}) вне экрана {}×{} — действие отменено".format(
+                x, y, width, height))
+        pyautogui.moveTo(x, y, duration=0.18)
+        time.sleep(0.12)
+        cursor_x, cursor_y = pyautogui.position()
+        if abs(cursor_x - x) > 3 or abs(cursor_y - y) > 3:
+            pyautogui.moveTo(x, y, duration=0.1)
+            time.sleep(0.1)
+            cursor_x, cursor_y = pyautogui.position()
+        if abs(cursor_x - x) > 3 or abs(cursor_y - y) > 3:
+            raise AgentError("курсор встал в ({}, {}) вместо ({}, {}) — клик отменён".format(
+                cursor_x, cursor_y, x, y))
+
     def execute(self, action: Dict[str, Any]) -> str:
         kind = action.get("type")
 
@@ -604,10 +764,9 @@ class Operator:
 
         if kind in ("click", "double_click", "right_click"):
             x, y = self.to_screen(action.get("x", 0), action.get("y", 0))
-            # Сначала наводим курсор: так срабатывают hover-состояния и меню,
-            # а промах видно ещё до нажатия.
-            pyautogui.moveTo(x, y, duration=0.18)
-            time.sleep(0.12)
+            # Сначала наводим курсор и проверяем, что он там, где нужно: так
+            # срабатывают hover-состояния, а промах виден до нажатия.
+            self.ensure_cursor(x, y)
             if kind == "click":
                 pyautogui.click(x=x, y=y, clicks=int(action.get("clicks") or 1),
                                 button=str(action.get("button") or "left"), interval=0.12)
@@ -620,15 +779,14 @@ class Operator:
 
         if kind == "move":
             x, y = self.to_screen(action.get("x", 0), action.get("y", 0))
-            pyautogui.moveTo(x, y, duration=0.25)
+            self.ensure_cursor(x, y)
             return "курсор в ({}, {})".format(x, y)
 
         if kind in ("type", "paste"):
             clicked = ""
             if action.get("x") is not None and action.get("y") is not None:
                 x, y = self.to_screen(action.get("x"), action.get("y"))
-                pyautogui.moveTo(x, y, duration=0.18)
-                time.sleep(0.1)
+                self.ensure_cursor(x, y)
                 pyautogui.click(x=x, y=y)
                 time.sleep(0.18)
                 clicked = " после клика в ({}, {})".format(x, y)
@@ -657,14 +815,14 @@ class Operator:
             amount = int(action.get("amount") or -3)
             if action.get("x") is not None and action.get("y") is not None:
                 x, y = self.to_screen(action.get("x"), action.get("y"))
-                pyautogui.moveTo(x, y, duration=0.15)
+                self.ensure_cursor(x, y)
             pyautogui.scroll(amount * 120)
             return "прокрутка {}".format("вверх" if amount > 0 else "вниз")
 
         if kind == "drag":
             from_x, from_y = self.to_screen(action.get("fromX", 0), action.get("fromY", 0))
             to_x, to_y = self.to_screen(action.get("toX", 0), action.get("toY", 0))
-            pyautogui.moveTo(from_x, from_y, duration=0.2)
+            self.ensure_cursor(from_x, from_y)
             pyautogui.dragTo(to_x, to_y, duration=0.5, button="left")
             return "перетаскивание ({}, {}) → ({}, {})".format(from_x, from_y, to_x, to_y)
 
@@ -688,6 +846,36 @@ class Operator:
         except AgentError as error:
             log("[!] не смог отправить шаг в CRM: {}".format(error))
 
+    def load_attachments(self, task_id: Optional[int]) -> str:
+        """Скачиваем вложения задания и превращаем их в текст для модели."""
+        if not (self.has_crm and task_id):
+            return ""
+        try:
+            info = self.crm.call("GET", "/api/agent/bot/{}".format(task_id), timeout=30)
+        except TaskCancelled:
+            raise
+        except AgentError as error:
+            log("[!] не удалось получить вложения задания: {}".format(error))
+            return ""
+        attachments = info.get("attachments") or []
+        if not attachments:
+            return ""
+        blocks = []
+        for item in attachments[:5]:
+            name = str(item.get("name") or "файл")
+            event_id = int(item.get("id") or 0)
+            try:
+                data = self.crm.download("/api/agent/bot/attachment/{}".format(event_id))
+            except TaskCancelled:
+                raise
+            except AgentError as error:
+                blocks.append("--- {}: не удалось скачать ({}) ---".format(name, error))
+                continue
+            text = extract_attachment_text(name, data)
+            log("  вложение: {} ({} Б, {} симв. текста)".format(name, len(data), len(text)))
+            blocks.append("--- {} ({} Б) ---\n{}".format(name, len(data), text))
+        return "\n\n".join(blocks)
+
     def task_cancelled(self, task_id: Optional[int]) -> bool:
         """Спрашиваем CRM, не отменили ли задание, — до следующего шага."""
         if not (self.has_crm and task_id):
@@ -707,6 +895,10 @@ class Operator:
         log("Задание: {}".format(prompt))
         self.report("info", "Задание принято: " + prompt)
 
+        self.attachments_context = self.load_attachments(task_id)
+        if self.attachments_context:
+            self.report("info", "Прочитал вложения задания — учту их в шагах")
+
         for index in range(max(1, max_steps)):
             if self.task_cancelled(task_id):
                 log("Задание отменено в CRM — останавливаюсь, шаги больше не шлю.")
@@ -722,8 +914,21 @@ class Operator:
                 except Exception as error:  # noqa: BLE001
                     log("[!] скриншот не удался: {}".format(error))
 
-            step_prompt = ('Задание: "{}"\nЭто шаг {}. Опиши мысль и выбери одно действие. '
-                           'Если всё готово — action finish.'.format(prompt, index + 1))
+            parts = ['Задание: "{}"'.format(prompt),
+                     'Это шаг {}.'.format(index + 1)]
+            if not self.text_only and self.last_shot:
+                parts.append('Размер кадра: {width}×{height} px — координаты клика '
+                             'в этих пикселях.'.format(**self.last_shot))
+            elif self.text_only:
+                parts.append('Работаем без скриншота: координаты считай по текущему экрану.')
+            parts.append('Опиши мысль и выбери одно действие. Если всё готово — action finish.')
+            if self.attachments_context:
+                if index == 0:
+                    parts.append('Файлы от пользователя (используй их содержимое):')
+                    parts.append(self.attachments_context)
+                else:
+                    parts.append('Вложения задания уже прочитаны на первом шаге.')
+            step_prompt = "\n".join(parts)
             decision = self.ask_model(step_prompt, screenshot)
             action = decision["action"]
             thought = decision.get("thought") or ""
@@ -927,6 +1132,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offset-y", type=int, default=0, help="смещение координат по Y")
     parser.add_argument("--no-vision-check", action="store_true",
                         help="не проверять, видит ли модель картинки")
+    parser.add_argument("--no-cursor-marker", action="store_true",
+                        help="не рисовать крестик курсора на скриншоте")
     parser.add_argument("--vision", action="store_true",
                         help="модель точно понимает картинки (deepseek-flash и т. п.): проверку пропустить")
     parser.add_argument("--check", action="store_true",
@@ -964,6 +1171,7 @@ def main() -> int:
         key_hint=PROVIDERS.get(args.provider or "local", {}).get("key_env", ""),
         offset_x=args.offset_x, offset_y=args.offset_y,
         vision_check=not args.no_vision_check, vision_forced=args.vision,
+        cursor_marker=not args.no_cursor_marker,
     )
     operator.current_task = None
 

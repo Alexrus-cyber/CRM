@@ -1,4 +1,4 @@
-import { getAgentTask } from "@/db/repo";
+import { getAgentTask, listAgentEvents } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
 
 /**
@@ -19,6 +19,17 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
   const task = await getAgentTask(ownerId, Number(id) || 0);
   if (!task) return Response.json({ error: "Задание не найдено" }, { status: 404 });
 
+  // Вложения задания: бот скачивает их отдельным маршрутом по eventId.
+  const events = await listAgentEvents(task.id);
+  const attachments = events
+    .filter((event) => event.kind === "attachment" && event.hasFile)
+    .map((event) => ({
+      id: event.id,
+      name: event.fileName || event.text,
+      mime: event.fileMime,
+      size: event.fileSize,
+    }));
+
   return Response.json(
     {
       task: {
@@ -28,6 +39,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         maxSteps: task.maxSteps,
         summary: task.summary,
       },
+      attachments,
     },
     { headers: { "Cache-Control": "no-store" } },
   );
