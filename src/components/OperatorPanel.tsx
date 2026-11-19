@@ -30,6 +30,7 @@ import {
   buildEnvLine,
   buildOperatorCommand,
   findProvider,
+  looksTextOnlyModel,
 } from "@/lib/operatorCommand";
 import {
   ActionGlyph,
@@ -801,7 +802,6 @@ export function OperatorPanel() {
                   {OPERATOR_PROVIDERS.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.label}
-                      {item.vision ? "" : " · без зрения"}
                     </option>
                   ))}
                 </select>
@@ -811,9 +811,12 @@ export function OperatorPanel() {
                 <Input
                   value={model}
                   onChange={(event) => setModel(event.target.value)}
-                  placeholder="например, qwen/qwen2.5-vl-72b-instruct"
+                  placeholder={`например, ${providerMeta.visionModel}`}
                   className="mt-1 h-9 text-[11px]"
                 />
+                <span className="mt-1 block text-[10px]">
+                  Зрение проверяется при запуске — модель должна понимать картинки.
+                </span>
               </label>
               <div className="text-[11px] text-muted sm:col-span-2">
                 <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-2">
@@ -888,13 +891,20 @@ export function OperatorPanel() {
               </div>
             </div>
 
-            {!providerMeta.vision && (
+            {looksTextOnlyModel(model) && (
               <div className="mt-2 flex items-start gap-1.5 rounded-xl border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-[10px] leading-relaxed text-amber-500">
                 <TriangleAlert size={12} className="mt-0.5 shrink-0" />
                 <span>
-                  {providerMeta.label} принимает только текст: экран бот не увидит и будет промахиваться
-                  по кнопкам, а текст может уйти не в то окно. Для работы по скриншоту выберите OpenAI,
-                  OpenRouter, Groq, Together, Mistral или локальную Qwen3-VL.
+                  «{model.trim()}» — текстовая модель, картинки она не принимает: экран бот не увидит
+                  и будет промахиваться. Для работы по скриншоту укажите{" "}
+                  <button
+                    type="button"
+                    onClick={() => setModel(providerMeta.visionModel)}
+                    className="font-medium underline underline-offset-2"
+                  >
+                    {providerMeta.visionModel}
+                  </button>
+                  .
                 </span>
               </div>
             )}

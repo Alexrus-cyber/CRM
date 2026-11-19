@@ -88,7 +88,7 @@ PROVIDERS: Dict[str, Dict[str, str]] = {
                    "key_env": "OPENROUTER_API_KEY"},
     "groq": {"base_url": "https://api.groq.com/openai/v1", "model": "meta-llama/llama-4-scout-17b-16e-instruct",
              "key_env": "GROQ_API_KEY"},
-    "deepseek": {"base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat",
+    "deepseek": {"base_url": "https://api.deepseek.com/v1", "model": "deepseek-flash",
                  "key_env": "DEEPSEEK_API_KEY"},
     "together": {"base_url": "https://api.together.xyz/v1", "model": "Qwen/Qwen2.5-VL-72B-Instruct-Turbo",
                  "key_env": "TOGETHER_API_KEY"},
@@ -138,9 +138,12 @@ SYSTEM_PROMPT = """Ты — оператор рабочего стола вну�
 """
 
 # Заведомо текстовые модели: картинок не понимают, координаты «придумывают».
+# У DeepSeek картинки понимает deepseek-flash; deepseek-chat и deepseek-v4-pro — текст.
 TEXT_ONLY_MODELS = (
-    "deepseek-chat", "deepseek-reasoner", "gpt-3.5", "llama-3.3", "mistral-large", "mixtral",
+    "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro",
+    "gpt-3.5", "llama-3.3", "mixtral",
 )
+VISION_EXAMPLES = "deepseek-flash, gpt-4o-mini, qwen2.5-vl, llama-4-scout, pixtral-12b, Qwen3-VL"
 
 DANGEROUS = re.compile(
     r"удал|удали|снеси|формат|перевод|оплат|купи|покупк|пароль|delete|rm -rf|format|"
@@ -383,7 +386,8 @@ class Operator:
     def __init__(self, crm: str, token: str, base_url: str, model: str, api_key: str,
                  dry_run: bool, assume_yes: bool, max_steps: int, delay: float,
                  poll: float, max_width: int, text_only: bool, key_hint: str = "",
-                 offset_x: int = 0, offset_y: int = 0, vision_check: bool = True) -> None:
+                 offset_x: int = 0, offset_y: int = 0, vision_check: bool = True,
+                 vision_forced: bool = False) -> None:
         self.crm = Http(crm, token, kind="CRM")
         self.has_crm = bool(crm and token)
         self.model_http = Http(base_url, kind="модель", key_hint=key_hint)
@@ -399,8 +403,10 @@ class Operator:
         self.text_only = text_only
         self.offset_x = int(offset_x)
         self.offset_y = int(offset_y)
-        self.vision_check = vision_check
-        self.vision_ok: Optional[bool] = None
+        self.vision_check = vision_check and not vision_forced
+        self.vision_forced = vision_forced
+        # --vision: считаем модель зрячей и не переключаем её в текстовый режим.
+        self.vision_ok: Optional[bool] = True if vision_forced else None
         self.map_logged = False
         self.last_shot: Optional[Dict[str, Any]] = None
         self.history: List[str] = []
@@ -426,9 +432,11 @@ class Operator:
         try:
             data = self.model_http.call("POST", "/chat/completions", payload, timeout=180, headers=headers)
         except AgentError as error:
-            # Модель без поддержки картинок: пробуем текстовый режим один раз.
-            if screenshot and not self.text_only and "image" in str(error).lower():
-                log("[!] Модель не приняла скриншот — продолжаю в текстовом режиме")
+            # Если зрение ещё не подтверждено, а API ругается на картинку —
+            # один раз пробуем текстовый режим. Подтверждённую vision-модель
+            # вслепую не переключаем: пусть ошибка будет видна.
+            if screenshot and not self.text_only and "image" in str(error).lower() and self.vision_ok is not True:
+                log("[!] Модель не приняла скриншот — пробую текстовый режим (проверьте, что модель vision)")
                 self.text_only = True
                 return self.ask_model(prompt, None)
             raise
@@ -471,7 +479,7 @@ class Operator:
                     {"type": "image_url", "image_url": {"url": url}},
                 ],
             }],
-            "max_tokens": 16,
+            "max_tokens": 64,  # модели с размышлениями успевают «подумать»
             "temperature": 0,
         }
         headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
@@ -919,6 +927,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offset-y", type=int, default=0, help="смещение координат по Y")
     parser.add_argument("--no-vision-check", action="store_true",
                         help="не проверять, видит ли модель картинки")
+    parser.add_argument("--vision", action="store_true",
+                        help="модель точно понимает картинки (deepseek-flash и т. п.): проверку пропустить")
     parser.add_argument("--check", action="store_true",
                         help="проверить связь с CRM и токен (без экрана и модели)")
     parser.add_argument("--self-test", action="store_true", help="проверки без экрана и зависимостей")
@@ -953,7 +963,7 @@ def main() -> int:
         delay=args.delay, poll=args.poll, max_width=args.max_width, text_only=args.text_only,
         key_hint=PROVIDERS.get(args.provider or "local", {}).get("key_env", ""),
         offset_x=args.offset_x, offset_y=args.offset_y,
-        vision_check=not args.no_vision_check,
+        vision_check=not args.no_vision_check, vision_forced=args.vision,
     )
     operator.current_task = None
 
@@ -973,18 +983,23 @@ def main() -> int:
                              " + подтверждения" if not args.yes else ""))
     if not args.text_only:
         lowered = (model or "").lower()
-        if any(hint in lowered for hint in TEXT_ONLY_MODELS):
-            log("[!] {} — текстовая модель без зрения: экран она не видит, координаты придумывает."
-                .format(model))
-            log("    Для точных кликов возьмите gpt-4o-mini, qwen2.5-vl, llama-4-scout,")
-            log("    pixtral или локальную Qwen3-VL. Либо запустите с --text-only, чтобы не обещать лишнего.")
+        if args.vision:
+            log("[i] --vision: проверку зрения пропускаю, считаю модель vision-моделью.")
+        elif any(hint in lowered for hint in TEXT_ONLY_MODELS):
+            log("[!] {} — похоже, текстовая модель без зрения: экран она не видит, "
+                "координаты придумывает.".format(model))
+            log("    Для DeepSeek vision-модель — deepseek-flash. Другие варианты: {}."
+                .format(VISION_EXAMPLES))
+            log("    Если модель всё же понимает картинки — запустите с --vision, чтобы убрать проверку.")
         else:
             seen = operator.probe_vision()
             if seen is True:
                 log("Зрение модели: проверено — картинки читает.")
             elif seen is False:
                 log("[!] Модель не прочитала число с тестовой картинки — похоже, изображения она не понимает.")
-                log("    Промахи по координатам почти гарантированы: выберите vision-модель.")
+                log("    Для DeepSeek нужен deepseek-flash (deepseek-chat картинок не принимает).")
+                log("    Другие vision-модели: {}.".format(VISION_EXAMPLES))
+                log("    Если уверены в модели — запустите с --vision, проверка отключится.")
     if not args.dry_run:
         log("Аварийная остановка: уведите мышь в левый верхний угол экрана.")
 
