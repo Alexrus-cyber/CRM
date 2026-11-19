@@ -61,6 +61,21 @@ export function normalizeGenParams(raw: unknown): GenParams {
 }
 
 /**
+ * Разбор значения из localStorage.
+ *
+ * `useStoredJson` отдаёт в `decode` **строку** JSON, а `normalizeGenParams`
+ * ждёт объект. Без `JSON.parse` настройки каждый раз «сбрасывались» в
+ * значения по умолчанию — интерфейс выглядел неактивным.
+ */
+export function decodeGenParams(raw: string): GenParams {
+  try {
+    return normalizeGenParams(JSON.parse(raw));
+  } catch {
+    return { ...GEN_DEFAULT_PARAMS };
+  }
+}
+
+/**
  * Поля для `/chat/completions`. Передаём только заданное: строгие сборки
  * отвергают незнакомые параметры, а не игнорируют их.
  */

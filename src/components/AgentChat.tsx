@@ -24,7 +24,7 @@ import { GenSettings } from "./GenSettings";
 import {
   AGENT_MAX_STEPS,
   GEN_DEFAULT_PARAMS,
-  normalizeGenParams,
+  decodeGenParams,
   type GenParams,
 } from "@/lib/genParams";
 import { formatFileSize, readOperatorFiles, type OperatorAttachment } from "./operator/files";
@@ -100,7 +100,7 @@ export function AgentChat({ userName }: { userName: string }) {
   const [params, setParams] = useStoredJson<GenParams>(
     "crm.ai.agent.params.v1",
     GEN_DEFAULT_PARAMS,
-    normalizeGenParams,
+    decodeGenParams,
   );
   const [maxSteps, setMaxSteps] = useStoredNumber("crm.ai.agent.steps.v1", 20);
   const [health, setHealth] = useState<Health | null>(null);
@@ -157,10 +157,14 @@ export function AgentChat({ userName }: { userName: string }) {
   };
 
   const send = async (preset?: string) => {
-    const content = (preset ?? text).trim();
+    const typed = (preset ?? text).trim();
+    // Файл без вопроса — тоже запрос: агент прочитает вложение и расскажет,
+    // что в нём, вместо того чтобы требовать текст.
+    const content =
+      typed || (attachments.length > 0 ? "Проанализируй приложенные файлы и коротко перескажи главное." : "");
     if (!content || running) return;
     setError(null);
-    setText("");
+    if (!preset) setText("");
     const attachedTurn = attachments.map((file) => ({ name: file.name, size: file.size }));
     const userTurn: Turn = {
       id: nextId(),
@@ -354,6 +358,7 @@ export function AgentChat({ userName }: { userName: string }) {
       <GenSettings
         value={params}
         onChange={setParams}
+        defaultOpen
         subtitle="Как модель думает и генерирует ответ. Пустое поле — параметр не передаём."
       >
         <label className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
@@ -571,9 +576,11 @@ export function AgentChat({ userName }: { userName: string }) {
               className="sr-only"
               aria-label="Приложить файлы для анализа"
               onChange={(event) => {
-                const list = event.target.files;
+                // Снимок делаем ДО input.value = "": иначе браузер очищает
+                // FileList, и файл «не прикрепляется».
+                const list = Array.from(event.target.files ?? []);
                 event.target.value = "";
-                if (!list || list.length === 0) return;
+                if (list.length === 0) return;
                 setReading(true);
                 void readOperatorFiles(attachments, list)
                   .then(({ files, errors }) => {
