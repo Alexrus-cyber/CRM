@@ -56,6 +56,12 @@ MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "6"))
 TIMEOUT = int(os.environ.get("AGENT_TIMEOUT", "180"))
 
 WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", Path(__file__).resolve().parent / "workspace"))
+
+try:  # генератор файлов: docx/xlsx/csv/html/svg/zip — на стандартной библиотеке
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import fileforge  # type: ignore
+except Exception:  # noqa: BLE001 — без него останутся обычные текстовые файлы
+    fileforge = None  # type: ignore
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_BYTES = 400_000  # столько агент готов отдать браузеру одним файлом
@@ -75,6 +81,8 @@ SYSTEM_PROMPT = """Ты — ИИ-агент внутри CRM (Nova CRM). Общ�
 Правила:
 - «Открой сайт X» → open_website. «Включи видео про X» → play_youtube.
 - «Сделай/верни файл» → create_file, затем коротко опиши, что внутри.
+  Форматы: docx (заголовки через #, списки через -), xlsx (строки CSV через ;),
+  csv, md, html, svg, json, zip (содержимое — JSON со списком files), txt.
 - Не выдумывай ссылки: используй только те, что знаешь наверняка, иначе
   сформируй поисковую ссылку (например, https://www.youtube.com/results?search_query=...).
 - Не больше 3 инструментов за один ответ, если не просят иначе.
@@ -88,12 +96,19 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "create_file",
-            "description": "Создать файл и отдать его пользователю на скачивание.",
+            "description": (
+                "Создать файл и отдать его пользователю на скачивание. "
+                "Поддерживаются docx, xlsx, csv, md, html, svg, json, zip, txt и другие."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Имя файла с расширением"},
                     "content": {"type": "string", "description": "Полное содержимое файла"},
+                    "format": {
+                        "type": "string",
+                        "description": "docx | xlsx | csv | md | html | svg | json | zip | txt",
+                    },
                     "mime": {"type": "string", "description": "MIME-тип, необязательно"},
                 },
                 "required": ["name", "content"],
@@ -172,12 +187,19 @@ def run_tool(name: str, args: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]
     events: List[Dict[str, Any]] = []
 
     if name == "create_file":
-        file_name = safe_file_name(args.get("name", "файл.txt"))
+        raw_name = str(args.get("name") or "файл.txt")
         content = str(args.get("content", ""))
-        data = content.encode("utf-8")
+        mime = guess_mime(raw_name, args.get("mime"))
+        if fileforge is not None:
+            try:
+                data, mime, file_name = fileforge.build(raw_name, content, args.get("format"))
+            except Exception as error:  # noqa: BLE001 — покажем модели, что не так
+                raise AgentError(f"Не удалось собрать файл: {error}") from error
+        else:
+            data = content.encode("utf-8")
+            file_name = safe_file_name(raw_name)
         if len(data) > MAX_FILE_BYTES:
             raise AgentError(f"Файл больше {MAX_FILE_BYTES // 1000} КБ — сократи содержимое")
-        mime = guess_mime(file_name, args.get("mime"))
         try:
             (WORKSPACE / file_name).write_bytes(data)
         except OSError as error:  # папка только для чтения и т. п.

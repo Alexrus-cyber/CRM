@@ -1,82 +1,81 @@
-# ИИ-агент CRM (Python)
+# Агенты CRM — обзор
 
-Отдельный процесс, который умеет не только разговаривать, но и делать:
-создавать файлы и управлять экраном браузера (открыть сайт, включить видео).
+В папке `agent/` два независимых агента и общий генератор файлов.
 
-Вкладка «Агент» на странице `/ai` доступна **только главному администратору**
-(это эксперимент). CRM проксирует запросы через `POST /api/ai/agent`, поэтому
-ключ модели и адрес сервера не попадают в браузерные логи агента.
-
-## Запуск
-
-Нужен только Python 3.9+ — сторонних пакетов нет.
-
-```bash
-python3 agent/agent.py
-```
-
-Агент слушает `http://127.0.0.1:8899`. CRM находит его по переменной
-`AGENT_URL` (по умолчанию — этот адрес).
-
-```bash
-AGENT_PORT=9001 AGENT_BASE_URL=http://127.0.0.1:8888/v1 AGENT_MODEL=qwen3:8b python3 agent/agent.py
-AGENT_URL=http://127.0.0.1:9001 npm run dev      # указать CRM, где искать агента
-```
-
-Модель, адрес и ключ можно не задавать в окружении — они приходят из интерфейса
-(те же настройки, что у чата: `Base URL`, `Модель`, `API-ключ`).
-
-## Переменные окружения
-
-| Переменная | По умолчанию | Назначение |
+| Файл | Что это | Зависимости |
 | --- | --- | --- |
-| `AGENT_HOST` | `127.0.0.1` | адрес прослушивания |
-| `AGENT_PORT` | `8899` | порт |
-| `AGENT_BASE_URL` | `http://127.0.0.1:8888/v1` | OpenAI-совместимый сервер |
-| `AGENT_MODEL` | — | модель по умолчанию |
-| `AGENT_API_KEY` | — | ключ, если сервер его требует |
-| `AGENT_WORKSPACE` | `agent/workspace` | папка созданных файлов |
-| `AGENT_MAX_STEPS` | `6` | лимит шагов «модель → инструмент» |
-| `AGENT_TIMEOUT` | `180` | таймаут запроса к модели, секунды |
+| `agent.py` | агент для вкладки «Агент» на странице `/ai`: диалог, файлы, открытие сайтов и видео | нет, только стандартная библиотека Python |
+| `desktop_operator.py` | бот-оператор рабочего стола: смотрит на экран, кликает, печатает, делает файлы | `pyautogui`, `Pillow`, `pyperclip` |
+| `fileforge.py` | сборка файлов (docx, xlsx, csv, md, html, svg, zip…) | нет |
+| `requirements.txt` | зависимости **оператора** | — |
+| `OPERATOR.md` | пошаговая инструкция для оператора | — |
 
-## Инструменты
-
-| Инструмент | Что делает |
-| --- | --- |
-| `create_file` | сохраняет файл в `agent/workspace/` и отдаёт его браузеру (до 400 КБ) |
-| `open_website` | открывает сайт в браузере (только `http/https`) |
-| `play_youtube` | открывает YouTube с автозапуском первого видео по запросу |
-
-Если сервер модели поддерживает function calling — используется он. Если нет
-(ответ `400`/`422` про `tools`), агент автоматически переходит на JSON-протокол:
-модель отвечает блоком ```` ```json {"tool": "...", "args": {...}} ``` ````.
-
-## Протокол
-
-`GET /health` — состояние агента и список инструментов.
-
-`POST /run` — тело `{ messages, settings: { baseUrl, apiKey, model }, context }`,
-ответ — SSE:
-
-| Событие | Данные |
-| --- | --- |
-| `status` | `{"text": "Вызываю инструмент: …"}` |
-| `action` | `{"type":"open_url","url":…,"label":…,"autoplay":…}` или `{"type":"file","name":…,"mime":…,"size":…,"data":<base64>}` |
-| `text` | `{"text": "ответ модели"}` |
-| `error` | `{"error": "…"}` |
-| `done` | `{"steps": N, "files": N, "actions": N}` |
+## Агент в чате (`agent.py`)
 
 ```bash
-curl -N -X POST http://127.0.0.1:8899/run \
-  -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Открой ютуб и включи видео про космос"}]}'
+python3 agent/agent.py          # http://127.0.0.1:8899
 ```
 
-## Ограничения
+`pip install` не нужен: агент написан на стандартной библиотеке (HTTP-сервер,
+JSON, urllib). CRM находит его по переменной `AGENT_URL`
+(по умолчанию `http://127.0.0.1:8899`).
 
-* История диалога с агентом не сохраняется в базе — это тестовый режим.
-* Действия (`open_url`) выполняет браузер: если всплывающие окна заблокированы,
-  открыть можно по карточке действия в диалоге.
-* Агент не имеет доступа к базе CRM: он видит только контекст, который передал
-  прокси (имя, роль, дата).
-* Файлы в `agent/workspace/` не попадают в git (папка в `.gitignore`).
+Инструменты: `create_file` (docx/xlsx/csv/md/html/svg/json/zip/txt),
+`open_website`, `play_youtube`. Адрес модели, ключ и имя модели приходят из
+интерфейса — подойдёт и локальный сервер, и облачный API.
+
+Переменные: `AGENT_HOST`, `AGENT_PORT`, `AGENT_BASE_URL`, `AGENT_MODEL`,
+`AGENT_API_KEY`, `AGENT_WORKSPACE`, `AGENT_MAX_STEPS`, `AGENT_TIMEOUT`.
+
+## Оператор рабочего стола (`desktop_operator.py`)
+
+```bash
+pip install -r agent/requirements.txt
+python3 agent/desktop_operator.py --watch --token ТОКЕН --provider local
+```
+
+Подробная инструкция — [`OPERATOR.md`](OPERATOR.md).
+
+Оператору нужны `pyautogui` и `Pillow`: он делает скриншоты и двигает мышь —
+без этих библиотек такое не сделать (агент в чате работает с браузером и
+файлами, ему они не нужны).
+
+## Генератор файлов (`fileforge.py`)
+
+Оба агента собирают файлы одним модулем:
+
+```python
+import fileforge
+data, mime, name = fileforge.build("план.docx", "# План\n- пункт")
+```
+
+Поддерживаются: `txt`, `md`, `csv`, `tsv`, `json`, `html`, `svg`, `xml`, `yaml`,
+`sql`, `py`, `js`, `ts`, `sh`, `docx`, `xlsx`, `zip`. DOCX и XLSX собираются как
+OOXML-архивы — Word и Excel открывают их без предупреждений, кириллица в порядке.
+PDF намеренно не поддерживается: без встроенного шрифта русский текст в PDF
+превращается в мусор, поэтому документы отдаются в DOCX/HTML.
+
+Проверка без экрана и зависимостей:
+
+```bash
+python3 agent/desktop_operator.py --self-test
+```
+
+## Провайдеры моделей
+
+Оба агента работают с любым OpenAI-совместимым API:
+
+| `--provider` | Адрес по умолчанию | Ключ |
+| --- | --- | --- |
+| `local` | `http://127.0.0.1:8000/v1` | обычно не нужен |
+| `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
+| `together` | `https://api.together.xyz/v1` | `TOGETHER_API_KEY` |
+| `mistral` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
+
+Свой адрес: `--base-url … --model … --api-key …`. Для оператора модель должна
+уметь смотреть картинки (vision): например `gpt-4o-mini`, `qwen/qwen2.5-vl-72b-instruct`,
+`Qwen/Qwen3-VL-8B-Instruct` на vLLM. Если модель не принимает скриншот, оператор
+сам переходит в текстовый режим и предупреждает об этом.

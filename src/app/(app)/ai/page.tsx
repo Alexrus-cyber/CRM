@@ -1,4 +1,4 @@
-import { Bot, FlaskConical, Gauge, MessagesSquare, Sparkles, ShieldCheck } from "lucide-react";
+import { Bot, FlaskConical, Gauge, MessagesSquare, MonitorCog, Sparkles, ShieldCheck } from "lucide-react";
 import { requireUser } from "@/lib/auth";
 import { getAiQuotaOverride, getAiUsage, listAiChats } from "@/db/repo";
 import { aiPolicyFor, AI_ROLE_POLICY, formatTokenCount } from "@/lib/aiPolicy";
@@ -6,6 +6,7 @@ import { ROLE_LABELS } from "@/lib/utils";
 import { Badge, Card, PageHeader } from "@/components/ui";
 import { LazyAiChat } from "@/components/LazyAiChat";
 import { AgentChat } from "@/components/AgentChat";
+import { OperatorPanel } from "@/components/OperatorPanel";
 import { AiTabs, type AiTab } from "@/components/AiTabs";
 import { AiUsageSummary } from "@/components/AiUsageSummary";
 
@@ -38,6 +39,13 @@ export default async function AiPage() {
       hint: "Эксперимент: агент создаёт файлы и управляет экраном",
       icon: <Bot size={14} />,
       content: <AgentChat userName={user.name} />,
+    });
+    tabs.push({
+      id: "operator",
+      label: "Оператор",
+      hint: "Бот, который управляет рабочим столом и возвращает файлы в чат",
+      icon: <MonitorCog size={14} />,
+      content: <OperatorPanel />,
     });
   }
 
@@ -114,7 +122,7 @@ export default async function AiPage() {
         title="Чат с ИИ"
         subtitle={
           isSuperAdmin
-            ? "Диалог с моделью, агент с инструментами и лимиты токенов"
+            ? "Диалог с моделью, агент с инструментами, оператор рабочего стола и лимиты"
             : "Тестовый harness: модель, тип раздумий, RAG-папка, файлы и картинки"
         }
         action={

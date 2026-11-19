@@ -373,11 +373,65 @@ export const taskMessages = pgTable(
   (t) => [index("task_messages_task_idx").on(t.taskId, t.id)],
 );
 
+/** Токен бота-оператора: один на пользователя, создаётся в блоке ИИ. */
+export const agentTokens = pgTable("agent_tokens", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .notNull()
+    .unique()
+    .references(() => users.id, { onDelete: "cascade" }),
+  token: text("token").notNull().unique(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Задание для агента-оператора: ставится в CRM, забирается ботом. */
+export const agentTasks = pgTable(
+  "agent_tasks",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    prompt: text("prompt").notNull(),
+    /** queued | running | done | failed | cancelled */
+    status: text("status").notNull().default("queued"),
+    maxSteps: integer("max_steps").notNull().default(15),
+    steps: integer("steps").notNull().default(0),
+    summary: text("summary").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("agent_tasks_status_idx").on(t.status, t.id)],
+);
+
+/** Журнал шагов агента и файлы, которые он вернул в чат. */
+export const agentEvents = pgTable(
+  "agent_events",
+  {
+    id: serial("id").primaryKey(),
+    taskId: integer("task_id")
+      .notNull()
+      .references(() => agentTasks.id, { onDelete: "cascade" }),
+    /** thought | action | result | file | error | info */
+    kind: text("kind").notNull(),
+    text: text("text").notNull().default(""),
+    action: text("action").notNull().default(""),
+    fileName: text("file_name").notNull().default(""),
+    fileMime: text("file_mime").notNull().default(""),
+    fileSize: integer("file_size").notNull().default(0),
+    fileData: text("file_data").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("agent_events_task_idx").on(t.taskId, t.id)],
+);
+
 export type User = typeof users.$inferSelect;
 export type Counterparty = typeof counterparties.$inferSelect;
 export type Task = typeof tasks.$inferSelect;
 export type Message = typeof messages.$inferSelect;
 export type TaskMessage = typeof taskMessages.$inferSelect;
+export type AgentTask = typeof agentTasks.$inferSelect;
+export type AgentEvent = typeof agentEvents.$inferSelect;
 export type TaskExport = typeof taskExports.$inferSelect;
 export type AiRagFolder = typeof aiRagFolders.$inferSelect;
 export type AiChat = typeof aiChats.$inferSelect;

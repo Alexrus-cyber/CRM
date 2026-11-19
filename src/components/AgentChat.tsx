@@ -45,6 +45,18 @@ type Health = {
   tools?: string[];
 };
 
+/** Пресеты OpenAI-совместимых API: локальная модель или облако по ключу. */
+const PROVIDERS: Array<{ id: string; label: string; baseUrl: string; model: string }> = [
+  { id: "local", label: "Локальная (vLLM / llama.cpp / LM Studio)", baseUrl: "http://127.0.0.1:8888/v1", model: "" },
+  { id: "openai", label: "OpenAI API", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  { id: "openrouter", label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", model: "qwen/qwen2.5-vl-72b-instruct" },
+  { id: "groq", label: "Groq", baseUrl: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
+  { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+  { id: "together", label: "Together", baseUrl: "https://api.together.xyz/v1", model: "Qwen/Qwen2.5-72B-Instruct-Turbo" },
+  { id: "mistral", label: "Mistral", baseUrl: "https://api.mistral.ai/v1", model: "mistral-large-latest" },
+  { id: "custom", label: "Свой адрес…", baseUrl: "", model: "" },
+];
+
 const EXAMPLES = [
   "Открой YouTube и включи видео про космос",
   "Открой сайт новостей и покажи, что там сегодня",
@@ -232,6 +244,21 @@ export function AgentChat({ userName }: { userName: string }) {
     }
   };
 
+  const normalized = settings.baseUrl.replace(/\/+$/, "");
+  const activeProvider =
+    PROVIDERS.find((provider) => provider.baseUrl && provider.baseUrl === normalized)?.id ?? "custom";
+  const remoteApi = !/^https?:\/\/(127\.0\.0\.1|localhost)/.test(normalized);
+
+  const applyProvider = (id: string) => {
+    const provider = PROVIDERS.find((item) => item.id === id);
+    if (!provider || id === "custom") return;
+    saveSettings({
+      ...settings,
+      baseUrl: provider.baseUrl,
+      model: provider.model || settings.model,
+    });
+  };
+
   const available = health?.available ?? false;
   const tools = useMemo(() => health?.tools ?? [], [health]);
 
@@ -285,6 +312,28 @@ export function AgentChat({ userName }: { userName: string }) {
       )}
 
       <div className="rounded-2xl border border-border bg-card">
+        <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 pt-3 text-[11px] text-muted">
+          <label className="flex items-center gap-1.5">
+            Провайдер
+            <select
+              value={activeProvider}
+              onChange={(e) => applyProvider(e.target.value)}
+              className="h-8 rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
+            >
+              {PROVIDERS.map((provider) => (
+                <option key={provider.id} value={provider.id}>
+                  {provider.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <span className="text-[10px]">
+            {remoteApi
+              ? "облачный API: ключ нужен и уходит в запросе, в базу не пишется"
+              : "локальная модель: ключ обычно не нужен"}
+          </span>
+        </div>
+
         <div className="grid gap-2 border-b border-border p-3 sm:grid-cols-3">
           <label className="text-[11px] text-muted">
             Base URL
