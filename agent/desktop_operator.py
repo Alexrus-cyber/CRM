@@ -202,6 +202,114 @@ VERIFY_PROMPT = """Ты проверяешь результат действия
 ok=false — если действие не удалось, открылось не то окно, текст не появился
 или экран выглядит так же, как до действия."""
 
+# Защита от зацикливания: сколько раз подряд допустимо одно и то же действие.
+# Клик/ввод — 2 раза, клавиши и прокрутка — 3 (прокрутка иногда нужна повторно).
+REPEAT_LIMITS = {
+    "click": 2,
+    "double_click": 2,
+    "right_click": 2,
+    "type": 2,
+    "paste": 2,
+    "drag": 2,
+    "key": 3,
+    "hotkey": 3,
+    "scroll": 3,
+}
+# Сколько «лишних» повторов терпим, прежде чем остановить задание.
+MAX_REPEAT_EXTRA = 3
+
+
+def action_signature(action: Dict[str, Any]) -> str:
+    """Отпечаток действия: тип + точка + текст/клавиши.
+
+    Нужен, чтобы отличить «повторил то же самое» от «сделал шаг дальше»:
+    координаты округляем, длинный текст сравниваем по длине и началу.
+    """
+    kind = str(action.get("type") or "")
+
+    def number(*keys: str) -> Optional[int]:
+        for key in keys:
+            value = action.get(key)
+            if value is None:
+                continue
+            try:
+                return int(round(float(value)))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    parts = [kind]
+    x, y = number("x"), number("y")
+    if x is not None or y is not None:
+        parts.append("{}:{}".format(x, y))
+    if kind == "drag":
+        parts.append("drag:{}:{}:{}:{}".format(number("fromX"), number("fromY"),
+                                               number("toX"), number("toY")))
+    text = str(action.get("text") or "")
+    if text:
+        parts.append("{}:{}".format(len(text), text[:60]))
+    keys = action.get("keys")
+    if isinstance(keys, list):
+        parts.append("+".join(str(key).lower() for key in keys))
+    if action.get("key"):
+        parts.append(str(action.get("key")).lower())
+    if action.get("amount") is not None:
+        parts.append("amount:{}".format(action.get("amount")))
+    return "|".join(parts)
+
+
+def action_label(action: Dict[str, Any]) -> str:
+    """Короткое человеческое описание действия для подсказки."""
+    kind = str(action.get("type") or "действие")
+    x, y = action.get("x"), action.get("y")
+    if kind in ("type", "paste"):
+        text = str(action.get("text") or "")
+        where = " в ({}, {})".format(x, y) if x is not None and y is not None else ""
+        return "ввод «{}»{}".format(text[:40], where)
+    if x is not None and y is not None:
+        return "{} в ({}, {})".format(kind, x, y)
+    if kind in ("key", "hotkey"):
+        keys = action.get("keys") or action.get("key") or ""
+        return "{} {}".format(kind, keys)
+    return kind
+
+
+def build_repeat_nudge(action: Dict[str, Any], streak: int) -> str:
+    """Вспомогательный промпт, когда бот застрял на одном действии.
+
+    Модель видит его перед следующим шагом: прямо сказано, что повторять
+    бессмысленно, и дан список других действий вместо бесконечных раздумий.
+    """
+    head = (
+        "ВАЖНО: это {}-й раз подряд одно и то же действие: {}.\n"
+        "Экран от него не меняется — повторять бессмысленно, ты застрял.\n"
+    ).format(streak, action_label(action))
+    return head + (
+        "Посмотри на скриншот, найди, что именно мешает, и выбери ДРУГОЕ действие:\n"
+        "- нужное окно не в фокусе → hotkey alt+tab;\n"
+        "- поверх открыт диалог или меню → key escape;\n"
+        "- элемент не виден → scroll -3 (или +3, если нужно вверх);\n"
+        "- программа закрыта → открой её (open_url или меню «Пуск»);\n"
+        "- текст не появляется → кликни в поле по координатам, затем type с x и y;\n"
+        "- цель уже достигнута → finish с коротким итогом.\n"
+        "Не повторяй прежние координаты и не рассуждай бесконечно: выбери один "
+        "другой шаг и выполни его. Если выполнить нельзя — finish и объясни, что мешает."
+    )
+
+
+
+def build_failed_nudge(count: int, note: str) -> str:
+    """Подсказка, когда проверка несколько раз подряд не увидела результата."""
+    return (
+        "Проверка {} раз подряд не подтвердила результат (последнее: «{}»).\n"
+        "Действие, которое ты выбрал, не работает. Не повторяй его: смени тактику — "
+        "например, Esc от диалога, alt+tab к нужному окну, прокрутка к элементу "
+        "или другой способ выполнить задачу. Если не получается — finish и объясни, "
+        "что именно мешает."
+    ).format(count, (note or "")[:120])
+
+
+
 TEXT_ONLY_MODELS = (
     "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro",
     "gpt-3.5", "llama-3.3", "mixtral",
@@ -447,6 +555,26 @@ def self_test() -> int:
     check("вердикт ok=false читается", bool(false_verdict) and false_verdict["ok"] is False)
 
     probe.generation = {}
+
+    # Антизацикливание: отпечаток действия и текст подсказки.
+    check("отпечаток: числа и строки совпадают",
+          action_signature({"type": "click", "x": 300, "y": "200"})
+          == action_signature({"type": "click", "x": "300", "y": 200}))
+    check("отпечаток: другая точка — другое действие",
+          action_signature({"type": "click", "x": 300, "y": 200})
+          != action_signature({"type": "click", "x": 300, "y": 260}))
+    check("отпечаток: другой текст — другое действие",
+          action_signature({"type": "type", "text": "привет"})
+          != action_signature({"type": "type", "text": "пока"}))
+    repeat_text = build_repeat_nudge({"type": "click", "x": 300, "y": 200}, 3)
+    check("подсказка про повтор упоминает счётчик",
+          "3" in repeat_text and "alt+tab" in repeat_text and "finish" in repeat_text)
+    failed_text = build_failed_nudge(2, "не видно результата")
+    check("подсказка после неудачной проверки",
+          "2 раз" in failed_text and "не подтвердила" in failed_text)
+    check("порог повтора у клика 2, у прокрутки 3",
+          REPEAT_LIMITS["click"] == 2 and REPEAT_LIMITS["scroll"] == 3)
+
     passed = sum(1 for item in checks if item)
     print("\n{}/{} проверок пройдено".format(passed, len(checks)))
     return 0 if passed == len(checks) else 1
@@ -557,7 +685,7 @@ class Operator:
                  offset_x: int = 0, offset_y: int = 0, vision_check: bool = True,
                  vision_forced: bool = False, cursor_marker: bool = True,
                  generation: Optional[Dict[str, Any]] = None,
-                 verify_actions: bool = True) -> None:
+                 verify_actions: bool = True, repeat_nudge: bool = True) -> None:
         self.crm = Http(crm, token, kind="CRM")
         self.has_crm = bool(crm and token)
         self.model_http = Http(base_url, kind="модель", key_hint=key_hint)
@@ -583,6 +711,13 @@ class Operator:
         self.generation = generation or {}
         self.verify_actions = verify_actions
         self.attachment_images: List[str] = []
+        # Антизацикливание: отпечаток последнего действия, серия повторов и
+        # подсказка, которую получит модель на следующем шаге.
+        self.repeat_nudge_enabled = repeat_nudge
+        self.last_signature = ""
+        self.repeat_streak = 0
+        self.pending_nudge = ""
+        self.failed_checks = 0
         self.map_logged = False
         self.last_shot: Optional[Dict[str, Any]] = None
         self.history: List[str] = []
@@ -607,6 +742,10 @@ class Operator:
         ]
         payload = {"model": self.model, "messages": messages, "temperature": 0.2, "stream": False}
         self.apply_generation(payload)
+        # Застряли — добавляем разнообразия: при низкой temperature модель
+        # послушно выбирает то же самое действие. Своё значение не трогаем.
+        if self.pending_nudge and (self.generation or {}).get("temperature") is None:
+            payload["temperature"] = 0.7
         headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
         try:
             data = self.model_http.call("POST", "/chat/completions", payload, timeout=180, headers=headers)
@@ -1069,6 +1208,10 @@ class Operator:
     def run(self, task_id: Optional[int], prompt: str, max_steps: int) -> bool:
         self.current_task = task_id
         self.history = []
+        self.last_signature = ""
+        self.repeat_streak = 0
+        self.pending_nudge = ""
+        self.failed_checks = 0
         log("Задание: {}".format(prompt))
         self.report("info", "Задание принято: " + prompt)
 
@@ -1099,6 +1242,8 @@ class Operator:
             elif self.text_only:
                 parts.append('Работаем без скриншота: координаты считай по текущему экрану.')
             parts.append('Опиши мысль и выбери одно действие. Если всё готово — action finish.')
+            if self.pending_nudge:
+                parts.append(self.pending_nudge)
             if self.attachments_context:
                 if index == 0:
                     parts.append('Файлы от пользователя (используй их содержимое):')
@@ -1126,6 +1271,46 @@ class Operator:
                                   {"status": "done", "summary": summary})
                 log("ГОТОВО: " + summary)
                 return True
+
+            # --- антизацикливание: одно и то же действие подряд ------------
+            signature = action_signature(action)
+            kind = str(action.get("type") or "")
+            if signature == self.last_signature and signature:
+                self.repeat_streak += 1
+            else:
+                self.repeat_streak = 1
+                if self.failed_checks == 0:
+                    self.pending_nudge = ""
+            self.last_signature = signature
+            limit = REPEAT_LIMITS.get(kind, 0)
+
+            if self.repeat_nudge_enabled and limit and self.repeat_streak >= limit:
+                self.pending_nudge = build_repeat_nudge(action, self.repeat_streak)
+                if self.repeat_streak == limit:
+                    log("  повтор действия {} раз — прошу модель сменить тактику".format(
+                        self.repeat_streak))
+                    self.report("info", "Похоже на зацикливание: прошу модель сменить тактику",
+                                action)
+                else:
+                    note = "Повтор действия пропущен ({} раз подряд): {}".format(
+                        self.repeat_streak, action_label(action))
+                    log("  " + note)
+                    self.report("info", note, action)
+                    self.history.append("шаг {}: {} не выполнен — повтор".format(
+                        index + 1, kind))
+                    if self.repeat_streak >= limit + MAX_REPEAT_EXTRA:
+                        stop = ("Застрял на одном действии {} раз подряд — останавливаюсь, "
+                                "чтобы не кликать вслепую. Уточните задание.").format(
+                                    self.repeat_streak)
+                        log(stop)
+                        self.report("error", stop, action)
+                        if self.has_crm and task_id:
+                            self.crm.call("POST",
+                                          "/api/agent/bot/{}/finish".format(task_id),
+                                          {"status": "failed", "summary": stop})
+                        return False
+                    time.sleep(max(0.2, self.delay))
+                    continue
 
             dangerous = bool(DANGEROUS.search(json.dumps(action, ensure_ascii=False)))
             reason = None
@@ -1160,6 +1345,17 @@ class Operator:
                                                              note), action)
                         self.history.append("проверка после {}: {} — {}".format(
                             action.get("type"), "ок" if verdict["ok"] else "проблема", note))
+                        self.failed_checks = 0 if verdict["ok"] else self.failed_checks + 1
+                        if verdict["ok"]:
+                            # Экран изменился — это прогресс, счётчик повторов
+                            # начинается заново (иначе «следующая страница»
+                            # тем же кликом считалась бы зацикливанием).
+                            self.repeat_streak = 0
+                            self.pending_nudge = ""
+                        if not verdict["ok"] and self.failed_checks >= 2:
+                            self.pending_nudge = build_failed_nudge(self.failed_checks, note)
+                            self.report("info", "Результата нет {} раз подряд — меняю тактику".format(
+                                self.failed_checks), action)
                 except TaskCancelled:
                     raise
                 except Exception as error:  # noqa: BLE001
@@ -1339,6 +1535,8 @@ def parse_args() -> argparse.Namespace:
                         help="не дублировать режим в chat_template_kwargs.enable_thinking")
     parser.add_argument("--no-verify-actions", action="store_true",
                         help="не проверять экран после каждого действия")
+    parser.add_argument("--no-repeat-nudge", action="store_true",
+                        help="не подсказывать модели, когда она зациклилась на действии")
     parser.add_argument("--check", action="store_true",
                         help="проверить связь с CRM и токен (без экрана и модели)")
     parser.add_argument("--self-test", action="store_true", help="проверки без экрана и зависимостей")
@@ -1386,6 +1584,7 @@ def main() -> int:
             "send_thinking_flag": not args.no_thinking_flag,
         },
         verify_actions=not args.no_verify_actions,
+        repeat_nudge=not args.no_repeat_nudge,
     )
     operator.current_task = None
 
