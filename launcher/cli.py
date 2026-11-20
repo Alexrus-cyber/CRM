@@ -155,6 +155,13 @@ def self_test() -> int:
     check("агент: адрес, модель и ключ уходят в переменные",
           env.get("AGENT_BASE_URL", "").endswith("/v1") and env.get("AGENT_MODEL") and env.get("AGENT_API_KEY"))
     check("агент: порт по умолчанию", env.get("AGENT_PORT") == "8899")
+    check("агент: уровень доверия уходит в AGENT_TRUST_LEVEL", env.get("AGENT_TRUST_LEVEL") == "verified")
+
+    trust_conf = settings_mod.LaunchSettings()
+    trust_conf.set_value("operator", "trust_level", "none")
+    trust_args = commands.agent_args(operator, trust_conf)
+    check("оператор: уровень доверия передаётся флагом --trust-level",
+          "--trust-level" in trust_args and "none" in trust_args)
 
     custom_conf = settings_mod.LaunchSettings()
     custom_conf.set_value("custom", "args", '--name "Иван Петров" --fast')

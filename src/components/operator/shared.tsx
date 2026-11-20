@@ -33,9 +33,54 @@ export type OperatorTask = {
   maxSteps: number;
   steps: number;
   summary: string;
+  trustLevel?: string;
+  pendingApproval?: PendingTaskApproval | string | null;
+  approvalResponse?: Record<string, unknown> | string | null;
   createdAt: string;
   updatedAt: string;
 };
+
+export type PendingTaskApproval = {
+  id: string;
+  kind: string;
+  title: string;
+  description?: string;
+  extraSteps?: number;
+  action?: Record<string, unknown> | null;
+  createdAt?: string;
+  requestedAt?: string;
+};
+
+export function parsePendingApproval(
+  raw?: PendingTaskApproval | Record<string, unknown> | string | null,
+): PendingTaskApproval | null {
+  if (!raw) return null;
+  let parsed: Partial<PendingTaskApproval> | null = null;
+  if (typeof raw === "string") {
+    if (!raw.trim().startsWith("{")) return null;
+    try {
+      parsed = JSON.parse(raw) as Partial<PendingTaskApproval>;
+    } catch {
+      return null;
+    }
+  } else if (typeof raw === "object") {
+    parsed = raw as Partial<PendingTaskApproval>;
+  }
+  if (!parsed || typeof parsed.title !== "string") return null;
+  return {
+    id: String(parsed.id ?? ""),
+    kind: String(parsed.kind ?? "dangerous_action"),
+    title: parsed.title,
+    description: parsed.description ? String(parsed.description) : undefined,
+    extraSteps: typeof parsed.extraSteps === "number" ? parsed.extraSteps : undefined,
+    action: parsed.action && typeof parsed.action === "object" ? parsed.action : null,
+    createdAt: parsed.createdAt
+      ? String(parsed.createdAt)
+      : parsed.requestedAt
+        ? String(parsed.requestedAt)
+        : undefined,
+  };
+}
 
 export type OperatorEvent = {
   id: number;
@@ -55,6 +100,16 @@ export const TASK_STATUS: Record<
 > = {
   queued: { label: "в очереди", className: "border-amber-500/40 bg-amber-500/10 text-amber-500", Icon: Clock3 },
   running: { label: "выполняется", className: "border-accent/40 bg-accent/15 text-accent2", Icon: Loader2 },
+  waiting_approval: {
+    label: "ждёт подтверждения",
+    className: "border-amber-500/50 bg-amber-500/15 text-amber-500",
+    Icon: PauseCircle,
+  },
+  waiting_steps: {
+    label: "лимит шагов",
+    className: "border-amber-500/50 bg-amber-500/15 text-amber-500",
+    Icon: PauseCircle,
+  },
   done: { label: "готово", className: "border-emerald-500/40 bg-emerald-500/10 text-emerald-500", Icon: CheckCircle2 },
   failed: { label: "ошибка", className: "border-red-500/40 bg-red-500/10 text-red-500", Icon: AlertTriangle },
   cancelled: { label: "отменено", className: "border-border bg-card2 text-muted", Icon: Ban },
@@ -84,15 +139,22 @@ export function ActionGlyph({ type, size = 14 }: { type: string; size?: number }
     case "click":
     case "double_click":
     case "right_click":
+    case "middle_click":
+    case "triple_click":
       return <MousePointerClick size={size} />;
     case "move":
       return <Move size={size} />;
     case "drag":
       return <MousePointerSquareDashed size={size} />;
     case "type":
+    case "paste":
       return <TypeIcon size={size} />;
     case "hotkey":
     case "key":
+    case "switch_language":
+    case "select_all_copy":
+    case "clipboard_get":
+    case "clipboard_set":
       return <Keyboard size={size} />;
     case "scroll":
       return <ScrollText size={size} />;
@@ -136,10 +198,37 @@ export function describeAction(raw: string): ParsedAction | null {
       return { type, title: `Двойной клик ${point(action.x, action.y)}`, json: raw };
     case "right_click":
       return { type, title: `Правый клик ${point(action.x, action.y)}`, json: raw };
+    case "middle_click":
+      return { type, title: `Средний клик ${point(action.x, action.y)}`, json: raw };
+    case "triple_click":
+      return { type, title: `Тройной клик ${point(action.x, action.y)}`, json: raw };
     case "move":
       return { type, title: `Курсор ${point(action.x, action.y)}`, json: raw };
     case "type":
+    case "paste":
       return { type, title: `Ввод текста: «${short(action.text, 80)}»`, json: raw };
+    case "switch_language":
+      return { type, title: `Переключить раскладку (${String(action.target ?? "toggle")})`, json: raw };
+    case "select_all_copy":
+      return { type, title: "Выделить всё и скопировать", json: raw };
+    case "clipboard_get":
+      return { type, title: "Прочитать буфер обмена", json: raw };
+    case "clipboard_set":
+      return { type, title: `Записать в буфер: «${short(action.text, 60)}»`, json: raw };
+    case "launch_app":
+      return { type, title: `Запуск приложения: ${short(action.app ?? action.path, 60)}`, json: raw };
+    case "run_command":
+      return { type, title: `Команда Sandbox: ${short(action.command, 80)}`, json: raw };
+    case "sandbox_write_file":
+      return { type, title: `Файл в Sandbox: ${short(action.path, 60)}`, json: raw };
+    case "sandbox_list":
+      return { type, title: `Список Sandbox: ${short(action.path ?? ".", 60)}`, json: raw };
+    case "export_from_sandbox":
+      return {
+        type,
+        title: `Экспорт из Sandbox: ${short(action.source, 40)} → ${short(action.destination, 40)}`,
+        json: raw,
+      };
     case "hotkey":
       return {
         type,

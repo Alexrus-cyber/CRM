@@ -5,6 +5,10 @@ import { AgentChat } from "@/components/AgentChat";
 type Sent = {
   messages?: Array<{ role: string; content: string }>;
   params?: Record<string, unknown>;
+  trustLevel?: string;
+  ragFolderId?: number;
+  ragFull?: boolean;
+  ragChunks?: number;
   attachments?: Array<{ name: string; text: string }>;
 };
 
@@ -28,12 +32,15 @@ type StoredMsg = {
 };
 
 const sent: Sent[] = [];
+const approvalsSent: Array<Record<string, unknown>> = [];
+const transcriptsSaved: Array<Record<string, unknown>> = [];
 const savedMessages: Array<{ conversationId: number; body: Record<string, unknown> }> = [];
 let conversations: StoredConversation[] = [];
 let messagesByConv: Record<number, StoredMsg[]> = {};
 let nextConvId = 1;
 let nextMsgId = 1;
 let sseReply = "";
+let sseResponder: ((url: string, init?: RequestInit) => Promise<Response> | Response) | null = null;
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -51,10 +58,52 @@ function mockFetch() {
       }
       if (url === "/api/ai/agent" && method === "POST") {
         sent.push(JSON.parse(String(init?.body ?? "{}")) as Sent);
+        if (sseResponder) {
+          return await sseResponder(url, init);
+        }
         if (sseReply) {
           return new Response(sseReply, { status: 200, headers: { "Content-Type": "text/event-stream" } });
         }
         return json({ error: "тест" });
+      }
+      if (url === "/api/ai/agent/approve" && method === "POST") {
+        approvalsSent.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+        return json({ ok: true });
+      }
+      if (url === "/api/ai/rag" && method === "GET") {
+        return json({
+          folders: [
+            {
+              id: 5,
+              name: "Документация",
+              filesCount: 3,
+              chunksCount: 40,
+              chars: 25000,
+              updatedAt: "2026-11-17T10:00:00.000Z",
+            },
+          ],
+        });
+      }
+      if (url === "/api/ai/agent/summarize" && method === "POST") {
+        return json({ summary: "Сжатый итог работы по проекту" });
+      }
+      if (url === "/api/agent/transcripts" && method === "GET") {
+        return json({ transcripts: [] });
+      }
+      if (url === "/api/agent/transcripts" && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        transcriptsSaved.push(body);
+        return json({
+          transcript: {
+            id: 99,
+            conversationId: body.conversationId ?? 1,
+            title: body.title ?? "Чат",
+            summary: body.summary ?? "",
+            fileName: body.fileName ?? "transcript.md",
+            chars: String(body.content ?? "").length,
+            createdAt: "2026-11-17T10:00:00.000Z",
+          },
+        });
       }
 
       if (url.startsWith("/api/agent/conversations?kind=agent") && method === "GET") {
@@ -118,12 +167,15 @@ describe("вкладка «Агент»", () => {
   beforeEach(() => {
     localStorage.clear();
     sent.length = 0;
+    approvalsSent.length = 0;
+    transcriptsSaved.length = 0;
     savedMessages.length = 0;
     conversations = [];
     messagesByConv = {};
     nextConvId = 1;
     nextMsgId = 1;
     sseReply = "";
+    sseResponder = null;
     mockFetch();
   });
 
@@ -214,5 +266,64 @@ describe("вкладка «Агент»", () => {
     await waitFor(() => expect(savedMessages.some((m) => m.body.role === "assistant")).toBe(true));
     const savedAssistant = savedMessages.find((m) => m.body.role === "assistant")!;
     expect(savedAssistant.body.files).toEqual([{ name: "fresh.csv", mime: "text/csv", size: 5 }]);
+  });
+
+  it("передаёт уровень доверия и RAG-папку, запрашивает подтверждение и сжимает чат в Summary", async () => {
+    render(<AgentChat userName="Тест" />);
+    const textarea = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    await waitFor(() => expect((textarea as HTMLTextAreaElement).disabled).toBe(false));
+
+    // Выбор уровня доверия «Дать полный доступ».
+    fireEvent.click(screen.getByRole("radio", { name: /Дать полный доступ/i }));
+
+    // Открытие RAG-панели, выбор папки и «Вся база».
+    fireEvent.click(screen.getByRole("button", { name: /Настроить/i }));
+    const ragSelect = await screen.findByLabelText("Выбор RAG-папки");
+    fireEvent.change(ragSelect, { target: { value: "5" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Вся база/i }));
+
+    // Стриминговый ответ с запросом подтверждения экспорта из Sandbox.
+    const encoder = new TextEncoder();
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              'event: approval_required\ndata: {"approvalId":"appr-1","kind":"sandbox_export","title":"Разрешить перенос?","description":"Экспорт проекта","source":"site","destination":"D:/out","mode":"copy","filesCount":4}\n\n',
+            ),
+          );
+          await new Promise((r) => setTimeout(r, 30));
+          controller.enqueue(encoder.encode('event: text\ndata: {"text":"Экспорт выполнен"}\n\n'));
+          controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    fireEvent.change(textarea, { target: { value: "собери сайт" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    await waitFor(() => expect(sent.length).toBe(1));
+    expect(sent[0].trustLevel).toBe("full");
+    expect(sent[0].ragFolderId).toBe(5);
+    expect(sent[0].ragFull).toBe(true);
+
+    // Появляется карточка подтверждения экспорта — жмём «Разрешить».
+    const approveBtn = await screen.findByRole("button", { name: /^Разрешить$/ });
+    fireEvent.click(approveBtn);
+    await waitFor(() => expect(approvalsSent.length).toBe(1));
+    expect(approvalsSent[0]).toMatchObject({ approvalId: "appr-1", approved: true, destination: "D:/out" });
+
+    expect(await screen.findByText("Экспорт выполнен")).toBeTruthy();
+
+    // Нажимаем кнопку ручного сжатия в Summary и новый чат.
+    const compressBtn = screen.getByRole("button", { name: /Сжать в Summary и новый чат/ });
+    await waitFor(() => expect((compressBtn as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(compressBtn);
+
+    expect(await screen.findByText(/Сжатый итог работы по проекту/)).toBeTruthy();
+    expect(transcriptsSaved).toHaveLength(1);
+    expect(String(transcriptsSaved[0].content)).toContain("# Переписка агента");
   });
 });

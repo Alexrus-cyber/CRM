@@ -87,11 +87,28 @@ const TABLES = [
   },
   {
     name: "agent_tasks",
-    columns: ["id", "user_id", "prompt", "status", "max_steps", "steps", "summary", "created_at", "updated_at"],
+    columns: [
+      "id",
+      "user_id",
+      "prompt",
+      "status",
+      "max_steps",
+      "steps",
+      "summary",
+      "trust_level",
+      "pending_approval",
+      "approval_response",
+      "created_at",
+      "updated_at",
+    ],
   },
   {
     name: "agent_events",
     columns: ["id", "task_id", "kind", "text", "action", "file_name", "file_mime", "file_size", "file_data", "created_at"],
+  },
+  {
+    name: "agent_transcripts",
+    columns: ["id", "user_id", "conversation_id", "title", "summary", "file_name", "content", "chars", "created_at"],
   },
   // Блок «Чат с ИИ»: история, расход токенов, квоты и RAG-индекс.
   { name: "ai_rag_folders", columns: ["id", "user_id", "name", "files_count", "chunks_count", "chars", "created_at", "updated_at"] },
@@ -147,6 +164,9 @@ function normalise(table, column, value) {
       "conversation_id",
       "is_default",
       "size",
+      "task_id",
+      "max_steps",
+      "steps",
     ].includes(column)
   ) {
     return Number(value);
@@ -184,6 +204,9 @@ function columnMigrations(dialect) {
     `alter table tasks add column accepted_at ${ts}`,
     "alter table messages add column content_lower text not null default ''",
     "alter table message_attachments add column name_lower text not null default ''",
+    "alter table agent_tasks add column trust_level text not null default 'verified'",
+    "alter table agent_tasks add column pending_approval text not null default ''",
+    "alter table agent_tasks add column approval_response text not null default ''",
   ];
 }
 
@@ -233,7 +256,7 @@ async function writePg(pool, data) {
     await client.query("begin");
     await client.query(
       "truncate table ai_rag_terms, ai_rag_chunks, ai_rag_folders, ai_chat_messages, ai_chats, ai_usage_events, " +
-        "ai_quota_overrides, agent_conversation_messages, agent_conversations, agent_events, agent_tasks, " +
+        "ai_quota_overrides, agent_transcripts, agent_conversation_messages, agent_conversations, agent_events, agent_tasks, " +
         "agent_connection_tokens, agent_connections, " +
         "agent_tokens, task_messages, task_exports, " +
         "message_attachments, chat_reads, messages, sessions, tasks, " +

@@ -101,6 +101,9 @@ def operator_args(spec: AgentSpec, settings: LaunchSettings) -> List[str]:
 
     if truthy(values.get("yes")):
         args.append("--yes")
+    trust_level = str(values.get("trust_level") or "").strip().lower()
+    if trust_level in ("full", "verified", "none"):
+        args.extend(["--trust-level", trust_level])
     if truthy(values.get("dry_run")):
         args.append("--dry-run")
     if truthy(values.get("text_only")):
@@ -128,6 +131,9 @@ def chat_agent_env(spec: AgentSpec, settings: LaunchSettings) -> Dict[str, str]:
     steps = number(values.get("max_steps"), int)
     if steps:
         env["AGENT_MAX_STEPS"] = str(steps)
+    trust_level = str(values.get("trust_level") or "verified").strip().lower()
+    if trust_level in ("full", "verified", "none"):
+        env["AGENT_TRUST_LEVEL"] = trust_level
     workspace = str(values.get("workspace") or "").strip()
     if workspace:
         env["AGENT_WORKSPACE"] = workspace

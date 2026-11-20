@@ -38,11 +38,14 @@ import random
 import os
 import platform
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
 import zipfile
 from pathlib import Path
@@ -53,6 +56,10 @@ try:
     import fileforge
 except ImportError:  # запуск из другой папки
     fileforge = None  # type: ignore
+try:
+    import sandbox as sandbox_mod
+except ImportError:
+    sandbox_mod = None  # type: ignore
 
 pyautogui = None
 PYAUTOGUI_ERROR: Optional[BaseException] = None
@@ -115,16 +122,23 @@ SYSTEM_PROMPT = """Ты — умный оператор рабочего сто�
 
 Действия:
 - {"type":"click","x":ЧИСЛО,"y":ЧИСЛО,"clicks":1,"button":"left"} — клик по координатам кадра;
-- {"type":"double_click","x":..,"y":..} / {"type":"right_click","x":..,"y":..};
+- {"type":"double_click","x":..,"y":..} / {"type":"right_click","x":..,"y":..} / {"type":"middle_click","x":..,"y":..} / {"type":"triple_click","x":..,"y":..};
 - {"type":"type","text":"текст","x":..,"y":..,"clear":false} — кликнуть в поле (x,y) и набрать текст;
   clear=true — сначала очистить поле; без x,y текст уйдёт в то окно, что сейчас активно;
 - {"type":"paste","text":"текст","x":..,"y":..} — то же самое длинным текстом через буфер обмена;
+- {"type":"switch_language","target":"ru|en|toggle"} — переключить раскладку клавиатуры (если текст не печатается или набирается не на том языке);
+- {"type":"select_all_copy","x":..,"y":..} — выделить всё и скопировать в буфер обмена (возвращает текст);
+- {"type":"clipboard_get"} / {"type":"clipboard_set","text":"…"} — прочитать или записать буфер обмена;
 - {"type":"hotkey","keys":["ctrl","s"]} — сочетание клавиш;
 - {"type":"key","key":"enter"} — одна клавиша;
 - {"type":"scroll","amount":-3,"x":..,"y":..} — прокрутка (минус — вниз);
 - {"type":"drag","fromX":..,"fromY":..,"toX":..,"toY":..};
 - {"type":"wait","seconds":1};
 - {"type":"open_url","url":"https://…"} — открыть сайт или видео в браузере;
+- {"type":"launch_app","app":"notepad"} — открыть программу на ПК (опасное действие: требует подтверждения на сайте);
+- {"type":"run_command","command":"…","cwd":"."} — выполнить команду в изолированной песочнице Sandbox (требует подтверждения на сайте);
+- {"type":"sandbox_write_file","path":"site/index.html","content":"…"} / {"type":"sandbox_list","path":"."};
+- {"type":"export_from_sandbox","source":"…","destination":"…","mode":"copy|move"} — перенести файлы из Sandbox (требует согласия на сайте);
 - {"type":"make_file","name":"план.docx","content":"…"} — сделать файл и отдать в чат;
 - {"type":"finish","summary":"что сделано"}.
 
@@ -137,6 +151,9 @@ SYSTEM_PROMPT = """Ты — умный оператор рабочего сто�
   (например, open_url вместо клика по иконке браузера, ctrl+l для адресной строки,
   alt+tab для переключения окна, escape от всплывающего меню, enter для отправки) —
   используй это.
+- Если нужно ввести русский или английский текст, а ввод не срабатывает или печатается
+  не на том языке (неверная раскладка), используй {"type":"switch_language","target":"ru"}
+  (или "en") или {"type":"paste",...}.
 - Писать текст можно только в то поле, куда сначала кликнул. Всегда указывай x и y
   в action type/paste (кроме случаев, когда поле гарантированно уже в фокусе).
 - Если просят написать в чате или мессенджере: кликни в поле ввода внизу окна чата,
@@ -150,8 +167,9 @@ SYSTEM_PROMPT = """Ты — умный оператор рабочего сто�
   Содержимое пиши полностью, по-русски.
 - Когда задание выполнено — action finish с кратким итогом.
 - Не выдумывай, что видишь: если нужного окна нет, открой его или переключись на него.
-- Опасные действия (удаление, переводы, покупки) выполняй, только если пользователь
-  прямо об этом попросил; иначе сначала спроси через finish и объясни причину.
+- Если действие потенциально опасно (удаление, оплата, перевод, запуск программ,
+  команды, изменение системы, отправка важных данных), обязательно добавь `"dangerous": true`
+  в action — сайт сначала спросит подтверждение у человека!
 """
 
 TEXT_EXTENSIONS = {
@@ -203,7 +221,9 @@ def extract_attachment_text(name: str, data: bytes, limit: int = 4000) -> str:
 
 # Заведомо текстовые модели: картинок не понимают, координаты «придумывают».
 # У DeepSeek картинки понимает deepseek-flash; deepseek-chat и deepseek-v4-pro — текст.
-MAX_STEPS_LIMIT = 500  # столько шагов разрешает и CRM, и интерфейс
+MAX_STEPS_LIMIT = 500  # начальный предел в CRM
+HARD_MAX_STEPS_LIMIT = 2000  # максимальный потолок при расширении шагов на месте
+APPROVAL_WAIT_TIMEOUT = 900  # 15 минут ожидания ответа человека на сайте
 
 VERIFY_PROMPT = """Ты проверяешь результат действия бота на рабочем столе.
 Тебе дают цель шага, описание действия, его результат и свежий скриншот.
@@ -367,12 +387,15 @@ REPEAT_LIMITS = {
     "click": 2,
     "double_click": 2,
     "right_click": 2,
+    "middle_click": 2,
+    "triple_click": 2,
     "type": 2,
     "paste": 2,
     "drag": 2,
     "key": 3,
     "hotkey": 3,
     "scroll": 3,
+    "switch_language": 3,
 }
 # Сколько «лишних» повторов терпим, прежде чем остановить задание.
 MAX_REPEAT_EXTRA = 3
@@ -407,6 +430,12 @@ def action_signature(action: Dict[str, Any]) -> str:
     text = str(action.get("text") or "")
     if text:
         parts.append("{}:{}".format(len(text), text[:60]))
+    if kind == "switch_language":
+        parts.append("lang:{}".format(str(action.get("target") or "toggle")))
+    if kind == "run_command":
+        parts.append("cmd:{}".format(str(action.get("command") or "")[:80]))
+    if kind == "launch_app":
+        parts.append("app:{}".format(str(action.get("app") or action.get("path") or "")))
     keys = action.get("keys")
     if isinstance(keys, list):
         parts.append("+".join(str(key).lower() for key in keys))
@@ -478,9 +507,48 @@ VISION_EXAMPLES = "deepseek-flash, gpt-4o-mini, qwen2.5-vl, llama-4-scout, pixtr
 
 DANGEROUS = re.compile(
     r"удал|удали|снеси|формат|перевод|оплат|купи|покупк|пароль|delete|rm -rf|format|"
-    r"payment|transfer|покупка|очист",
+    r"payment|transfer|покупка|очист|shutdown|reboot|regedit|powershell|cmd\.exe",
     re.IGNORECASE,
 )
+
+ALWAYS_CONFIRM_ACTIONS = {"launch_app", "run_command", "export_from_sandbox"}
+DANGEROUS_HOTKEYS = {("alt", "f4"), ("ctrl", "alt", "delete"), ("win", "r"), ("super", "r")}
+
+TRUST_ORDER = {"none": 0, "verified": 1, "full": 2}
+
+
+def normalize_trust_level(raw: Any, default: str = "verified") -> str:
+    value = str(raw or "").strip().lower()
+    if value in TRUST_ORDER:
+        return value
+    return default
+
+
+def effective_trust_level(cli_trust: str = "", assume_yes: bool = False, task_trust: str = "") -> str:
+    """Выбирает действующий уровень доверия: задача CRM и строгий CLI уважаются."""
+    cli = normalize_trust_level(cli_trust, "") if cli_trust else ("full" if assume_yes else "")
+    task = normalize_trust_level(task_trust, "") if task_trust else ""
+    if cli and task:
+        # Если на сайте выставлено ограничение ("none" или "verified"), оно имеет приоритет,
+        # а если CLI строже — побеждает более строгий вариант.
+        return cli if TRUST_ORDER[cli] <= TRUST_ORDER[task] else task
+    return task or cli or "verified"
+
+
+def is_dangerous_action(action: Dict[str, Any]) -> bool:
+    """Определяет, нужно ли подтверждение на сайте перед выполнением действия."""
+    if not isinstance(action, dict):
+        return False
+    kind = str(action.get("type") or "").lower()
+    if kind in ALWAYS_CONFIRM_ACTIONS:
+        return True
+    if bool(action.get("dangerous") or action.get("requires_confirmation")):
+        return True
+    if kind == "hotkey":
+        keys = tuple(str(k).lower().strip() for k in (action.get("keys") or []) if str(k).strip())
+        if keys in DANGEROUS_HOTKEYS:
+            return True
+    return bool(DANGEROUS.search(json.dumps(action, ensure_ascii=False)))
 
 
 class AgentError(RuntimeError):
@@ -902,25 +970,300 @@ def self_test() -> int:
         sys.stdout = orig_stdout
     check("configure_stdio переводит cp1251-поток на UTF-8", stdio_utf_ok)
 
+    # Уровни доверия и определение опасных действий.
+    check("effective_trust_level: none побеждает full",
+          effective_trust_level("full", True, "none") == "none"
+          and effective_trust_level("none", False, "full") == "none")
+    check("effective_trust_level: verified в задаче не обходится --yes",
+          effective_trust_level("", True, "verified") == "verified"
+          and effective_trust_level("", False, "") == "verified")
+    check("is_dangerous_action помечает launch_app/run_command/alt+f4/dangerous",
+          is_dangerous_action({"type": "launch_app", "app": "calc"})
+          and is_dangerous_action({"type": "run_command", "command": "ls"})
+          and is_dangerous_action({"type": "export_from_sandbox", "source": ".", "destination": "/tmp"})
+          and is_dangerous_action({"type": "hotkey", "keys": ["alt", "f4"]})
+          and is_dangerous_action({"type": "click", "x": 10, "y": 10, "dangerous": True})
+          and not is_dangerous_action({"type": "click", "x": 10, "y": 10}))
+    check("action_signature учитывает switch_language",
+          action_signature({"type": "switch_language", "target": "ru"})
+          != action_signature({"type": "switch_language", "target": "en"}))
+
+    # Симуляция: при доверии 'none' действие блокируется, при 'verified' и лимите шагов —
+    # задача продлевается на месте через ответ сайта и доходит до finish.
+    none_op = Operator(crm="", token="", base_url="http://127.0.0.1:8000/v1",
+                       model="sim-vl", api_key="", dry_run=False, assume_yes=False,
+                       max_steps=3, delay=0.0, poll=1.0, max_width=1600, text_only=True,
+                       vision_check=False, verify_actions=False, self_reflect=False,
+                       trust_level="none")
+    none_calls = {"n": 0, "executed": 0}
+
+    class NoneModelHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            none_calls["n"] += 1
+            if none_calls["n"] == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "thought": "кликну",
+                    "action": {"type": "click", "x": 10, "y": 10}
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "thought": "завершаю",
+                "action": {"type": "finish", "summary": "ok"}
+            })}}]}
+
+    none_op.model_http = NoneModelHttp()  # type: ignore[assignment]
+
+    def count_exec(act: Dict[str, Any]) -> str:
+        none_calls["executed"] += 1
+        return "done"
+
+    none_op.execute = count_exec  # type: ignore[method-assign]
+    none_ok = none_op.run(None, "Кликни", 3)
+    check("уровень доверия none блокирует клики и команды ПК",
+          none_ok and none_calls["executed"] == 0)
+
+    # Симуляция продления шагов на месте через CRM approval и подтверждения launch_app.
+    ext_state = {"model_step": 0, "approvals": [], "finished": False, "executed": []}
+
+    class ExtCrmHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            if path == "/api/agent/bot/77" and method == "GET":
+                return {"task": {"id": 77, "status": "running", "maxSteps": 1,
+                                 "trustLevel": "verified"}, "attachments": []}
+            if path == "/api/agent/bot/77/approval" and method == "POST":
+                ext_state["approvals"].append(payload)
+                return {"ok": True}
+            if path == "/api/agent/bot/77/finish" and method == "POST":
+                ext_state["finished"] = (payload or {}).get("status") == "done"
+                return {"ok": True}
+            return {"ok": True}
+
+    class ExtModelHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            ext_state["model_step"] += 1
+            if ext_state["model_step"] == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "thought": "открываю",
+                    "action": {"type": "launch_app", "app": "calc"}
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "thought": "готово",
+                "action": {"type": "finish", "summary": "сделано после продления"}
+            })}}]}
+
+    ext_op = Operator(crm="http://127.0.0.1:3000", token="crmop_" + "a" * 32,
+                      base_url="http://127.0.0.1:8000/v1", model="sim-vl", api_key="",
+                      dry_run=False, assume_yes=False, max_steps=1, delay=0.0, poll=1.0,
+                      max_width=1600, text_only=True, vision_check=False,
+                      verify_actions=False, self_reflect=False, trust_level="verified")
+    ext_op.crm = ExtCrmHttp()  # type: ignore[assignment]
+    ext_op.model_http = ExtModelHttp()  # type: ignore[assignment]
+    ext_op.execute = lambda act: (ext_state["executed"].append(act.get("type")), "launched")[1]  # type: ignore[method-assign]
+
+    def fake_site_approval(task_id: Optional[int], kind: str, title: str,
+                           description: str, action: Optional[Dict[str, Any]] = None,
+                           extra_steps: int = 0) -> Dict[str, Any]:
+        ext_state["approvals"].append({"kind": kind, "extra_steps": extra_steps})
+        if kind == "step_limit":
+            return {"decision": "extend", "extraSteps": 5}
+        return {"decision": "approve"}
+
+    ext_op.request_website_approval = fake_site_approval  # type: ignore[method-assign]
+    ext_ok = ext_op.run(77, "Запусти калькулятор", 1)
+    check("verified запрашивает одобрение опасных действий и продлевает шаги на месте без потери контекста",
+          ext_ok and ext_state["finished"] and ext_state["executed"] == ["launch_app"]
+          and [a["kind"] for a in ext_state["approvals"]] == ["dangerous_action", "step_limit"])
+
+    # Симуляция досрочного увеличения maxSteps прямо на сайте во время работы задачи.
+    live_state = {"model_step": 0, "finished": False}
+
+    class LiveExtCrmHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            if path == "/api/agent/bot/78" and method == "GET":
+                return {"task": {"id": 78, "status": "running",
+                                 "maxSteps": 1 if live_state["model_step"] == 0 else 4,
+                                 "trustLevel": "full"}, "attachments": []}
+            if path == "/api/agent/bot/78/finish" and method == "POST":
+                live_state["finished"] = (payload or {}).get("status") == "done"
+                return {"ok": True}
+            return {"ok": True}
+
+    class LiveExtModelHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            live_state["model_step"] += 1
+            if live_state["model_step"] == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "thought": "жду",
+                    "action": {"type": "wait", "seconds": 0.1}
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "thought": "готово",
+                "action": {"type": "finish", "summary": "досрочно продлено"}
+            })}}]}
+
+    live_op = Operator(crm="http://127.0.0.1:3000", token="crmop_" + "a" * 32,
+                       base_url="http://127.0.0.1:8000/v1", model="sim-vl", api_key="",
+                       dry_run=False, assume_yes=False, max_steps=1, delay=0.0, poll=1.0,
+                       max_width=1600, text_only=True, vision_check=False,
+                       verify_actions=False, self_reflect=False, trust_level="full")
+    live_op.crm = LiveExtCrmHttp()  # type: ignore[assignment]
+    live_op.model_http = LiveExtModelHttp()  # type: ignore[assignment]
+    live_op.execute = lambda act: "waited"  # type: ignore[method-assign]
+    live_ok = live_op.run(78, "Проверь досрочное продление", 1)
+    check("увеличение maxSteps на сайте во время работы подхватывается на лету",
+          live_ok and live_state["finished"] and live_state["model_step"] == 2)
+
     passed = sum(1 for item in checks if item)
     print("\n{}/{} проверок пройдено".format(passed, len(checks)))
     return 0 if passed == len(checks) else 1
 
 
+def copy_to_clipboard(text: str) -> bool:
+    """Копирует текст в буфер обмена через pyperclip или системную утилиту."""
+    if pyperclip is not None:
+        try:
+            pyperclip.copy(text)
+            return True
+        except Exception:  # noqa: BLE001
+            pass
+    system = platform.system()
+    try:
+        if system == "Windows":
+            subprocess.run(["clip"], input=text.encode("utf-16-le"), check=True, timeout=5)
+            return True
+        if system == "Darwin" and shutil.which("pbcopy"):
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+            return True
+        for tool in (["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+            if shutil.which(tool[0]):
+                subprocess.run(tool, input=text.encode("utf-8"), check=True, timeout=5)
+                return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def read_from_clipboard() -> str:
+    """Читает текст из буфера обмена."""
+    if pyperclip is not None:
+        try:
+            return str(pyperclip.paste() or "")
+        except Exception:  # noqa: BLE001
+            pass
+    system = platform.system()
+    try:
+        if system == "Darwin" and shutil.which("pbpaste"):
+            out = subprocess.run(["pbpaste"], stdout=subprocess.PIPE, check=True, timeout=5)
+            return out.stdout.decode("utf-8", "replace")
+        for tool in (["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard", "--output"]):
+            if shutil.which(tool[0]):
+                out = subprocess.run(tool, stdout=subprocess.PIPE, check=True, timeout=5)
+                return out.stdout.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def get_keyboard_layout() -> str:
+    """Возвращает код текущей раскладки ('ru', 'en' или ''), если ОС позволяет узнать."""
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            tid = user32.GetWindowThreadProcessId(hwnd, None) if hwnd else 0
+            hkl = user32.GetKeyboardLayout(tid)
+            lang_id = hkl & 0xFFFF
+            if lang_id == 0x0419:
+                return "ru"
+            if lang_id in (0x0409, 0x0809):
+                return "en"
+        except Exception:  # noqa: BLE001
+            pass
+    return ""
+
+
+def switch_keyboard_layout(target: str = "toggle") -> str:
+    """Переключает раскладку клавиатуры (ru / en / toggle)."""
+    goal = str(target or "toggle").strip().lower()
+    if goal in ("rus", "russian", "рус", "русский"):
+        goal = "ru"
+    elif goal in ("eng", "english", "us", "англ", "английский"):
+        goal = "en"
+    elif goal not in ("ru", "en"):
+        goal = "toggle"
+
+    current = get_keyboard_layout()
+    if goal in ("ru", "en") and current == goal:
+        return "раскладка уже {}".format(goal.upper())
+
+    system = platform.system()
+    if system == "Windows":
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if hwnd and goal in ("ru", "en"):
+                layout_hex = "00000419" if goal == "ru" else "00000409"
+                hkl = user32.LoadKeyboardLayoutW(layout_hex, 1)
+                if hkl:
+                    user32.PostMessageW(hwnd, 0x0050, 0, hkl)
+                    time.sleep(0.15)
+                    if get_keyboard_layout() == goal:
+                        return "раскладка переключена на {}".format(goal.upper())
+        except Exception:  # noqa: BLE001
+            pass
+        if pyautogui is not None:
+            pyautogui.hotkey("alt", "shift")
+            time.sleep(0.15)
+            after = get_keyboard_layout()
+            if goal in ("ru", "en") and after and after != goal:
+                pyautogui.hotkey("win", "space")
+                time.sleep(0.15)
+            return "переключил раскладку (Alt+Shift / Win+Space)"
+
+    if system == "Linux" and goal in ("ru", "en") and shutil.which("setxkbmap"):
+        try:
+            subprocess.run(["setxkbmap", "ru" if goal == "ru" else "us"], check=True, timeout=5)
+            return "раскладка переключена на {} (setxkbmap)".format(goal.upper())
+        except Exception:  # noqa: BLE001
+            pass
+
+    require_pyautogui()
+    if system == "Darwin":
+        pyautogui.hotkey("ctrl", "space")
+        return "переключил раскладку (Ctrl+Space)"
+    pyautogui.hotkey("alt", "shift")
+    return "переключил раскладку (Alt+Shift)"
+
+
 def type_text(text: str) -> None:
-    """Ввод текста; кириллица — через буфер обмена, иначе pyautogui пишет мусор."""
+    """Ввод текста: проверяет раскладку и использует буфер обмена для не-ASCII."""
     if not text:
         return
     require_pyautogui()
     plain = all(ord(char) < 128 for char in text) and "\n" not in text
-    if plain and len(text) <= 200 or pyperclip is None:
+    if plain and len(text) <= 200:
+        # Если в Windows стоит русская раскладка, ASCII через write() превратится в кракозябры.
+        if get_keyboard_layout() == "ru":
+            switch_keyboard_layout("en")
         pyautogui.write(text, interval=0.02)
         return
-    # Кириллица, переносы строк и длинный текст: pyautogui.write их теряет.
-    pyperclip.copy(text)
-    modifier = "command" if platform.system() == "Darwin" else "ctrl"
-    pyautogui.hotkey(modifier, "v")
-    time.sleep(0.05)
+    if copy_to_clipboard(text):
+        modifier = "command" if platform.system() == "Darwin" else "ctrl"
+        pyautogui.hotkey(modifier, "v")
+        time.sleep(0.06)
+        return
+    # Резерв: если буфер обмена вообще недоступен, переключаемся на нужную раскладку.
+    if any("а" <= ch.lower() <= "я" or ch.lower() == "ё" for ch in text):
+        switch_keyboard_layout("ru")
+    pyautogui.write(text, interval=0.02)
 
 
 class Http:
@@ -1013,7 +1356,7 @@ class Operator:
                  vision_forced: bool = False, cursor_marker: bool = True,
                  generation: Optional[Dict[str, Any]] = None,
                  verify_actions: bool = True, repeat_nudge: bool = True,
-                 self_reflect: bool = True) -> None:
+                 self_reflect: bool = True, trust_level: str = "") -> None:
         self.crm = Http(crm, token, kind="CRM")
         self.has_crm = bool(crm and token)
         self.model_http = Http(base_url, kind="модель", key_hint=key_hint)
@@ -1022,6 +1365,8 @@ class Operator:
         self.api_key = api_key
         self.dry_run = dry_run
         self.assume_yes = assume_yes
+        self.cli_trust_level = normalize_trust_level(trust_level, "") if trust_level else ""
+        self.task_trust_level = ""
         self.max_steps_cap = max_steps
         self.delay = delay
         self.poll = max(1.0, poll)
@@ -1528,9 +1873,80 @@ class Operator:
             webbrowser.open(url)
             return "открыт адрес " + url
 
+        if kind == "switch_language":
+            return switch_keyboard_layout(str(action.get("target") or "toggle"))
+
+        if kind == "clipboard_get":
+            text = read_from_clipboard()
+            return "в буфере ({} симв.): {}".format(len(text), text[:300])
+
+        if kind == "clipboard_set":
+            text = str(action.get("text") or "")
+            if copy_to_clipboard(text):
+                return "скопировано в буфер ({} симв.)".format(len(text))
+            return "не удалось записать в буфер обмена"
+
+        if kind == "launch_app":
+            app_name = str(action.get("app") or action.get("path") or "").strip()
+            if not app_name:
+                return "не указано приложение"
+            args = [str(a) for a in (action.get("args") or []) if str(a).strip()]
+            exe = shutil.which(app_name)
+            if not exe and Path(app_name).is_file():
+                exe = app_name
+            if not exe and platform.system() == "Windows":
+                os.startfile(app_name)  # type: ignore[attr-defined]
+                return "запущено приложение: " + app_name
+            if not exe and platform.system() == "Darwin":
+                subprocess.Popen(["open", "-a", app_name, *args])
+                return "запущено приложение: " + app_name
+            if not exe:
+                raise AgentError("приложение не найдено: " + app_name)
+            subprocess.Popen([exe, *args])
+            return "запущено приложение: " + app_name
+
+        if kind == "sandbox_write_file":
+            if sandbox_mod is None:
+                raise AgentError("Модуль sandbox.py не найден")
+            rel = str(action.get("path") or "output.txt")
+            content = str(action.get("content") or "")
+            res = sandbox_mod.write_text_file(rel, content)
+            return "Sandbox: сохранён {} ({} Б)".format(res["path"], res["bytes"])
+
+        if kind == "sandbox_list":
+            if sandbox_mod is None:
+                raise AgentError("Модуль sandbox.py не найден")
+            rel = str(action.get("path") or ".")
+            items = sandbox_mod.list_tree(rel)
+            names = [it["path"] + ("/" if it["is_dir"] else "") for it in items[:25]]
+            return "Sandbox ({}): {}".format(len(items), ", ".join(names) or "пусто")
+
+        if kind == "run_command":
+            if sandbox_mod is None:
+                raise AgentError("Модуль sandbox.py не найден")
+            cmd = str(action.get("command") or "").strip()
+            if not cmd:
+                return "пустая команда"
+            cwd = str(action.get("cwd") or ".")
+            res = sandbox_mod.run_command(cmd, rel_cwd=cwd, timeout=int(action.get("timeout") or 60))
+            out = (res.get("stdout") or "") + (res.get("stderr") or "")
+            return "команда (код {}): {}".format(res.get("exit_code"), out[:400] or "без вывода")
+
+        if kind == "export_from_sandbox":
+            if sandbox_mod is None:
+                raise AgentError("Модуль sandbox.py не найден")
+            source = str(action.get("source") or ".")
+            destination = str(action.get("destination") or "").strip()
+            if not destination:
+                raise AgentError("не указана папка назначения для экспорта из Sandbox")
+            move = str(action.get("mode") or "copy").lower() == "move"
+            res = sandbox_mod.export_path(source, destination, move=move)
+            return "экспорт из Sandbox ({}): {} → {} ({} файлов)".format(
+                res["mode"], res["source"], res["destination"], res["files"])
+
         require_pyautogui()
 
-        if kind in ("click", "double_click", "right_click"):
+        if kind in ("click", "double_click", "right_click", "middle_click", "triple_click"):
             x, y = self.to_screen(action.get("x", 0), action.get("y", 0))
             # Сначала наводим курсор и проверяем, что он там, где нужно: так
             # срабатывают hover-состояния, а промах виден до нажатия.
@@ -1542,8 +1958,28 @@ class Operator:
             if kind == "double_click":
                 pyautogui.doubleClick(x=x, y=y)
                 return "двойной клик в ({}, {})".format(x, y)
+            if kind == "middle_click":
+                pyautogui.middleClick(x=x, y=y)
+                return "средний клик в ({}, {})".format(x, y)
+            if kind == "triple_click":
+                pyautogui.tripleClick(x=x, y=y)
+                return "тройной клик в ({}, {})".format(x, y)
             pyautogui.rightClick(x=x, y=y)
             return "правый клик в ({}, {})".format(x, y)
+
+        if kind == "select_all_copy":
+            if action.get("x") is not None and action.get("y") is not None:
+                x, y = self.to_screen(action.get("x"), action.get("y"))
+                self.ensure_cursor(x, y)
+                pyautogui.click(x=x, y=y)
+                time.sleep(0.15)
+            modifier = "command" if platform.system() == "Darwin" else "ctrl"
+            pyautogui.hotkey(modifier, "a")
+            time.sleep(0.08)
+            pyautogui.hotkey(modifier, "c")
+            time.sleep(0.1)
+            copied = read_from_clipboard()
+            return "скопировано ({} симв.): {}".format(len(copied), copied[:300])
 
         if kind == "move":
             x, y = self.to_screen(action.get("x", 0), action.get("y", 0))
@@ -1654,18 +2090,87 @@ class Operator:
             blocks.append("--- {} ({} Б) ---\n{}".format(name, len(data), placeholder))
         return "\n\n".join(blocks)
 
+    def current_trust_level(self) -> str:
+        return effective_trust_level(self.cli_trust_level, self.assume_yes, self.task_trust_level)
+
+    def sync_task_state(self, task_id: Optional[int]) -> Optional[Dict[str, Any]]:
+        """Запрашиваем свежее состояние задачи (статус, лимит шагов, уровень доверия)."""
+        if not (self.has_crm and task_id):
+            return None
+        try:
+            data = self.crm.call("GET", "/api/agent/bot/{}".format(task_id), timeout=10)
+        except TaskCancelled:
+            raise
+        except AgentError:
+            return None
+        task = data.get("task")
+        if isinstance(task, dict):
+            if task.get("trustLevel"):
+                self.task_trust_level = normalize_trust_level(task.get("trustLevel"), "verified")
+            if str(task.get("status") or "") == "cancelled":
+                raise TaskCancelled("Задание отменено в CRM")
+        return task if isinstance(task, dict) else None
+
     def task_cancelled(self, task_id: Optional[int]) -> bool:
         """Спрашиваем CRM, не отменили ли задание, — до следующего шага."""
         if not (self.has_crm and task_id):
             return False
         try:
-            data = self.crm.call("GET", "/api/agent/bot/{}".format(task_id), timeout=10)
+            task = self.sync_task_state(task_id)
         except TaskCancelled:
             return True
-        except AgentError:
+        if not task:
             return False
-        status = str((data.get("task") or {}).get("status") or "")
-        return status == "cancelled"
+        return str(task.get("status") or "") == "cancelled"
+
+    def request_website_approval(
+        self,
+        task_id: Optional[int],
+        kind: str,
+        title: str,
+        description: str,
+        action: Optional[Dict[str, Any]] = None,
+        extra_steps: int = 0,
+    ) -> Dict[str, Any]:
+        """Ставит задание на паузу и ждёт подтверждения/продления от человека на сайте."""
+        if not (self.has_crm and task_id):
+            return {"decision": "reject"}
+        req_id = "req-" + uuid.uuid4().hex[:10]
+        payload: Dict[str, Any] = {
+            "id": req_id,
+            "approvalId": req_id,
+            "kind": kind,
+            "title": title[:160],
+            "description": description[:500],
+            "action": action,
+        }
+        if extra_steps > 0:
+            payload["extraSteps"] = int(extra_steps)
+        self.crm.call("POST", "/api/agent/bot/{}/approval".format(task_id), payload, timeout=15)
+        log("[?] Ожидаю решения на сайте ({}): {}".format(kind, title))
+        deadline = time.time() + APPROVAL_WAIT_TIMEOUT
+        while time.time() < deadline:
+            task = self.sync_task_state(task_id)
+            if task:
+                raw_resp = task.get("approvalResponse")
+                resp: Optional[Dict[str, Any]] = None
+                if isinstance(raw_resp, dict):
+                    resp = raw_resp
+                elif isinstance(raw_resp, str) and raw_resp.strip().startswith("{"):
+                    try:
+                        resp = json.loads(raw_resp)
+                    except json.JSONDecodeError:
+                        resp = None
+                if resp and resp.get("id") == req_id:
+                    return resp
+                status = str(task.get("status") or "")
+                # Если человек уже нажал «+20 шагов» прямо на сайте, status вернулся в running.
+                if kind == "step_limit" and status == "running":
+                    return {"id": req_id, "decision": "extend", "extraSteps": int(extra_steps or 20)}
+                if status in ("cancelled", "failed", "done"):
+                    return {"id": req_id, "decision": "reject"}
+            time.sleep(min(2.0, max(1.0, self.poll)))
+        return {"id": req_id, "decision": "timeout"}
 
     def run(self, task_id: Optional[int], prompt: str, max_steps: int) -> bool:
         self.current_task = task_id
@@ -1677,17 +2182,64 @@ class Operator:
         self._last_frame_sig = None
         last_outcome = ""
         last_screen_unchanged = False
-        log("Задание: {}".format(prompt))
-        self.report("info", "Задание принято: " + prompt)
+        current_max_steps = min(HARD_MAX_STEPS_LIMIT, max(1, int(max_steps or 15)))
+        if self.has_crm and task_id:
+            try:
+                task_info = self.sync_task_state(task_id)
+                if task_info and task_info.get("maxSteps"):
+                    current_max_steps = min(HARD_MAX_STEPS_LIMIT, max(1, int(task_info["maxSteps"])))
+            except TaskCancelled:
+                log("Задание отменено в CRM — останавливаюсь.")
+                return False
+
+        log("Задание: {} (доверие: {}, лимит шагов: {})".format(
+            prompt, self.current_trust_level(), current_max_steps))
+        self.report("info", "Задание принято (доверие: {}): {}".format(
+            self.current_trust_level(), prompt))
 
         self.attachments_context = self.load_attachments(task_id)
         if self.attachments_context:
             self.report("info", "Прочитал вложения задания — учту их в шагах")
 
-        for index in range(min(MAX_STEPS_LIMIT, max(1, max_steps))):
-            if self.task_cancelled(task_id):
-                log("Задание отменено в CRM — останавливаюсь, шаги больше не шлю.")
-                return False
+        index = 0
+        while True:
+            if self.has_crm and task_id:
+                try:
+                    task_info = self.sync_task_state(task_id)
+                except TaskCancelled:
+                    log("Задание отменено в CRM — останавливаюсь, шаги больше не шлю.")
+                    return False
+                if task_info and task_info.get("maxSteps"):
+                    server_max = min(HARD_MAX_STEPS_LIMIT, max(1, int(task_info["maxSteps"])))
+                    if server_max > current_max_steps:
+                        log("Лимит шагов увеличен на сайте: {} → {}".format(current_max_steps, server_max))
+                        current_max_steps = server_max
+                        if self.max_steps_cap and self.max_steps_cap < server_max:
+                            self.max_steps_cap = server_max
+
+            if index >= current_max_steps:
+                # Достигнут предел шагов: если есть связь с сайтом и не упёрлись в 2000,
+                # спрашиваем на сайте разрешение продолжить в ЭТОМ же чате/контексте.
+                if self.has_crm and task_id and current_max_steps < HARD_MAX_STEPS_LIMIT:
+                    extra = min(20, HARD_MAX_STEPS_LIMIT - current_max_steps)
+                    resp = self.request_website_approval(
+                        task_id,
+                        kind="step_limit",
+                        title="Достигнут лимит {} шагов".format(current_max_steps),
+                        description="Разрешите добавить шаги и продолжить выполнение текущей задачи без потери контекста.",
+                        action={"type": "extend_steps", "currentSteps": current_max_steps, "addSteps": extra},
+                        extra_steps=extra,
+                    )
+                    decision = str(resp.get("decision") or "reject").lower()
+                    if decision in ("approve", "approved", "extend", "extend_steps", "allow"):
+                        added = max(1, int(resp.get("extraSteps") or extra))
+                        current_max_steps = min(HARD_MAX_STEPS_LIMIT, current_max_steps + added)
+                        if self.max_steps_cap:
+                            self.max_steps_cap = max(self.max_steps_cap, current_max_steps)
+                        self.report("info", "Лимит продлён до {} шагов — продолжаю с шага {}".format(
+                            current_max_steps, index + 1))
+                        continue
+                break
 
             screenshot = None
             shot = None
@@ -1779,18 +2331,34 @@ class Operator:
                     time.sleep(max(0.2, self.delay))
                     continue
 
-            dangerous = bool(DANGEROUS.search(json.dumps(action, ensure_ascii=False)))
+            trust = self.current_trust_level()
+            dangerous = is_dangerous_action(action)
             reason = None
             if self.dry_run:
                 reason = "dry-run: действие не выполнено"
-            elif dangerous and not self.assume_yes:
-                log("[!] Потенциально опасное действие: {}".format(json.dumps(action, ensure_ascii=False)))
-                try:
-                    answer = input("    Выполнить? [y/N]: ").strip().lower()
-                except EOFError:
-                    answer = "n"
-                if answer not in ("y", "yes", "д", "да"):
-                    reason = "отклонено пользователем"
+            elif trust == "none" and kind not in ("wait", "make_file", "finish"):
+                reason = ("заблокировано уровнем доверия «Нет доступа к компьютеру»: "
+                          "действие «{}» не выполнено").format(kind)
+            elif dangerous and trust == "verified":
+                if self.has_crm and task_id:
+                    resp = self.request_website_approval(
+                        task_id,
+                        kind="dangerous_action",
+                        title="Подтвердите действие: {}".format(action_label(action)),
+                        description="ИИ запрашивает выполнение потенциально опасного действия на вашем ПК / в песочнице.",
+                        action=action,
+                    )
+                    decision_resp = str(resp.get("decision") or "reject").lower()
+                    if decision_resp not in ("approve", "approved", "allow", "yes"):
+                        reason = "отклонено пользователем на сайте"
+                else:
+                    log("[!] Потенциально опасное действие: {}".format(json.dumps(action, ensure_ascii=False)))
+                    try:
+                        answer = input("    Выполнить? [y/N]: ").strip().lower()
+                    except EOFError:
+                        answer = "n"
+                    if answer not in ("y", "yes", "д", "да"):
+                        reason = "отклонено пользователем"
 
             if reason:
                 log("  пропуск: " + reason)
@@ -1892,9 +2460,10 @@ class Operator:
                         screenshot=screenshot,
                     )
 
+            index += 1
             time.sleep(max(0.2, self.delay))
 
-        note = "Достигнут предел в {} шагов — задание остановлено".format(max_steps)
+        note = "Достигнут предел в {} шагов — задание остановлено".format(current_max_steps)
         self.report("error", note)
         if self.has_crm and task_id:
             self.crm.call("POST", "/api/agent/bot/{}/finish".format(task_id),
@@ -1935,7 +2504,8 @@ class Operator:
                 log("Жду задание в очереди…")
                 time.sleep(self.poll)
                 continue
-            limit = min(MAX_STEPS_LIMIT, max(1, int(task.get("maxSteps") or 15)))
+            self.task_trust_level = normalize_trust_level(task.get("trustLevel"), "") if task.get("trustLevel") else ""
+            limit = min(HARD_MAX_STEPS_LIMIT, max(1, int(task.get("maxSteps") or 15)))
             if self.max_steps_cap:
                 limit = min(limit, self.max_steps_cap)
             try:
@@ -2035,6 +2605,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="взять одно задание и выйти")
     parser.add_argument("--dry-run", action="store_true", help="только планировать, без действий")
     parser.add_argument("--yes", action="store_true", help="не спрашивать про опасные действия")
+    parser.add_argument("--trust-level", default="", choices=["", "full", "verified", "none"],
+                        help="уровень доверия ИИ: full (полный), verified (с проверкой), none (без доступа)")
     parser.add_argument("--text-only", action="store_true", help="не отправлять скриншоты (без vision)")
     parser.add_argument("--max-steps", type=int, default=0, help="жёсткий предел шагов (0 — из задания)")
     parser.add_argument("--delay", type=float, default=0.8, help="пауза между шагами, сек")
@@ -2100,7 +2672,7 @@ def main() -> int:
     operator = Operator(
         crm=args.server, token=args.token, base_url=base_url, model=model, api_key=api_key,
         dry_run=args.dry_run, assume_yes=args.yes,
-        max_steps=min(MAX_STEPS_LIMIT, max(0, args.max_steps)),
+        max_steps=min(HARD_MAX_STEPS_LIMIT, max(0, args.max_steps)),
         delay=args.delay, poll=args.poll, max_width=args.max_width, text_only=args.text_only,
         key_hint=PROVIDERS.get(args.provider or "local", {}).get("key_env", ""),
         offset_x=args.offset_x, offset_y=args.offset_y,
@@ -2118,6 +2690,7 @@ def main() -> int:
         verify_actions=not args.no_verify_actions,
         repeat_nudge=not args.no_repeat_nudge,
         self_reflect=not args.no_self_reflect,
+        trust_level=args.trust_level,
     )
     operator.current_task = None
 
@@ -2133,8 +2706,10 @@ def main() -> int:
     if not api_key and "127.0.0.1" not in base_url and "localhost" not in base_url:
         log("[!] Ключ API не задан — облачный провайдер ответит 401. Передайте --api-key sk-… "
             "или переменную {}; поле есть во вкладке «Оператор» → «Подключение».".format(key_hint))
-    log("Режим: {}{}".format("DRY-RUN" if args.dry_run else "ИСПОЛНЕНИЕ",
-                             " + подтверждения" if not args.yes else ""))
+    log("Режим: {} · доверие: {}".format(
+        "DRY-RUN" if args.dry_run else "ИСПОЛНЕНИЕ",
+        operator.current_trust_level(),
+    ))
     log("Генерация: раздумья {}, temperature {}, top_p {}, max_tokens {}, проверка "
         "{}, саморазбор {}".format(args.reasoning,
                                    args.temperature if args.temperature is not None else "по умолчанию",

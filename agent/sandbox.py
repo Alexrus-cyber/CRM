@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Изолированная песочница (Sandbox) для ИИ-агента и десктопного оператора.
+
+Модель не может выйти за пределы корня Sandbox при создании проектов,
+записи/чтении файлов, создании папок или запуске bash-команд в проекте:
+  * любые `..`, абсолютные пути, UNC-пути, диски Windows (`C:\\`) и симлинки,
+    ведущие наружу, блокируются до выполнения;
+  * дочерние процессы получают очищенное окружение без API-ключей и токенов CRM
+    (`HOME`, `TMPDIR`, `TEMP` направлены внутрь Sandbox);
+  * статическая проверка команд отсекает очевидные попытки побега и
+    деструктивные системные команды;
+  * перенос файлов из Sandbox наружу в папку пользователя выполняется только
+    после явного согласия человека через `export_path`.
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import platform
+import re
+import shutil
+import subprocess
+import threading
+import time
+import zipfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+DEFAULT_SANDBOX_DIR = Path(__file__).resolve().parent / "sandbox"
+
+# Переменные окружения, которые безопасно оставить дочерним процессам в Sandbox
+# (секреты вроде AGENT_API_KEY, OPENAI_API_KEY, CRM_AGENT_TOKEN сюда не попадают).
+SAFE_ENV_KEYS = (
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "COMSPEC",
+    "WINDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "SHELL",
+    "USERPROFILE",
+    "NODE_ENV",
+    "PYTHONIOENCODING",
+)
+
+# Очевидные попытки побега из Sandbox или разрушения системы.
+ESCAPE_PATTERNS = [
+    re.compile(r"(?:^|[\s;|&`(])rm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+/(?:\s|$|\*)", re.IGNORECASE),
+    re.compile(r"(?:^|[\s;|&`(])(?:mkfs|fdisk|parted|shutdown|reboot|halt|poweroff)\b", re.IGNORECASE),
+    re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),  # fork bomb
+    re.compile(r"(?:/etc/(?:shadow|sudoers|passwd)|~/.ssh|/root/\.ssh)", re.IGNORECASE),
+    re.compile(r"[A-Za-z]:\\Windows\\System32", re.IGNORECASE),
+    re.compile(r"(?:^|[\s;|&`(])cd\s+/(?:\s|$|;|&&)", re.IGNORECASE),
+    re.compile(r"(?:^|[\s;|&`(])dd\s+if=.*\s+of=/dev/", re.IGNORECASE),
+]
+
+MAX_OUTPUT_CHARS = 18_000
+MAX_SANDBOX_FILE_BYTES = 2_000_000
+MAX_LIST_ITEMS = 500
+
+
+class SandboxError(RuntimeError):
+    """Ошибка нарушения границ песочницы или выполнения внутри неё."""
+
+
+def get_sandbox_root(raw: Optional[str] = None) -> Path:
+    base = Path(raw or os.environ.get("AGENT_SANDBOX_DIR") or DEFAULT_SANDBOX_DIR).expanduser()
+    resolved = base.resolve(strict=False)
+    resolved.mkdir(parents=True, exist_ok=True)
+    (resolved / ".tmp").mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def _is_within_root(root: Path, candidate: Path) -> bool:
+    try:
+        return os.path.commonpath([str(root), str(candidate)]) == str(root)
+    except ValueError:
+        return False
+
+
+def safe_resolve(root: Path, rel_path: str = ".", *, allow_root: bool = False) -> Path:
+    """Преобразует относительный путь в путь строго внутри `root`.
+
+    Отвергает:
+      - пустой путь (если `allow_root=False`);
+      - нулевые байты, абсолютные пути (`/…`, `\\…`), буквы дисков (`C:…`);
+      - сегменты `..`, ведущие наружу;
+      - любые существующие симлинки, указывающие за пределы `root`.
+    """
+    root_resolved = root.resolve(strict=False)
+    raw = str(rel_path if rel_path is not None else ".").strip()
+    if not raw or raw == ".":
+        if allow_root:
+            return root_resolved
+        raise SandboxError("Путь внутри Sandbox не может быть пустым")
+
+    if "\x00" in raw:
+        raise SandboxError("Недопустимый символ в пути")
+
+    normalized = raw.replace("\\", "/")
+    if normalized.startswith("/") or normalized.startswith("~"):
+        raise SandboxError(f"Запрещён выход за пределы Sandbox (абсолютный путь): {raw}")
+    if re.match(r"^[A-Za-z]:", normalized):
+        raise SandboxError(f"Запрещён выход за пределы Sandbox (диск): {raw}")
+
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if not parts:
+        if allow_root:
+            return root_resolved
+        raise SandboxError("Укажите путь файла или папки внутри Sandbox")
+
+    current = root_resolved
+    for part in parts:
+        if part == "..":
+            raise SandboxError(f"Запрещён переход «..» за пределы Sandbox: {raw}")
+        if any(ch in part for ch in '<>:"|?*'):
+            raise SandboxError(f"Недопустимые символы в имени «{part}»")
+        current = current / part
+        if current.is_symlink():
+            target = current.resolve(strict=False)
+            if not _is_within_root(root_resolved, target):
+                raise SandboxError(f"Запрещена символьная ссылка за пределы Sandbox: {raw}")
+
+    final = current.resolve(strict=False)
+    if not _is_within_root(root_resolved, final):
+        raise SandboxError(f"Путь выходит за границы Sandbox: {raw}")
+    if final == root_resolved and not allow_root:
+        raise SandboxError("Нельзя перезаписать корень Sandbox")
+    return final
+
+
+def relative_to_root(root: Path, target: Path) -> str:
+    return target.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix()
+
+
+def write_file(root: Path, rel_path: str, content: str) -> Dict[str, Any]:
+    target = safe_resolve(root, rel_path, allow_root=False)
+    data = (content or "").encode("utf-8")
+    if len(data) > MAX_SANDBOX_FILE_BYTES:
+        raise SandboxError(f"Файл «{rel_path}» превышает лимит {MAX_SANDBOX_FILE_BYTES // 1000} КБ")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    return {
+        "path": relative_to_root(root, target),
+        "size": len(data),
+    }
+
+
+def mkdir(root: Path, rel_path: str) -> Dict[str, Any]:
+    target = safe_resolve(root, rel_path, allow_root=False)
+    target.mkdir(parents=True, exist_ok=True)
+    return {"path": relative_to_root(root, target)}
+
+
+def read_file(root: Path, rel_path: str, limit: int = 30_000) -> str:
+    target = safe_resolve(root, rel_path, allow_root=False)
+    if not target.is_file():
+        raise SandboxError(f"Файл не найден в Sandbox: {rel_path}")
+    return target.read_text(encoding="utf-8", errors="replace")[:limit]
+
+
+def delete_path(root: Path, rel_path: str) -> bool:
+    target = safe_resolve(root, rel_path, allow_root=False)
+    if not target.exists():
+        return False
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return True
+
+
+def list_tree(root: Path, rel_path: str = ".") -> Dict[str, Any]:
+    root_resolved = root.resolve(strict=False)
+    base = safe_resolve(root_resolved, rel_path, allow_root=True)
+    if not base.exists():
+        return {"root": str(root_resolved), "items": [], "projects": []}
+
+    items: List[Dict[str, Any]] = []
+    projects: List[Dict[str, Any]] = []
+
+    if base == root_resolved:
+        for child in sorted(root_resolved.iterdir(), key=lambda p: p.name.lower()):
+            if child.name.startswith("."):
+                continue
+            if child.is_dir():
+                file_count = sum(1 for p in child.rglob("*") if p.is_file())
+                projects.append({"name": child.name, "files": file_count})
+
+    for entry in sorted(base.rglob("*"), key=lambda p: str(p).lower()):
+        rel = relative_to_root(root_resolved, entry)
+        if rel.startswith(".tmp"):
+            continue
+        if len(items) >= MAX_LIST_ITEMS:
+            break
+        items.append({
+            "path": rel,
+            "type": "dir" if entry.is_dir() else "file",
+            "size": entry.stat().st_size if entry.is_file() else 0,
+        })
+
+    return {
+        "root": str(root_resolved),
+        "items": items,
+        "projects": projects,
+    }
+
+
+def zip_path(root: Path, rel_path: str) -> Tuple[bytes, str]:
+    target = safe_resolve(root, rel_path, allow_root=True)
+    if not target.exists():
+        raise SandboxError(f"Не найдено в Sandbox: {rel_path}")
+    buffer = io.BytesIO()
+    if target.is_file():
+        return target.read_bytes(), target.name
+    root_name = target.name if target != root.resolve(strict=False) else "sandbox"
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for file_path in sorted(target.rglob("*")):
+            if file_path.is_file():
+                rel = file_path.relative_to(target).as_posix()
+                if rel.startswith(".tmp"):
+                    continue
+                archive.write(file_path, arcname=f"{root_name}/{rel}")
+    return buffer.getvalue(), f"{root_name}.zip"
+
+
+def export_path(
+    root: Path,
+    source_rel: str,
+    dest_raw: str,
+    mode: str = "copy",
+) -> Dict[str, Any]:
+    """Копирует или переносит файл/папку из Sandbox в указанный пользователем путь."""
+    src = safe_resolve(root, source_rel, allow_root=False)
+    if not src.exists():
+        raise SandboxError(f"Источник не найден в Sandbox: {source_rel}")
+
+    raw_dest = str(dest_raw or "").strip()
+    if not raw_dest:
+        raise SandboxError("Не указана папка назначения на компьютере")
+
+    dest = Path(raw_dest).expanduser().resolve(strict=False)
+    # Запрещаем перенос в корень диска или в родителя Sandbox целиком.
+    if dest == dest.parent or str(dest) in ("/", "\\"):
+        raise SandboxError("Нельзя переносить файлы в корень файловой системы")
+
+    root_resolved = root.resolve(strict=False)
+    if _is_within_root(dest, root_resolved) and dest != root_resolved:
+        raise SandboxError("Папка назначения не может содержать сам Sandbox")
+
+    # Если назначение — существующая папка и переносим файл, кладём внутрь под тем же именем;
+    # если переносим папку и dest не заканчивается именем проекта, можно положить внутрь или в dest.
+    target = dest / src.name if (src.is_file() and dest.is_dir()) else dest
+    copied_files: List[str] = []
+    total_bytes = 0
+
+    if src.is_dir():
+        target.mkdir(parents=True, exist_ok=True)
+        for item in src.rglob("*"):
+            if item.is_file():
+                rel = item.relative_to(src)
+                if str(rel).startswith(".tmp"):
+                    continue
+                out_file = target / rel
+                out_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, out_file)
+                copied_files.append(rel.as_posix())
+                total_bytes += item.stat().st_size
+        if mode == "move":
+            shutil.rmtree(src)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+        copied_files.append(src.name)
+        total_bytes = target.stat().st_size
+        if mode == "move":
+            src.unlink()
+
+    return {
+        "source": relative_to_root(root, src) if src.exists() else source_rel,
+        "destination": str(target),
+        "mode": "move" if mode == "move" else "copy",
+        "filesCount": len(copied_files),
+        "bytes": total_bytes,
+        "files": copied_files[:100],
+    }
+
+
+def inspect_command_escape(command: str, root: Path, rel_cwd: str = ".") -> Optional[str]:
+    """Возвращает причину блокировки, если команда пытается сбежать из Sandbox."""
+    text = (command or "").strip()
+    if not text:
+        return "Пустая команда"
+    for pattern in ESCAPE_PATTERNS:
+        if pattern.search(text):
+            return "Команда заблокирована защитой Sandbox (попытка доступа к системным путям или выхода за пределы песочницы)"
+    # Считаем глубину рабочей папки внутри Sandbox: больше `depth` шагов `../` — выход наружу.
+    clean_cwd = "/".join(p for p in str(rel_cwd or ".").replace("\\", "/").split("/") if p not in ("", "."))
+    depth = len(clean_cwd.split("/")) if clean_cwd else 0
+    for match in re.finditer(r"((?:\.\./|\.\.\\)+)", text):
+        ups = match.group(1).count("..")
+        if ups > depth:
+            return "Команда заблокирована защитой Sandbox (попытка выйти через .. выше корня песочницы)"
+    return None
+
+
+def sanitized_env(root: Path, cwd: Path) -> Dict[str, str]:
+    root_resolved = root.resolve(strict=False)
+    tmp_dir = root_resolved / ".tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    env: Dict[str, str] = {}
+    for key in SAFE_ENV_KEYS:
+        if key in os.environ:
+            env[key] = os.environ[key]
+    env["HOME"] = str(root_resolved)
+    env["TMPDIR"] = str(tmp_dir)
+    env["TEMP"] = str(tmp_dir)
+    env["TMP"] = str(tmp_dir)
+    env["PWD"] = str(cwd)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["CRM_SANDBOX"] = "1"
+    env["CRM_SANDBOX_ROOT"] = str(root_resolved)
+    return env
+
+
+def _shell_argv(command: str) -> List[str]:
+    if platform.system() == "Windows":
+        return ["cmd", "/c", command]
+    bash = shutil.which("bash")
+    if bash:
+        return [bash, "-lc", command]
+    return ["/bin/sh", "-c", command]
+
+
+class ProcessManager:
+    """Управляет фоновыми процессами (локальными серверами проектов) внутри Sandbox."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._procs: Dict[int, Dict[str, Any]] = {}
+
+    def start(self, root: Path, command: str, rel_cwd: str = ".") -> Dict[str, Any]:
+        issue = inspect_command_escape(command, root, rel_cwd)
+        if issue:
+            raise SandboxError(issue)
+        cwd = safe_resolve(root, rel_cwd, allow_root=True)
+        cwd.mkdir(parents=True, exist_ok=True)
+        env = sanitized_env(root, cwd)
+
+        kwargs: Dict[str, Any] = {
+            "cwd": str(cwd),
+            "env": env,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if platform.system() != "Windows":
+            kwargs["start_new_session"] = True
+        else:
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+        proc = subprocess.Popen(_shell_argv(command), **kwargs)
+        lines: List[str] = []
+
+        def reader() -> None:
+            if not proc.stdout:
+                return
+            for line in proc.stdout:
+                with self._lock:
+                    lines.append(line.rstrip("\r\n"))
+                    if len(lines) > 120:
+                        del lines[: len(lines) - 120]
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+
+        # Ждём чуть-чуть: ловим мгновенный краш или URL поднявшегося сервера.
+        deadline = time.monotonic() + 1.8
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.15)
+
+        output = "\n".join(lines).strip()[:MAX_OUTPUT_CHARS]
+        url = _detect_local_url(command, output)
+
+        if proc.poll() is not None:
+            return {
+                "background": False,
+                "exitCode": proc.returncode,
+                "cwd": relative_to_root(root, cwd) if cwd != root.resolve(strict=False) else ".",
+                "output": output or f"Процесс завершился с кодом {proc.returncode}",
+                "url": url,
+            }
+
+        entry = {
+            "pid": proc.pid,
+            "proc": proc,
+            "command": command[:300],
+            "cwd": relative_to_root(root, cwd) if cwd != root.resolve(strict=False) else ".",
+            "url": url,
+            "lines": lines,
+            "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        with self._lock:
+            self._procs[proc.pid] = entry
+
+        return {
+            "background": True,
+            "pid": proc.pid,
+            "cwd": entry["cwd"],
+            "output": output or f"Фоновый процесс запущен (PID {proc.pid})",
+            "url": url,
+        }
+
+    def list(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            dead = [pid for pid, info in self._procs.items() if info["proc"].poll() is not None]
+            for pid in dead:
+                self._procs.pop(pid, None)
+            return [
+                {
+                    "pid": pid,
+                    "command": info["command"],
+                    "cwd": info["cwd"],
+                    "url": info["url"],
+                    "startedAt": info["startedAt"],
+                }
+                for pid, info in self._procs.items()
+            ]
+
+    def stop(self, pid: int) -> bool:
+        with self._lock:
+            info = self._procs.pop(pid, None)
+        if not info:
+            return False
+        proc: subprocess.Popen[str] = info["proc"]
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+
+
+def _detect_local_url(command: str, output: str) -> str:
+    match = re.search(r"https?://(?:127\.0\.0\.1|localhost|0\.0\.0\.0):(\d{2,5})", output or "")
+    if match:
+        return f"http://127.0.0.1:{match.group(1)}"
+    # Подсказка из команды: `http.server 8123` или `--port 5173` или `PORT=3001`.
+    port_match = re.search(
+        r"(?:http\.server\s+|--port[=\s]+|-p\s+|PORT=)(\d{2,5})",
+        command or "",
+    )
+    if port_match:
+        return f"http://127.0.0.1:{port_match.group(1)}"
+    return ""
+
+
+def run_command(
+    root: Path,
+    command: str,
+    rel_cwd: str = ".",
+    timeout: int = 60,
+    background: bool = False,
+    process_manager: Optional[ProcessManager] = None,
+) -> Dict[str, Any]:
+    """Выполнить bash/shell-команду строго внутри песочницы `root`."""
+    if background:
+        mgr = process_manager or ProcessManager()
+        return mgr.start(root, command, rel_cwd)
+
+    issue = inspect_command_escape(command, root, rel_cwd)
+    if issue:
+        raise SandboxError(issue)
+
+    cwd = safe_resolve(root, rel_cwd, allow_root=True)
+    cwd.mkdir(parents=True, exist_ok=True)
+    env = sanitized_env(root, cwd)
+    safe_timeout = max(1, min(300, int(timeout or 60)))
+
+    try:
+        completed = subprocess.run(
+            _shell_argv(command),
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=safe_timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        partial = (error.stdout or "") if isinstance(error.stdout, str) else ""
+        raise SandboxError(
+            f"Команда превысила таймаут {safe_timeout} с. Если это сервер — запустите с background=true.\n{partial[:2000]}"
+        ) from error
+
+    output = (completed.stdout or "").strip()[:MAX_OUTPUT_CHARS]
+    return {
+        "background": False,
+        "exitCode": completed.returncode,
+        "cwd": relative_to_root(root, cwd) if cwd != root.resolve(strict=False) else ".",
+        "output": output or f"(вывод пуст, код возврата {completed.returncode})",
+        "url": _detect_local_url(command, output),
+    }
+
+
+def run_pc_command(command: str, timeout: int = 60) -> Dict[str, Any]:
+    """Команда на ПК пользователя (вызывается только при полном доверии или явном разрешении на сайте)."""
+    text = (command or "").strip()
+    if not text:
+        raise SandboxError("Пустая команда")
+    safe_timeout = max(1, min(180, int(timeout or 60)))
+    try:
+        completed = subprocess.run(
+            _shell_argv(text),
+            cwd=str(Path.home()),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=safe_timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SandboxError(f"Команда на ПК превысила таймаут {safe_timeout} с") from error
+    output = (completed.stdout or "").strip()[:MAX_OUTPUT_CHARS]
+    return {
+        "exitCode": completed.returncode,
+        "output": output or f"(вывод пуст, код возврата {completed.returncode})",
+    }

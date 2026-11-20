@@ -44,4 +44,10 @@ describe("команда запуска оператора", () => {
     expect(cmd).not.toContain("--temperature");
     expect(cmd).not.toContain("--reasoning");
   });
+
+  it("передаёт уровень доверия флагом --trust-level", () => {
+    expect(buildOperatorCommand({ provider: "local", trustLevel: "full" })).toContain("--trust-level full");
+    expect(buildOperatorCommand({ provider: "local", trustLevel: "verified" })).toContain("--trust-level verified");
+    expect(buildOperatorCommand({ provider: "local", trustLevel: "none" })).toContain("--trust-level none");
+  });
 });

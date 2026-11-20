@@ -1,7 +1,13 @@
-import { getAgentTask, listAgentEvents, setAgentTaskStatus } from "@/db/repo";
+import {
+  extendAgentTaskSteps,
+  getAgentTask,
+  listAgentEvents,
+  respondAgentTaskApproval,
+  setAgentTaskStatus,
+} from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 
-/** Карточка задания: шаги журнала и метаданные файлов (без base64). */
+/** Карточка задания: шаги журнала и управление (отмена, подтверждение, расширение шагов). */
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
@@ -27,10 +33,46 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const task = await getAgentTask(me.id, Number(id) || 0);
   if (!task) return Response.json({ error: "Задание не найдено" }, { status: 404 });
 
-  const body = (await req.json().catch(() => null)) as { action?: string } | null;
+  const body = (await req.json().catch(() => null)) as
+    | {
+        action?: string;
+        approvalId?: string;
+        note?: string;
+        addSteps?: number;
+      }
+    | null;
+
   if (body?.action === "cancel") {
     await setAgentTaskStatus(task.id, me.id, "cancelled", "Отменено пользователем");
     return Response.json({ ok: true });
   }
+
+  if (body?.action === "approve") {
+    const updated = await respondAgentTaskApproval(task.id, me.id, {
+      approvalId: typeof body.approvalId === "string" ? body.approvalId : undefined,
+      decision: "approved",
+      note: typeof body.note === "string" ? body.note : undefined,
+    });
+    if (!updated) return Response.json({ error: "Задание уже завершено или отменено" }, { status: 409 });
+    return Response.json({ ok: true, task: updated });
+  }
+
+  if (body?.action === "reject") {
+    const updated = await respondAgentTaskApproval(task.id, me.id, {
+      approvalId: typeof body.approvalId === "string" ? body.approvalId : undefined,
+      decision: "rejected",
+      note: typeof body.note === "string" ? body.note : undefined,
+    });
+    if (!updated) return Response.json({ error: "Задание уже завершено или отменено" }, { status: 409 });
+    return Response.json({ ok: true, task: updated });
+  }
+
+  if (body?.action === "extend_steps") {
+    const addSteps = Math.max(1, Number(body.addSteps ?? 15) || 15);
+    const updated = await extendAgentTaskSteps(task.id, me.id, addSteps);
+    if (!updated) return Response.json({ error: "Нельзя расширить лимит завершённой задачи" }, { status: 409 });
+    return Response.json({ ok: true, task: updated });
+  }
+
   return Response.json({ error: "Неизвестное действие" }, { status: 400 });
 }

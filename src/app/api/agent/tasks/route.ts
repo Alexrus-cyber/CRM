@@ -1,6 +1,7 @@
 import { addAgentEvent, createAgentTask, listAgentTasks } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 import { AGENT_MAX_STEPS } from "@/lib/genParams";
+import { normalizeTrustLevel } from "@/lib/trust";
 
 /** Очередь заданий для бота-оператора рабочего стола. */
 export const dynamic = "force-dynamic";
@@ -28,6 +29,7 @@ export async function POST(req: Request) {
     | {
         prompt?: string;
         maxSteps?: number;
+        trustLevel?: string;
         files?: Array<{ name?: string; mime?: string; size?: number; data?: string }>;
       }
     | null;
@@ -51,7 +53,8 @@ export async function POST(req: Request) {
   }
 
   const maxSteps = Math.min(Math.max(Number(body?.maxSteps ?? 15) || 15, 1), AGENT_MAX_STEPS);
-  const task = await createAgentTask(me.id, prompt, maxSteps);
+  const trustLevel = normalizeTrustLevel(body?.trustLevel);
+  const task = await createAgentTask(me.id, prompt, maxSteps, trustLevel);
 
   for (const file of files) {
     await addAgentEvent({

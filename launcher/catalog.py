@@ -40,6 +40,12 @@ REASONING_MODES: Tuple[Tuple[str, str], ...] = (
     ("high", "Глубоко"),
 )
 
+TRUST_LEVELS: Tuple[Tuple[str, str], ...] = (
+    ("verified", "Полный доступ, но с проверкой данных"),
+    ("full", "Дать полный доступ"),
+    ("none", "Нет доступа к компьютеру"),
+)
+
 
 @dataclass(frozen=True)
 class Field:
@@ -104,7 +110,9 @@ OPERATOR = AgentSpec(
               hint="Берётся в CRM: «Оператор» → «Токен агента»."),
         Field("max_steps", "Предел шагов (0 — из задания)", "int", 0),
         Field("delay", "Пауза между шагами, сек", "float", 0.8),
-        Field("yes", "Не спрашивать про опасные действия", "bool", True),
+        Field("trust_level", "Уровень доверия ИИ", "choice", "verified", choices=TRUST_LEVELS,
+              hint="При проверке данных опасные действия, команды и экспорт просят согласие на сайте."),
+        Field("yes", "Не спрашивать в консоли (--yes)", "bool", False),
         Field("dry_run", "Dry-run: только планировать", "bool", False),
         Field("text_only", "Без скриншотов (модель без vision)", "bool", False),
         Field("verify", "Проверять экран после каждого действия", "bool", True),
@@ -131,6 +139,7 @@ CHAT_AGENT = AgentSpec(
         Field("host", "Адрес прослушивания", "text", "127.0.0.1"),
         Field("port", "Порт", "int", 8899),
         Field("max_steps", "Предел шагов на задачу", "int", 500),
+        Field("trust_level", "Уровень доверия ИИ", "choice", "verified", choices=TRUST_LEVELS),
         Field("workspace", "Папка для файлов агента", "folder", ""),
         Field("open_browser", "Открыть адрес после запуска", "bool", True),
     ),
