@@ -308,6 +308,38 @@ def _gui_smoke(check) -> None:
             app = gui.LauncherApp(root)
             check("интерфейс: агенты попали в список", len(app.agents) >= 3)
             check("интерфейс: выбрана форма оператора", app.spec.id == "operator")
+            hotkeys = {"<Control-a>", "<Control-c>", "<Control-v>", "<Control-KeyPress>"}
+            check("интерфейс: Ctrl+A/C/V привязаны к полям и журналу",
+                  hotkeys <= set(app._model_widgets["model"].bindings)
+                  and hotkeys <= set(app.log.bindings))
+
+            # Проверяем работу выделения/копирования/вставки в полях и журнале,
+            # включая русскую раскладку и запрет вставки в журнал (disabled).
+            model_entry = app._model_widgets["model"]
+            base_entry = app._model_widgets["base_url"]
+            app.model_var.set("qwen3-vl:8b")
+            app.base_url_var.set("old-url")
+            model_entry.bindings["<Control-a>"](type("E", (), {"widget": model_entry})())
+            model_entry.bindings["<Control-c>"](type("E", (), {"widget": model_entry})())
+            base_entry.bindings["<Control-KeyPress>"](
+                type("E", (), {"widget": base_entry, "keysym": "Cyrillic_ef", "keycode": 65})(),
+            )
+            base_entry.bindings["<Control-KeyPress>"](
+                type("E", (), {"widget": base_entry, "keysym": "Cyrillic_em", "keycode": 86})(),
+            )
+            check("интерфейс: Ctrl+A/C/V работают в полях (в т.ч. на русской раскладке)",
+                  app.base_url_var.get() == "qwen3-vl:8b")
+
+            app._log("лог для копирования")
+            app.log.bindings["<Control-a>"](type("E", (), {"widget": app.log})())
+            app.log.bindings["<Control-KeyPress>"](
+                type("E", (), {"widget": app.log, "keysym": "Cyrillic_es", "keycode": 67})(),
+            )
+            before_log = app.log.content
+            app.log.bindings["<Control-v>"](type("E", (), {"widget": app.log})())
+            check("интерфейс: журнал копируется через Ctrl+A/C и не портится по Ctrl+V",
+                  "лог для копирования" in app.log.clipboard_get() and app.log.content == before_log)
+            app._sync_model_tab()
 
             app._show_agent("chat_agent")
             app.field_vars["port"].set("8901")

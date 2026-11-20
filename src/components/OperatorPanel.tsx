@@ -14,6 +14,7 @@ import {
   MonitorCog,
   Paperclip,
   Play,
+  PlugZap,
   Rocket,
   Settings2,
   ShieldCheck,
@@ -99,6 +100,20 @@ function statusFilterMatches(status: string, filter: string): boolean {
   return true;
 }
 
+function formatAgo(seconds: number): string {
+  if (seconds < 5) return "только что";
+  if (seconds < 60) return `${seconds} с назад`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} мин назад`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3600)} ч назад`;
+  return `${Math.floor(seconds / 86_400)} дн назад`;
+}
+
+type BotCheckState = {
+  state: "idle" | "busy" | "online" | "warn" | "fail";
+  text: string;
+  checkedAt?: string;
+};
+
 export function OperatorPanel() {
   const [tab, setTab] = useState<SubTab>("desk");
   // Подключение и токен из карточки «Подключения и токены» (хранятся в базе).
@@ -109,6 +124,9 @@ export function OperatorPanel() {
     state: "idle",
     text: "",
   });
+  // Ручная проверка подключения настольного бота: срабатывает только по кнопке,
+  // без фонового опроса и постоянного индикатора.
+  const [botCheck, setBotCheck] = useState<BotCheckState>({ state: "idle", text: "" });
   const [tasks, setTasks] = useState<OperatorTask[]>([]);
   const [events, setEvents] = useState<OperatorEvent[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -266,7 +284,7 @@ export function OperatorPanel() {
     setCheck({ state: "busy", text: "" });
     try {
       const res = await fetch("/api/agent/bot/whoami", {
-        headers: { "x-agent-token": value },
+        headers: { "x-agent-token": value, "x-check-only": "1" },
         cache: "no-store",
       });
       const data = (await res.json().catch(() => ({}))) as {
@@ -288,6 +306,86 @@ export function OperatorPanel() {
       });
     } catch {
       setCheck({ state: "fail", text: "CRM не отвечает — проверьте адрес CRM в шаге 3." });
+    }
+  };
+
+  /**
+   * Ручная проверка подключения бота по нажатию кнопки: проверяет реальную
+   * активность токенов и текущих запусков в CRM (без автоопроса и heartbeat).
+   */
+  const checkBotConnection = async () => {
+    if (botCheck.state === "busy") return;
+    setBotCheck({ state: "busy", text: "" });
+    try {
+      const query = connection?.connectionId ? `?connectionId=${connection.connectionId}` : "";
+      const res = await fetch(`/api/agent/bot/status${query}`, { cache: "no-store" });
+      const data = (await res.json().catch(() => ({}))) as {
+        state?: "online" | "stale" | "never" | "no_tokens";
+        secondsAgo?: number | null;
+        tokenName?: string;
+        tokenHint?: string;
+        connectionName?: string;
+        tokensCount?: number;
+        totalTokensCount?: number;
+        runningTask?: { id: number; steps: number; maxSteps: number } | null;
+        queue?: { queued?: number; running?: number };
+        checkedAt?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.state) {
+        setBotCheck({ state: "fail", text: data.error ?? `Не удалось проверить подключение (HTTP ${res.status})` });
+        return;
+      }
+
+      const checkedAt = data.checkedAt ? formatTime(data.checkedAt) : formatTime(new Date());
+      const tokenLabel = data.tokenName
+        ? `токен «${data.tokenName}»${data.tokenHint ? ` ${data.tokenHint}` : ""}`
+        : data.tokenHint || "токен";
+      const connLabel = data.connectionName ? `, подключение «${data.connectionName}»` : "";
+      const queueLabel = `в очереди ${data.queue?.queued ?? 0}, в работе ${data.queue?.running ?? 0}`;
+
+      if (data.state === "no_tokens") {
+        setBotCheck({
+          state: "warn",
+          checkedAt,
+          text:
+            connection?.connectionName && (data.totalTokensCount ?? 0) > 0
+              ? `В подключении «${connection.connectionName}» нет токенов — создайте токен во вкладке «Подключение».`
+              : "Нет токенов подключения — создайте токен во вкладке «Подключение» и запустите desktop_operator.py.",
+        });
+        return;
+      }
+
+      if (data.state === "never") {
+        setBotCheck({
+          state: "warn",
+          checkedAt,
+          text: `Бот ещё ни разу не подключался к CRM (токенов: ${data.tokensCount ?? 0}). Запустите desktop_operator.py с флагом --watch · ${queueLabel}.`,
+        });
+        return;
+      }
+
+      if (data.state === "online") {
+        const ago = data.secondsAgo !== null && data.secondsAgo !== undefined ? formatAgo(data.secondsAgo) : "сейчас";
+        const taskPart = data.runningTask
+          ? `выполняет запуск #${data.runningTask.id} (шаг ${data.runningTask.steps}/${data.runningTask.maxSteps})`
+          : `последний опрос ${ago}`;
+        setBotCheck({
+          state: "online",
+          checkedAt,
+          text: `Бот подключён · ${taskPart} (${tokenLabel}${connLabel}) · ${queueLabel}`,
+        });
+        return;
+      }
+
+      const ago = data.secondsAgo !== null && data.secondsAgo !== undefined ? formatAgo(data.secondsAgo) : "давно";
+      setBotCheck({
+        state: "warn",
+        checkedAt,
+        text: `Бот сейчас не на связи · последний опрос ${ago} (${tokenLabel}${connLabel}) · проверьте, запущен ли desktop_operator.py --watch`,
+      });
+    } catch {
+      setBotCheck({ state: "fail", text: "CRM не отвечает — не удалось проверить подключение бота." });
     }
   };
 
@@ -466,16 +564,59 @@ export function OperatorPanel() {
         <Badge className="border-border text-muted">
           <Terminal size={11} /> desktop_operator.py
         </Badge>
-        {connection && connection.connectionId !== null && connection.tokensCount === 0 && (
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          {connection && connection.connectionId !== null && connection.tokensCount === 0 && (
+            <button
+              type="button"
+              onClick={() => setTab("setup")}
+              className="flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] font-medium text-amber-500"
+            >
+              <KeyRound size={11} /> нет токенов
+            </button>
+          )}
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => void checkBotConnection()}
+            disabled={botCheck.state === "busy"}
+            title="Разовая проверка: выходил ли бот на связь с CRM"
+          >
+            {botCheck.state === "busy" ? <Loader2 size={12} className="animate-spin" /> : <PlugZap size={12} />}
+            Проверить подключение бота
+          </Button>
+        </div>
+      </div>
+
+      {botCheck.state !== "idle" && botCheck.state !== "busy" && (
+        <div
+          className={cn(
+            "flex items-start gap-2 rounded-xl border px-3 py-2 text-[11px] leading-relaxed",
+            botCheck.state === "online"
+              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-500"
+              : botCheck.state === "warn"
+                ? "border-amber-500/40 bg-amber-500/10 text-amber-500"
+                : "border-red-500/40 bg-red-500/10 text-red-500",
+          )}
+        >
+          {botCheck.state === "online" ? (
+            <Check size={13} className="mt-0.5 shrink-0" />
+          ) : (
+            <TriangleAlert size={13} className="mt-0.5 shrink-0" />
+          )}
+          <span className="min-w-0 flex-1">
+            {botCheck.text}
+            {botCheck.checkedAt && <span className="ml-1.5 text-[10px] opacity-80">· проверено в {botCheck.checkedAt}</span>}
+          </span>
           <button
             type="button"
-            onClick={() => setTab("setup")}
-            className="ml-auto flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] font-medium text-amber-500"
+            onClick={() => setBotCheck({ state: "idle", text: "" })}
+            className="shrink-0 opacity-70 transition hover:opacity-100"
+            aria-label="Скрыть результат проверки бота"
           >
-            <KeyRound size={11} /> нет токенов
+            <X size={13} />
           </button>
-        )}
-      </div>
+        </div>
+      )}
 
       {/* Пульт */}
       {tab === "desk" && (
@@ -705,7 +846,15 @@ export function OperatorPanel() {
                       >
                         команда запуска
                       </button>
-                      . Уже запускали? Проверьте токен кнопкой «Проверить связь».
+                      . Уже запускали?
+                      <button
+                        type="button"
+                        onClick={() => void checkBotConnection()}
+                        className="ml-1 font-medium text-accent2 underline-offset-2 hover:underline"
+                      >
+                        Проверить подключение бота
+                      </button>
+                      .
                     </span>
                   </div>
                 )}

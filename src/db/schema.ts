@@ -428,6 +428,44 @@ export const agentTokens = pgTable("agent_tokens", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** История двух чатов: планировщик «Оператора» и интерактивный «Агент». */
+export const agentConversations = pgTable(
+  "agent_conversations",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    kind: text("kind").$type<"plan" | "agent">().notNull(),
+    title: text("title").notNull().default("Новый чат"),
+    /** Настраиваемый отдельно для каждого план-чата; для агента пусто. */
+    systemPrompt: text("system_prompt").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("agent_conversations_user_kind_idx").on(t.userId, t.kind, t.updatedAt)],
+);
+
+/** Текст истории и только метаданные вложений/созданных файлов (без их байтов). */
+export const agentConversationMessages = pgTable(
+  "agent_conversation_messages",
+  {
+    id: serial("id").primaryKey(),
+    conversationId: integer("conversation_id")
+      .notNull()
+      .references(() => agentConversations.id, { onDelete: "cascade" }),
+    role: text("role").$type<"user" | "assistant">().notNull(),
+    content: text("content").notNull().default(""),
+    reasoning: text("reasoning").notNull().default(""),
+    attachments: text("attachments").notNull().default("[]"),
+    actions: text("actions").notNull().default("[]"),
+    files: text("files").notNull().default("[]"),
+    error: text("error").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("agent_conversation_messages_conversation_idx").on(t.conversationId)],
+);
+
 /** Задание для агента-оператора: ставится в CRM, забирается ботом. */
 export const agentTasks = pgTable(
   "agent_tasks",
@@ -476,6 +514,8 @@ export type Message = typeof messages.$inferSelect;
 export type TaskMessage = typeof taskMessages.$inferSelect;
 export type AgentTask = typeof agentTasks.$inferSelect;
 export type AgentEvent = typeof agentEvents.$inferSelect;
+export type AgentConversation = typeof agentConversations.$inferSelect;
+export type AgentConversationMessage = typeof agentConversationMessages.$inferSelect;
 export type TaskExport = typeof taskExports.$inferSelect;
 export type AiRagFolder = typeof aiRagFolders.$inferSelect;
 export type AiChat = typeof aiChats.$inferSelect;

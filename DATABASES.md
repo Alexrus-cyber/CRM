@@ -137,6 +137,23 @@ SQLITE_PATH=./data/crm.sqlite
 Таблицы описаны в `src/db/dialect.ts` (оба движка) и `src/db/schema.ts`;
 миграция переезда старых токенов — `migrateLegacyAgentTokens` в `dialect.ts`.
 
+## История планировщика и вкладки «Агент»
+
+Переписка чата-планировщика («Оператор») и чатов вкладки «Агент» хранится в
+базе за пользователем (`super_admin`) в двух таблицах, одинаково описанных в
+`src/db/schema.ts` и `src/db/dialect.ts` (и поддерживаемых в `scripts/db-sync.mjs`):
+
+* `agent_conversations` — список чатов (`user_id`, `kind = 'plan' | 'agent'`,
+  `title`, `system_prompt` для индивидуального системного промпта каждого
+  план-чата, `created_at`, `updated_at`), индекс `(user_id, kind, updated_at)`;
+* `agent_conversation_messages` — сообщения (`conversation_id` с `on delete cascade`,
+  `role`, `content`, `reasoning`, JSON-метаданные `attachments`, `actions`, `files`,
+  `error`, `created_at`), индекс `(conversation_id)`.
+
+Вложения и созданные агентом файлы записываются в историю **только
+метаданными** (имя, MIME-тип, размер) — бинарные байты и base64 в эти таблицы
+не сохраняются.
+
 ## Чат: вложения, прочтения, поиск
 
 Чат живёт в трёх таблицах, одинаково описанных в обоих движках

@@ -27,6 +27,138 @@ LOG_FG = "#d7dbe0"
 MUTED = "#8b93a1"
 
 
+def _bind_edit_shortcuts(widget: tk.Widget) -> None:
+    """Bind standard clipboard shortcuts explicitly for bundled Tk runtimes.
+
+    Some portable Tcl/Tk bundles omit or alter the platform's default Entry
+    bindings, and Windows Tk ignores `<Control-c/v/a>` when a non-Latin
+    (e.g. Russian) keyboard layout is active. Handling both key names and
+    layout-independent keycodes/keysyms makes editing reliable in dist builds.
+    """
+
+    def is_text(target: Any) -> bool:
+        return isinstance(target, tk.Text)
+
+    def has_selection(target: Any) -> bool:
+        try:
+            if is_text(target):
+                return bool(target.tag_ranges("sel"))
+            return bool(target.selection_present())
+        except (tk.TclError, AttributeError):
+            return False
+
+    def selected_text(target: Any) -> str:
+        if is_text(target):
+            return str(target.get("sel.first", "sel.last"))
+        start = int(target.index("sel.first"))
+        end = int(target.index("sel.last"))
+        return str(target.get())[start:end]
+
+    def copy(event: Any) -> str:
+        target = getattr(event, "widget", None) or widget
+        if not has_selection(target):
+            return "break"
+        try:
+            value = selected_text(target)
+            target.clipboard_clear()
+            target.clipboard_append(value)
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            pass
+        return "break"
+
+    def editable(target: Any) -> bool:
+        try:
+            if isinstance(target, (ttk.Entry, ttk.Combobox)) and hasattr(target, "instate"):
+                if target.instate(["disabled"]) or target.instate(["readonly"]):
+                    return False
+            return str(target.cget("state")) not in {"disabled", "readonly"}
+        except (tk.TclError, AttributeError):
+            return True
+
+    def cut(event: Any) -> str:
+        target = getattr(event, "widget", None) or widget
+        if not editable(target) or not has_selection(target):
+            return "break"
+        copy(event)
+        try:
+            target.delete("sel.first", "sel.last")
+        except (tk.TclError, AttributeError):
+            pass
+        return "break"
+
+    def paste(event: Any) -> str:
+        target = getattr(event, "widget", None) or widget
+        if not editable(target):
+            return "break"
+        try:
+            value = str(target.clipboard_get())
+            if not is_text(target):
+                value = value.replace("\r\n", "\n").strip("\r\n")
+            if has_selection(target):
+                target.delete("sel.first", "sel.last")
+            target.insert("insert", value)
+        except (tk.TclError, AttributeError):
+            pass
+        return "break"
+
+    def select_all(event: Any) -> str:
+        target = getattr(event, "widget", None) or widget
+        try:
+            if is_text(target):
+                target.tag_add("sel", "1.0", "end-1c")
+                target.mark_set("insert", "end-1c")
+            else:
+                target.selection_range(0, "end")
+                target.icursor("end")
+        except (tk.TclError, AttributeError):
+            pass
+        return "break"
+
+    def dispatch_ctrl_key(event: Any) -> str | None:
+        keysym = str(getattr(event, "keysym", "") or "").lower()
+        # Латинские сочетания уже перехватываются отдельными привязками ниже.
+        if keysym in {"a", "c", "x", "v"}:
+            return None
+        keycode = getattr(event, "keycode", None)
+        win = sys.platform.startswith("win")
+        if keysym == "cyrillic_ef" or (win and keycode == 65):
+            return select_all(event)
+        if keysym == "cyrillic_es" or (win and keycode == 67):
+            return copy(event)
+        if keysym == "cyrillic_che" or (win and keycode == 88):
+            return cut(event)
+        if keysym == "cyrillic_em" or (win and keycode == 86):
+            return paste(event)
+        return None
+
+    sequences: list[tuple[str, Any]] = [
+        ("<Control-a>", select_all),
+        ("<Control-A>", select_all),
+        ("<Control-c>", copy),
+        ("<Control-C>", copy),
+        ("<Control-x>", cut),
+        ("<Control-X>", cut),
+        ("<Control-v>", paste),
+        ("<Control-V>", paste),
+        ("<Control-Insert>", copy),
+        ("<Shift-Insert>", paste),
+        ("<Control-KeyPress>", dispatch_ctrl_key),
+    ]
+    if sys.platform == "darwin":
+        sequences.extend([
+            ("<Command-a>", select_all),
+            ("<Command-A>", select_all),
+            ("<Command-c>", copy),
+            ("<Command-C>", copy),
+            ("<Command-x>", cut),
+            ("<Command-X>", cut),
+            ("<Command-v>", paste),
+            ("<Command-V>", paste),
+        ])
+    for sequence, handler in sequences:
+        widget.bind(sequence, handler)
+
+
 class LauncherApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -180,6 +312,7 @@ class LauncherApp:
                 "max_tokens": self.max_tokens_var,
             }[key]
             widget = ttk.Entry(holder, textvariable=variable)
+        _bind_edit_shortcuts(widget)
         widget.grid(row=1, column=0, sticky="ew", pady=(2, 0))
         self._model_widgets[key] = widget
         if key == "provider":
@@ -203,6 +336,10 @@ class LauncherApp:
 
         self.log = tk.Text(frame, height=10, bg=LOG_BG, fg=LOG_FG, insertbackground=LOG_FG,
                            relief="flat", wrap="word", font=("Consolas", 9), padx=8, pady=6)
+        _bind_edit_shortcuts(self.log)
+        # Отключённый Text в Tk часто не получает фокус по клику — без этого
+        # Ctrl+A/Ctrl+C после клика по журналу уходили в предыдущее поле.
+        self.log.bind("<Button-1>", lambda _event: self.log.focus_set(), add="+")
         self.log.grid(row=1, column=0, sticky="nsew")
         self.log.configure(state="disabled")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.log.yview)
@@ -215,7 +352,7 @@ class LauncherApp:
         footer.columnconfigure(1, weight=1)
         self.status_var = tk.StringVar(value="агент не запущен")
         tk.Label(footer, textvariable=self.status_var, font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w")
-        tk.Label(footer, text="Ctrl+Enter — запуск · Ctrl+. — остановка", fg=MUTED,
+        tk.Label(footer, text="Ctrl+A/C/V — выделить/копировать/вставить · Ctrl+Enter — запуск · Ctrl+. — остановка", fg=MUTED,
                  font=("Segoe UI", 9)).grid(row=0, column=2, sticky="e")
 
     # ------------------------------------------------------------------
@@ -353,6 +490,7 @@ class LauncherApp:
             else:
                 variable = tk.StringVar(value="" if value is None else str(value))
                 widget = ttk.Entry(holder, textvariable=variable)
+            _bind_edit_shortcuts(widget)
             widget.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(2, 0))
             self.field_vars[field.key] = variable
             if field.kind in ("file", "folder"):

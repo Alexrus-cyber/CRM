@@ -12,7 +12,7 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export async function GET(req: Request) {
-  const ownerId = await botOwner(req);
+  const ownerId = await botOwner(req, { touch: req.headers.get("x-check-only") !== "1" });
   if (!ownerId) {
     const token = readAgentToken(req);
     const reason = token ? "Токен не подходит" : "Токен не передан";

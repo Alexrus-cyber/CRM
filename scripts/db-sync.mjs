@@ -78,6 +78,14 @@ const TABLES = [
   // Устаревший одиночный токен на пользователя — остаётся ради старых баз.
   { name: "agent_tokens", columns: ["id", "user_id", "token", "created_at"] },
   {
+    name: "agent_conversations",
+    columns: ["id", "user_id", "kind", "title", "system_prompt", "created_at", "updated_at"],
+  },
+  {
+    name: "agent_conversation_messages",
+    columns: ["id", "conversation_id", "role", "content", "reasoning", "attachments", "actions", "files", "error", "created_at"],
+  },
+  {
     name: "agent_tasks",
     columns: ["id", "user_id", "prompt", "status", "max_steps", "steps", "summary", "created_at", "updated_at"],
   },
@@ -136,6 +144,7 @@ function normalise(table, column, value) {
       "last_read_id",
       "message_id",
       "connection_id",
+      "conversation_id",
       "is_default",
       "size",
     ].includes(column)
@@ -224,7 +233,8 @@ async function writePg(pool, data) {
     await client.query("begin");
     await client.query(
       "truncate table ai_rag_terms, ai_rag_chunks, ai_rag_folders, ai_chat_messages, ai_chats, ai_usage_events, " +
-        "ai_quota_overrides, agent_events, agent_tasks, agent_connection_tokens, agent_connections, " +
+        "ai_quota_overrides, agent_conversation_messages, agent_conversations, agent_events, agent_tasks, " +
+        "agent_connection_tokens, agent_connections, " +
         "agent_tokens, task_messages, task_exports, " +
         "message_attachments, chat_reads, messages, sessions, tasks, " +
         "counterparties, users " +

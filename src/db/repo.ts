@@ -927,7 +927,10 @@ export async function saveAgentToken(userId: number, token: string): Promise<voi
 }
 
 /** Владелец токена — по нему бот получает доступ к своим задачам. */
-export async function findAgentTokenOwner(token: string): Promise<number | null> {
+export async function findAgentTokenOwner(
+  token: string,
+  options?: { touch?: boolean },
+): Promise<number | null> {
   if (!token) return null;
 
   // Сначала новые токены подключений, затем legacy-таблица.
@@ -936,12 +939,130 @@ export async function findAgentTokenOwner(token: string): Promise<number | null>
   );
   if (fresh) {
     // Отмечаем активность: в списке токенов видно, какой бот живой.
-    await q(sql`update agent_connection_tokens set last_used_at = ${nowIso()} where token = ${token}`);
+    // При ручной проверке токена из браузера (`touch: false`) дату не трогаем,
+    // чтобы не создавать ложное впечатление, что бот сейчас запущен.
+    if (options?.touch !== false) {
+      await q(sql`update agent_connection_tokens set last_used_at = ${nowIso()} where token = ${token}`);
+    }
     return toNum(fresh.user_id);
   }
 
   const row = await q1(sql`select user_id from agent_tokens where token = ${token} limit 1`);
   return row ? toNum(row.user_id) : null;
+}
+
+export type AgentBotConnectionStatus = {
+  state: "online" | "stale" | "never" | "no_tokens";
+  connected: boolean;
+  secondsAgo: number | null;
+  lastSeenAt: string | null;
+  tokenName: string;
+  tokenHint: string;
+  connectionName: string;
+  tokensCount: number;
+  totalTokensCount: number;
+  runningTask: { id: number; steps: number; maxSteps: number; updatedAt: string } | null;
+  queue: { queued: number; running: number };
+};
+
+const BOT_ONLINE_WINDOW_SEC = 30;
+const BOT_RUNNING_TASK_WINDOW_SEC = 120;
+
+/**
+ * Сводка активности настольного бота для ручной проверки во вкладке «Оператор».
+ * Опирается на `last_used_at` токенов (бот опрашивает `/api/agent/bot/next` каждые
+ * несколько секунд) и на свежую задачу в статусе `running`.
+ */
+export async function getAgentBotConnectionStatus(
+  userId: number,
+  connectionId?: number,
+): Promise<AgentBotConnectionStatus> {
+  const scopeId = connectionId && connectionId > 0 ? connectionId : 0;
+
+  const totalConnRow = await q1<{ count: number }>(sql`
+    select count(*) as count from agent_connection_tokens where user_id = ${userId}`);
+  const legacyRow = await q1<{ count: number }>(sql`
+    select count(*) as count from agent_tokens where user_id = ${userId}`);
+  const totalTokensCount = toNum(totalConnRow?.count) + toNum(legacyRow?.count);
+
+  const tokenRows = scopeId
+    ? await q(sql`
+        select t.id, t.name, t.token, t.last_used_at, c.name as connection_name
+        from agent_connection_tokens t
+        join agent_connections c on c.id = t.connection_id
+        where t.user_id = ${userId} and t.connection_id = ${scopeId}
+        order by t.last_used_at desc, t.id desc`)
+    : await q(sql`
+        select t.id, t.name, t.token, t.last_used_at, c.name as connection_name
+        from agent_connection_tokens t
+        join agent_connections c on c.id = t.connection_id
+        where t.user_id = ${userId}
+        order by t.last_used_at desc, t.id desc`);
+
+  const tokensCount = scopeId ? tokenRows.length : totalTokensCount;
+  let latestRow: Raw | null = null;
+  let latestMs = -1;
+  for (const row of tokenRows) {
+    const iso = toIso(row.last_used_at);
+    if (!iso) continue;
+    const ms = new Date(iso).getTime();
+    if (!Number.isNaN(ms) && ms > latestMs) {
+      latestMs = ms;
+      latestRow = row;
+    }
+  }
+
+  const queuedRow = await q1<{ count: number }>(sql`
+    select count(*) as count from agent_tasks where user_id = ${userId} and status = 'queued'`);
+  const runningCountRow = await q1<{ count: number }>(sql`
+    select count(*) as count from agent_tasks where user_id = ${userId} and status = 'running'`);
+  const runningRow = await q1(sql`
+    select id, steps, max_steps, updated_at
+    from agent_tasks
+    where user_id = ${userId} and status = 'running'
+    order by updated_at desc, id desc limit 1`);
+
+  const nowMs = Date.now();
+  const lastSeenAt = latestRow ? toIso(latestRow.last_used_at) : null;
+  const secondsAgo = latestMs >= 0 ? Math.max(0, Math.round((nowMs - latestMs) / 1000)) : null;
+
+  const runningTask = runningRow
+    ? {
+        id: toNum(runningRow.id),
+        steps: toNum(runningRow.steps),
+        maxSteps: toNum(runningRow.max_steps),
+        updatedAt: toIso(runningRow.updated_at) ?? nowIso(),
+      }
+    : null;
+  const runningMs = runningTask ? new Date(runningTask.updatedAt).getTime() : NaN;
+  const runningSecondsAgo = !Number.isNaN(runningMs) ? Math.max(0, Math.round((nowMs - runningMs) / 1000)) : null;
+
+  const connected =
+    (secondsAgo !== null && secondsAgo <= BOT_ONLINE_WINDOW_SEC) ||
+    (runningSecondsAgo !== null && runningSecondsAgo <= BOT_RUNNING_TASK_WINDOW_SEC);
+
+  let state: AgentBotConnectionStatus["state"];
+  if (tokensCount === 0) state = "no_tokens";
+  else if (connected) state = "online";
+  else if (lastSeenAt !== null) state = "stale";
+  else state = "never";
+
+  return {
+    state,
+    connected,
+    secondsAgo,
+    lastSeenAt,
+    tokenName: latestRow ? String(latestRow.name ?? "") : "",
+    tokenHint: latestRow ? maskToken(String(latestRow.token ?? "")) : "",
+    connectionName: latestRow ? String(latestRow.connection_name ?? "") : "",
+    tokensCount,
+    totalTokensCount,
+    runningTask,
+    queue: {
+      queued: toNum(queuedRow?.count),
+      running: toNum(runningCountRow?.count),
+    },
+  };
 }
 
 /* --------------------- подключения и токены бота ------------------- */
@@ -1710,4 +1831,179 @@ export async function getLiveRevision(): Promise<string> {
 export async function userExists(id: number): Promise<boolean> {
   const row = await q1<{ id: number }>(sql`select id from users where id = ${id} limit 1`);
   return Boolean(row);
+}
+
+/* ---------------------- история агента и планировщика --------------------- */
+
+export type AgentConversationKind = "plan" | "agent";
+
+export type AgentConversationRow = {
+  id: number;
+  userId: number;
+  kind: AgentConversationKind;
+  title: string;
+  systemPrompt: string;
+  messagesCount: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AgentConversationMessageRow = {
+  id: number;
+  conversationId: number;
+  role: "user" | "assistant";
+  content: string;
+  reasoning: string;
+  attachments: unknown[];
+  actions: unknown[];
+  files: unknown[];
+  error: string;
+  createdAt: string;
+};
+
+function parseStoredArray(value: unknown): unknown[] {
+  try {
+    const parsed = JSON.parse(String(value ?? "[]")) as unknown;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function mapAgentConversation(row: Raw): AgentConversationRow {
+  return {
+    id: toNum(row.id),
+    userId: toNum(row.user_id),
+    kind: row.kind === "plan" ? "plan" : "agent",
+    title: String(row.title ?? "Новый чат"),
+    systemPrompt: String(row.system_prompt ?? ""),
+    messagesCount: toNum(row.messages_count),
+    createdAt: toIso(row.created_at) ?? nowIso(),
+    updatedAt: toIso(row.updated_at) ?? nowIso(),
+  };
+}
+
+export async function listAgentConversations(
+  userId: number,
+  kind: AgentConversationKind,
+  limit = 100,
+): Promise<AgentConversationRow[]> {
+  const rows = await q(sql`select c.*,
+      (select count(*) from agent_conversation_messages m where m.conversation_id = c.id) as messages_count
+    from agent_conversations c
+    where c.user_id = ${userId} and c.kind = ${kind}
+    order by c.updated_at desc, c.id desc limit ${Math.max(1, Math.min(limit, 200))}`);
+  return rows.map(mapAgentConversation);
+}
+
+export async function getAgentConversation(userId: number, id: number): Promise<AgentConversationRow | null> {
+  const row = await q1(sql`select c.*,
+      (select count(*) from agent_conversation_messages m where m.conversation_id = c.id) as messages_count
+    from agent_conversations c where c.id = ${id} and c.user_id = ${userId} limit 1`);
+  return row ? mapAgentConversation(row) : null;
+}
+
+export async function createAgentConversation(
+  userId: number,
+  kind: AgentConversationKind,
+  title = kind === "plan" ? "Новый план" : "Новый чат",
+  systemPrompt = "",
+): Promise<AgentConversationRow> {
+  const now = nowIso();
+  const row = await q1<{ id: number }>(sql`insert into agent_conversations
+      (user_id, kind, title, system_prompt, created_at, updated_at)
+    values (${userId}, ${kind}, ${title.slice(0, 120)}, ${systemPrompt}, ${now}, ${now}) returning id`);
+  return {
+    id: toNum(row?.id),
+    userId,
+    kind,
+    title: title.slice(0, 120),
+    systemPrompt,
+    messagesCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export async function updateAgentConversation(
+  userId: number,
+  id: number,
+  input: { title?: string; systemPrompt?: string },
+): Promise<AgentConversationRow | null> {
+  const current = await getAgentConversation(userId, id);
+  if (!current) return null;
+  const title = input.title === undefined ? current.title : input.title.slice(0, 120);
+  const systemPrompt = input.systemPrompt === undefined ? current.systemPrompt : input.systemPrompt;
+  await q(sql`update agent_conversations
+    set title = ${title}, system_prompt = ${systemPrompt}, updated_at = ${nowIso()}
+    where id = ${id} and user_id = ${userId}`);
+  return getAgentConversation(userId, id);
+}
+
+export async function deleteAgentConversation(userId: number, id: number): Promise<boolean> {
+  const current = await getAgentConversation(userId, id);
+  if (!current) return false;
+  await q(sql`delete from agent_conversation_messages where conversation_id = ${id}`);
+  await q(sql`delete from agent_conversations where id = ${id} and user_id = ${userId}`);
+  return true;
+}
+
+export async function listAgentConversationMessages(conversationId: number): Promise<AgentConversationMessageRow[]> {
+  const rows = await q(sql`select id, conversation_id, role, content, reasoning, attachments, actions, files, error, created_at
+    from agent_conversation_messages where conversation_id = ${conversationId} order by id asc limit 400`);
+  return rows.map((row) => ({
+    id: toNum(row.id),
+    conversationId: toNum(row.conversation_id),
+    role: row.role === "assistant" ? "assistant" : "user",
+    content: String(row.content ?? ""),
+    reasoning: String(row.reasoning ?? ""),
+    attachments: parseStoredArray(row.attachments),
+    actions: parseStoredArray(row.actions),
+    files: parseStoredArray(row.files),
+    error: String(row.error ?? ""),
+    createdAt: toIso(row.created_at) ?? nowIso(),
+  }));
+}
+
+export async function insertAgentConversationMessage(input: {
+  userId: number;
+  conversationId: number;
+  role: "user" | "assistant";
+  content: string;
+  reasoning?: string;
+  attachments?: string;
+  actions?: string;
+  files?: string;
+  error?: string;
+}): Promise<AgentConversationMessageRow | null> {
+  const createdAt = nowIso();
+  const row = await q1<{ id: number }>(sql`insert into agent_conversation_messages
+      (conversation_id, role, content, reasoning, attachments, actions, files, error, created_at)
+    select id, ${input.role}, ${input.content}, ${input.reasoning ?? ""}, ${input.attachments ?? "[]"},
+      ${input.actions ?? "[]"}, ${input.files ?? "[]"}, ${input.error ?? ""}, ${createdAt}
+    from agent_conversations where id = ${input.conversationId} and user_id = ${input.userId}
+    returning id`);
+  if (!row) return null;
+
+  const title = input.content.replace(/\s+/g, " ").trim().slice(0, 80);
+  await q(sql`update agent_conversations set
+      title = case
+        when ${input.role} = 'user' and title in ('Новый план', 'Новый чат') and ${title} <> '' then ${title}
+        else title
+      end,
+      updated_at = ${createdAt}
+    where id = ${input.conversationId} and user_id = ${input.userId}`);
+
+  return {
+    id: toNum(row.id),
+    conversationId: input.conversationId,
+    role: input.role,
+    content: input.content,
+    reasoning: input.reasoning ?? "",
+    attachments: parseStoredArray(input.attachments),
+    actions: parseStoredArray(input.actions),
+    files: parseStoredArray(input.files),
+    error: input.error ?? "",
+    createdAt,
+  };
 }

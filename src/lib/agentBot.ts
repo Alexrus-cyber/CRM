@@ -22,8 +22,8 @@ export function readAgentToken(req: Request): string {
  * (или `Authorization: Bearer`). Возвращает id пользователя-владельца токена
  * или null.
  */
-export async function botOwner(req: Request): Promise<number | null> {
+export async function botOwner(req: Request, options?: { touch?: boolean }): Promise<number | null> {
   const token = readAgentToken(req);
   if (!token) return null;
-  return findAgentTokenOwner(token);
+  return findAgentTokenOwner(token, options);
 }
