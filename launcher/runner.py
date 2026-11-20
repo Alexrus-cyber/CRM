@@ -87,10 +87,14 @@ class AgentRun:
         if sys.platform.startswith("win"):
             # Не показывать консольное окно у дочернего процесса.
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        child_env = dict(self.env)
+        child_env.setdefault("PYTHONIOENCODING", "utf-8")
+        child_env.setdefault("PYTHONUTF8", "1")
+        child_env.setdefault("PYTHONUNBUFFERED", "1")
         self.process = subprocess.Popen(
             list(self.command),
             cwd=str(self.cwd),
-            env=dict(self.env),
+            env=child_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

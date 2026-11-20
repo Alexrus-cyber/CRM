@@ -119,6 +119,11 @@ def child_env(extra: Mapping[str, str] | None = None, reuse_runtime: bool = True
       заново (именно эта повторная распаковка и падала).
     """
     env: Dict[str, str] = dict(os.environ)
+    env.update({
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        "PYTHONUNBUFFERED": "1",
+    })
     for key, value in (extra or {}).items():
         if value is None:
             continue
