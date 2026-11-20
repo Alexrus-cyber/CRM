@@ -14,7 +14,6 @@ import {
   MonitorCog,
   Paperclip,
   Play,
-  RefreshCw,
   Rocket,
   Settings2,
   ShieldCheck,
@@ -49,6 +48,7 @@ import {
   type OperatorTask,
 } from "./operator/shared";
 import { PlannerChat } from "./operator/PlannerChat";
+import { ConnectionsCard, type ConnectionSelection } from "./operator/ConnectionsCard";
 import { formatFileSize, readOperatorFiles, type OperatorAttachment } from "./operator/files";
 
 /**
@@ -101,9 +101,9 @@ function statusFilterMatches(status: string, filter: string): boolean {
 
 export function OperatorPanel() {
   const [tab, setTab] = useState<SubTab>("desk");
-  const [tokenExists, setTokenExists] = useState<boolean | null>(null);
-  const [tokenHint, setTokenHint] = useState<string | null>(null);
-  const [freshToken, setFreshToken] = useState<string | null>(null);
+  // Подключение и токен из карточки «Подключения и токены» (хранятся в базе).
+  const [connection, setConnection] = useState<ConnectionSelection | null>(null);
+  // Ручная вставка: пригодится, если токен выдан на другой машине.
   const [tokenInput, setTokenInput] = useState("");
   const [check, setCheck] = useState<{ state: "idle" | "busy" | "ok" | "fail"; text: string }>({
     state: "idle",
@@ -148,15 +148,18 @@ export function OperatorPanel() {
 
   /* ------------------------------ загрузка ------------------------------ */
 
-  const fetchToken = useCallback(async (): Promise<{ exists: boolean; hint: string | null } | null> => {
-    try {
-      const res = await fetch("/api/agent/token", { cache: "no-store" });
-      if (!res.ok) return null;
-      const data = (await res.json()) as { exists?: boolean; hint?: string | null };
-      return { exists: Boolean(data.exists), hint: data.hint ?? null };
-    } catch {
-      return null;
-    }
+  // Последнее применённое подключение: адрес подставляем только когда сменилось
+  // само подключение, иначе ручная правка «Адреса CRM» затиралась бы на каждом
+  // обновлении списка токенов.
+  const appliedConnection = useRef<{ id: number | null; server: string }>({ id: null, server: "" });
+
+  const onConnectionChange = useCallback((next: ConnectionSelection) => {
+    setConnection(next);
+    const applied = appliedConnection.current;
+    const changed = applied.id !== next.connectionId || applied.server !== next.server;
+    appliedConnection.current = { id: next.connectionId, server: next.server };
+    // Адрес CRM берём из подключения: команда должна смотреть в тот же сервер.
+    if (changed && next.server) setServer(next.server);
   }, []);
 
   const fetchTasks = useCallback(async (): Promise<OperatorTask[] | null> => {
@@ -186,18 +189,14 @@ export function OperatorPanel() {
 
   useEffect(() => {
     let alive = true;
-    void Promise.all([fetchToken(), fetchTasks()]).then(([token, list]) => {
+    void fetchTasks().then((list) => {
       if (!alive) return;
-      if (token) {
-        setTokenExists(token.exists);
-        setTokenHint(token.hint);
-      }
       if (list) setTasks(list);
     });
     return () => {
       alive = false;
     };
-  }, [fetchToken, fetchTasks]);
+  }, [fetchTasks]);
 
   const activeTask = useMemo(
     () => tasks.find((task) => task.id === selectedId) ?? tasks[0] ?? null,
@@ -255,30 +254,13 @@ export function OperatorPanel() {
     }
   };
 
-  const createToken = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await fetch("/api/agent/token", { method: "POST" });
-      const data = (await res.json().catch(() => ({}))) as { token?: string; error?: string };
-      if (!res.ok || !data.token) {
-        setError(data.error ?? "Не удалось создать токен");
-        return;
-      }
-      setFreshToken(data.token);
-      setTokenInput(data.token);
-      setTokenHint(`…${data.token.slice(-6)}`);
-      setCheck({ state: "idle", text: "" });
-      setTokenExists(true);
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const checkConnection = async () => {
-    const value = (tokenInput.trim() || freshToken || "").trim();
+    const value = (connection?.token.trim() || tokenInput.trim()).trim();
     if (!value) {
-      setCheck({ state: "fail", text: "Вставьте токен: он показывается один раз при создании." });
+      setCheck({
+        state: "fail",
+        text: "Сначала создайте токен в подключении или нажмите «Показать» у существующего.",
+      });
       return;
     }
     setCheck({ state: "busy", text: "" });
@@ -408,7 +390,7 @@ export function OperatorPanel() {
   const progress = activeTask ? Math.min(100, Math.round((activeTask.steps / Math.max(activeTask.maxSteps, 1)) * 100)) : 0;
   const finished = activeTask ? ["done", "failed", "cancelled"].includes(activeTask.status) : false;
 
-  const effectiveToken = (tokenInput.trim() || freshToken || "").trim();
+  const effectiveToken = (connection?.token.trim() || tokenInput.trim()).trim();
 
   const providerMeta = findProvider(provider);
   const commandOptions = useMemo(
@@ -484,13 +466,13 @@ export function OperatorPanel() {
         <Badge className="border-border text-muted">
           <Terminal size={11} /> desktop_operator.py
         </Badge>
-        {tokenExists === false && (
+        {connection && connection.connectionId !== null && connection.tokensCount === 0 && (
           <button
             type="button"
             onClick={() => setTab("setup")}
             className="ml-auto flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] font-medium text-amber-500"
           >
-            <KeyRound size={11} /> токен не создан
+            <KeyRound size={11} /> нет токенов
           </button>
         )}
       </div>
@@ -867,82 +849,49 @@ export function OperatorPanel() {
       {/* Подключение */}
       {tab === "setup" && (
         <div className="space-y-3">
+          <ConnectionsCard defaultServer={server} onChange={onConnectionChange} />
+
           <Card
-            title="1. Токен бота"
-            subtitle="Один токен на аккаунт — по нему бот забирает свои задания"
-            action={
-              <Badge
+            title="Проверка токена"
+            subtitle="Убедиться, что бот с этим токеном видит очередь CRM"
+          >
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <Input
+                value={tokenInput}
+                onChange={(event) => {
+                  setTokenInput(event.target.value);
+                  setCheck({ state: "idle", text: "" });
+                }}
+                placeholder="crmop_… — если токен выдан на другой машине"
+                spellCheck={false}
+                autoComplete="off"
+                className="h-9 min-w-0 flex-1 font-mono text-[11px]"
+              />
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void checkConnection()}
+                disabled={check.state === "busy"}
+              >
+                {check.state === "busy" ? <Loader2 size={13} className="animate-spin" /> : <ShieldCheck size={13} />}
+                Проверить связь
+              </Button>
+            </div>
+            {check.state !== "idle" && check.state !== "busy" && (
+              <p
                 className={cn(
-                  "border",
-                  tokenExists ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-500" : "border-amber-500/40 bg-amber-500/10 text-amber-500",
+                  "mt-1.5 flex items-start gap-1.5 text-[10px] leading-relaxed",
+                  check.state === "ok" ? "text-emerald-500" : "text-red-500",
                 )}
               >
-                <KeyRound size={11} />
-                {tokenExists === null ? "проверяю…" : tokenExists ? `создан ·${tokenHint ?? ""}` : "не создан"}
-              </Badge>
-            }
-          >
-            <div className="flex flex-wrap items-center gap-2">
-              <Button size="sm" variant={tokenExists ? "secondary" : "primary"} onClick={() => void createToken()} disabled={busy}>
-                {busy ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
-                {tokenExists ? "Обновить токен" : "Создать токен"}
-              </Button>
-              <span className="text-[10px] text-muted">старый токен перестанет работать сразу</span>
-            </div>
-
-            {freshToken && (
-              <div className="mt-3 rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-2.5">
-                <p className="text-[10px] text-muted">Токен показывается один раз — сохраните его в команде из шага 3.</p>
-                <div className="mt-1.5 flex items-center gap-2">
-                  <code className="min-w-0 flex-1 truncate rounded-lg bg-card2 px-2 py-1.5 text-[11px]">{freshToken}</code>
-                  <Button size="sm" variant="ghost" onClick={() => void copy(freshToken, "token")}>
-                    {copied === "token" ? <Check size={12} /> : <ClipboardCopy size={12} />}
-                    {copied === "token" ? "скопировано" : "копировать"}
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            <div className="mt-3 rounded-xl border border-border bg-card2/50 p-2.5">
-              <p className="text-[10px] uppercase tracking-wide text-muted">Проверка токена</p>
-              <div className="mt-1.5 flex flex-col gap-2 sm:flex-row">
-                <Input
-                  value={tokenInput}
-                  onChange={(event) => {
-                    setTokenInput(event.target.value);
-                    setCheck({ state: "idle", text: "" });
-                  }}
-                  placeholder="crmop_… (вставьте токен целиком)"
-                  spellCheck={false}
-                  autoComplete="off"
-                  className="h-9 min-w-0 flex-1 font-mono text-[11px]"
-                />
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => void checkConnection()}
-                  disabled={check.state === "busy"}
-                >
-                  {check.state === "busy" ? <Loader2 size={13} className="animate-spin" /> : <ShieldCheck size={13} />}
-                  Проверить связь
-                </Button>
-              </div>
-              {check.state !== "idle" && check.state !== "busy" && (
-                <p
-                  className={cn(
-                    "mt-1.5 flex items-start gap-1.5 text-[10px] leading-relaxed",
-                    check.state === "ok" ? "text-emerald-500" : "text-red-500",
-                  )}
-                >
-                  {check.state === "ok" ? <Check size={11} className="mt-0.5 shrink-0" /> : <TriangleAlert size={11} className="mt-0.5 shrink-0" />}
-                  {check.text}
-                </p>
-              )}
-              <p className="mt-1.5 text-[10px] leading-relaxed text-muted">
-                Токен виден только при создании: вставьте сохранённый — проверим его и подставим в команду.
-                Маска вида «…abcdef» не подойдёт.
+                {check.state === "ok" ? <Check size={11} className="mt-0.5 shrink-0" /> : <TriangleAlert size={11} className="mt-0.5 shrink-0" />}
+                {check.text}
               </p>
-            </div>
+            )}
+            <p className="mt-1.5 text-[10px] leading-relaxed text-muted">
+              Проверяется токен, выбранный в подключении (если он показан) или вставленный вручную.
+              Маска вида «…abcdef» не подойдёт — нажмите «Показать» у нужного токена.
+            </p>
           </Card>
 
           <Card

@@ -66,7 +66,16 @@ const TABLES = [
   { name: "task_exports", columns: ["id", "user_id", "task_id", "created_at"] },
   // Быстрая переписка по задаче (блок «Задачи»).
   { name: "task_messages", columns: ["id", "task_id", "author_id", "content", "content_lower", "created_at"] },
-  // Агент-оператор: токены ботов, очередь заданий, журнал шагов и файлы.
+  // Агент-оператор: подключения и их токены, очередь заданий, журнал шагов и файлы.
+  {
+    name: "agent_connections",
+    columns: ["id", "user_id", "name", "server_url", "is_default", "created_at", "updated_at"],
+  },
+  {
+    name: "agent_connection_tokens",
+    columns: ["id", "connection_id", "user_id", "name", "token", "created_at", "last_used_at"],
+  },
+  // Устаревший одиночный токен на пользователя — остаётся ради старых баз.
   { name: "agent_tokens", columns: ["id", "user_id", "token", "created_at"] },
   {
     name: "agent_tasks",
@@ -126,6 +135,8 @@ function normalise(table, column, value) {
       "peer_id",
       "last_read_id",
       "message_id",
+      "connection_id",
+      "is_default",
       "size",
     ].includes(column)
   ) {
@@ -213,7 +224,8 @@ async function writePg(pool, data) {
     await client.query("begin");
     await client.query(
       "truncate table ai_rag_terms, ai_rag_chunks, ai_rag_folders, ai_chat_messages, ai_chats, ai_usage_events, " +
-        "ai_quota_overrides, agent_events, agent_tasks, agent_tokens, task_messages, task_exports, " +
+        "ai_quota_overrides, agent_events, agent_tasks, agent_connection_tokens, agent_connections, " +
+        "agent_tokens, task_messages, task_exports, " +
         "message_attachments, chat_reads, messages, sessions, tasks, " +
         "counterparties, users " +
         "restart identity cascade",
@@ -258,7 +270,7 @@ function writeSqlite(db, data) {
 
 function report(data) {
   for (const table of TABLES) {
-    console.log(`  ${table.name.padEnd(20)} ${String((data[table.name] ?? []).length).padStart(5)}`);
+    console.log(`  ${table.name.padEnd(24)} ${String((data[table.name] ?? []).length).padStart(5)}`);
   }
 }
 

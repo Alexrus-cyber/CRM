@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { nowIso, q, q1, toIso, toNum, toYmd } from "./dialect";
 import { tokenize } from "@/lib/rag";
@@ -928,8 +929,231 @@ export async function saveAgentToken(userId: number, token: string): Promise<voi
 /** Владелец токена — по нему бот получает доступ к своим задачам. */
 export async function findAgentTokenOwner(token: string): Promise<number | null> {
   if (!token) return null;
+
+  // Сначала новые токены подключений, затем legacy-таблица.
+  const fresh = await q1<{ user_id: number }>(
+    sql`select user_id from agent_connection_tokens where token = ${token} limit 1`,
+  );
+  if (fresh) {
+    // Отмечаем активность: в списке токенов видно, какой бот живой.
+    await q(sql`update agent_connection_tokens set last_used_at = ${nowIso()} where token = ${token}`);
+    return toNum(fresh.user_id);
+  }
+
   const row = await q1(sql`select user_id from agent_tokens where token = ${token} limit 1`);
   return row ? toNum(row.user_id) : null;
+}
+
+/* --------------------- подключения и токены бота ------------------- */
+
+export type AgentConnectionRow = {
+  id: number;
+  userId: number;
+  name: string;
+  serverUrl: string;
+  isDefault: boolean;
+  tokensCount: number;
+  activeTokens: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AgentTokenRow = {
+  id: number;
+  connectionId: number;
+  name: string;
+  /** Хвост токена для списка: сам токен показываем только по кнопке «Показать». */
+  hint: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+};
+
+function maskToken(token: string): string {
+  const value = String(token ?? "");
+  return value ? `…${value.slice(-6)}` : "";
+}
+
+function mapAgentConnection(row: Raw): AgentConnectionRow {
+  return {
+    id: toNum(row.id),
+    userId: toNum(row.user_id),
+    name: String(row.name ?? ""),
+    serverUrl: String(row.server_url ?? ""),
+    isDefault: toNum(row.is_default) === 1,
+    tokensCount: toNum(row.tokens_count),
+    activeTokens: toNum(row.active_tokens),
+    createdAt: toIso(row.created_at) ?? nowIso(),
+    updatedAt: toIso(row.updated_at) ?? nowIso(),
+  };
+}
+
+function mapAgentToken(row: Raw): AgentTokenRow {
+  return {
+    id: toNum(row.id),
+    connectionId: toNum(row.connection_id),
+    name: String(row.name ?? ""),
+    hint: maskToken(String(row.token ?? "")),
+    createdAt: toIso(row.created_at) ?? nowIso(),
+    lastUsedAt: toIso(row.last_used_at),
+  };
+}
+
+/** Подключения пользователя: основное — первым, дальше по дате создания. */
+export async function listAgentConnections(userId: number): Promise<AgentConnectionRow[]> {
+  const rows = await q(sql`
+    select c.*,
+           (select count(*) from agent_connection_tokens t where t.connection_id = c.id) as tokens_count,
+           (select count(*) from agent_connection_tokens t
+              where t.connection_id = c.id
+                and (t.last_used_at is null or t.last_used_at > ${dayAgoIso()})) as active_tokens
+    from agent_connections c
+    where c.user_id = ${userId}
+    order by c.is_default desc, c.id`);
+  return rows.map(mapAgentConnection);
+}
+
+export async function getAgentConnection(userId: number, id: number): Promise<AgentConnectionRow | null> {
+  const row = await q1(sql`
+    select c.*,
+           (select count(*) from agent_connection_tokens t where t.connection_id = c.id) as tokens_count,
+           (select count(*) from agent_connection_tokens t
+              where t.connection_id = c.id
+                and (t.last_used_at is null or t.last_used_at > ${dayAgoIso()})) as active_tokens
+    from agent_connections c
+    where c.id = ${id} and c.user_id = ${userId} limit 1`);
+  return row ? mapAgentConnection(row) : null;
+}
+
+/**
+ * Новое подключение. Первое автоматически становится основным, чтобы
+ * интерфейсу и старым клиентам всегда было что выбрать.
+ */
+export async function createAgentConnection(
+  userId: number,
+  name: string,
+  serverUrl: string,
+): Promise<AgentConnectionRow> {
+  const now = nowIso();
+  const existing = await q1<{ count: number }>(
+    sql`select count(*) as count from agent_connections where user_id = ${userId}`,
+  );
+  const isDefault = toNum(existing?.count) === 0 ? 1 : 0;
+  const inserted = await q1<{ id: number }>(sql`
+    insert into agent_connections (user_id, name, server_url, is_default, created_at, updated_at)
+    values (${userId}, ${name}, ${serverUrl}, ${isDefault}, ${now}, ${now}) returning id`);
+  const id = toNum(inserted?.id);
+  const created = await getAgentConnection(userId, id);
+  if (!created) throw new Error("Не удалось создать подключение");
+  return created;
+}
+
+export async function updateAgentConnection(
+  userId: number,
+  id: number,
+  patch: { name?: string; serverUrl?: string },
+): Promise<AgentConnectionRow | null> {
+  const current = await getAgentConnection(userId, id);
+  if (!current) return null;
+  const name = patch.name?.trim() || current.name;
+  const serverUrl = patch.serverUrl !== undefined ? patch.serverUrl.trim() : current.serverUrl;
+  await q(sql`update agent_connections set name = ${name}, server_url = ${serverUrl}, updated_at = ${nowIso()}
+    where id = ${id} and user_id = ${userId}`);
+  return getAgentConnection(userId, id);
+}
+
+/** Сделать подключение основным: флаг снимается с остальных. */
+export async function setDefaultAgentConnection(userId: number, id: number): Promise<boolean> {
+  const current = await getAgentConnection(userId, id);
+  if (!current) return false;
+  await q(sql`update agent_connections set is_default = 0 where user_id = ${userId}`);
+  await q(sql`update agent_connections set is_default = 1, updated_at = ${nowIso()}
+    where id = ${id} and user_id = ${userId}`);
+  return true;
+}
+
+/** Удаление подключения вместе с его токенами (каскад в схеме). */
+export async function deleteAgentConnection(userId: number, id: number): Promise<boolean> {
+  const current = await getAgentConnection(userId, id);
+  if (!current) return false;
+  await q(sql`delete from agent_connection_tokens where connection_id = ${id}`);
+  await q(sql`delete from agent_connections where id = ${id} and user_id = ${userId}`);
+  if (current.isDefault) {
+    // Основным становится следующее по порядку, чтобы не остаться без выбора.
+    const next = await q1<{ id: number }>(
+      sql`select id from agent_connections where user_id = ${userId} order by id limit 1`,
+    );
+    if (next) await setDefaultAgentConnection(userId, toNum(next.id));
+  }
+  return true;
+}
+
+export async function listAgentTokens(userId: number, connectionId: number): Promise<AgentTokenRow[]> {
+  const rows = await q(sql`
+    select id, connection_id, name, token, created_at, last_used_at
+    from agent_connection_tokens
+    where user_id = ${userId} and connection_id = ${connectionId}
+    order by id desc`);
+  return rows.map(mapAgentToken);
+}
+
+/** Сколько токенов у подключения — для проверки прав и подсказок. */
+export async function countAgentTokens(userId: number, connectionId: number): Promise<number> {
+  const row = await q1<{ count: number }>(sql`
+    select count(*) as count from agent_connection_tokens
+    where user_id = ${userId} and connection_id = ${connectionId}`);
+  return toNum(row?.count);
+}
+
+/**
+ * Новый токен подключения. Полное значение возвращается один раз — в базе оно
+ * лежит открытым (боту нужно сверять), но в интерфейсе по умолчанию маска.
+ */
+export async function createAgentConnectionToken(
+  userId: number,
+  connectionId: number,
+  name: string,
+): Promise<{ token: string; item: AgentTokenRow } | null> {
+  const connection = await getAgentConnection(userId, connectionId);
+  if (!connection) return null;
+  const token = `crmop_${randomBytes(24).toString("hex")}`;
+  const now = nowIso();
+  const inserted = await q1<{ id: number }>(sql`
+    insert into agent_connection_tokens (connection_id, user_id, name, token, created_at)
+    values (${connectionId}, ${userId}, ${name}, ${token}, ${now}) returning id`);
+  const id = toNum(inserted?.id);
+  return {
+    token,
+    item: {
+      id,
+      connectionId,
+      name,
+      hint: maskToken(token),
+      createdAt: now,
+      lastUsedAt: null,
+    },
+  };
+}
+
+/** Полное значение токена — по кнопке «Показать». */
+export async function revealAgentToken(userId: number, tokenId: number): Promise<string | null> {
+  const row = await q1<{ token: string }>(
+    sql`select token from agent_connection_tokens where id = ${tokenId} and user_id = ${userId} limit 1`,
+  );
+  return row ? String(row.token) : null;
+}
+
+/** Отзыв токена: строка удаляется, бот сразу теряет доступ. */
+export async function deleteAgentConnectionToken(userId: number, tokenId: number): Promise<boolean> {
+  const row = await q1<{ id: number }>(
+    sql`select id from agent_connection_tokens where id = ${tokenId} and user_id = ${userId} limit 1`,
+  );
+  if (!row) return false;
+  await q(sql`delete from agent_connection_tokens where id = ${tokenId} and user_id = ${userId}`);
+  return true;
+}
+
+function dayAgoIso(): string {
+  return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 }
 
 export async function createAgentTask(userId: number, prompt: string, maxSteps: number): Promise<AgentTaskRow> {

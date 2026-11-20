@@ -125,6 +125,30 @@ const PG_DDL = [
     token text not null unique,
     created_at timestamptz not null default now()
   )`,
+  // Подключения: адрес CRM, к которому подключается бот. У пользователя их
+  // может быть несколько (свой сервер, тестовый, сервер заказчика), а токенов
+  // на каждое — сколько нужно (по одному на машину/оператора).
+  `create table if not exists agent_connections (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    name text not null,
+    server_url text not null default '',
+    is_default integer not null default 0,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    unique (user_id, name)
+  )`,
+  `create table if not exists agent_connection_tokens (
+    id serial primary key,
+    connection_id integer not null references agent_connections(id) on delete cascade,
+    user_id integer not null references users(id) on delete cascade,
+    name text not null default '',
+    token text not null unique,
+    created_at timestamptz not null default now(),
+    last_used_at timestamptz
+  )`,
+  `create index if not exists agent_connections_user_idx on agent_connections (user_id)`,
+  `create index if not exists agent_connection_tokens_conn_idx on agent_connection_tokens (connection_id)`,
   `create table if not exists agent_tasks (
     id serial primary key,
     user_id integer not null references users(id) on delete cascade,
@@ -334,6 +358,27 @@ const SQLITE_DDL = [
     token text not null unique,
     created_at text not null
   )`,
+  `create table if not exists agent_connections (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    name text not null,
+    server_url text not null default '',
+    is_default integer not null default 0,
+    created_at text not null,
+    updated_at text not null,
+    unique (user_id, name)
+  )`,
+  `create table if not exists agent_connection_tokens (
+    id integer primary key autoincrement,
+    connection_id integer not null references agent_connections(id) on delete cascade,
+    user_id integer not null references users(id) on delete cascade,
+    name text not null default '',
+    token text not null unique,
+    created_at text not null,
+    last_used_at text
+  )`,
+  `create index if not exists agent_connections_user_idx on agent_connections (user_id)`,
+  `create index if not exists agent_connection_tokens_conn_idx on agent_connection_tokens (connection_id)`,
   `create table if not exists agent_tasks (
     id integer primary key autoincrement,
     user_id integer not null references users(id) on delete cascade,
@@ -629,6 +674,35 @@ async function migrateColumns(executor: Executor): Promise<void> {
     } catch (error) {
       const message = (error as Error).message ?? "";
       if (!/already exists|duplicate column/i.test(message)) throw error;
+    }
+  }
+  await migrateLegacyAgentTokens(executor);
+}
+
+/**
+ * Старые токены (`agent_tokens`, один на пользователя) переезжают в первое
+ * подключение: у пользователя появляется «Основной CRM» с одним токеном.
+ * Повторный запуск ничего не делает — обе вставки проверяют `not exists`.
+ */
+async function migrateLegacyAgentTokens(executor: Executor): Promise<void> {
+  const statements = [
+    `insert into agent_connections (user_id, name, server_url, is_default, created_at, updated_at)
+     select t.user_id, 'Основной CRM', '', 1, t.created_at, t.created_at
+     from agent_tokens t
+     where not exists (select 1 from agent_connections c where c.user_id = t.user_id)`,
+    `insert into agent_connection_tokens (connection_id, user_id, name, token, created_at, last_used_at)
+     select c.id, t.user_id, 'Основной', t.token, t.created_at, null
+     from agent_tokens t
+     join agent_connections c on c.user_id = t.user_id
+     where not exists (select 1 from agent_connection_tokens x where x.token = t.token)`,
+  ];
+  for (const statement of statements) {
+    try {
+      await executor.exec(statement);
+    } catch (error) {
+      // Старой таблицы может не быть (свежая база) — это нормально.
+      const message = (error as Error).message ?? "";
+      if (!/no such table|does not exist/i.test(message)) throw error;
     }
   }
 }
