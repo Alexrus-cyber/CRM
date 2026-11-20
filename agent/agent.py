@@ -158,8 +158,27 @@ class AgentError(Exception):
     """Ошибка, которую можно показать пользователю как есть."""
 
 
+def configure_stdio() -> None:
+    """Переводит stdout/stderr на UTF-8 с errors='replace' (важно для Windows cp1251)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError, AttributeError):
+                try:
+                    reconfigure(errors="replace")
+                except (OSError, ValueError, AttributeError):
+                    pass
+
+
 def log(message: str) -> None:
-    print(f"[agent] {message}", flush=True)
+    text = f"[agent] {message}"
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(enc, errors="replace").decode(enc, errors="replace"), flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -671,6 +690,7 @@ class Server(ThreadingHTTPServer):
 
 
 def main() -> int:
+    configure_stdio()
     server = Server((HOST, PORT), Handler)
     log(f"слушаю http://{HOST}:{PORT} · модель: {MODEL or 'из запроса'} · база: {BASE_URL}")
     log(f"папка файлов: {WORKSPACE}")

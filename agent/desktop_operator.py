@@ -331,8 +331,32 @@ class TaskCancelled(AgentError):
     """Задание отменили в CRM: бот сразу останавливается и ничего не досылает."""
 
 
+def configure_stdio() -> None:
+    """Переводит stdout/stderr на UTF-8 с errors='replace' (важно для Windows cp1251)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError, AttributeError):
+                try:
+                    reconfigure(errors="replace")
+                except (OSError, ValueError, AttributeError):
+                    pass
+
+
+def _safe_print(text: str) -> None:
+    """Печать без падения на UnicodeEncodeError в строгой cp1251-консоли/pipe."""
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        safe = text.encode(enc, errors="replace").decode(enc, errors="replace")
+        print(safe, flush=True)
+
+
 def log(message: str) -> None:
-    print(time.strftime("[%H:%M:%S] ") + str(message), flush=True)
+    _safe_print(time.strftime("[%H:%M:%S] ") + str(message))
 
 
 # Значения, которые остаются в команде, если токен не подставлен.
@@ -574,6 +598,33 @@ def self_test() -> int:
           "2 раз" in failed_text and "не подтвердила" in failed_text)
     check("порог повтора у клика 2, у прокрутки 3",
           REPEAT_LIMITS["click"] == 2 and REPEAT_LIMITS["scroll"] == 3)
+
+    # Проверка вывода кириллицы и «→» при строгой cp1251-кодировке (Windows pipe).
+    orig_stdout = sys.stdout
+    buf = io.BytesIO()
+    try:
+        sys.stdout = io.TextIOWrapper(buf, encoding="cp1251", errors="strict")
+        log("Ошибка → тест")
+        sys.stdout.flush()
+        safe_cp_ok = "Ошибка" in buf.getvalue().decode("cp1251", errors="replace")
+    except BaseException:  # noqa: BLE001
+        safe_cp_ok = False
+    finally:
+        sys.stdout = orig_stdout
+    check("log не падает на символе «→» при cp1251-потоке", safe_cp_ok)
+
+    buf_utf = io.BytesIO()
+    try:
+        sys.stdout = io.TextIOWrapper(buf_utf, encoding="cp1251", errors="strict")
+        configure_stdio()
+        log("Ошибка → тест")
+        sys.stdout.flush()
+        stdio_utf_ok = "Ошибка → тест" in buf_utf.getvalue().decode("utf-8", errors="strict")
+    except BaseException:  # noqa: BLE001
+        stdio_utf_ok = False
+    finally:
+        sys.stdout = orig_stdout
+    check("configure_stdio переводит cp1251-поток на UTF-8", stdio_utf_ok)
 
     passed = sum(1 for item in checks if item)
     print("\n{}/{} проверок пройдено".format(passed, len(checks)))
@@ -1259,7 +1310,7 @@ class Operator:
                                         "({} симв.)".format(len(str(action.get("content") or "")))
                                         if action.get("type") == "make_file" else ""))
             if thought:
-                print("         " + thought, flush=True)
+                _safe_print("         " + thought)
             if thought:
                 self.report("thought", thought, action)
 
@@ -1544,6 +1595,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_stdio()
     args = parse_args()
     if args.self_test:
         return self_test()

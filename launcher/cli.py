@@ -36,16 +36,30 @@ from launcher.catalog import DEFAULT_AGENTS, PROVIDER_PRESETS, agent_by_id, load
 # --------------------------------------------------------------------------
 
 def ensure_std_streams() -> None:
-    """В оконной сборке exe stdout/stderr могут быть None — берём реальные fd."""
+    """Настраивает stdout/stderr на UTF-8 с заменой неизвестных символов.
+
+    В оконной сборке exe потоки могут быть None, а при запуске через pipe на
+    русской Windows Python открывает их в cp1251 с errors='strict' — любая
+    стрелка «→» или эмодзи в логах роняет процесс с UnicodeEncodeError.
+    """
     for name, fd in (("stdout", 1), ("stderr", 2)):
-        stream = getattr(sys, name)
-        if stream is not None:
+        stream = getattr(sys, name, None)
+        if stream is None:
+            try:
+                raw = os.fdopen(os.dup(fd), "wb", buffering=0)
+                setattr(sys, name, io.TextIOWrapper(raw, encoding="utf-8", errors="replace", line_buffering=True))
+            except (OSError, ValueError):
+                setattr(sys, name, open(os.devnull, "w", encoding="utf-8", errors="replace"))
             continue
-        try:
-            raw = os.fdopen(os.dup(fd), "wb", buffering=0)
-            setattr(sys, name, io.TextIOWrapper(raw, encoding="utf-8", errors="replace", line_buffering=True))
-        except (OSError, ValueError):
-            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+            except (OSError, ValueError, AttributeError):
+                try:
+                    reconfigure(errors="replace")
+                except (OSError, ValueError, AttributeError):
+                    pass
 
 
 def run_agent(argv: Sequence[str]) -> int:
@@ -240,6 +254,47 @@ def self_test() -> int:
         ) if not bundle.is_frozen() else (0, [])
         check("режим --run-agent выполняет скрипт", code == 0 and any("hi" in line for line in out))
 
+        # Проверка защиты от Windows cp1251 в дочернем pipe и в ensure_std_streams.
+        child_env = bundle.child_env({})
+        check("окружение child_env включает UTF-8 для Python",
+              child_env.get("PYTHONIOENCODING") == "utf-8"
+              and child_env.get("PYTHONUTF8") == "1"
+              and child_env.get("PYTHONUNBUFFERED") == "1")
+
+        orig_stdout = sys.stdout
+        cp_buf = io.BytesIO()
+        try:
+            sys.stdout = io.TextIOWrapper(cp_buf, encoding="cp1251", errors="strict")
+            ensure_std_streams()
+            print("Ошибка → тест", flush=True)
+            sys.stdout.flush()
+            reconfigured_ok = "Ошибка → тест" in cp_buf.getvalue().decode("utf-8", errors="strict")
+        except BaseException:  # noqa: BLE001 — тест не должен ронять self-test
+            reconfigured_ok = False
+        finally:
+            sys.stdout = orig_stdout
+        check("ensure_std_streams переводит cp1251-поток на UTF-8", reconfigured_ok)
+
+        if not bundle.is_frozen():
+            import subprocess
+
+            utf_script = Path(tmp) / "utf_agent.py"
+            utf_script.write_text("print('Ошибка: тест → ✅')\n", encoding="utf-8")
+            cp_env = dict(os.environ)
+            cp_env["PYTHONIOENCODING"] = "cp1251"
+            cp_env["PYTHONUTF8"] = "0"
+            proc = subprocess.run(
+                bundle.run_agent_args(utf_script, []),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                env=cp_env,
+                timeout=30,
+            )
+            check("--run-agent не падает на кириллице и '→' при cp1251 в окружении",
+                  proc.returncode == 0 and "Ошибка: тест → ✅" in (proc.stdout or ""))
+
     _spec_checks(check)
     _gui_smoke(check)
 
@@ -404,6 +459,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    ensure_std_streams()
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
