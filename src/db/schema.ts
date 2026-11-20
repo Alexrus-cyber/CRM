@@ -373,7 +373,51 @@ export const taskMessages = pgTable(
   (t) => [index("task_messages_task_idx").on(t.taskId, t.id)],
 );
 
-/** Токен бота-оператора: один на пользователя, создаётся в блоке ИИ. */
+/**
+ * Подключение бота-оператора: адрес CRM. У пользователя их может быть несколько
+ * («свой сервер», «тестовый», «у заказчика»), токенов на каждое — сколько нужно.
+ */
+export const agentConnections = pgTable(
+  "agent_connections",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    serverUrl: text("server_url").notNull().default(""),
+    /** 1 — подключение по умолчанию (для интерфейса и старых клиентов). */
+    isDefault: integer("is_default").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("agent_connections_user_name_idx").on(t.userId, t.name),
+    index("agent_connections_user_idx").on(t.userId),
+  ],
+);
+
+/** Токены подключения: по одному на машину/оператора, отзываются по отдельности. */
+export const agentConnectionTokens = pgTable(
+  "agent_connection_tokens",
+  {
+    id: serial("id").primaryKey(),
+    connectionId: integer("connection_id")
+      .notNull()
+      .references(() => agentConnections.id, { onDelete: "cascade" }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    name: text("name").notNull().default(""),
+    token: text("token").notNull().unique(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    /** Когда токен последний раз обращался к CRM — видно в списке. */
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+  },
+  (t) => [index("agent_connection_tokens_conn_idx").on(t.connectionId)],
+);
+
+/** Старые токены (один на пользователя). Оставлены для совместимости и миграции. */
 export const agentTokens = pgTable("agent_tokens", {
   id: serial("id").primaryKey(),
   userId: integer("user_id")
