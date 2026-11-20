@@ -150,6 +150,8 @@ export type CommandOptions = {
   gen?: GenParams;
   /** Проверять результат после каждого действия (по умолчанию да). */
   verifyActions?: boolean;
+  /** Саморазбор при неудаче действия (по умолчанию да). */
+  selfReflect?: boolean;
 };
 
 /** Команда запуска бота — ровно те флаги, которые понимает скрипт. */
@@ -170,6 +172,7 @@ export function buildOperatorCommand(options: CommandOptions): string {
 
   if (options.gen) parts.push(...genParamsFlags(options.gen));
   if (options.verifyActions === false) parts.push("--no-verify-actions");
+  if (options.selfReflect === false) parts.push("--no-self-reflect");
 
   if (options.dryRun) parts.push("--dry-run");
   if (options.assumeYes) parts.push("--yes");

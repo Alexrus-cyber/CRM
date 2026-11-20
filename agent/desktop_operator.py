@@ -97,11 +97,21 @@ PROVIDERS: Dict[str, Dict[str, str]] = {
                 "key_env": "MISTRAL_API_KEY"},
 }
 
-SYSTEM_PROMPT = """Ты — оператор рабочего стола внутри CRM. Ты видишь скриншот экрана
-пользователя и выполняешь задание по шагам.
+SYSTEM_PROMPT = """Ты — умный оператор рабочего стола внутри CRM. Ты видишь скриншот
+экрана пользователя и выполняешь задание осознанно, шаг за шагом.
+
+Не выбирай координаты наугад! Сначала разберись, что происходит на картинке,
+задай себе уточняющий вопрос «что мне сейчас делать дальше?» и выбери самый
+надёжный способ (горячая клавиша, ввод текста, прокрутка, open_url, клик или finish).
 
 Отвечай ТОЛЬКО одним JSON-объектом без пояснений и без markdown:
-{"thought": "короткая мысль по-русски", "action": {"type": "...", ...}}
+{
+  "observation": "что сейчас реально видно на скриншоте (активное окно, поля, что изменилось)",
+  "next_question": "уточняющий вопрос себе: что мне сейчас делать дальше и почему именно это?",
+  "self_check": "если прошлый шаг не удался или экран не изменился — что пошло не так (иначе пусто)",
+  "thought": "краткий вывод и план этого шага по-русски",
+  "action": {"type": "...", ...}
+}
 
 Действия:
 - {"type":"click","x":ЧИСЛО,"y":ЧИСЛО,"clicks":1,"button":"left"} — клик по координатам кадра;
@@ -120,22 +130,26 @@ SYSTEM_PROMPT = """Ты — оператор рабочего стола вну�
 
 Правила:
 - Координаты — в пикселях скриншота, который ты видишь (его размер указан в задании).
-- Текущее положение курсора отмечено на скриншоте красным крестиком. Если он не
-  там, куда нужно кликнуть, — сначала переведи его (action move), затем кликай.
-- Один шаг — одно действие. Не спеши: сначала осмотрись, потом действуй.
+- Текущее положение курсора отмечено на скриншоте красным крестиком: если прошлый
+  клик промахнулся, по крестику видно, куда именно попал курсор и насколько нужно
+  поправить координаты. Перед кликом курсор наводится сам (лишний action move не нужен).
+- Один шаг — одно осознанное действие. Если можно сделать надёжнее без хрупких кликов
+  (например, open_url вместо клика по иконке браузера, ctrl+l для адресной строки,
+  alt+tab для переключения окна, escape от всплывающего меню, enter для отправки) —
+  используй это.
 - Писать текст можно только в то поле, куда сначала кликнул. Всегда указывай x и y
-  в action type/paste — иначе текст уйдёт в случайное активное окно.
+  в action type/paste (кроме случаев, когда поле гарантированно уже в фокусе).
 - Если просят написать в чате или мессенджере: кликни в поле ввода внизу окна чата,
   набери текст, затем action key с "enter" для отправки. Убедись по скриншоту, что
   текст появился в поле ввода, а не в документе, поиске или адресной строке; если
-  попал не туда — не продолжай, вернись и кликни точнее.
+  попал не туда — остановись, разберись что пошло не так и вернись в нужное окно.
 - Не открывай блокнот или документ, если просят написать в чате: работай в том окне,
   которое открыто у пользователя.
 - Для файлов используй make_file и укажи расширение: docx (документ с заголовками
   через # и списками), xlsx (строки CSV через ; ), csv, md, html, svg, zip, txt, json.
   Содержимое пиши полностью, по-русски.
 - Когда задание выполнено — action finish с кратким итогом.
-- Не выдумывай, что видишь: если нужного окна нет, открой его.
+- Не выдумывай, что видишь: если нужного окна нет, открой его или переключись на него.
 - Опасные действия (удаление, переводы, покупки) выполняй, только если пользователь
   прямо об этом попросил; иначе сначала спроси через finish и объясни причину.
 """
@@ -192,15 +206,160 @@ def extract_attachment_text(name: str, data: bytes, limit: int = 4000) -> str:
 MAX_STEPS_LIMIT = 500  # столько шагов разрешает и CRM, и интерфейс
 
 VERIFY_PROMPT = """Ты проверяешь результат действия бота на рабочем столе.
-Тебе дают описание действия, его результат и свежий скриншот. Посмотри на экран
-и реши, получилось ли задуманное: открылось ли нужное окно, появился ли текст,
-сработала ли кнопка.
+Тебе дают цель шага, описание действия, его результат и свежий скриншот.
+Посмотри на экран и честно реши, получилось ли задуманное: открылось ли нужное окно,
+появился ли текст в нужном месте, сработала ли кнопка.
 
 Ответь ТОЛЬКО одним JSON-объектом без пояснений и без markdown:
-{"ok": true, "note": "одна короткая фраза по-русски, что видно на экране"}
+{"ok": true, "note": "одна короткая фраза по-русски, что видно на экране", "why": ""}
 
-ok=false — если действие не удалось, открылось не то окно, текст не появился
-или экран выглядит так же, как до действия."""
+ok=false — если действие не удалось, открылось не то окно, текст не появился,
+попали мимо цели или экран выглядит так же, как до действия (тогда в why кратко
+укажи вероятную причину)."""
+
+SELF_REFLECT_PROMPT = """Ты — оператор рабочего стола, который только что столкнулся с неудачей
+или застрял на шаге. Остановись, посмотри на актуальный скриншот и разбери,
+что именно ты делаешь не так.
+
+Сначала задай себе уточняющий вопрос по ситуации на экране, потом честно
+сформулируй причину (почему прежнее действие не сработало) и конкретный новый
+способ действий.
+
+Ответь ТОЛЬКО одним JSON-объектом без пояснений и без markdown:
+{
+  "question": "короткий вопрос себе: почему действие не сработало или что происходит на экране?",
+  "diagnosis": "конкретная причина ошибки (например: окно не в фокусе, промах мимо элемента по крестику курсора, всплывающее окно перекрыло цель, нужна прокрутка или горячая клавиша)",
+  "next_strategy": "что конкретно сделать по-другому на следующем шаге (иначе чем раньше)"
+}"""
+
+
+def _strip_thinking(text: str) -> str:
+    """Убирает <think>...</think> и markdown-блоки кода вокруг JSON."""
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", str(text or ""), flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE)
+    return cleaned.strip()
+
+
+def _extract_json_objects(text: str) -> List[Dict[str, Any]]:
+    """Находит все корректные JSON-объекты в ответе модели (даже среди текста)."""
+    cleaned = _strip_thinking(text)
+    decoder = json.JSONDecoder()
+    found: List[Dict[str, Any]] = []
+    index = 0
+    length = len(cleaned)
+    while index < length:
+        pos = cleaned.find("{", index)
+        if pos < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(cleaned, pos)
+            if isinstance(obj, dict):
+                found.append(obj)
+            index = end
+        except json.JSONDecodeError:
+            index = pos + 1
+    return found
+
+
+def frame_signature(image: Any) -> Optional[bytes]:
+    """Мини-отпечаток 32×18 кадра в оттенках серого — чтобы видеть, изменился ли экран."""
+    if image is None:
+        return None
+    try:
+        resample = getattr(getattr(Image, "Resampling", Image), "BILINEAR", 2)
+        thumb = image.convert("L").resize((32, 18), resample)
+        return bytes(thumb.getdata())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def frames_similar(sig_a: Optional[bytes], sig_b: Optional[bytes], threshold: float = 1.2) -> bool:
+    """True, если два кадра визуально почти не отличаются (ср. разница <= threshold)."""
+    if not sig_a or not sig_b or len(sig_a) != len(sig_b):
+        return False
+    diff = sum(abs(a - b) for a, b in zip(sig_a, sig_b)) / float(len(sig_a))
+    return diff <= threshold
+
+
+def format_decision_thought(decision: Dict[str, Any]) -> str:
+    """Собирает понятную человеку мысль шага из наблюдения, вопроса и плана."""
+    parts: List[str] = []
+    seen: List[str] = []
+    for label, key in (("Вижу", "observation"), ("Вопрос", "next_question"),
+                       ("Разбор", "self_check"), ("План", "thought")):
+        value = str(decision.get(key) or "").strip()
+        if not value:
+            continue
+        low = value.lower()
+        if any(low == item or low in item for item in seen):
+            continue
+        seen.append(low)
+        parts.append("{}: {}".format(label, value))
+    return " | ".join(parts)
+
+
+def build_self_question(action: Dict[str, Any], reason: str = "") -> str:
+    """Формулирует вопрос самой себе, когда действие не дало результата."""
+    label = action_label(action)
+    why = " ({})".format((reason or "").strip()[:160]) if reason else ""
+    return (
+        "Почему у меня не получилось «{}»{}? Что я делаю не так — выбрал(а) неверные "
+        "координаты (сравни с красным крестиком курсора), окно не в фокусе, мешает диалог/"
+        "меню, нужна прокрутка, горячая клавиша или совсем другой способ?"
+    ).format(label, why)
+
+
+def build_reflection_nudge(reflection: Dict[str, str]) -> str:
+    """Подсказка на следующий шаг по итогам собственного разбора ошибки."""
+    lines = ["САМОРАЗБОР ПОСЛЕ НЕУДАЧИ (опирайся на него при выборе следующего шага):"]
+    if reflection.get("question"):
+        lines.append("- Вопрос себе: " + reflection["question"])
+    if reflection.get("diagnosis"):
+        lines.append("- Что я делал(а) не так: " + reflection["diagnosis"])
+    if reflection.get("next_strategy"):
+        lines.append("- Как действовать иначе: " + reflection["next_strategy"])
+    lines.append("Посмотри на свежий скриншот и выполни новый план (не повторяй старую ошибку).")
+    return "\n".join(lines)
+
+
+def build_step_prompt(prompt: str, step_index: int, shot: Optional[Dict[str, Any]],
+                      text_only: bool, pending_nudge: str = "",
+                      attachments_context: str = "", last_outcome: str = "",
+                      screen_unchanged: bool = False) -> str:
+    """Собирает запрос шага: к скриншоту всегда приложен уточняющий вопрос."""
+    parts = [
+        'Задание: "{}"'.format(prompt),
+        "Это шаг {}.".format(step_index + 1),
+    ]
+    if not text_only and shot:
+        parts.append(
+            "Размер кадра: {width}×{height} px (координаты клика — в этих пикселях).".format(**shot)
+        )
+    elif text_only:
+        parts.append("Работаем без скриншота: координаты считай по текущему экрану.")
+    if last_outcome:
+        parts.append("Итог прошлого шага: " + last_outcome)
+    if screen_unchanged:
+        parts.append(
+            "Важное наблюдение: экран после предыдущего шага визуально почти не изменился — "
+            "подумай, сработало ли прошлое действие, и не повторяй его вслепую."
+        )
+    if pending_nudge:
+        parts.append(pending_nudge)
+    parts.append(
+        "Уточняющий вопрос по текущему скриншоту: что именно сейчас открыто и происходит "
+        "на экране, что мне делать дальше для достижения цели и почему именно этот шаг "
+        "сработает надёжнее (не выдавай просто координаты наугад — оцени, нужен ли клик, "
+        "клавиша/сочетание, прокрутка, open_url, make_file или finish)?"
+    )
+    if attachments_context:
+        if step_index == 0:
+            parts.append("Файлы от пользователя (используй их содержимое):")
+            parts.append(attachments_context)
+        else:
+            parts.append("Вложения задания уже прочитаны на первом шаге.")
+    return "\n".join(parts)
 
 # Защита от зацикливания: сколько раз подряд допустимо одно и то же действие.
 # Клик/ввод — 2 раза, клавиши и прокрутка — 3 (прокрутка иногда нужна повторно).
@@ -299,10 +458,11 @@ def build_repeat_nudge(action: Dict[str, Any], streak: int) -> str:
 
 
 def build_failed_nudge(count: int, note: str) -> str:
-    """Подсказка, когда проверка несколько раз подряд не увидела результата."""
+    """Подсказка, когда проверка не увидела результата: задаёт модели вопрос себе."""
     return (
         "Проверка {} раз подряд не подтвердила результат (последнее: «{}»).\n"
-        "Действие, которое ты выбрал, не работает. Не повторяй его: смени тактику — "
+        "Задай себе вопрос: почему выбранное действие не работает и что я делаю не так? "
+        "Не повторяй его: посмотри на красный крестик курсора и смени тактику — "
         "например, Esc от диалога, alt+tab к нужному окну, прокрутка к элементу "
         "или другой способ выполнить задачу. Если не получается — finish и объясни, "
         "что именно мешает."
@@ -599,6 +759,122 @@ def self_test() -> int:
     check("порог повтора у клика 2, у прокрутки 3",
           REPEAT_LIMITS["click"] == 2 and REPEAT_LIMITS["scroll"] == 3)
 
+    # Уточняющий вопрос на шаге, разбор богатого JSON и саморазбор неудачи.
+    step_q = build_step_prompt(
+        "Открой настройки", 0, {"width": 1600, "height": 900}, False,
+        screen_unchanged=True, last_outcome="⚠️ не сработало",
+    )
+    check("запрос со скриншотом содержит уточняющий вопрос что делать дальше",
+          "что мне делать дальше" in step_q and "Уточняющий вопрос" in step_q
+          and "почти не изменился" in step_q)
+
+    rich_decision = probe.parse_decision(
+        "<think>осматриваю экран</think>\n"
+        '{"observation": "открыт рабочий стол", "next_question": "как открыть браузер?", '
+        '"thought": "нажму alt+tab", "action": {"type": "hotkey", "keys": ["alt", "tab"]}}'
+    )
+    check("parse_decision извлекает observation/next_question и пропускает <think>",
+          rich_decision["observation"] == "открыт рабочий стол"
+          and rich_decision["next_question"] == "как открыть браузер?"
+          and rich_decision["action"]["type"] == "hotkey")
+    formatted_thought = format_decision_thought(rich_decision)
+    check("format_decision_thought объединяет наблюдение, вопрос и план",
+          "Вижу:" in formatted_thought and "Вопрос:" in formatted_thought and "План:" in formatted_thought)
+
+    parsed_refl = probe.parse_reflection(
+        '```json\n{"question": "почему мимо?", "diagnosis": "окно свернуто", '
+        '"next_strategy": "нажать alt+tab"}\n```',
+        "по умолчанию",
+    )
+    check("parse_reflection читает вопрос, диагноз и новый план",
+          parsed_refl["question"] == "почему мимо?"
+          and parsed_refl["diagnosis"] == "окно свернуто"
+          and parsed_refl["next_strategy"] == "нажать alt+tab")
+
+    check("frames_similar различает похожие и разные отпечатки кадра",
+          frames_similar(b"\x10" * 576, b"\x11" * 576)
+          and not frames_similar(b"\x10" * 576, b"\x90" * 576))
+
+    # Сквозная симуляция неудачи действия → вопрос себе → саморазбор → смена тактики.
+    sim_calls: List[Tuple[str, Any]] = []
+
+    class SimHttp:
+        def __init__(self) -> None:
+            self.step = 0
+
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            sys_content = str(((payload or {}).get("messages") or [{}])[0].get("content") or "")
+            user_content = ((payload or {}).get("messages") or [{}])[-1].get("content")
+            user_text = (
+                " ".join(str(p.get("text") or "") for p in user_content if isinstance(p, dict))
+                if isinstance(user_content, list) else str(user_content or "")
+            )
+            sim_calls.append((sys_content[:120], user_text))
+            if "проверяешь результат действия" in sys_content:
+                if self.step == 1:
+                    return {"choices": [{"message": {"content": json.dumps({
+                        "ok": False, "note": "окно не открылось", "why": "клик попал мимо иконки"
+                    })}}]}
+                return {"choices": [{"message": {"content": json.dumps({
+                    "ok": True, "note": "нужное окно открылось", "why": ""
+                })}}]}
+            if "столкнулся с неудачей" in sys_content:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "question": "почему клик в (100, 100) не открыл окно?",
+                    "diagnosis": "курсор правее иконки",
+                    "next_strategy": "использовать hotkey alt+tab"
+                })}}]}
+            self.step += 1
+            if self.step == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "observation": "вижу рабочий стол",
+                    "next_question": "что мне делать дальше?",
+                    "thought": "кликну по иконке",
+                    "action": {"type": "click", "x": 100, "y": 100}
+                })}}]}
+            if self.step == 2:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "observation": "прошлый клик промахнулся",
+                    "next_question": "что делать иначе?",
+                    "self_check": "перехожу к alt+tab по саморазбору",
+                    "thought": "переключусь клавишами",
+                    "action": {"type": "hotkey", "keys": ["alt", "tab"]}
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "observation": "окно открыто",
+                "next_question": "цель достигнута?",
+                "thought": "завершаю",
+                "action": {"type": "finish", "summary": "окно открыто"}
+            })}}]}
+
+    sim_op = Operator(crm="", token="", base_url="http://127.0.0.1:8000/v1",
+                      model="sim-vl", api_key="", dry_run=False, assume_yes=True,
+                      max_steps=5, delay=0.0, poll=1.0, max_width=1600, text_only=False,
+                      vision_check=False, vision_forced=True, verify_actions=True,
+                      repeat_nudge=True, self_reflect=True)
+    sim_op.model_http = SimHttp()  # type: ignore[assignment]
+    sim_shot_counter = {"n": 0}
+
+    def sim_screenshot() -> Tuple[str, Dict[str, Any]]:
+        sim_shot_counter["n"] += 1
+        val = 10 if sim_shot_counter["n"] <= 2 else 180
+        sim_op._last_frame_sig = bytes([val]) * 576
+        shot = {"width": 1600, "height": 900, "screen_width": 1600, "screen_height": 900}
+        sim_op.last_shot = shot
+        return "data:image/jpeg;base64,AA==", shot
+
+    sim_op.screenshot = sim_screenshot  # type: ignore[method-assign]
+    sim_op.execute = lambda act: "ok: {}".format(act.get("type"))  # type: ignore[method-assign]
+    sim_ok = sim_op.run(None, "Открой окно", 5)
+    refl_prompts = [u for s, u in sim_calls if "столкнулся с неудачей" in s]
+    step2_prompts = [u for s, u in sim_calls if "умный оператор" in s and "САМОРАЗБОР" in u]
+    check("при неудаче бот задаёт вопрос себе, разбирает ошибку и меняет тактику",
+          sim_ok and len(refl_prompts) == 1
+          and "Почему у меня не получилось" in refl_prompts[0]
+          and len(step2_prompts) == 1
+          and "использовать hotkey alt+tab" in step2_prompts[0])
+
     # Проверка вывода кириллицы и «→» при строгой cp1251-кодировке (Windows pipe).
     orig_stdout = sys.stdout
     buf = io.BytesIO()
@@ -736,7 +1012,8 @@ class Operator:
                  offset_x: int = 0, offset_y: int = 0, vision_check: bool = True,
                  vision_forced: bool = False, cursor_marker: bool = True,
                  generation: Optional[Dict[str, Any]] = None,
-                 verify_actions: bool = True, repeat_nudge: bool = True) -> None:
+                 verify_actions: bool = True, repeat_nudge: bool = True,
+                 self_reflect: bool = True) -> None:
         self.crm = Http(crm, token, kind="CRM")
         self.has_crm = bool(crm and token)
         self.model_http = Http(base_url, kind="модель", key_hint=key_hint)
@@ -761,9 +1038,10 @@ class Operator:
         # Раздумья и генерация: те же поля, что в «Чате с моделью».
         self.generation = generation or {}
         self.verify_actions = verify_actions
+        self.self_reflect = self_reflect
         self.attachment_images: List[str] = []
         # Антизацикливание: отпечаток последнего действия, серия повторов и
-        # подсказка, которую получит модель на следующем шаге.
+        # подсказка/саморазбор, которые получит модель на следующем шаге.
         self.repeat_nudge_enabled = repeat_nudge
         self.last_signature = ""
         self.repeat_streak = 0
@@ -771,6 +1049,10 @@ class Operator:
         self.failed_checks = 0
         self.map_logged = False
         self.last_shot: Optional[Dict[str, Any]] = None
+        self._last_frame_sig: Optional[bytes] = None
+        self._last_verify_shot: Optional[str] = None
+        self._last_screen_unchanged: bool = False
+        self.current_task: Optional[int] = None
         self.history: List[str] = []
 
     # ------------------------------------------------------------- модель
@@ -856,28 +1138,31 @@ class Operator:
 
     def parse_verdict(self, text: str) -> Optional[Dict[str, Any]]:
         """Достаёт JSON-вердикт проверки из ответа модели (можно в ```-блоке)."""
-        raw = (text or "").strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start < 0 or end <= start:
+        objects = _extract_json_objects(text)
+        data: Optional[Dict[str, Any]] = None
+        for obj in reversed(objects):
+            if "ok" in obj or "note" in obj:
+                data = obj
+                break
+        if data is None and objects:
+            data = objects[-1]
+        if data is None:
             return None
-        try:
-            data = json.loads(raw[start:end + 1])
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(data, dict):
-            return None
-        return {"ok": bool(data.get("ok")), "note": str(data.get("note") or "").strip()[:200]}
+        return {
+            "ok": bool(data.get("ok")),
+            "note": str(data.get("note") or "").strip()[:200],
+            "why": str(data.get("why") or "").strip()[:240],
+        }
 
-    def verify_action(self, action: Dict[str, Any], result: str) -> Optional[Dict[str, Any]]:
+    def verify_action(self, action: Dict[str, Any], result: str,
+                      step_context: str = "", prev_frame_sig: Optional[bytes] = None) -> Optional[Dict[str, Any]]:
         """Скриншот после действия + вопрос модели: получилось ли?
 
         Ошибка проверки не должна ломать задание: любая проблема возвращает None,
         и бот просто идёт дальше по обычной логике.
         """
+        self._last_verify_shot = None
+        self._last_screen_unchanged = False
         if not self.verify_actions or self.text_only or not self.model:
             return None
         kind = str(action.get("type") or "")
@@ -889,11 +1174,22 @@ class Operator:
         except Exception as error:  # noqa: BLE001
             log("[!] проверка: не удалось снять экран ({})".format(error))
             return None
+        self._last_verify_shot = screenshot
+        unchanged = frames_similar(prev_frame_sig, self._last_frame_sig)
+        self._last_screen_unchanged = unchanged
 
-        payload_text = ("Действие: " + json.dumps(action, ensure_ascii=False)
-                        + "\nРезультат: " + result
-                        + '\n\nПосмотри на скриншот: получилось ли? Ответь JSON '
-                          '{"ok": true|false, "note": "что видно"}')
+        context_lines = []
+        if step_context:
+            context_lines.append("Цель шага: " + step_context[:300])
+        context_lines.append("Действие: " + json.dumps(action, ensure_ascii=False))
+        context_lines.append("Результат: " + result)
+        if unchanged:
+            context_lines.append("Визуальное сравнение: экран после действия почти не изменился.")
+        context_lines.append(
+            '\nПосмотри на скриншот: получилось ли? Ответь JSON '
+            '{"ok": true|false, "note": "что видно", "why": "причина если false"}'
+        )
+        payload_text = "\n".join(context_lines)
         messages = [
             {"role": "system", "content": VERIFY_PROMPT},
             {"role": "user", "content": [
@@ -902,7 +1198,7 @@ class Operator:
             ]},
         ]
         payload: Dict[str, Any] = {"model": self.model, "messages": messages,
-                                   "temperature": 0, "max_tokens": 200, "stream": False}
+                                   "temperature": 0, "max_tokens": 240, "stream": False}
         self.apply_generation(payload)
         payload["temperature"] = 0
         headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
@@ -923,6 +1219,108 @@ class Operator:
         if verdict is None:
             log("[!] проверка: модель ответила без JSON — пропускаю")
         return verdict
+
+    @staticmethod
+    def parse_reflection(text: str, default_question: str = "") -> Dict[str, str]:
+        """Разбирает ответ саморазбора (JSON или обычный текст)."""
+        objects = _extract_json_objects(text)
+        data: Optional[Dict[str, Any]] = None
+        for obj in reversed(objects):
+            if any(key in obj for key in ("diagnosis", "next_strategy", "question")):
+                data = obj
+                break
+        if data is None and objects:
+            data = objects[-1]
+        if data is not None:
+            return {
+                "question": str(data.get("question") or default_question).strip()[:280],
+                "diagnosis": str(data.get("diagnosis") or "").strip()[:400],
+                "next_strategy": str(data.get("next_strategy") or "").strip()[:400],
+            }
+        cleaned = _strip_thinking(text)
+        return {
+            "question": default_question[:280],
+            "diagnosis": cleaned[:400] if cleaned else "Предыдущее действие не дало ожидаемого результата.",
+            "next_strategy": "",
+        }
+
+    def reflect_on_failure(self, task_prompt: str, action: Dict[str, Any],
+                           reason: str, screenshot: Optional[str] = None) -> Dict[str, str]:
+        """Когда действие не удалось: бот задаёт вопрос себе и разбирает ошибку.
+
+        Возвращает {"question", "diagnosis", "next_strategy"} и сохраняет
+        итог в self.pending_nudge для следующего шага.
+        """
+        question = build_self_question(action, reason)
+        log("  [?] Вопрос себе: " + question)
+        self.report("thought", "🤔 Вопрос себе: " + question, action)
+
+        reflection: Dict[str, str] = {
+            "question": question,
+            "diagnosis": reason,
+            "next_strategy": "",
+        }
+        if self.self_reflect and self.model:
+            shot_url = screenshot
+            if not shot_url and not self.text_only:
+                try:
+                    shot_url, _ = self.screenshot()
+                except Exception:  # noqa: BLE001
+                    shot_url = None
+
+            summary_lines = [
+                'Задание: "{}"'.format(task_prompt),
+                "Неудачное действие: {}".format(json.dumps(action, ensure_ascii=False)),
+                "Что пошло не так: {}".format(reason),
+                "Мой вопрос себе: {}".format(question),
+            ]
+            if self.history:
+                summary_lines.append("Последние шаги:\n" + "\n".join(self.history[-6:]))
+            prompt_text = "\n".join(summary_lines)
+            user_content: Any = (
+                [{"type": "text", "text": prompt_text},
+                 {"type": "image_url", "image_url": {"url": shot_url}}]
+                if (shot_url and not self.text_only) else prompt_text
+            )
+            payload: Dict[str, Any] = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": SELF_REFLECT_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 360,
+                "stream": False,
+            }
+            self.apply_generation(payload)
+            if (self.generation or {}).get("temperature") is None:
+                payload["temperature"] = 0.3
+            headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
+            try:
+                data = self.model_http.call("POST", "/chat/completions", payload, timeout=120,
+                                            headers=headers)
+                choices = data.get("choices") or []
+                raw_text = str((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+                if raw_text:
+                    reflection = self.parse_reflection(raw_text, question)
+            except TaskCancelled:
+                raise
+            except AgentError as error:
+                log("[!] саморазбор не удался ({}) — использую базовую подсказку".format(error))
+
+        diag_parts = []
+        if reflection.get("diagnosis"):
+            diag_parts.append("Что не так: " + reflection["diagnosis"])
+        if reflection.get("next_strategy"):
+            diag_parts.append("Новый план: " + reflection["next_strategy"])
+        if diag_parts:
+            summary = " | ".join(diag_parts)
+            log("  [!] Разбор: " + summary)
+            self.report("thought", "💡 " + summary, action)
+            self.history.append("разбор неудачи ({}): {}".format(action.get("type"), summary[:200]))
+
+        self.pending_nudge = build_reflection_nudge(reflection)
+        return reflection
 
     def probe_vision(self) -> Optional[bool]:
         """Видит ли модель картинки: просим прочитать число с тестовой плашки.
@@ -973,18 +1371,28 @@ class Operator:
 
     @staticmethod
     def parse_decision(text: str) -> Dict[str, Any]:
-        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            raise AgentError("Модель ответила без JSON: " + text[:200])
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError as error:
-            raise AgentError("Не разобрал JSON модели: " + text[:200]) from error
+        objects = _extract_json_objects(text)
+        data: Optional[Dict[str, Any]] = None
+        for obj in reversed(objects):
+            action = obj.get("action")
+            if isinstance(action, dict) and action.get("type"):
+                data = obj
+                break
+        if data is None:
+            if not objects:
+                cleaned = _strip_thinking(text)
+                raise AgentError("Модель ответила без JSON: " + cleaned[:200])
+            data = objects[-1]
         action = data.get("action") or {}
         if not isinstance(action, dict) or not action.get("type"):
             raise AgentError("В ответе модели нет action.type")
-        return {"thought": str(data.get("thought") or ""), "action": action}
+        return {
+            "observation": str(data.get("observation") or "").strip(),
+            "next_question": str(data.get("next_question") or data.get("question") or "").strip(),
+            "self_check": str(data.get("self_check") or "").strip(),
+            "thought": str(data.get("thought") or "").strip(),
+            "action": action,
+        }
 
     # ------------------------------------------------------------- экран
     @staticmethod
@@ -1005,6 +1413,9 @@ class Operator:
             image = image.resize((self.max_width, max(1, int(round(raw_height * ratio)))))
         if image.mode != "RGB":
             image = image.convert("RGB")
+
+        # Считаем отпечаток чистого экрана до рисования крестика курсора.
+        self._last_frame_sig = frame_signature(image)
 
         # Красный крестик в точке курсора: модель видит, где он сейчас, и не
         # кликает «наугад» после промаха.
@@ -1263,6 +1674,9 @@ class Operator:
         self.repeat_streak = 0
         self.pending_nudge = ""
         self.failed_checks = 0
+        self._last_frame_sig = None
+        last_outcome = ""
+        last_screen_unchanged = False
         log("Задание: {}".format(prompt))
         self.report("info", "Задание принято: " + prompt)
 
@@ -1285,34 +1699,28 @@ class Operator:
                 except Exception as error:  # noqa: BLE001
                     log("[!] скриншот не удался: {}".format(error))
 
-            parts = ['Задание: "{}"'.format(prompt),
-                     'Это шаг {}.'.format(index + 1)]
-            if not self.text_only and self.last_shot:
-                parts.append('Размер кадра: {width}×{height} px — координаты клика '
-                             'в этих пикселях.'.format(**self.last_shot))
-            elif self.text_only:
-                parts.append('Работаем без скриншота: координаты считай по текущему экрану.')
-            parts.append('Опиши мысль и выбери одно действие. Если всё готово — action finish.')
-            if self.pending_nudge:
-                parts.append(self.pending_nudge)
-            if self.attachments_context:
-                if index == 0:
-                    parts.append('Файлы от пользователя (используй их содержимое):')
-                    parts.append(self.attachments_context)
-                else:
-                    parts.append('Вложения задания уже прочитаны на первом шаге.')
-            step_prompt = "\n".join(parts)
+            step_prompt = build_step_prompt(
+                prompt=prompt,
+                step_index=index,
+                shot=self.last_shot,
+                text_only=self.text_only,
+                pending_nudge=self.pending_nudge,
+                attachments_context=self.attachments_context,
+                last_outcome=last_outcome,
+                screen_unchanged=last_screen_unchanged,
+            )
             decision = self.ask_model(step_prompt, screenshot,
                                       self.attachment_images if index == 0 else None)
+            self.pending_nudge = ""
             action = decision["action"]
-            thought = decision.get("thought") or ""
+            thought_text = format_decision_thought(decision)
             log("Шаг {} | {} {}".format(index + 1, action.get("type"),
                                         "({} симв.)".format(len(str(action.get("content") or "")))
                                         if action.get("type") == "make_file" else ""))
-            if thought:
-                _safe_print("         " + thought)
-            if thought:
-                self.report("thought", thought, action)
+            if thought_text:
+                _safe_print("         " + thought_text)
+                self.report("thought", thought_text, action)
+                self.history.append("шаг {} мысль: {}".format(index + 1, thought_text[:200]))
 
             if action.get("type") == "finish":
                 summary = str(action.get("summary") or "Готово")
@@ -1330,25 +1738,33 @@ class Operator:
                 self.repeat_streak += 1
             else:
                 self.repeat_streak = 1
-                if self.failed_checks == 0:
-                    self.pending_nudge = ""
             self.last_signature = signature
             limit = REPEAT_LIMITS.get(kind, 0)
 
             if self.repeat_nudge_enabled and limit and self.repeat_streak >= limit:
-                self.pending_nudge = build_repeat_nudge(action, self.repeat_streak)
+                repeat_nudge = build_repeat_nudge(action, self.repeat_streak)
                 if self.repeat_streak == limit:
-                    log("  повтор действия {} раз — прошу модель сменить тактику".format(
+                    log("  повтор действия {} раз — задаю себе вопрос и меняю тактику".format(
                         self.repeat_streak))
-                    self.report("info", "Похоже на зацикливание: прошу модель сменить тактику",
+                    self.report("info", "Похоже на зацикливание: разбираю, что идёт не так",
                                 action)
+                    self.reflect_on_failure(
+                        prompt,
+                        action,
+                        "одно и то же действие повторяется {} раз подряд".format(self.repeat_streak),
+                        screenshot=screenshot,
+                    )
+                    self.pending_nudge = (self.pending_nudge + "\n\n" + repeat_nudge).strip()
                 else:
+                    self.pending_nudge = repeat_nudge
                     note = "Повтор действия пропущен ({} раз подряд): {}".format(
                         self.repeat_streak, action_label(action))
                     log("  " + note)
                     self.report("info", note, action)
                     self.history.append("шаг {}: {} не выполнен — повтор".format(
                         index + 1, kind))
+                    last_outcome = note
+                    last_screen_unchanged = True
                     if self.repeat_streak >= limit + MAX_REPEAT_EXTRA:
                         stop = ("Застрял на одном действии {} раз подряд — останавливаюсь, "
                                 "чтобы не кликать вслепую. Уточните задание.").format(
@@ -1380,39 +1796,101 @@ class Operator:
                 log("  пропуск: " + reason)
                 self.report("action", reason, action)
                 self.history.append("шаг {}: {} — {}".format(index + 1, action.get("type"), reason))
+                last_outcome = reason
+                last_screen_unchanged = False
             else:
+                prev_frame_sig = self._last_frame_sig
                 try:
                     result = self.execute(action)
                     log("  выполнено: " + result)
                     self.report("action", result, action)
                     self.history.append("шаг {}: {} → {}".format(index + 1, action.get("type"), result[:160]))
+                    last_outcome = result
+                    last_screen_unchanged = False
 
                     # Проверяем результат по свежему скриншоту: бот не идёт
                     # дальше «наугад», если клик не сработал.
-                    verdict = self.verify_action(action, result)
+                    verdict = self.verify_action(
+                        action,
+                        result,
+                        step_context=thought_text or prompt,
+                        prev_frame_sig=prev_frame_sig,
+                    )
                     if verdict is not None:
                         note = verdict["note"] or ("получилось" if verdict["ok"] else "результата не видно")
                         self.report("result", "{} {}".format("✅" if verdict["ok"] else "⚠️",
                                                              note), action)
                         self.history.append("проверка после {}: {} — {}".format(
                             action.get("type"), "ок" if verdict["ok"] else "проблема", note))
-                        self.failed_checks = 0 if verdict["ok"] else self.failed_checks + 1
                         if verdict["ok"]:
+                            self.failed_checks = 0
                             # Экран изменился — это прогресс, счётчик повторов
                             # начинается заново (иначе «следующая страница»
                             # тем же кликом считалась бы зацикливанием).
                             self.repeat_streak = 0
                             self.pending_nudge = ""
-                        if not verdict["ok"] and self.failed_checks >= 2:
-                            self.pending_nudge = build_failed_nudge(self.failed_checks, note)
-                            self.report("info", "Результата нет {} раз подряд — меняю тактику".format(
-                                self.failed_checks), action)
+                            last_outcome = "✅ " + note
+                            last_screen_unchanged = False
+                        else:
+                            self.failed_checks += 1
+                            last_outcome = "⚠️ " + note
+                            last_screen_unchanged = self._last_screen_unchanged
+                            fail_reason = verdict.get("why") or note
+                            if self._last_screen_unchanged and "не изменился" not in fail_reason.lower():
+                                fail_reason += " (экран визуально не изменился)"
+                            self.reflect_on_failure(
+                                prompt,
+                                action,
+                                fail_reason,
+                                screenshot=self._last_verify_shot or screenshot,
+                            )
+                            if self.failed_checks >= 2:
+                                self.report("info", "Результата нет {} раз подряд — меняю тактику".format(
+                                    self.failed_checks), action)
+                                self.pending_nudge = (
+                                    self.pending_nudge + "\n" + build_failed_nudge(self.failed_checks, note)
+                                ).strip()
+                    elif (
+                        self.self_reflect
+                        and not self.text_only
+                        and prev_frame_sig is not None
+                        and kind not in ("wait", "finish", "make_file", "open_url", "move")
+                    ):
+                        # Если проверка отключена или не ответила JSON — ловим тихий промах по кадру.
+                        after_url = self._last_verify_shot
+                        if after_url is None:
+                            time.sleep(min(0.6, max(0.25, self.delay)))
+                            try:
+                                after_url, _ = self.screenshot()
+                            except Exception:  # noqa: BLE001
+                                after_url = None
+                        if after_url and frames_similar(prev_frame_sig, self._last_frame_sig):
+                            self.failed_checks += 1
+                            last_screen_unchanged = True
+                            last_outcome = "экран визуально не изменился после {}".format(kind)
+                            self.reflect_on_failure(
+                                prompt,
+                                action,
+                                "экран после действия визуально не изменился",
+                                screenshot=after_url,
+                            )
+                        else:
+                            self.failed_checks = 0
                 except TaskCancelled:
                     raise
                 except Exception as error:  # noqa: BLE001
                     log("  ошибка: {}".format(error))
                     self.report("error", str(error)[:400], action)
                     self.history.append("шаг {}: ошибка {}".format(index + 1, error))
+                    self.failed_checks += 1
+                    last_outcome = "ошибка: " + str(error)[:160]
+                    last_screen_unchanged = True
+                    self.reflect_on_failure(
+                        prompt,
+                        action,
+                        "ошибка при выполнении: {}".format(error),
+                        screenshot=screenshot,
+                    )
 
             time.sleep(max(0.2, self.delay))
 
@@ -1588,6 +2066,8 @@ def parse_args() -> argparse.Namespace:
                         help="не проверять экран после каждого действия")
     parser.add_argument("--no-repeat-nudge", action="store_true",
                         help="не подсказывать модели, когда она зациклилась на действии")
+    parser.add_argument("--no-self-reflect", action="store_true",
+                        help="не задавать модели самопроверочный вопрос при неудаче действия")
     parser.add_argument("--check", action="store_true",
                         help="проверить связь с CRM и токен (без экрана и модели)")
     parser.add_argument("--self-test", action="store_true", help="проверки без экрана и зависимостей")
@@ -1637,6 +2117,7 @@ def main() -> int:
         },
         verify_actions=not args.no_verify_actions,
         repeat_nudge=not args.no_repeat_nudge,
+        self_reflect=not args.no_self_reflect,
     )
     operator.current_task = None
 
@@ -1654,12 +2135,13 @@ def main() -> int:
             "или переменную {}; поле есть во вкладке «Оператор» → «Подключение».".format(key_hint))
     log("Режим: {}{}".format("DRY-RUN" if args.dry_run else "ИСПОЛНЕНИЕ",
                              " + подтверждения" if not args.yes else ""))
-    log("Генерация: раздумья {}, temperature {}, top_p {}, max_tokens {}, проверка после "
-        "действия {}".format(args.reasoning,
-                             args.temperature if args.temperature is not None else "по умолчанию",
-                             args.top_p if args.top_p is not None else "—",
-                             args.max_tokens if args.max_tokens is not None else "—",
-                             "выкл" if args.no_verify_actions else "вкл"))
+    log("Генерация: раздумья {}, temperature {}, top_p {}, max_tokens {}, проверка "
+        "{}, саморазбор {}".format(args.reasoning,
+                                   args.temperature if args.temperature is not None else "по умолчанию",
+                                   args.top_p if args.top_p is not None else "—",
+                                   args.max_tokens if args.max_tokens is not None else "—",
+                                   "выкл" if args.no_verify_actions else "вкл",
+                                   "выкл" if args.no_self_reflect else "вкл"))
     if not args.text_only:
         lowered = (model or "").lower()
         if args.vision:

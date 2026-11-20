@@ -109,6 +109,7 @@ OPERATOR = AgentSpec(
         Field("text_only", "Без скриншотов (модель без vision)", "bool", False),
         Field("verify", "Проверять экран после каждого действия", "bool", True),
         Field("repeat_nudge", "Подсказывать при зацикливании", "bool", True),
+        Field("self_reflect", "Разбирать неудачи (вопрос себе)", "bool", True),
     ),
 )
 

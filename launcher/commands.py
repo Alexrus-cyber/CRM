@@ -109,6 +109,8 @@ def operator_args(spec: AgentSpec, settings: LaunchSettings) -> List[str]:
         args.append("--no-verify-actions")
     if not truthy(values.get("repeat_nudge", True)):
         args.append("--no-repeat-nudge")
+    if not truthy(values.get("self_reflect", True)):
+        args.append("--no-self-reflect")
     return args
 
 
