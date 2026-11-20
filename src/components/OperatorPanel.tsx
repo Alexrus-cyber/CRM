@@ -15,8 +15,10 @@ import {
   Paperclip,
   Play,
   PlugZap,
+  Plus,
   Rocket,
   Settings2,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   Square,
@@ -28,7 +30,21 @@ import { Badge, Button, Card, EmptyState, Input, Textarea } from "@/components/u
 import { cn, formatDateTime, formatTime } from "@/lib/utils";
 import { useStoredJson } from "@/lib/useStoredValue";
 import { GenSettings } from "./GenSettings";
-import { AGENT_MAX_STEPS, GEN_DEFAULT_PARAMS, decodeGenParams, type GenParams } from "@/lib/genParams";
+import { TrustSelector } from "./TrustSelector";
+import {
+  AGENT_MAX_STEPS,
+  GEN_DEFAULT_PARAMS,
+  OPERATOR_MAX_EXTEND_STEPS,
+  decodeGenParams,
+  type GenParams,
+} from "@/lib/genParams";
+import {
+  DEFAULT_TRUST_LEVEL,
+  decodeTrustLevel,
+  findTrustLevel,
+  normalizeTrustLevel,
+  type TrustLevel,
+} from "@/lib/trust";
 import {
   OPERATOR_PROVIDERS,
   buildCommandWithKey,
@@ -44,6 +60,7 @@ import {
   AgentFileCard,
   describeAction,
   MetricCard,
+  parsePendingApproval,
   StatusChip,
   type OperatorEvent,
   type OperatorTask,
@@ -95,7 +112,7 @@ function decodeFlag(raw: string): boolean {
 function statusFilterMatches(status: string, filter: string): boolean {
   if (filter === "all") return true;
   if (filter === "queued") return status === "queued" || status === "paused";
-  if (filter === "running") return status === "running";
+  if (filter === "running") return status === "running" || status === "waiting_approval" || status === "waiting_steps";
   if (filter === "done") return status === "done";
   return true;
 }
@@ -141,6 +158,12 @@ export function OperatorPanel() {
     GEN_DEFAULT_PARAMS,
     decodeGenParams,
   );
+  const [trustLevel, setTrustLevel] = useStoredJson<TrustLevel>(
+    "crm.ai.operator.trust.v1",
+    DEFAULT_TRUST_LEVEL,
+    decodeTrustLevel,
+  );
+  const [actionBusy, setActionBusy] = useState(false);
   // Храним именно «выключено»: useStoredNumber не сохраняет 0 и переключатель
   // нельзя было выключить.
   const [verifyOff, setVerifyOff] = useStoredJson<boolean>(
@@ -408,6 +431,7 @@ export function OperatorPanel() {
         body: JSON.stringify({
           prompt: text,
           maxSteps: Math.max(maxSteps, 1),
+          trustLevel,
           files: files.map((file) => ({
             name: file.name,
             mime: file.mime,
@@ -457,13 +481,61 @@ export function OperatorPanel() {
     setTasks((prev) => prev.map((task) => (task.id === id ? { ...task, status: "cancelled" } : task)));
   };
 
+  const respondApproval = async (id: number, decision: "approve" | "reject", approvalId?: string) => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/agent/tasks/${id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: decision, approvalId }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
+      if (!res.ok) {
+        setError(data.error ?? "Не удалось отправить ответ");
+        return;
+      }
+      if (data.task) {
+        setTasks((prev) => prev.map((task) => (task.id === id ? data.task! : task)));
+      }
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const extendSteps = async (id: number, addSteps = 20) => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/agent/tasks/${id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "extend_steps", addSteps }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
+      if (!res.ok) {
+        setError(data.error ?? "Не удалось продлить лимит шагов");
+        return;
+      }
+      if (data.task) {
+        setTasks((prev) => prev.map((task) => (task.id === id ? data.task! : task)));
+      }
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
   /* ------------------------------- выводы ------------------------------- */
 
   const counts = useMemo(
     () => ({
       all: tasks.length,
       queued: tasks.filter((task) => task.status === "queued" || task.status === "paused").length,
-      running: tasks.filter((task) => task.status === "running").length,
+      running: tasks.filter(
+        (task) => task.status === "running" || task.status === "waiting_approval" || task.status === "waiting_steps",
+      ).length,
       done: tasks.filter((task) => task.status === "done").length,
     }),
     [tasks],
@@ -485,6 +557,10 @@ export function OperatorPanel() {
   }, [events, currentAction]);
 
   const parsedAction = describeAction(currentAction?.action ?? "");
+  const pendingApproval = useMemo(
+    () => parsePendingApproval(activeTask?.pendingApproval),
+    [activeTask?.pendingApproval],
+  );
   const progress = activeTask ? Math.min(100, Math.round((activeTask.steps / Math.max(activeTask.maxSteps, 1)) * 100)) : 0;
   const finished = activeTask ? ["done", "failed", "cancelled"].includes(activeTask.status) : false;
 
@@ -503,6 +579,7 @@ export function OperatorPanel() {
       dryRun,
       assumeYes,
       textOnly,
+      trustLevel,
       gen: genParams,
       verifyActions: !verifyOff,
     }),
@@ -517,6 +594,7 @@ export function OperatorPanel() {
       dryRun,
       assumeYes,
       textOnly,
+      trustLevel,
       genParams,
       verifyOff,
     ],
@@ -627,6 +705,8 @@ export function OperatorPanel() {
             <MetricCard label="Готово" value={counts.done} hint="из последних запусков" icon={<Check size={12} />} />
             <MetricCard label="Файлы" value={files.length} hint="в открытом запуске" icon={<FileText size={12} />} />
           </div>
+
+          <TrustSelector value={trustLevel} onChange={setTrustLevel} />
 
           <GenSettings
             value={genParams}
@@ -796,6 +876,16 @@ export function OperatorPanel() {
                   <span className="flex flex-wrap items-center gap-2">
                     Запуск #{activeTask.id}
                     <StatusChip status={activeTask.status} />
+                    {activeTask.trustLevel && (
+                      <span
+                        className={cn(
+                          "rounded-md border px-1.5 py-0.5 text-[10px] font-medium",
+                          findTrustLevel(normalizeTrustLevel(activeTask.trustLevel)).badgeClass,
+                        )}
+                      >
+                        {findTrustLevel(normalizeTrustLevel(activeTask.trustLevel)).shortLabel}
+                      </span>
+                    )}
                     <span className="text-[10px] font-normal text-muted">
                       {formatDateTime(activeTask.createdAt)}
                     </span>
@@ -831,8 +921,90 @@ export function OperatorPanel() {
                       style={{ width: `${Math.max(progress, 2)}%` }}
                     />
                   </div>
+                  {!finished && activeTask.maxSteps < OPERATOR_MAX_EXTEND_STEPS && (
+                    <button
+                      type="button"
+                      onClick={() => void extendSteps(activeTask.id, 20)}
+                      disabled={actionBusy}
+                      className="flex shrink-0 items-center gap-0.5 rounded-md border border-accent/40 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent2 hover:bg-accent/20 disabled:opacity-50"
+                      title="Продлить лимит шагов этой задачи без потери контекста (до 2000)"
+                    >
+                      <Plus size={10} /> +20 шагов
+                    </button>
+                  )}
                   {activeTask.summary && <span className="truncate">{activeTask.summary}</span>}
                 </div>
+
+                {/* Карточка подтверждения действия или продления шагов прямо на сайте */}
+                {(pendingApproval || activeTask.status === "waiting_steps" || activeTask.status === "waiting_approval") && (
+                  <div className="mt-3 space-y-2 rounded-xl border border-amber-500/50 bg-amber-500/10 p-3 text-xs">
+                    <div className="flex items-start gap-2">
+                      <ShieldAlert size={16} className="mt-0.5 shrink-0 text-amber-500" />
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <p className="font-semibold text-text">
+                          {pendingApproval?.title ??
+                            (activeTask.status === "waiting_steps"
+                              ? `Достигнут лимит ${activeTask.maxSteps} шагов`
+                              : "Оператор ждёт вашего подтверждения")}
+                        </p>
+                        {pendingApproval?.description && (
+                          <p className="text-[11px] text-muted">{pendingApproval.description}</p>
+                        )}
+                        {pendingApproval?.action && (
+                          <pre className="max-h-32 overflow-auto rounded-lg bg-card px-2 py-1.5 font-mono text-[10px] text-text">
+                            {JSON.stringify(pendingApproval.action, null, 2)}
+                          </pre>
+                        )}
+                      </div>
+                    </div>
+
+                    {pendingApproval?.kind === "step_limit" || activeTask.status === "waiting_steps" ? (
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          size="sm"
+                          onClick={() => void extendSteps(activeTask.id, pendingApproval?.extraSteps ?? 20)}
+                          disabled={actionBusy}
+                        >
+                          <Plus size={12} /> +{pendingApproval?.extraSteps ?? 20} шагов и продолжить
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => void extendSteps(activeTask.id, 50)}
+                          disabled={actionBusy}
+                        >
+                          <Plus size={12} /> +50 шагов
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="danger"
+                          onClick={() => void cancelTask(activeTask.id)}
+                          disabled={actionBusy}
+                        >
+                          <Square size={12} /> Остановить
+                        </Button>
+                      </div>
+                    ) : (
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          size="sm"
+                          onClick={() => void respondApproval(activeTask.id, "approve", pendingApproval?.id)}
+                          disabled={actionBusy}
+                        >
+                          <Check size={12} /> Разрешить выполнение
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="danger"
+                          onClick={() => void respondApproval(activeTask.id, "reject", pendingApproval?.id)}
+                          disabled={actionBusy}
+                        >
+                          <X size={12} /> Отклонить
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {activeTask.status === "queued" && events.length === 0 && (
                   <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-muted">
@@ -1315,11 +1487,13 @@ function EventRow({ event }: { event: OperatorEvent }) {
       ? "Мысль модели"
       : event.kind === "error"
         ? "Ошибка"
-        : event.kind === "result"
-          ? checkPassed ? "Проверка: получилось" : "Проверка: результат под вопросом"
-          : event.kind === "info"
-            ? "Служебное сообщение"
-            : "Действие");
+        : event.kind === "approval"
+          ? "Подтверждение на сайте"
+          : event.kind === "result"
+            ? checkPassed ? "Проверка: получилось" : "Проверка: результат под вопросом"
+            : event.kind === "info"
+              ? "Служебное сообщение"
+              : "Действие");
 
   return (
     <div className="rounded-lg border border-border bg-card px-2 py-1.5">

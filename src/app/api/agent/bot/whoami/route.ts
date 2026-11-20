@@ -29,7 +29,15 @@ export async function GET(req: Request) {
   }
 
   const [owner, tasks] = await Promise.all([getUser(ownerId), listAgentTasks(ownerId, 100)]);
-  const counts = { queued: 0, running: 0, done: 0, failed: 0, cancelled: 0 };
+  const counts = {
+    queued: 0,
+    running: 0,
+    waiting_approval: 0,
+    waiting_steps: 0,
+    done: 0,
+    failed: 0,
+    cancelled: 0,
+  };
   for (const task of tasks) {
     if (task.status in counts) counts[task.status as keyof typeof counts] += 1;
   }

@@ -133,6 +133,7 @@ export function keyEnvName(providerId: string): string {
 }
 
 import { genParamsFlags, type GenParams } from "./genParams";
+import type { TrustLevel } from "./trust";
 
 export type CommandOptions = {
   provider: string;
@@ -146,6 +147,8 @@ export type CommandOptions = {
   dryRun?: boolean;
   assumeYes?: boolean;
   textOnly?: boolean;
+  /** Уровень доверия ИИ: full | verified | none. */
+  trustLevel?: TrustLevel;
   /** Раздумья и генерация с вкладки «Оператор» — передаются боту флагами. */
   gen?: GenParams;
   /** Проверять результат после каждого действия (по умолчанию да). */
@@ -170,6 +173,7 @@ export function buildOperatorCommand(options: CommandOptions): string {
   const key = (options.apiKey ?? "").trim();
   if (key && options.keyMode !== "env") parts.push("--api-key", key);
 
+  if (options.trustLevel) parts.push("--trust-level", options.trustLevel);
   if (options.gen) parts.push(...genParamsFlags(options.gen));
   if (options.verifyActions === false) parts.push("--no-verify-actions");
   if (options.selfReflect === false) parts.push("--no-self-reflect");

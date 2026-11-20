@@ -2,6 +2,8 @@ import { randomBytes } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { nowIso, q, q1, toIso, toNum, toYmd } from "./dialect";
 import { tokenize } from "@/lib/rag";
+import { normalizeTrustLevel, type TrustLevel } from "@/lib/trust";
+import { OPERATOR_MAX_EXTEND_STEPS } from "@/lib/genParams";
 import type { Role, TaskPriority, TaskStatus } from "./schema";
 
 export type UserLite = {
@@ -873,6 +875,24 @@ export async function deleteTaskMessage(id: number): Promise<void> {
 
 /* ---------------------- агент-оператор рабочего стола --------------- */
 
+export type AgentTaskApprovalRequest = {
+  id: string;
+  kind: "dangerous_action" | "step_limit" | "sandbox_export" | "shell_command";
+  title: string;
+  description: string;
+  action?: Record<string, unknown>;
+  extraSteps?: number;
+  requestedAt: string;
+};
+
+export type AgentTaskApprovalDecision = {
+  id: string;
+  decision: "approved" | "rejected" | "extend_steps";
+  extraSteps?: number;
+  note?: string;
+  decidedAt: string;
+};
+
 export type AgentTaskRow = {
   id: number;
   userId: number;
@@ -881,6 +901,9 @@ export type AgentTaskRow = {
   maxSteps: number;
   steps: number;
   summary: string;
+  trustLevel: TrustLevel;
+  pendingApproval: AgentTaskApprovalRequest | null;
+  approvalResponse: AgentTaskApprovalDecision | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -898,6 +921,17 @@ export type AgentEventRow = {
   createdAt: string;
 };
 
+function parseJsonObject<T>(raw: unknown): T | null {
+  const str = String(raw ?? "").trim();
+  if (!str) return null;
+  try {
+    const parsed: unknown = JSON.parse(str);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as T) : null;
+  } catch {
+    return null;
+  }
+}
+
 function mapAgentTask(r: Raw): AgentTaskRow {
   return {
     id: toNum(r.id),
@@ -907,6 +941,9 @@ function mapAgentTask(r: Raw): AgentTaskRow {
     maxSteps: toNum(r.max_steps),
     steps: toNum(r.steps),
     summary: String(r.summary ?? ""),
+    trustLevel: normalizeTrustLevel(r.trust_level),
+    pendingApproval: parseJsonObject<AgentTaskApprovalRequest>(r.pending_approval),
+    approvalResponse: parseJsonObject<AgentTaskApprovalDecision>(r.approval_response),
     createdAt: toIso(r.created_at) ?? nowIso(),
     updatedAt: toIso(r.updated_at) ?? nowIso(),
   };
@@ -1015,11 +1052,11 @@ export async function getAgentBotConnectionStatus(
   const queuedRow = await q1<{ count: number }>(sql`
     select count(*) as count from agent_tasks where user_id = ${userId} and status = 'queued'`);
   const runningCountRow = await q1<{ count: number }>(sql`
-    select count(*) as count from agent_tasks where user_id = ${userId} and status = 'running'`);
+    select count(*) as count from agent_tasks where user_id = ${userId} and status in ('running', 'waiting_approval', 'waiting_steps')`);
   const runningRow = await q1(sql`
     select id, steps, max_steps, updated_at
     from agent_tasks
-    where user_id = ${userId} and status = 'running'
+    where user_id = ${userId} and status in ('running', 'waiting_approval', 'waiting_steps')
     order by updated_at desc, id desc limit 1`);
 
   const nowMs = Date.now();
@@ -1277,11 +1314,17 @@ function dayAgoIso(): string {
   return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 }
 
-export async function createAgentTask(userId: number, prompt: string, maxSteps: number): Promise<AgentTaskRow> {
+export async function createAgentTask(
+  userId: number,
+  prompt: string,
+  maxSteps: number,
+  trustLevel: TrustLevel = "verified",
+): Promise<AgentTaskRow> {
   const now = nowIso();
+  const safeTrust = normalizeTrustLevel(trustLevel);
   const row = await q1<{ id: number }>(sql`
-    insert into agent_tasks (user_id, prompt, status, max_steps, steps, summary, created_at, updated_at)
-    values (${userId}, ${prompt}, 'queued', ${maxSteps}, 0, '', ${now}, ${now}) returning id`);
+    insert into agent_tasks (user_id, prompt, status, max_steps, steps, summary, trust_level, pending_approval, approval_response, created_at, updated_at)
+    values (${userId}, ${prompt}, 'queued', ${maxSteps}, 0, '', ${safeTrust}, '', '', ${now}, ${now}) returning id`);
   const id = toNum(row?.id);
   return {
     id,
@@ -1291,6 +1334,9 @@ export async function createAgentTask(userId: number, prompt: string, maxSteps: 
     maxSteps,
     steps: 0,
     summary: "",
+    trustLevel: safeTrust,
+    pendingApproval: null,
+    approvalResponse: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -1298,14 +1344,14 @@ export async function createAgentTask(userId: number, prompt: string, maxSteps: 
 
 export async function listAgentTasks(userId: number, limit = 12): Promise<AgentTaskRow[]> {
   const rows = await q(sql`
-    select id, user_id, prompt, status, max_steps, steps, summary, created_at, updated_at
+    select id, user_id, prompt, status, max_steps, steps, summary, trust_level, pending_approval, approval_response, created_at, updated_at
     from agent_tasks where user_id = ${userId} order by id desc limit ${limit}`);
   return rows.map(mapAgentTask);
 }
 
 export async function getAgentTask(userId: number, id: number): Promise<AgentTaskRow | null> {
   const row = await q1(sql`
-    select id, user_id, prompt, status, max_steps, steps, summary, created_at, updated_at
+    select id, user_id, prompt, status, max_steps, steps, summary, trust_level, pending_approval, approval_response, created_at, updated_at
     from agent_tasks where id = ${id} and user_id = ${userId} limit 1`);
   return row ? mapAgentTask(row) : null;
 }
@@ -1339,13 +1385,145 @@ export async function setAgentTaskStatus(
   summary?: string,
 ): Promise<void> {
   const now = nowIso();
+  const clearPending = ["done", "failed", "cancelled"].includes(status);
   if (summary === undefined) {
-    await q(sql`update agent_tasks set status = ${status}, updated_at = ${now} where id = ${id} and user_id = ${userId}`);
+    await q(sql`update agent_tasks
+      set status = ${status},
+          pending_approval = case when ${clearPending} then '' else pending_approval end,
+          updated_at = ${now}
+      where id = ${id} and user_id = ${userId}`);
     return;
   }
   await q(sql`
-    update agent_tasks set status = ${status}, summary = ${summary}, updated_at = ${now}
+    update agent_tasks
+    set status = ${status},
+        summary = ${summary},
+        pending_approval = case when ${clearPending} then '' else pending_approval end,
+        updated_at = ${now}
     where id = ${id} and user_id = ${userId}`);
+}
+
+/** Бот запрашивает подтверждение опасного действия или расширение лимита шагов на сайте. */
+export async function requestAgentTaskApproval(
+  taskId: number,
+  userId: number,
+  input: {
+    id: string;
+    kind: AgentTaskApprovalRequest["kind"];
+    title: string;
+    description: string;
+    action?: Record<string, unknown>;
+    extraSteps?: number;
+  },
+): Promise<AgentTaskApprovalRequest | null> {
+  const task = await getAgentTask(userId, taskId);
+  if (!task || task.status === "cancelled") return null;
+  const now = nowIso();
+  const reqPayload: AgentTaskApprovalRequest = {
+    id: input.id,
+    kind: input.kind,
+    title: input.title.slice(0, 240),
+    description: input.description.slice(0, 2000),
+    ...(input.action ? { action: input.action } : {}),
+    ...(input.extraSteps ? { extraSteps: input.extraSteps } : {}),
+    requestedAt: now,
+  };
+  const nextStatus = input.kind === "step_limit" ? "waiting_steps" : "waiting_approval";
+  await q(sql`
+    update agent_tasks
+    set status = ${nextStatus},
+        pending_approval = ${JSON.stringify(reqPayload)},
+        approval_response = '',
+        updated_at = ${now}
+    where id = ${taskId} and user_id = ${userId}`);
+  await addAgentEvent({
+    taskId,
+    kind: "approval",
+    text: `${reqPayload.title}${reqPayload.description ? ` — ${reqPayload.description}` : ""}`,
+    action: input.action ? JSON.stringify(input.action) : "",
+  });
+  return reqPayload;
+}
+
+/** Пользователь на сайте одобряет/отклоняет действие или расширяет лимит шагов прямо в активной задаче. */
+export async function respondAgentTaskApproval(
+  taskId: number,
+  userId: number,
+  input: {
+    approvalId?: string;
+    decision: "approved" | "rejected" | "extend_steps";
+    extraSteps?: number;
+    note?: string;
+  },
+): Promise<AgentTaskRow | null> {
+  const task = await getAgentTask(userId, taskId);
+  if (!task || task.status === "cancelled") return null;
+  const now = nowIso();
+  const id = input.approvalId || task.pendingApproval?.id || `appr_${Date.now()}`;
+  const addSteps =
+    input.decision === "extend_steps"
+      ? Math.max(1, Math.min(OPERATOR_MAX_EXTEND_STEPS - task.maxSteps, Math.round(input.extraSteps || 15)))
+      : 0;
+  const nextMaxSteps = Math.min(OPERATOR_MAX_EXTEND_STEPS, task.maxSteps + addSteps);
+  const decisionPayload: AgentTaskApprovalDecision = {
+    id,
+    decision: input.decision,
+    ...(addSteps > 0 ? { extraSteps: addSteps } : {}),
+    ...(input.note ? { note: input.note.slice(0, 500) } : {}),
+    decidedAt: now,
+  };
+
+  await q(sql`
+    update agent_tasks
+    set status = 'running',
+        max_steps = ${nextMaxSteps},
+        pending_approval = '',
+        approval_response = ${JSON.stringify(decisionPayload)},
+        updated_at = ${now}
+    where id = ${taskId} and user_id = ${userId}`);
+
+  const eventText =
+    input.decision === "extend_steps"
+      ? `Лимит шагов расширен (+${addSteps}) до ${nextMaxSteps} — продолжаем с текущего шага`
+      : input.decision === "approved"
+        ? `Пользователь на сайте разрешил действие${input.note ? `: ${input.note}` : ""}`
+        : `Пользователь на сайте отклонил действие${input.note ? `: ${input.note}` : ""}`;
+  await addAgentEvent({ taskId, kind: "info", text: eventText });
+  return getAgentTask(userId, taskId);
+}
+
+/** Увеличить лимит шагов активной или ожидающей задачи прямо на месте. */
+export async function extendAgentTaskSteps(
+  taskId: number,
+  userId: number,
+  addStepsRaw: number,
+): Promise<AgentTaskRow | null> {
+  const task = await getAgentTask(userId, taskId);
+  if (!task || task.status === "cancelled" || task.status === "done") return null;
+  const addSteps = Math.max(1, Math.min(OPERATOR_MAX_EXTEND_STEPS, Math.round(addStepsRaw || 15)));
+  const nextMaxSteps = Math.min(OPERATOR_MAX_EXTEND_STEPS, Math.max(task.maxSteps + addSteps, task.steps + 1));
+  const actualAdded = nextMaxSteps - task.maxSteps;
+  if (task.pendingApproval?.kind === "step_limit") {
+    return respondAgentTaskApproval(taskId, userId, {
+      approvalId: task.pendingApproval.id,
+      decision: "extend_steps",
+      extraSteps: Math.max(1, actualAdded),
+    });
+  }
+  const now = nowIso();
+  const nextStatus = task.status === "waiting_steps" ? "running" : task.status;
+  await q(sql`
+    update agent_tasks
+    set max_steps = ${nextMaxSteps},
+        status = ${nextStatus},
+        updated_at = ${now}
+    where id = ${taskId} and user_id = ${userId}`);
+  await addAgentEvent({
+    taskId,
+    kind: "info",
+    text: `Лимит шагов увеличен до ${nextMaxSteps} (+${actualAdded})`,
+  });
+  return getAgentTask(userId, taskId);
 }
 
 export async function bumpAgentTaskStep(id: number): Promise<void> {
@@ -2007,3 +2185,100 @@ export async function insertAgentConversationMessage(input: {
     createdAt,
   };
 }
+
+/* ------------------ сохранённые переписки (файлы истории) ---------------- */
+
+export type AgentTranscriptRow = {
+  id: number;
+  userId: number;
+  conversationId: number;
+  title: string;
+  summary: string;
+  fileName: string;
+  content: string;
+  chars: number;
+  createdAt: string;
+};
+
+function mapAgentTranscript(row: Raw): AgentTranscriptRow {
+  const content = String(row.content ?? "");
+  return {
+    id: toNum(row.id),
+    userId: toNum(row.user_id),
+    conversationId: toNum(row.conversation_id),
+    title: String(row.title ?? "Переписка агента"),
+    summary: String(row.summary ?? ""),
+    fileName: String(row.file_name ?? "transcript.md"),
+    content,
+    chars: toNum(row.chars) || content.length,
+    createdAt: toIso(row.created_at) ?? nowIso(),
+  };
+}
+
+export async function createAgentTranscript(input: {
+  userId: number;
+  conversationId: number;
+  title: string;
+  summary: string;
+  fileName: string;
+  content: string;
+}): Promise<AgentTranscriptRow> {
+  const createdAt = nowIso();
+  const content = String(input.content ?? "").slice(0, 2_000_000);
+  const chars = content.length;
+  const row = await q1<{ id: number }>(sql`
+    insert into agent_transcripts (user_id, conversation_id, title, summary, file_name, content, chars, created_at)
+    values (${input.userId}, ${input.conversationId}, ${input.title.slice(0, 160)}, ${input.summary.slice(0, 20_000)},
+            ${input.fileName.slice(0, 160)}, ${content}, ${chars}, ${createdAt})
+    returning id`);
+  return {
+    id: toNum(row?.id),
+    userId: input.userId,
+    conversationId: input.conversationId,
+    title: input.title.slice(0, 160),
+    summary: input.summary.slice(0, 20_000),
+    fileName: input.fileName.slice(0, 160),
+    content,
+    chars,
+    createdAt,
+  };
+}
+
+export async function listAgentTranscripts(
+  userId: number,
+  limit = 40,
+): Promise<Array<Omit<AgentTranscriptRow, "content">>> {
+  const rows = await q(sql`
+    select id, user_id, conversation_id, title, summary, file_name, chars, created_at
+    from agent_transcripts
+    where user_id = ${userId}
+    order by id desc
+    limit ${Math.max(1, Math.min(limit, 100))}`);
+  return rows.map((row) => ({
+    id: toNum(row.id),
+    userId: toNum(row.user_id),
+    conversationId: toNum(row.conversation_id),
+    title: String(row.title ?? "Переписка агента"),
+    summary: String(row.summary ?? ""),
+    fileName: String(row.file_name ?? "transcript.md"),
+    chars: toNum(row.chars),
+    createdAt: toIso(row.created_at) ?? nowIso(),
+  }));
+}
+
+export async function getAgentTranscript(userId: number, id: number): Promise<AgentTranscriptRow | null> {
+  const row = await q1(sql`
+    select id, user_id, conversation_id, title, summary, file_name, content, chars, created_at
+    from agent_transcripts
+    where id = ${id} and user_id = ${userId}
+    limit 1`);
+  return row ? mapAgentTranscript(row) : null;
+}
+
+export async function deleteAgentTranscript(userId: number, id: number): Promise<boolean> {
+  const existing = await getAgentTranscript(userId, id);
+  if (!existing) return false;
+  await q(sql`delete from agent_transcripts where id = ${id} and user_id = ${userId}`);
+  return true;
+}
+

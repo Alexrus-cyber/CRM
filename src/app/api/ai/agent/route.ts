@@ -1,17 +1,24 @@
+import { getRagFolder, listRagChunks, searchRagChunks } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
-import { normalizeBaseUrl } from "@/lib/ai";
+import { estimateTokens, normalizeBaseUrl } from "@/lib/ai";
 import { AGENT_MAX_STEPS, normalizeGenParams } from "@/lib/genParams";
+import {
+  RAG_FULL_MAX_CHARS,
+  formatFullRagContext,
+  formatRagContext,
+  ragBudgetChars,
+} from "@/lib/rag";
+import { normalizeTrustLevel } from "@/lib/trust";
 import { ROLE_LABELS } from "@/lib/utils";
 
 /**
  * Мост к Python-агенту (`agent/agent.py`).
  *
- * Агент — отдельный процесс: он решает, что делать, вызывает инструменты и
- * отдаёт браузеру действия (открыть сайт, включить видео, скачать файл).
- * Здесь мы только проверяем права (пока это эксперимент для главного админа),
- * добавляем контекст CRM и пробрасываем SSE-поток без буферизации.
- *
- * Адрес задаётся переменной AGENT_URL (по умолчанию http://127.0.0.1:8899).
+ * Поддерживает:
+ *  - неограниченное RAG-окружение (обычный поиск и режим «Вся база»);
+ *  - передачу уровня доверия (`full` | `verified` | `none`);
+ *  - длительный SSE-поток (до 15 мин), чтобы пользователь успевал подтвердить
+ *    выполнение bash-команд, действий на ПК и перенос файлов из Sandbox на сайте.
  */
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -20,7 +27,6 @@ export const AGENT_URL = (process.env.AGENT_URL || "http://127.0.0.1:8899").repl
 const START_HINT =
   "Запустите агента в папке проекта: python3 agent/agent.py (или задайте AGENT_URL, если он на другом хосте)";
 
-/** Агент доступен только главному администратору — пока это эксперимент. */
 function allowed(role: string): boolean {
   return role === "super_admin";
 }
@@ -67,40 +73,108 @@ export async function POST(req: Request) {
         params?: unknown;
         maxSteps?: number;
         attachments?: IncomingAttachment[];
+        trustLevel?: string;
+        runId?: string;
+        ragFolderId?: number;
+        ragFull?: boolean;
+        ragChunks?: number;
+        contextLimit?: number;
       }
     | null;
 
   const messages = (body?.messages ?? [])
     .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-    .slice(-20)
-    .map((m) => ({ role: m.role, content: String(m.content).slice(0, 8000) }));
+    .slice(-100)
+    .map((m) => ({ role: m.role, content: String(m.content).slice(0, 32_000) }));
   if (messages.length === 0) {
     return Response.json({ error: "Пустой запрос" }, { status: 400 });
   }
 
-  // Файлы уже распознаны в браузере — агенту нужен только текст и, для
-  // картинок, data-URL: тогда vision-модель видит сам снимок.
   const attachments = (body?.attachments ?? [])
     .filter((item) => item && typeof item === "object")
-    .slice(0, 5)
+    .slice(0, 8)
     .map((item) => {
-      const image = typeof item.image === "string" && item.image.startsWith("data:image/")
-        ? item.image.slice(0, 6_000_000)
-        : "";
+      const image =
+        typeof item.image === "string" && item.image.startsWith("data:image/")
+          ? item.image.slice(0, 6_000_000)
+          : "";
       return {
-        name: String(item.name ?? "файл").slice(0, 120),
-        note: String(item.note ?? "").slice(0, 120),
-        text: String(item.text ?? "").slice(0, 30_000),
+        name: String(item.name ?? "файл").slice(0, 160),
+        note: String(item.note ?? "").slice(0, 160),
+        text: String(item.text ?? "").slice(0, 120_000),
         ...(image ? { image } : {}),
       };
     });
 
-  // Раздумья и генерация — те же ручки, что в «Чате с моделью».
+  // RAG-окружение без искусственных ограничений: вся база или топ-N фрагментов.
+  const ragFolderId = Number(body?.ragFolderId ?? 0) || 0;
+  const ragFull = Boolean(body?.ragFull);
+  const ragChunks = Math.max(0, Math.min(500, Number(body?.ragChunks ?? 8) || 8));
+  const contextLimit = Math.max(0, Number(body?.contextLimit ?? 0) || 0);
+
+  let ragContext = "";
+  let ragMeta: { folderName: string; hits: number; totalChunks: number; ragFull: boolean; truncated: boolean } | null =
+    null;
+
+  if (ragFolderId > 0 && (ragFull || ragChunks > 0)) {
+    const folder = await getRagFolder(me.id, ragFolderId);
+    if (folder) {
+      const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+      if (ragFull) {
+        const chunks = await listRagChunks(ragFolderId);
+        if (chunks.length > 0) {
+          const relevant = lastUser ? await searchRagChunks(ragFolderId, lastUser, chunks.length) : [];
+          const seen = new Set<number>();
+          const ordered: Array<{ id: number; path: string; text: string; score: number }> = [];
+          for (const hit of relevant) {
+            if (seen.has(hit.id)) continue;
+            seen.add(hit.id);
+            ordered.push(hit);
+          }
+          for (const chunk of chunks) {
+            if (seen.has(chunk.id)) continue;
+            seen.add(chunk.id);
+            ordered.push({ ...chunk, score: 0 });
+          }
+          const usedTokens = messages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
+          const budgetChars =
+            contextLimit > 0 ? ragBudgetChars(contextLimit, usedTokens, 1024) : RAG_FULL_MAX_CHARS;
+          const packed = formatFullRagContext(ordered, budgetChars);
+          if (packed.used > 0) {
+            ragContext = packed.text;
+            ragMeta = {
+              folderName: folder.name,
+              hits: packed.used,
+              totalChunks: ordered.length,
+              ragFull: true,
+              truncated: packed.truncated,
+            };
+          }
+        }
+      } else if (lastUser.trim()) {
+        const hits = await searchRagChunks(ragFolderId, lastUser, ragChunks);
+        if (hits.length > 0) {
+          const maxChars = contextLimit > 0 ? ragBudgetChars(contextLimit, 0, 1024) : RAG_FULL_MAX_CHARS;
+          ragContext = formatRagContext(hits, maxChars);
+          ragMeta = {
+            folderName: folder.name,
+            hits: hits.length,
+            totalChunks: folder.chunksCount,
+            ragFull: false,
+            truncated: false,
+          };
+        }
+      }
+    }
+  }
+
   const params = normalizeGenParams(body?.params);
   const maxSteps = Math.min(
     AGENT_MAX_STEPS,
     Math.max(1, Number.isFinite(body?.maxSteps) ? Number(body?.maxSteps) : AGENT_MAX_STEPS),
   );
+  const trustLevel = normalizeTrustLevel(body?.trustLevel);
+  const runId = typeof body?.runId === "string" && body.runId.trim() ? body.runId.trim().slice(0, 80) : undefined;
 
   const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl ?? "") ?? undefined;
   const payload = {
@@ -108,6 +182,8 @@ export async function POST(req: Request) {
     attachments,
     params,
     maxSteps,
+    trustLevel,
+    ...(runId ? { runId } : {}),
     settings: {
       baseUrl,
       apiKey: (body?.settings?.apiKey ?? "").trim().slice(0, 400),
@@ -117,6 +193,7 @@ export async function POST(req: Request) {
       user: me.name,
       roleLabel: ROLE_LABELS[me.role] ?? me.role,
       today: new Date().toISOString().slice(0, 10),
+      ...(ragContext ? { ragContext, ragMeta } : {}),
     },
   };
 
@@ -127,7 +204,7 @@ export async function POST(req: Request) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       cache: "no-store",
-      signal: AbortSignal.timeout(290000),
+      signal: AbortSignal.timeout(900_000),
     });
   } catch {
     return Response.json({ error: `Агент не запущен. ${START_HINT}`, hint: START_HINT }, { status: 503 });

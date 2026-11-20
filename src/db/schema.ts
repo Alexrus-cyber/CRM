@@ -475,15 +475,40 @@ export const agentTasks = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     prompt: text("prompt").notNull(),
-    /** queued | running | done | failed | cancelled */
+    /** queued | running | waiting_approval | waiting_steps | done | failed | cancelled | paused */
     status: text("status").notNull().default("queued"),
     maxSteps: integer("max_steps").notNull().default(15),
     steps: integer("steps").notNull().default(0),
     summary: text("summary").notNull().default(""),
+    /** full | verified | none */
+    trustLevel: text("trust_level").notNull().default("verified"),
+    /** JSON запроса подтверждения или расширения шагов на сайте. */
+    pendingApproval: text("pending_approval").notNull().default(""),
+    /** JSON ответа пользователя на сайте по последнему запросу. */
+    approvalResponse: text("approval_response").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index("agent_tasks_status_idx").on(t.status, t.id)],
+);
+
+/** Полные стенограммы переписки агента (создаются при Summary/архивации, доступны для скачивания и повторной обработки). */
+export const agentTranscripts = pgTable(
+  "agent_transcripts",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    conversationId: integer("conversation_id").notNull().default(0),
+    title: text("title").notNull().default("Переписка агента"),
+    summary: text("summary").notNull().default(""),
+    fileName: text("file_name").notNull(),
+    content: text("content").notNull(),
+    chars: integer("chars").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("agent_transcripts_user_idx").on(t.userId, t.id)],
 );
 
 /** Журнал шагов агента и файлы, которые он вернул в чат. */
@@ -514,6 +539,7 @@ export type Message = typeof messages.$inferSelect;
 export type TaskMessage = typeof taskMessages.$inferSelect;
 export type AgentTask = typeof agentTasks.$inferSelect;
 export type AgentEvent = typeof agentEvents.$inferSelect;
+export type AgentTranscript = typeof agentTranscripts.$inferSelect;
 export type AgentConversation = typeof agentConversations.$inferSelect;
 export type AgentConversationMessage = typeof agentConversationMessages.$inferSelect;
 export type TaskExport = typeof taskExports.$inferSelect;

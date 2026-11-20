@@ -38,6 +38,8 @@ export const GEN_DEFAULT_PARAMS: GenParams = {
 
 /** Предел шагов у обоих агентов. */
 export const AGENT_MAX_STEPS = 500;
+/** Жёсткий потолок при расширении лимита шагов «на месте» в операторе. */
+export const OPERATOR_MAX_EXTEND_STEPS = 2000;
 
 export function normalizeGenParams(raw: unknown): GenParams {
   const source = (raw ?? {}) as Partial<GenParams>;

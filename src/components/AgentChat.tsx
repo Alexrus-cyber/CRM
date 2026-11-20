@@ -1,46 +1,87 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import {
+  Archive,
   Bot,
+  Check,
   Download,
   ExternalLink,
+  FileArchive,
   FileText,
+  FolderOpen,
+  FolderOutput,
+  Gauge,
   History,
   Loader2,
   MessageSquarePlus,
   Paperclip,
   PlayCircle,
   PlugZap,
+  RefreshCw,
   Send,
+  ShieldAlert,
   Sparkles,
+  Square,
+  Terminal,
   Trash2,
   TriangleAlert,
   X,
 } from "lucide-react";
-import { AI_DEFAULT_BASE_URL, AI_STORAGE_SETTINGS, formatBytes, type AiSettings } from "@/lib/ai";
+import { AI_DEFAULT_BASE_URL, AI_MAX_FILE_BYTES, AI_STORAGE_SETTINGS, formatBytes, type AiSettings } from "@/lib/ai";
 import { Input } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import { useStoredJson, useStoredNumber } from "@/lib/useStoredValue";
+import { extractFile } from "@/lib/fileExtract";
+import { splitIntoChunks } from "@/lib/rag";
 import { GenSettings } from "./GenSettings";
+import { TrustSelector } from "./TrustSelector";
 import {
   AGENT_MAX_STEPS,
   GEN_DEFAULT_PARAMS,
   decodeGenParams,
   type GenParams,
 } from "@/lib/genParams";
+import { DEFAULT_TRUST_LEVEL, decodeTrustLevel, findTrustLevel, type TrustLevel } from "@/lib/trust";
+import {
+  DEFAULT_AGENT_CONTEXT_LIMIT,
+  ROLLOVER_THRESHOLD_RATIO,
+  buildTranscriptFileName,
+  estimateAgentConversationTokens,
+  formatTranscriptMarkdown,
+  shouldAutoRollover,
+  type TranscriptTurn,
+} from "@/lib/transcripts";
 import { formatFileSize, readOperatorFiles, type OperatorAttachment } from "./operator/files";
 
 /**
- * Вкладка «Агент» блока ИИ (эксперимент, только главный админ).
+ * Вкладка «Агент» блока ИИ (только главный администратор).
  *
- * В отличие от обычного чата, агент умеет действовать: создаёт файлы и
- * открывает сайты в браузере. Сами решения принимает Python-процесс
- * (`agent/agent.py`), а этот компонент показывает шаги, действия и файлы.
+ * Поддерживает:
+ *  - 3 уровня доверия ИИ (full / verified / none);
+ *  - изолированную песочницу Sandbox + экспорт проектов наружу с подтверждением;
+ *  - неограниченный клиентский RAG из папок и режим «Вся база»;
+ *  - контроль контекста модели, автогенерацию Summary при приближении к лимиту
+ *    и архивацию полной переписки в `.md` файл для повторной обработки.
  */
 
 type AgentFile = { name: string; mime: string; size: number; data: string };
-type AgentAction = { type: "open_url"; url: string; label: string; autoplay?: boolean };
+type AgentAction = {
+  type: "open_url" | "command_result" | "sandbox_file" | "project_created" | "sandbox_export";
+  url?: string;
+  label?: string;
+  autoplay?: boolean;
+  command?: string;
+  cwd?: string;
+  exitCode?: number | null;
+  output?: string;
+  path?: string;
+  project?: string;
+  source?: string;
+  destination?: string;
+  mode?: string;
+  filesCount?: number;
+};
 
 type Turn = {
   id: string;
@@ -48,9 +89,7 @@ type Turn = {
   content: string;
   actions: AgentAction[];
   files: AgentFile[];
-  /** Что приложил пользователь в этом сообщении. */
   attached?: Array<{ name: string; size: number }>;
-  /** Размышления модели, если сервер их отдаёт. */
   reasoning?: string;
   error?: string;
 };
@@ -79,7 +118,54 @@ type Health = {
   endpoint?: string;
   hint?: string;
   model?: string | null;
+  sandbox?: string;
   tools?: string[];
+};
+
+type RagFolder = {
+  id: number;
+  name: string;
+  filesCount: number;
+  chunksCount: number;
+  chars: number;
+  updatedAt: string;
+};
+
+type RagPrefs = {
+  folderId: number;
+  ragFull: boolean;
+  ragChunks: number;
+};
+
+type PendingApproval = {
+  approvalId: string;
+  kind: string;
+  title: string;
+  description: string;
+  command?: string;
+  cwd?: string;
+  source?: string;
+  destination?: string;
+  mode?: string;
+  filesCount?: number;
+};
+
+type SandboxState = {
+  available: boolean;
+  root?: string;
+  projects: string[];
+  items: Array<{ path: string; isDir: boolean; size: number }>;
+  processes: Array<{ pid: number; command: string; cwd: string; alive: boolean }>;
+};
+
+type TranscriptMeta = {
+  id: number;
+  conversationId: number;
+  title: string;
+  summary: string;
+  fileName: string;
+  chars: number;
+  createdAt: string;
 };
 
 function decodeStoredTurn(message: StoredTurn): Turn {
@@ -118,13 +204,13 @@ const PROVIDERS: Array<{ id: string; label: string; baseUrl: string; model: stri
 
 const EXAMPLES = [
   "Открой YouTube и включи видео про космос",
-  "Открой сайт новостей и покажи, что там сегодня",
+  "Создай в Sandbox проект landing-site на HTML+CSS",
   "Сделай CSV-файл с планом на неделю по продажам",
 ];
 
 const DEFAULT_SETTINGS: AiSettings = { baseUrl: AI_DEFAULT_BASE_URL, apiKey: "", model: "" };
+const DEFAULT_RAG_PREFS: RagPrefs = { folderId: 0, ragFull: false, ragChunks: 12 };
 
-/** Разбор сохранённых настроек — уже после гидратации, через useStoredJson. */
 function decodeSettings(raw: string): AiSettings {
   const parsed = JSON.parse(raw) as Partial<AiSettings>;
   return {
@@ -132,6 +218,35 @@ function decodeSettings(raw: string): AiSettings {
     apiKey: String(parsed.apiKey ?? ""),
     model: String(parsed.model ?? ""),
   };
+}
+
+function decodeRagPrefs(raw: string): RagPrefs {
+  try {
+    const parsed = JSON.parse(raw) as Partial<RagPrefs>;
+    return {
+      folderId: Math.max(0, Math.floor(Number(parsed.folderId) || 0)),
+      ragFull: Boolean(parsed.ragFull),
+      ragChunks: Math.min(500, Math.max(0, Math.floor(Number(parsed.ragChunks ?? 12)))),
+    };
+  } catch {
+    return DEFAULT_RAG_PREFS;
+  }
+}
+
+function turnsToTranscript(turns: Turn[]): TranscriptTurn[] {
+  return turns.map((t) => ({
+    role: t.role,
+    content: t.content,
+    reasoning: t.reasoning,
+    error: t.error,
+    attached: t.attached,
+    files: t.files.map((f) => ({ name: f.name, mime: f.mime, size: f.size })),
+    actions: t.actions.map((a) => ({
+      type: a.type,
+      label: a.label || a.command || a.path || a.project || a.source,
+      url: a.url,
+    })),
+  }));
 }
 
 export function AgentChat({ userName }: { userName: string }) {
@@ -145,7 +260,22 @@ export function AgentChat({ userName }: { userName: string }) {
     GEN_DEFAULT_PARAMS,
     decodeGenParams,
   );
+  const [trustLevel, setTrustLevel] = useStoredJson<TrustLevel>(
+    "crm.ai.agent.trust.v1",
+    DEFAULT_TRUST_LEVEL,
+    decodeTrustLevel,
+  );
+  const [ragPrefs, setRagPrefs] = useStoredJson<RagPrefs>(
+    "crm.ai.agent.rag.v1",
+    DEFAULT_RAG_PREFS,
+    decodeRagPrefs,
+  );
   const [maxSteps, setMaxSteps] = useStoredNumber("crm.ai.agent.steps.v1", 20);
+  const [contextLimit, setContextLimit] = useStoredNumber(
+    "crm.ai.agent.context_limit.v1",
+    DEFAULT_AGENT_CONTEXT_LIMIT,
+  );
+
   const [health, setHealth] = useState<Health | null>(null);
   const [conversations, setConversations] = useState<AgentConversation[]>([]);
   const [conversationId, setConversationId] = useState<number | null>(null);
@@ -156,9 +286,36 @@ export function AgentChat({ userName }: { userName: string }) {
   const [reading, setReading] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+
+  // Подтверждение команд/экспорта при уровне доверия verified.
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
+  const [approvalDest, setApprovalDest] = useState("");
+  const [approvalBusy, setApprovalBusy] = useState(false);
+
+  // RAG папки и загрузка без ограничений размера папки.
+  const [ragFolders, setRagFolders] = useState<RagFolder[]>([]);
+  const [ragBusy, setRagBusy] = useState(false);
+  const [ragProgress, setRagProgress] = useState<{ done: number; total: number; phase: "read" | "upload" } | null>(null);
+  const [ragOpen, setRagOpen] = useState(false);
+
+  // Песочница Sandbox и экспорт на ПК.
+  const [sandbox, setSandbox] = useState<SandboxState | null>(null);
+  const [sandboxOpen, setSandboxOpen] = useState(false);
+  const [exportSource, setExportSource] = useState(".");
+  const [exportDest, setExportDest] = useState("");
+  const [exportMode, setExportMode] = useState<"copy" | "move">("copy");
+  const [sandboxBusy, setSandboxBusy] = useState(false);
+
+  // Summary и архив переписок (.md).
+  const [transcripts, setTranscripts] = useState<TranscriptMeta[]>([]);
+  const [transcriptsOpen, setTranscriptsOpen] = useState(false);
+  const [summarizing, setSummarizing] = useState(false);
+
   const listRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const ragDirRef = useRef<HTMLInputElement>(null);
   const counter = useRef(0);
 
   const nextId = () => {
@@ -170,7 +327,6 @@ export function AgentChat({ userName }: { userName: string }) {
     setSettings(next);
   };
 
-  /** Состояние агента: жив ли Python-процесс и какие у него инструменты. */
   const loadHealth = useCallback(async (): Promise<Health> => {
     try {
       const res = await fetch("/api/ai/agent", { cache: "no-store" });
@@ -181,11 +337,75 @@ export function AgentChat({ userName }: { userName: string }) {
     }
   }, []);
 
+  const refreshSandbox = useCallback(async () => {
+    try {
+      const res = await fetch("/api/ai/agent/sandbox", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as SandboxState;
+      setSandbox(data);
+    } catch {
+      /* фоновая проверка — тихо игнорируем */
+    }
+  }, []);
+
+  const refreshRagFolders = useCallback(async () => {
+    try {
+      const res = await fetch("/api/ai/rag", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { folders?: RagFolder[] };
+      if (Array.isArray(data.folders)) setRagFolders(data.folders);
+    } catch {
+      /* тихо игнорируем в фоне */
+    }
+  }, []);
+
+  const refreshTranscripts = useCallback(async () => {
+    try {
+      const res = await fetch("/api/agent/transcripts", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { transcripts?: TranscriptMeta[] };
+      if (Array.isArray(data.transcripts)) setTranscripts(data.transcripts);
+    } catch {
+      /* тихо игнорируем в фоне */
+    }
+  }, []);
+
   useEffect(() => {
     let alive = true;
-    void loadHealth().then((next) => {
+    void (async () => {
+      const next = await loadHealth();
       if (alive) setHealth(next);
-    });
+
+      try {
+        const res = await fetch("/api/ai/rag", { cache: "no-store" });
+        if (res.ok && alive) {
+          const data = (await res.json()) as { folders?: RagFolder[] };
+          if (Array.isArray(data.folders)) setRagFolders(data.folders);
+        }
+      } catch {
+        /* тихо игнорируем в фоне */
+      }
+
+      try {
+        const res = await fetch("/api/ai/agent/sandbox", { cache: "no-store" });
+        if (res.ok && alive) {
+          const data = (await res.json()) as SandboxState;
+          setSandbox(data);
+        }
+      } catch {
+        /* тихо игнорируем в фоне */
+      }
+
+      try {
+        const res = await fetch("/api/agent/transcripts", { cache: "no-store" });
+        if (res.ok && alive) {
+          const data = (await res.json()) as { transcripts?: TranscriptMeta[] };
+          if (Array.isArray(data.transcripts)) setTranscripts(data.transcripts);
+        }
+      } catch {
+        /* тихо игнорируем в фоне */
+      }
+    })();
     return () => {
       alive = false;
     };
@@ -209,11 +429,11 @@ export function AgentChat({ userName }: { userName: string }) {
     setStatus(null);
   }, []);
 
-  const createConversation = useCallback(async () => {
+  const createConversation = useCallback(async (title?: string) => {
     const res = await fetch("/api/agent/conversations", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind: "agent" }),
+      body: JSON.stringify({ kind: "agent", ...(title ? { title } : {}) }),
     });
     const data = (await res.json().catch(() => ({}))) as { conversation?: AgentConversation; error?: string };
     if (!res.ok || !data.conversation) throw new Error(data.error ?? "Не удалось создать чат агента");
@@ -229,27 +449,30 @@ export function AgentChat({ userName }: { userName: string }) {
     return conversation;
   }, []);
 
-  const saveConversationMessage = useCallback(async (
-    id: number,
-    message: {
-      role: "user" | "assistant";
-      content: string;
-      reasoning?: string;
-      error?: string;
-      attachments?: Array<{ name: string; size: number }>;
-      actions?: AgentAction[];
-      files?: Array<{ name: string; mime: string; size: number }>;
+  const saveConversationMessage = useCallback(
+    async (
+      id: number,
+      message: {
+        role: "user" | "assistant";
+        content: string;
+        reasoning?: string;
+        error?: string;
+        attachments?: Array<{ name: string; size: number }>;
+        actions?: AgentAction[];
+        files?: Array<{ name: string; mime: string; size: number }>;
+      },
+    ) => {
+      const res = await fetch(`/api/agent/conversations/${id}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(message),
+      });
+      const data = (await res.json().catch(() => ({}))) as { message?: StoredTurn; error?: string };
+      if (!res.ok || !data.message) throw new Error(data.error ?? "Не удалось сохранить переписку");
+      return decodeStoredTurn(data.message);
     },
-  ) => {
-    const res = await fetch(`/api/agent/conversations/${id}/messages`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(message),
-    });
-    const data = (await res.json().catch(() => ({}))) as { message?: StoredTurn; error?: string };
-    if (!res.ok || !data.message) throw new Error(data.error ?? "Не удалось сохранить переписку");
-    return decodeStoredTurn(data.message);
-  }, []);
+    [],
+  );
 
   useEffect(() => {
     let alive = true;
@@ -321,6 +544,288 @@ export function AgentChat({ userName }: { userName: string }) {
     }
   };
 
+  /* --------------------------- Summary и архивация --------------------------- */
+
+  const currentConversation = useMemo(
+    () => conversations.find((c) => c.id === conversationId) ?? null,
+    [conversations, conversationId],
+  );
+
+  const usedTokens = useMemo(
+    () => estimateAgentConversationTokens(turnsToTranscript(turns)),
+    [turns],
+  );
+  const contextPercent = contextLimit > 0 ? Math.min(100, Math.round((usedTokens / contextLimit) * 100)) : 0;
+
+  const rolloverToSummaryChat = useCallback(
+    async (sourceTurns: Turn[], reason: "auto" | "manual") => {
+      if (sourceTurns.length === 0 || summarizing) return;
+      setSummarizing(true);
+      setError(null);
+      const chatTitle = currentConversation?.title || "Чат агента";
+      const transcriptTurns = turnsToTranscript(sourceTurns);
+      try {
+        setStatus("Составляю Summary переписки…");
+        const sumRes = await fetch("/api/ai/agent/summarize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: chatTitle, turns: transcriptTurns, settings }),
+        });
+        const sumData = (await sumRes.json().catch(() => ({}))) as { summary?: string };
+        const summaryText =
+          sumData.summary?.trim() ||
+          `Summary чата «${chatTitle}» (${sourceTurns.length} сообщений).`;
+
+        const fileName = buildTranscriptFileName(chatTitle);
+        const markdown = formatTranscriptMarkdown({
+          title: chatTitle,
+          summary: summaryText,
+          turns: transcriptTurns,
+        });
+
+        let savedTranscriptId: number | null = null;
+        try {
+          const tRes = await fetch("/api/agent/transcripts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              conversationId: conversationId ?? 0,
+              title: chatTitle,
+              summary: summaryText,
+              fileName,
+              content: markdown,
+            }),
+          });
+          if (tRes.ok) {
+            const tData = (await tRes.json().catch(() => ({}))) as { transcript?: TranscriptMeta };
+            if (tData.transcript) {
+              savedTranscriptId = tData.transcript.id;
+              setTranscripts((prev) => [tData.transcript!, ...prev]);
+            }
+          }
+        } catch {
+          /* best-effort */
+        }
+
+        // Дублируем стенограмму в Sandbox/transcripts/, если агент онлайн.
+        void fetch("/api/ai/agent/sandbox", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "write_transcript", fileName, content: markdown }),
+        }).catch(() => null);
+
+        const nextConv = await createConversation(`Продолжение: ${chatTitle}`.slice(0, 80));
+        const reasonLine =
+          reason === "auto"
+            ? `Контекст достиг ${Math.round(ROLLOVER_THRESHOLD_RATIO * 100)}% лимита (${contextLimit} токенов) — создан новый чат со сжатым Summary.`
+            : "Создан новый чат со сжатым Summary текущей переписки.";
+        const archiveHint = savedTranscriptId
+          ? `\n\nПолная переписка сохранена в файл «${fileName}» (доступен в разделе «Архив переписок» для скачивания и повторного анализа).`
+          : `\n\nПолная переписка архивирована под именем «${fileName}».`;
+
+        const handoffText = `${reasonLine}\n\n${summaryText}${archiveHint}`;
+        const savedMsg = await saveConversationMessage(nextConv.id, {
+          role: "assistant",
+          content: handoffText,
+        });
+        setTurns([savedMsg]);
+        setNotice(
+          savedTranscriptId
+            ? `Переписка сжата в Summary и сохранена в ${fileName}. Открыт новый чат.`
+            : "Переписка сжата в Summary. Открыт новый чат.",
+        );
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : "Не удалось сжать переписку в Summary");
+      } finally {
+        setSummarizing(false);
+        setStatus(null);
+      }
+    },
+    [contextLimit, conversationId, createConversation, currentConversation?.title, saveConversationMessage, settings, summarizing],
+  );
+
+  const attachTranscript = async (item: TranscriptMeta) => {
+    try {
+      const res = await fetch(`/api/agent/transcripts/${item.id}`, { cache: "no-store" });
+      if (!res.ok) throw new Error("Не удалось загрузить переписку");
+      const data = (await res.json()) as { transcript?: { content?: string; fileName?: string } };
+      const content = String(data.transcript?.content ?? "");
+      if (!content) throw new Error("Файл переписки пуст");
+      setAttachments((prev) => [
+        ...prev.slice(0, 4),
+        {
+          name: item.fileName || `transcript-${item.id}.md`,
+          mime: "text/markdown",
+          size: content.length,
+          data: "",
+          text: content,
+          note: "архивная переписка агента",
+        },
+      ]);
+      setNotice(`Файл переписки «${item.fileName}» приложен к запросу — можно задать вопрос или продолжить работу.`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось приложить переписку");
+    }
+  };
+
+  /* --------------------------- RAG: загрузка папки --------------------------- */
+
+  const uploadRagFolder = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (files.length === 0 || ragBusy || running) return;
+
+    setError(null);
+    setNotice(null);
+    setRagBusy(true);
+    setRagProgress({ done: 0, total: files.length, phase: "read" });
+    const folderName = (files[0].webkitRelativePath?.split("/")[0] || "Папка").slice(0, 100);
+
+    try {
+      const items: Array<{ path: string; chunks: string[] }> = [];
+      let skipped = 0;
+      for (let i = 0; i < files.length; i += 1) {
+        const file = files[i];
+        const path = (file.webkitRelativePath || file.name).slice(0, 300);
+        if (file.size > AI_MAX_FILE_BYTES) {
+          skipped += 1;
+        } else {
+          const extracted = await extractFile(file);
+          if (extracted.kind === "text" && extracted.text.trim()) {
+            items.push({ path, chunks: splitIntoChunks(extracted.text) });
+          } else {
+            skipped += 1;
+          }
+        }
+        if (i % 5 === 0) setRagProgress({ done: i + 1, total: files.length, phase: "read" });
+      }
+      if (items.length === 0) {
+        setError("В папке не найдено читаемого текста для RAG.");
+        return;
+      }
+
+      const createdRes = await fetch("/api/ai/rag", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: `${folderName}${skipped > 0 ? ` (+${skipped} пропущено)` : ""}` }),
+      });
+      if (!createdRes.ok) throw new Error("Не удалось создать RAG-папку");
+      const created = (await createdRes.json()) as { folder: RagFolder };
+      const newId = created.folder.id;
+
+      let batch: Array<{ path: string; chunks: string[] }> = [];
+      let batchChars = 0;
+      let uploaded = 0;
+      const flush = async () => {
+        if (batch.length === 0) return;
+        const res = await fetch("/api/ai/rag/chunks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ folderId: newId, items: batch }),
+        });
+        if (!res.ok) throw new Error("Не удалось загрузить фрагменты RAG");
+        batch = [];
+        batchChars = 0;
+      };
+
+      for (const item of items) {
+        const chars = item.chunks.reduce((sum, c) => sum + c.length, 0);
+        if (batch.length >= 150 || batchChars + chars > 3_000_000) await flush();
+        batch.push(item);
+        batchChars += chars;
+        uploaded += 1;
+        setRagProgress({ done: uploaded, total: items.length, phase: "upload" });
+      }
+      await flush();
+
+      await refreshRagFolders();
+      setRagPrefs({ ...ragPrefs, folderId: newId });
+      setNotice(`RAG-папка «${folderName}» проиндексирована полностью (${items.length} файлов).`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось загрузить папку RAG");
+    } finally {
+      setRagBusy(false);
+      setRagProgress(null);
+    }
+  };
+
+  /* --------------------------- Подтверждение & Sandbox --------------------------- */
+
+  const sendApprovalDecision = async (approved: boolean) => {
+    if (!pendingApproval || approvalBusy) return;
+    setApprovalBusy(true);
+    try {
+      const res = await fetch("/api/ai/agent/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          approvalId: pendingApproval.approvalId,
+          approved,
+          destination: approvalDest.trim(),
+        }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setError(data.error ?? "Не удалось отправить подтверждение");
+        return;
+      }
+      setPendingApproval(null);
+      setApprovalDest("");
+    } catch {
+      setError("Сеть недоступна при отправке подтверждения");
+    } finally {
+      setApprovalBusy(false);
+    }
+  };
+
+  const runSandboxExport = async () => {
+    if (!exportSource.trim() || !exportDest.trim() || sandboxBusy) return;
+    setSandboxBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/ai/agent/sandbox", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "export",
+          source: exportSource.trim(),
+          destination: exportDest.trim(),
+          mode: exportMode,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        filesCount?: number;
+        destination?: string;
+        error?: string;
+      };
+      if (!res.ok) throw new Error(data.error ?? "Не удалось перенести файлы из Sandbox");
+      setNotice(
+        `${exportMode === "move" ? "Перенесено" : "Скопировано"} ${data.filesCount ?? 0} файлов в ${data.destination ?? exportDest}`,
+      );
+      await refreshSandbox();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Ошибка экспорта из Sandbox");
+    } finally {
+      setSandboxBusy(false);
+    }
+  };
+
+  const stopSandboxProcess = async (pid: number) => {
+    setSandboxBusy(true);
+    try {
+      await fetch("/api/ai/agent/sandbox", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "stop_process", pid }),
+      });
+      await refreshSandbox();
+    } finally {
+      setSandboxBusy(false);
+    }
+  };
+
+  /* --------------------------- Отправка запроса --------------------------- */
+
   const scrollDown = () => {
     requestAnimationFrame(() => {
       if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
@@ -335,12 +840,11 @@ export function AgentChat({ userName }: { userName: string }) {
   const send = async (preset?: string) => {
     const typed = (preset ?? text).trim();
     const activeId = conversationId;
-    // Файл без вопроса — тоже запрос: агент прочитает вложение и расскажет,
-    // что в нём, вместо того чтобы требовать текст.
     const content =
       typed || (attachments.length > 0 ? "Проанализируй приложенные файлы и коротко перескажи главное." : "");
     if (!content || running || historyLoading || activeId === null) return;
     setError(null);
+    setNotice(null);
     if (!preset) setText("");
     const attachedTurn = attachments.map((file) => ({ name: file.name, size: file.size }));
     const userTurn: Turn = {
@@ -372,6 +876,7 @@ export function AgentChat({ userName }: { userName: string }) {
       error: string;
     } = { content: "", reasoning: "", actions: [], files: [], error: "" };
     let userSaved = false;
+    let storedUserForRollover: Turn | null = null;
 
     try {
       setStatus("Сохраняю переписку…");
@@ -381,6 +886,7 @@ export function AgentChat({ userName }: { userName: string }) {
         attachments: attachedTurn,
       });
       userSaved = true;
+      storedUserForRollover = storedUser;
       setTurns((prev) => prev.map((turn) => (turn.id === userTurn.id ? storedUser : turn)));
       setConversations((prev) => {
         const current = prev.find((item) => item.id === activeId);
@@ -396,7 +902,12 @@ export function AgentChat({ userName }: { userName: string }) {
           messages: history.map((t) => ({ role: t.role, content: t.content })),
           settings,
           params,
+          trustLevel,
           maxSteps: Math.min(AGENT_MAX_STEPS, Math.max(1, maxSteps)),
+          ragFolderId: ragPrefs.folderId,
+          ragFull: ragPrefs.ragFull,
+          ragChunks: ragPrefs.ragChunks,
+          contextLimit,
           attachments: attachments.map((file) => ({
             name: file.name,
             note: file.note,
@@ -405,7 +916,6 @@ export function AgentChat({ userName }: { userName: string }) {
           })),
         }),
       });
-      // Файлы уже ушли в запросе — в следующем сообщении их быть не должно.
       setAttachments([]);
 
       if (!res.ok || !res.body) {
@@ -444,6 +954,26 @@ export function AgentChat({ userName }: { userName: string }) {
 
           if (event === "status") {
             setStatus(String(data.text ?? ""));
+          } else if (event === "approval_required") {
+            const req: PendingApproval = {
+              approvalId: String(data.approvalId ?? ""),
+              kind: String(data.kind ?? "command"),
+              title: String(data.title ?? "Требуется подтверждение"),
+              description: String(data.description ?? ""),
+              command: data.command ? String(data.command) : undefined,
+              cwd: data.cwd ? String(data.cwd) : undefined,
+              source: data.source ? String(data.source) : undefined,
+              destination: data.destination ? String(data.destination) : undefined,
+              mode: data.mode ? String(data.mode) : undefined,
+              filesCount: typeof data.filesCount === "number" ? data.filesCount : undefined,
+            };
+            setPendingApproval(req);
+            setApprovalDest(req.destination ?? "");
+            scrollDown();
+          } else if (event === "rag") {
+            setNotice(
+              `RAG «${String(data.folderName ?? "папка")}»: подключено ${Number(data.hits ?? 0)} из ${Number(data.totalChunks ?? 0)} фрагментов${data.truncated ? " (обрезано по лимиту контекста)" : ""}.`,
+            );
           } else if (event === "reasoning") {
             assistantDraft.reasoning = String(data.text ?? "");
             patch((t) => ({ ...t, reasoning: assistantDraft.reasoning }));
@@ -474,13 +1004,31 @@ export function AgentChat({ userName }: { userName: string }) {
               };
               assistantDraft.actions.push(action);
               patch((t) => ({ ...t, actions: [...t.actions, action] }));
-              // Браузер может заблокировать всплывающее окно — карточка с
-              // кнопкой остаётся, поэтому действие не теряется.
               if (action.url) openUrl(action.url);
+            } else {
+              const action: AgentAction = {
+                type: String(data.type ?? "command_result") as AgentAction["type"],
+                label: String(data.label ?? data.command ?? data.project ?? data.path ?? data.source ?? ""),
+                command: data.command ? String(data.command) : undefined,
+                cwd: data.cwd ? String(data.cwd) : undefined,
+                exitCode: typeof data.exitCode === "number" ? data.exitCode : undefined,
+                output: data.output ? String(data.output) : undefined,
+                path: data.path ? String(data.path) : undefined,
+                project: data.project ? String(data.project) : undefined,
+                source: data.source ? String(data.source) : undefined,
+                destination: data.destination ? String(data.destination) : undefined,
+                mode: data.mode ? String(data.mode) : undefined,
+                filesCount: typeof data.filesCount === "number" ? data.filesCount : undefined,
+              };
+              assistantDraft.actions.push(action);
+              patch((t) => ({ ...t, actions: [...t.actions, action] }));
+              void refreshSandbox();
             }
             scrollDown();
           } else if (event === "done") {
             setStatus(null);
+            setPendingApproval(null);
+            void refreshSandbox();
           }
         }
       }
@@ -492,6 +1040,7 @@ export function AgentChat({ userName }: { userName: string }) {
           : "Не удалось сохранить сообщение";
       patch((t) => ({ ...t, error: assistantDraft.error }));
     } finally {
+      let updatedTurns = history;
       if (userSaved) {
         try {
           const storedAssistant = await saveConversationMessage(activeId, {
@@ -502,18 +1051,16 @@ export function AgentChat({ userName }: { userName: string }) {
             actions: assistantDraft.actions,
             files: assistantDraft.files.map(({ name, mime, size }) => ({ name, mime, size })),
           });
-          setTurns((prev) =>
-            prev.map((turn) =>
-              turn.id === assistantId
-                ? {
-                    ...storedAssistant,
-                    // Сохраняем живые байты файлов в текущем сеансе для скачивания;
-                    // в базе остаются только имя, тип и размер.
-                    files: assistantDraft.files.length > 0 ? assistantDraft.files : storedAssistant.files,
-                  }
-                : turn,
-            ),
-          );
+          const mergedAssistant: Turn = {
+            ...storedAssistant,
+            files: assistantDraft.files.length > 0 ? assistantDraft.files : storedAssistant.files,
+          };
+          updatedTurns = [
+            ...turns,
+            storedUserForRollover ?? history[history.length - 1],
+            mergedAssistant,
+          ];
+          setTurns((prev) => prev.map((turn) => (turn.id === assistantId ? mergedAssistant : turn)));
           setConversations((prev) => {
             const current = prev.find((item) => item.id === activeId);
             if (!current) return prev;
@@ -525,8 +1072,17 @@ export function AgentChat({ userName }: { userName: string }) {
         }
       }
       setRunning(false);
+      setPendingApproval(null);
       setStatus(null);
       scrollDown();
+
+      // Автоматически переводим переписку в Summary + новый чат при достижении 80% лимита.
+      if (userSaved && !assistantDraft.error && contextLimit > 0) {
+        const nextTokens = estimateAgentConversationTokens(turnsToTranscript(updatedTurns));
+        if (shouldAutoRollover(nextTokens, contextLimit, updatedTurns.length)) {
+          await rolloverToSummaryChat(updatedTurns, "auto");
+        }
+      }
     }
   };
 
@@ -547,12 +1103,17 @@ export function AgentChat({ userName }: { userName: string }) {
 
   const available = health?.available ?? false;
   const tools = useMemo(() => health?.tools ?? [], [health]);
+  const activeRagFolder = useMemo(
+    () => ragFolders.find((folder) => folder.id === ragPrefs.folderId) ?? null,
+    [ragFolders, ragPrefs.folderId],
+  );
+  const trustMeta = findTrustLevel(trustLevel);
 
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px]">
         <span className="flex items-center gap-1.5 font-semibold text-amber-500">
-          <Sparkles size={13} /> Агент (эксперимент)
+          <Sparkles size={13} /> Агент
         </span>
         <span
           className={cn(
@@ -572,17 +1133,24 @@ export function AgentChat({ userName }: { userName: string }) {
           />
           {health === null ? "проверяю…" : available ? "агент онлайн" : "агент не запущен"}
         </span>
+        <span className={cn("rounded-md border px-1.5 py-0.5 text-[10px] font-medium", trustMeta.badgeClass)}>
+          {trustMeta.shortLabel}
+        </span>
         {health?.endpoint && <span className="text-muted">· {health.endpoint}</span>}
         <button
           type="button"
           onClick={() => {
             void loadHealth().then(setHealth);
+            void refreshSandbox();
           }}
           className="ml-auto rounded-lg border border-border bg-card px-2 py-1 font-medium text-muted transition hover:text-text"
         >
           Проверить
         </button>
       </div>
+
+      {/* Выбор уровня доверия ИИ */}
+      <TrustSelector value={trustLevel} onChange={setTrustLevel} disabled={running} />
 
       <div className="flex flex-wrap items-center gap-1.5 rounded-xl border border-border bg-card p-2">
         <History size={13} className="ml-1 text-muted" />
@@ -608,6 +1176,16 @@ export function AgentChat({ userName }: { userName: string }) {
         </select>
         <button
           type="button"
+          onClick={() => void rolloverToSummaryChat(turns, "manual")}
+          disabled={historyLoading || running || summarizing || turns.length === 0}
+          className="flex h-8 items-center gap-1 rounded-lg border border-border bg-card2 px-2 text-[10px] font-medium text-muted transition hover:text-text disabled:opacity-40"
+          title="Сжать переписку в Summary, сохранить полный текст в .md и открыть новый чат"
+        >
+          {summarizing ? <Loader2 size={12} className="animate-spin" /> : <Archive size={12} />}
+          Сжать в Summary и новый чат
+        </button>
+        <button
+          type="button"
           onClick={() => void startNewConversation()}
           disabled={historyLoading || running}
           className="flex h-8 items-center gap-1 rounded-lg border border-border bg-card2 px-2 text-[10px] font-medium text-muted transition hover:text-text disabled:opacity-40"
@@ -625,6 +1203,348 @@ export function AgentChat({ userName }: { userName: string }) {
           <Trash2 size={13} />
         </button>
       </div>
+
+      {/* Индикатор контекста, панель RAG-папок, Sandbox и архива переписок */}
+      <div className="grid gap-2 lg:grid-cols-3">
+        <div className="rounded-xl border border-border bg-card p-2.5 text-[11px]">
+          <div className="flex items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5 font-medium text-text">
+              <Gauge size={13} className="text-accent2" /> Контекст чата
+            </span>
+            <label className="flex items-center gap-1 text-[10px] text-muted">
+              лимит
+              <Input
+                type="number"
+                min={0}
+                step={512}
+                value={contextLimit}
+                onChange={(e) => setContextLimit(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+                className="h-6 w-20 px-1.5 text-[10px]"
+              />
+            </label>
+          </div>
+          {contextLimit > 0 ? (
+            <div className="mt-2">
+              <div className="mb-1 flex items-center justify-between text-[10px] text-muted">
+                <span>≈{usedTokens} / {contextLimit} токенов</span>
+                <span>{contextPercent}% (авто-Summary на 80%)</span>
+              </div>
+              <div className="h-1.5 overflow-hidden rounded-full bg-card2">
+                <div
+                  className={cn(
+                    "h-full rounded-full transition-all",
+                    contextPercent >= 80 ? "bg-amber-500" : "bg-emerald-500",
+                  )}
+                  style={{ width: `${Math.max(contextPercent, 2)}%` }}
+                />
+              </div>
+            </div>
+          ) : (
+            <p className="mt-1.5 text-[10px] text-muted">Автопереход по лимиту отключён (лимит = 0).</p>
+          )}
+        </div>
+
+        <div className="rounded-xl border border-border bg-card p-2.5 text-[11px]">
+          <div className="flex items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5 font-medium text-text">
+              <FolderOpen size={13} className="text-accent2" /> RAG-база знаний
+            </span>
+            <button
+              type="button"
+              onClick={() => setRagOpen((v) => !v)}
+              className="text-[10px] font-medium text-accent2 hover:underline"
+            >
+              {ragOpen ? "Скрыть" : activeRagFolder ? `${activeRagFolder.chunksCount} фрагм.` : "Настроить"}
+            </button>
+          </div>
+          <p className="mt-1 truncate text-[10px] text-muted">
+            {activeRagFolder
+              ? `${activeRagFolder.name} · ${activeRagFolder.filesCount} файлов${ragPrefs.ragFull ? " · вся база" : ` · до ${ragPrefs.ragChunks} фрагм.`}`
+              : "Папка не выбрана — можно загрузить папку любого размера"}
+          </p>
+        </div>
+
+        <div className="rounded-xl border border-border bg-card p-2.5 text-[11px]">
+          <div className="flex items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5 font-medium text-text">
+              <Terminal size={13} className="text-accent2" /> Sandbox и архивы
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setSandboxOpen((v) => !v)}
+                className="text-[10px] font-medium text-accent2 hover:underline"
+              >
+                Sandbox ({sandbox?.items?.length ?? 0})
+              </button>
+              <button
+                type="button"
+                onClick={() => setTranscriptsOpen((v) => !v)}
+                className="text-[10px] font-medium text-accent2 hover:underline"
+              >
+                Архив ({transcripts.length})
+              </button>
+            </div>
+          </div>
+          <p className="mt-1 truncate text-[10px] text-muted">
+            Проекты: {sandbox?.projects?.length ? sandbox.projects.join(", ") : "пока пусто"} · процессов:{" "}
+            {sandbox?.processes?.filter((p) => p.alive).length ?? 0}
+          </p>
+        </div>
+      </div>
+
+      {/* Панель настройки RAG-папки */}
+      {ragOpen && (
+        <div className="space-y-2 rounded-2xl border border-border bg-card p-3 text-[11px]">
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              ref={ragDirRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(event) => void uploadRagFolder(event)}
+              {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
+            />
+            <button
+              type="button"
+              onClick={() => ragDirRef.current?.click()}
+              disabled={ragBusy || running}
+              className="flex items-center gap-1.5 rounded-lg border border-border bg-card2 px-2.5 py-1.5 font-medium text-text hover:border-accent/50 disabled:opacity-50"
+            >
+              {ragBusy ? <Loader2 size={12} className="animate-spin" /> : <FolderOpen size={12} />}
+              Загрузить папку в RAG
+            </button>
+            <button
+              type="button"
+              onClick={() => void refreshRagFolders()}
+              disabled={ragBusy}
+              className="flex items-center gap-1 rounded-lg border border-border bg-card2 px-2 py-1.5 text-muted hover:text-text"
+              title="Обновить список RAG-папок"
+            >
+              <RefreshCw size={12} />
+            </button>
+            <select
+              aria-label="Выбор RAG-папки"
+              value={ragPrefs.folderId || ""}
+              onChange={(e) => setRagPrefs({ ...ragPrefs, folderId: Number(e.target.value) || 0 })}
+              className="h-8 min-w-[180px] flex-1 rounded-lg border border-border bg-card2 px-2 text-[11px] text-text"
+            >
+              <option value="">Без RAG-папки</option>
+              {ragFolders.map((folder) => (
+                <option key={folder.id} value={folder.id}>
+                  {folder.name} ({folder.filesCount} файлов · {folder.chunksCount} фрагм. · {formatBytes(folder.chars)})
+                </option>
+              ))}
+            </select>
+          </div>
+          {ragProgress && (
+            <p className="text-[10px] text-muted">
+              {ragProgress.phase === "read" ? "Читаем файлы" : "Загружаем в базу"}: {ragProgress.done}/{ragProgress.total}
+            </p>
+          )}
+          <div className="flex flex-wrap items-center gap-3 pt-1">
+            <label className="flex items-center gap-1.5 text-muted">
+              Фрагментов на запрос
+              <Input
+                type="number"
+                min={0}
+                max={500}
+                disabled={ragPrefs.ragFull}
+                value={ragPrefs.ragChunks}
+                onChange={(e) =>
+                  setRagPrefs({ ...ragPrefs, ragChunks: Math.min(500, Math.max(0, Number(e.target.value) || 0)) })
+                }
+                className="h-7 w-16 px-1.5 text-[11px]"
+              />
+            </label>
+            <label className="flex items-center gap-1.5 text-muted">
+              <input
+                type="checkbox"
+                checked={ragPrefs.ragFull}
+                onChange={(e) => setRagPrefs({ ...ragPrefs, ragFull: e.target.checked })}
+                className="h-3.5 w-3.5 accent-[#7c5cff]"
+              />
+              <span>Вся база: отдавать весь индекс папки в контекст без обрезки</span>
+            </label>
+          </div>
+        </div>
+      )}
+
+      {/* Панель Sandbox и переноса файлов наружу */}
+      {sandboxOpen && (
+        <div className="space-y-2.5 rounded-2xl border border-border bg-card p-3 text-[11px]">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="font-semibold text-text">
+              Изолированная папка Sandbox {sandbox?.root ? `(${sandbox.root})` : ""}
+            </span>
+            <div className="flex items-center gap-2">
+              <a
+                href="/api/ai/agent/sandbox?download=."
+                className="flex items-center gap-1 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[10px] font-medium text-emerald-500 hover:bg-emerald-500/20"
+              >
+                <FileArchive size={12} /> Скачать всё (.zip)
+              </a>
+              <button
+                type="button"
+                onClick={() => void refreshSandbox()}
+                className="rounded-lg border border-border bg-card2 px-2 py-1 text-[10px] text-muted hover:text-text"
+              >
+                Обновить
+              </button>
+            </div>
+          </div>
+
+          {sandbox?.projects && sandbox.projects.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {sandbox.projects.map((proj) => (
+                <div
+                  key={proj}
+                  className="flex items-center gap-1.5 rounded-lg border border-border bg-card2 px-2 py-1 text-[10px]"
+                >
+                  <span className="font-medium text-text">{proj}</span>
+                  <a
+                    href={`/api/ai/agent/sandbox?download=${encodeURIComponent(proj)}`}
+                    className="text-emerald-500 hover:underline"
+                  >
+                    ZIP
+                  </a>
+                  <button
+                    type="button"
+                    onClick={() => setExportSource(proj)}
+                    className="text-accent2 hover:underline"
+                  >
+                    экспорт
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {sandbox?.items && sandbox.items.length > 0 ? (
+            <div className="max-h-36 overflow-y-auto rounded-lg border border-border bg-card2/50 p-2 font-mono text-[10px] text-muted">
+              {sandbox.items.slice(0, 60).map((it) => (
+                <div key={it.path} className="flex items-center justify-between gap-2 py-0.5">
+                  <span className="truncate">{it.path}{it.isDir ? "/" : ""}</span>
+                  {!it.isDir && <span className="shrink-0">{formatBytes(it.size)}</span>}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-[10px] text-muted">В Sandbox пока нет файлов.</p>
+          )}
+
+          {sandbox?.processes && sandbox.processes.some((p) => p.alive) && (
+            <div className="space-y-1">
+              <p className="text-[10px] font-medium text-text">Фоновые процессы в Sandbox:</p>
+              {sandbox.processes
+                .filter((p) => p.alive)
+                .map((proc) => (
+                  <div
+                    key={proc.pid}
+                    className="flex items-center justify-between gap-2 rounded-lg border border-border bg-card2 px-2 py-1 text-[10px]"
+                  >
+                    <span className="truncate font-mono">
+                      PID {proc.pid}: {proc.command}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void stopSandboxProcess(proc.pid)}
+                      disabled={sandboxBusy}
+                      className="flex items-center gap-1 rounded border border-red-500/40 bg-red-500/10 px-1.5 py-0.5 text-red-500"
+                    >
+                      <Square size={10} /> Стоп
+                    </button>
+                  </div>
+                ))}
+            </div>
+          )}
+
+          <div className="grid gap-2 border-t border-border pt-2 sm:grid-cols-[1fr_1.4fr_auto_auto]">
+            <Input
+              value={exportSource}
+              onChange={(e) => setExportSource(e.target.value)}
+              placeholder="Источник в Sandbox (например, site)"
+              className="h-8 text-[11px]"
+            />
+            <Input
+              value={exportDest}
+              onChange={(e) => setExportDest(e.target.value)}
+              placeholder="Папка на ПК (например, C:\Projects\site)"
+              className="h-8 text-[11px]"
+            />
+            <select
+              value={exportMode}
+              onChange={(e) => setExportMode(e.target.value === "move" ? "move" : "copy")}
+              className="h-8 rounded-lg border border-border bg-card2 px-2 text-[11px] text-text"
+            >
+              <option value="copy">Скопировать</option>
+              <option value="move">Перенести</option>
+            </select>
+            <button
+              type="button"
+              onClick={() => void runSandboxExport()}
+              disabled={sandboxBusy || !exportSource.trim() || !exportDest.trim()}
+              className="flex h-8 items-center gap-1 rounded-lg bg-accent px-2.5 text-[11px] font-medium text-white disabled:opacity-40"
+            >
+              <FolderOutput size={12} /> Выгрузить на ПК
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Архив переписок (.md) */}
+      {transcriptsOpen && (
+        <div className="space-y-2 rounded-2xl border border-border bg-card p-3 text-[11px]">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-semibold text-text">Сохранённые переписки агента (.md)</span>
+            <button
+              type="button"
+              onClick={() => void refreshTranscripts()}
+              className="text-[10px] text-accent2 hover:underline"
+            >
+              Обновить
+            </button>
+          </div>
+          {transcripts.length === 0 ? (
+            <p className="text-[10px] text-muted">
+              Сохранённых переписок пока нет. Они появляются автоматически при достижении 80% лимита
+              контекста или по кнопке «Сжать в Summary и новый чат».
+            </p>
+          ) : (
+            <div className="max-h-48 space-y-1.5 overflow-y-auto">
+              {transcripts.map((item) => (
+                <div
+                  key={item.id}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-card2 px-2.5 py-1.5"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate font-medium text-text">{item.fileName}</p>
+                    <p className="truncate text-[10px] text-muted">
+                      {item.title} · {formatBytes(item.chars)}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <a
+                      href={`/api/agent/transcripts/${item.id}?download=1`}
+                      download={item.fileName}
+                      className="flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 text-[10px] text-text hover:border-accent/50"
+                    >
+                      <Download size={11} /> Скачать
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() => void attachTranscript(item)}
+                      className="flex items-center gap-1 rounded-md border border-accent/40 bg-accent/10 px-2 py-1 text-[10px] font-medium text-accent2 hover:bg-accent/20"
+                    >
+                      <Paperclip size={11} /> Приложить в чат
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {health !== null && !available && (
         <div className="rounded-2xl border border-border bg-card p-3 text-[11px] text-muted">
@@ -717,6 +1637,59 @@ export function AgentChat({ userName }: { userName: string }) {
           </label>
         </div>
 
+        {/* Карточка подтверждения команды / переноса файлов при уровне доверия verified */}
+        {pendingApproval && (
+          <div className="m-3 space-y-2 rounded-xl border border-amber-500/50 bg-amber-500/10 p-3 text-xs">
+            <div className="flex items-start gap-2">
+              <ShieldAlert size={16} className="mt-0.5 shrink-0 text-amber-500" />
+              <div className="min-w-0 flex-1 space-y-1">
+                <p className="font-semibold text-text">{pendingApproval.title}</p>
+                {pendingApproval.description && (
+                  <p className="text-[11px] text-muted">{pendingApproval.description}</p>
+                )}
+                {pendingApproval.command && (
+                  <pre className="overflow-x-auto rounded-lg bg-card px-2 py-1.5 font-mono text-[11px] text-text">
+                    {pendingApproval.command}
+                    {pendingApproval.cwd ? `\n# cwd: ${pendingApproval.cwd}` : ""}
+                  </pre>
+                )}
+                {pendingApproval.kind === "sandbox_export" && (
+                  <div className="space-y-1.5 pt-1">
+                    <p className="text-[11px] text-muted">
+                      Источник в Sandbox: <b>{pendingApproval.source}</b> ({pendingApproval.filesCount ?? 0} файлов ·{" "}
+                      {pendingApproval.mode === "move" ? "перенос" : "копирование"})
+                    </p>
+                    <Input
+                      value={approvalDest}
+                      onChange={(e) => setApprovalDest(e.target.value)}
+                      placeholder="Папка назначения на ПК (можно изменить перед согласием)"
+                      className="h-8 text-[11px]"
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void sendApprovalDecision(true)}
+                disabled={approvalBusy}
+                className="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+              >
+                <Check size={12} /> Разрешить
+              </button>
+              <button
+                type="button"
+                onClick={() => void sendApprovalDecision(false)}
+                disabled={approvalBusy}
+                className="flex items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-500 hover:bg-red-500/20 disabled:opacity-50"
+              >
+                <X size={12} /> Отклонить
+              </button>
+            </div>
+          </div>
+        )}
+
         <div ref={listRef} className="h-[420px] space-y-3 overflow-y-auto p-3">
           {historyLoading ? (
             <div className="flex h-full items-center justify-center gap-2 text-[11px] text-muted">
@@ -725,12 +1698,12 @@ export function AgentChat({ userName }: { userName: string }) {
           ) : turns.length === 0 ? (
             <div className="rounded-xl border border-dashed border-border bg-card2/50 p-4 text-xs">
               <p className="flex items-center gap-1.5 font-semibold">
-                <Bot size={14} className="text-accent2" /> {userName}, агент умеет не только отвечать
+                <Bot size={14} className="text-accent2" /> {userName}, агент умеет создавать проекты и работать в Sandbox
               </p>
               <ul className="mt-2 space-y-1 text-muted">
-                <li>• создаёт файлы (CSV, markdown, HTML, код) и отдаёт их на скачивание;</li>
-                <li>• открывает сайты в вашем браузере;</li>
-                <li>• включает видео на YouTube по запросу.</li>
+                <li>• создаёт проекты и файлы строго в изолированной папке Sandbox (и выгружает наружу после вашего согласия);</li>
+                <li>• запускает команды, проверяет сборку и открывает сайты в браузере;</li>
+                <li>• ищет по целым RAG-папкам любого размера и сохраняет длинные чаты через Summary в .md.</li>
               </ul>
               {tools.length > 0 && (
                 <p className="mt-2 text-[10px] text-muted">Инструменты: {tools.join(", ")}</p>
@@ -789,19 +1762,58 @@ export function AgentChat({ userName }: { userName: string }) {
                     </div>
                   )}
 
-                  {turn.actions.map((action, index) => (
-                    <a
-                      key={`${action.url}-${index}`}
-                      href={action.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-2 rounded-xl border border-accent/40 bg-accent/10 px-2.5 py-2 font-medium text-accent2 transition hover:bg-accent/20"
-                    >
-                      {action.autoplay ? <PlayCircle size={14} /> : <ExternalLink size={14} />}
-                      <span className="min-w-0 flex-1 truncate">{action.label}</span>
-                      <span className="text-[10px] text-muted">открыть</span>
-                    </a>
-                  ))}
+                  {turn.actions.map((action, index) => {
+                    if (action.type === "open_url" && action.url) {
+                      return (
+                        <a
+                          key={`${action.url}-${index}`}
+                          href={action.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-2 rounded-xl border border-accent/40 bg-accent/10 px-2.5 py-2 font-medium text-accent2 transition hover:bg-accent/20"
+                        >
+                          {action.autoplay ? <PlayCircle size={14} /> : <ExternalLink size={14} />}
+                          <span className="min-w-0 flex-1 truncate">{action.label}</span>
+                          <span className="text-[10px] text-muted">открыть</span>
+                        </a>
+                      );
+                    }
+                    if (action.type === "command_result") {
+                      return (
+                        <div
+                          key={`cmd-${index}`}
+                          className="rounded-xl border border-border bg-card px-2.5 py-2 text-[11px]"
+                        >
+                          <p className="flex items-center gap-1.5 font-mono font-medium text-text">
+                            <Terminal size={12} className="text-accent2" />
+                            {action.command}
+                            {action.exitCode !== undefined && action.exitCode !== null && (
+                              <span className="ml-auto text-[10px] text-muted">код {action.exitCode}</span>
+                            )}
+                          </p>
+                          {action.output && (
+                            <pre className="mt-1 max-h-32 overflow-auto rounded bg-card2 px-2 py-1 text-[10px] text-muted">
+                              {action.output}
+                            </pre>
+                          )}
+                        </div>
+                      );
+                    }
+                    return (
+                      <div
+                        key={`act-${index}`}
+                        className="flex items-center gap-2 rounded-xl border border-border bg-card px-2.5 py-2 text-[11px] text-muted"
+                      >
+                        <FolderOutput size={13} className="shrink-0 text-emerald-500" />
+                        <span className="min-w-0 flex-1 truncate">
+                          {action.type === "project_created" && `Проект создан в Sandbox: ${action.project}`}
+                          {action.type === "sandbox_file" && `Файл в Sandbox: ${action.path}`}
+                          {action.type === "sandbox_export" &&
+                            `Экспорт (${action.filesCount ?? 0} файлов): ${action.source} → ${action.destination}`}
+                        </span>
+                      </div>
+                    );
+                  })}
 
                   {turn.files.map((file, index) =>
                     file.data ? (
@@ -847,6 +1859,7 @@ export function AgentChat({ userName }: { userName: string }) {
               <Loader2 size={11} className="animate-spin" /> {status}
             </p>
           )}
+          {notice && <p className="mb-2 text-[11px] text-emerald-500">{notice}</p>}
           {error && <p className="mb-2 text-[11px] text-red-500">{error}</p>}
           {attachments.length > 0 && (
             <div className="mb-2 flex flex-wrap gap-1">
@@ -876,8 +1889,6 @@ export function AgentChat({ userName }: { userName: string }) {
               className="sr-only"
               aria-label="Приложить файлы для анализа"
               onChange={(event) => {
-                // Снимок делаем ДО input.value = "": иначе браузер очищает
-                // FileList, и файл «не прикрепляется».
                 const list = Array.from(event.target.files ?? []);
                 event.target.value = "";
                 if (list.length === 0) return;
@@ -925,8 +1936,8 @@ export function AgentChat({ userName }: { userName: string }) {
             </button>
           </div>
           <p className="mt-1.5 text-[10px] text-muted">
-            Скрепка — файлы для анализа (до 5 по 10 МБ). Переписка сохраняется в базе; в истории остаются
-            имена вложений и созданных файлов, но не сами байты файлов.
+            Скрепка — файлы для анализа (до 5 по 10 МБ) или сохранённые .md-переписки. В истории остаются имена файлов,
+            а при 80% лимита контекста чат автоматически архивируется и продолжается через Summary.
           </p>
         </div>
       </div>

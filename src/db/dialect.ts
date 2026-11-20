@@ -180,10 +180,25 @@ const PG_DDL = [
     max_steps integer not null default 15,
     steps integer not null default 0,
     summary text not null default '',
+    trust_level text not null default 'verified',
+    pending_approval text not null default '',
+    approval_response text not null default '',
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
   )`,
   `create index if not exists agent_tasks_status_idx on agent_tasks (status, id)`,
+  `create table if not exists agent_transcripts (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    conversation_id integer not null default 0,
+    title text not null default 'Переписка агента',
+    summary text not null default '',
+    file_name text not null,
+    content text not null,
+    chars integer not null default 0,
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists agent_transcripts_user_idx on agent_transcripts (user_id, id)`,
   `create table if not exists agent_events (
     id serial primary key,
     task_id integer not null references agent_tasks(id) on delete cascade,
@@ -433,10 +448,25 @@ const SQLITE_DDL = [
     max_steps integer not null default 15,
     steps integer not null default 0,
     summary text not null default '',
+    trust_level text not null default 'verified',
+    pending_approval text not null default '',
+    approval_response text not null default '',
     created_at text not null,
     updated_at text not null
   )`,
   `create index if not exists agent_tasks_status_idx on agent_tasks (status, id)`,
+  `create table if not exists agent_transcripts (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    conversation_id integer not null default 0,
+    title text not null default 'Переписка агента',
+    summary text not null default '',
+    file_name text not null,
+    content text not null,
+    chars integer not null default 0,
+    created_at text not null
+  )`,
+  `create index if not exists agent_transcripts_user_idx on agent_transcripts (user_id, id)`,
   `create table if not exists agent_events (
     id integer primary key autoincrement,
     task_id integer not null references agent_tasks(id) on delete cascade,
@@ -713,6 +743,9 @@ async function migrateColumns(executor: Executor): Promise<void> {
     // поэтому нормализуем текст в JS и ищем по готовой строке.
     `alter table messages add column content_lower text not null default ''`,
     `alter table message_attachments add column name_lower text not null default ''`,
+    `alter table agent_tasks add column trust_level text not null default 'verified'`,
+    `alter table agent_tasks add column pending_approval text not null default ''`,
+    `alter table agent_tasks add column approval_response text not null default ''`,
   ];
   for (const statement of statements) {
     try {
