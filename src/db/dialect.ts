@@ -147,6 +147,29 @@ const PG_DDL = [
     created_at timestamptz not null default now(),
     last_used_at timestamptz
   )`,
+  `create table if not exists agent_conversations (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    kind text not null,
+    title text not null default 'Новый чат',
+    system_prompt text not null default '',
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`,
+  `create index if not exists agent_conversations_user_kind_idx on agent_conversations (user_id, kind, updated_at)`,
+  `create table if not exists agent_conversation_messages (
+    id serial primary key,
+    conversation_id integer not null references agent_conversations(id) on delete cascade,
+    role text not null,
+    content text not null default '',
+    reasoning text not null default '',
+    attachments text not null default '[]',
+    actions text not null default '[]',
+    files text not null default '[]',
+    error text not null default '',
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists agent_conversation_messages_conversation_idx on agent_conversation_messages (conversation_id)`,
   `create index if not exists agent_connections_user_idx on agent_connections (user_id)`,
   `create index if not exists agent_connection_tokens_conn_idx on agent_connection_tokens (connection_id)`,
   `create table if not exists agent_tasks (
@@ -377,6 +400,29 @@ const SQLITE_DDL = [
     created_at text not null,
     last_used_at text
   )`,
+  `create table if not exists agent_conversations (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    kind text not null,
+    title text not null default 'Новый чат',
+    system_prompt text not null default '',
+    created_at text not null,
+    updated_at text not null
+  )`,
+  `create index if not exists agent_conversations_user_kind_idx on agent_conversations (user_id, kind, updated_at)`,
+  `create table if not exists agent_conversation_messages (
+    id integer primary key autoincrement,
+    conversation_id integer not null references agent_conversations(id) on delete cascade,
+    role text not null,
+    content text not null default '',
+    reasoning text not null default '',
+    attachments text not null default '[]',
+    actions text not null default '[]',
+    files text not null default '[]',
+    error text not null default '',
+    created_at text not null
+  )`,
+  `create index if not exists agent_conversation_messages_conversation_idx on agent_conversation_messages (conversation_id)`,
   `create index if not exists agent_connections_user_idx on agent_connections (user_id)`,
   `create index if not exists agent_connection_tokens_conn_idx on agent_connection_tokens (connection_id)`,
   `create table if not exists agent_tasks (

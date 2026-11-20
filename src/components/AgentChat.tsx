@@ -6,7 +6,9 @@ import {
   Download,
   ExternalLink,
   FileText,
+  History,
   Loader2,
+  MessageSquarePlus,
   Paperclip,
   PlayCircle,
   PlugZap,
@@ -53,6 +55,25 @@ type Turn = {
   error?: string;
 };
 
+type AgentConversation = {
+  id: number;
+  kind: "agent";
+  title: string;
+  messagesCount: number;
+  updatedAt: string;
+};
+
+type StoredTurn = {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  reasoning?: string;
+  error?: string;
+  attachments?: Array<{ name?: string; size?: number }>;
+  actions?: AgentAction[];
+  files?: Array<{ name?: string; mime?: string; size?: number }>;
+};
+
 type Health = {
   available: boolean;
   endpoint?: string;
@@ -60,6 +81,28 @@ type Health = {
   model?: string | null;
   tools?: string[];
 };
+
+function decodeStoredTurn(message: StoredTurn): Turn {
+  return {
+    id: `m${message.id}`,
+    role: message.role === "assistant" ? "assistant" : "user",
+    content: String(message.content ?? ""),
+    reasoning: String(message.reasoning ?? ""),
+    error: String(message.error ?? "") || undefined,
+    actions: Array.isArray(message.actions) ? message.actions : [],
+    files: Array.isArray(message.files)
+      ? message.files.map((file) => ({
+          name: String(file.name ?? "файл"),
+          mime: String(file.mime ?? "application/octet-stream"),
+          size: Number(file.size ?? 0),
+          data: "",
+        }))
+      : [],
+    attached: Array.isArray(message.attachments)
+      ? message.attachments.map((file) => ({ name: String(file.name ?? "файл"), size: Number(file.size ?? 0) }))
+      : [],
+  };
+}
 
 /** Пресеты OpenAI-совместимых API: локальная модель или облако по ключу. */
 const PROVIDERS: Array<{ id: string; label: string; baseUrl: string; model: string }> = [
@@ -104,6 +147,9 @@ export function AgentChat({ userName }: { userName: string }) {
   );
   const [maxSteps, setMaxSteps] = useStoredNumber("crm.ai.agent.steps.v1", 20);
   const [health, setHealth] = useState<Health | null>(null);
+  const [conversations, setConversations] = useState<AgentConversation[]>([]);
+  const [conversationId, setConversationId] = useState<number | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(true);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<OperatorAttachment[]>([]);
@@ -145,6 +191,136 @@ export function AgentChat({ userName }: { userName: string }) {
     };
   }, [loadHealth]);
 
+  const openConversation = useCallback(async (id: number) => {
+    const res = await fetch(`/api/agent/conversations/${id}`, { cache: "no-store" });
+    const data = (await res.json().catch(() => ({}))) as {
+      conversation?: AgentConversation;
+      messages?: StoredTurn[];
+      error?: string;
+    };
+    if (!res.ok || !data.conversation) throw new Error(data.error ?? "Не удалось открыть чат агента");
+
+    setConversationId(id);
+    setTurns((data.messages ?? []).map(decodeStoredTurn));
+    setAttachments([]);
+    setText("");
+    counter.current = 0;
+    setError(null);
+    setStatus(null);
+  }, []);
+
+  const createConversation = useCallback(async () => {
+    const res = await fetch("/api/agent/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "agent" }),
+    });
+    const data = (await res.json().catch(() => ({}))) as { conversation?: AgentConversation; error?: string };
+    if (!res.ok || !data.conversation) throw new Error(data.error ?? "Не удалось создать чат агента");
+
+    const conversation = data.conversation;
+    setConversations((prev) => [conversation, ...prev.filter((item) => item.id !== conversation.id)]);
+    setConversationId(conversation.id);
+    setTurns([]);
+    setAttachments([]);
+    setText("");
+    setError(null);
+    setStatus(null);
+    return conversation;
+  }, []);
+
+  const saveConversationMessage = useCallback(async (
+    id: number,
+    message: {
+      role: "user" | "assistant";
+      content: string;
+      reasoning?: string;
+      error?: string;
+      attachments?: Array<{ name: string; size: number }>;
+      actions?: AgentAction[];
+      files?: Array<{ name: string; mime: string; size: number }>;
+    },
+  ) => {
+    const res = await fetch(`/api/agent/conversations/${id}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(message),
+    });
+    const data = (await res.json().catch(() => ({}))) as { message?: StoredTurn; error?: string };
+    if (!res.ok || !data.message) throw new Error(data.error ?? "Не удалось сохранить переписку");
+    return decodeStoredTurn(data.message);
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    const initialize = async () => {
+      try {
+        const res = await fetch("/api/agent/conversations?kind=agent", { cache: "no-store" });
+        const data = (await res.json().catch(() => ({}))) as {
+          conversations?: AgentConversation[];
+          error?: string;
+        };
+        if (!res.ok) throw new Error(data.error ?? "Не удалось загрузить историю агента");
+        if (!alive) return;
+        const list = data.conversations ?? [];
+        setConversations(list);
+        if (list.length > 0) await openConversation(list[0].id);
+        else await createConversation();
+      } catch (caught) {
+        if (alive) setError(caught instanceof Error ? caught.message : "Не удалось загрузить чаты агента");
+      } finally {
+        if (alive) setHistoryLoading(false);
+      }
+    };
+    void initialize();
+    return () => {
+      alive = false;
+    };
+  }, [createConversation, openConversation]);
+
+  const selectConversation = async (id: number) => {
+    if (id === conversationId || running || historyLoading) return;
+    setHistoryLoading(true);
+    setError(null);
+    try {
+      await openConversation(id);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось открыть чат агента");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const startNewConversation = async () => {
+    if (running || historyLoading) return;
+    setHistoryLoading(true);
+    try {
+      await createConversation();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось создать чат агента");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const deleteCurrentConversation = async () => {
+    if (conversationId === null || running || historyLoading) return;
+    const id = conversationId;
+    setHistoryLoading(true);
+    try {
+      const res = await fetch(`/api/agent/conversations/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Не удалось удалить чат агента");
+      const rest = conversations.filter((item) => item.id !== id);
+      setConversations(rest);
+      if (rest.length > 0) await openConversation(rest[0].id);
+      else await createConversation();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось удалить чат агента");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
   const scrollDown = () => {
     requestAnimationFrame(() => {
       if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
@@ -158,11 +334,12 @@ export function AgentChat({ userName }: { userName: string }) {
 
   const send = async (preset?: string) => {
     const typed = (preset ?? text).trim();
+    const activeId = conversationId;
     // Файл без вопроса — тоже запрос: агент прочитает вложение и расскажет,
     // что в нём, вместо того чтобы требовать текст.
     const content =
       typed || (attachments.length > 0 ? "Проанализируй приложенные файлы и коротко перескажи главное." : "");
-    if (!content || running) return;
+    if (!content || running || historyLoading || activeId === null) return;
     setError(null);
     if (!preset) setText("");
     const attachedTurn = attachments.map((file) => ({ name: file.name, size: file.size }));
@@ -187,8 +364,31 @@ export function AgentChat({ userName }: { userName: string }) {
     const patch = (update: (turn: Turn) => Turn) => {
       setTurns((prev) => prev.map((t) => (t.id === assistantId ? update(t) : t)));
     };
+    const assistantDraft: {
+      content: string;
+      reasoning: string;
+      actions: AgentAction[];
+      files: AgentFile[];
+      error: string;
+    } = { content: "", reasoning: "", actions: [], files: [], error: "" };
+    let userSaved = false;
 
     try {
+      setStatus("Сохраняю переписку…");
+      const storedUser = await saveConversationMessage(activeId, {
+        role: "user",
+        content: userTurn.content,
+        attachments: attachedTurn,
+      });
+      userSaved = true;
+      setTurns((prev) => prev.map((turn) => (turn.id === userTurn.id ? storedUser : turn)));
+      setConversations((prev) => {
+        const current = prev.find((item) => item.id === activeId);
+        if (!current) return prev;
+        const title = current.title === "Новый чат" ? content.replace(/\s+/g, " ").slice(0, 80) : current.title;
+        const updated = { ...current, title, messagesCount: current.messagesCount + 1, updatedAt: new Date().toISOString() };
+        return [updated, ...prev.filter((item) => item.id !== activeId)];
+      });
       const res = await fetch("/api/ai/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -210,7 +410,8 @@ export function AgentChat({ userName }: { userName: string }) {
 
       if (!res.ok || !res.body) {
         const data = (await res.json().catch(() => ({}))) as { error?: string };
-        patch((t) => ({ ...t, error: data.error ?? "Агент недоступен" }));
+        assistantDraft.error = data.error ?? "Агент недоступен";
+        patch((t) => ({ ...t, error: assistantDraft.error }));
         setStatus(null);
         return;
       }
@@ -244,13 +445,15 @@ export function AgentChat({ userName }: { userName: string }) {
           if (event === "status") {
             setStatus(String(data.text ?? ""));
           } else if (event === "reasoning") {
-            patch((t) => ({ ...t, reasoning: String(data.text ?? "") }));
+            assistantDraft.reasoning = String(data.text ?? "");
+            patch((t) => ({ ...t, reasoning: assistantDraft.reasoning }));
             scrollDown();
           } else if (event === "text") {
-            const reply = String(data.text ?? "");
-            patch((t) => ({ ...t, content: reply }));
+            assistantDraft.content = String(data.text ?? "");
+            patch((t) => ({ ...t, content: assistantDraft.content }));
           } else if (event === "error") {
-            patch((t) => ({ ...t, error: String(data.error ?? "Ошибка агента") }));
+            assistantDraft.error = String(data.error ?? "Ошибка агента");
+            patch((t) => ({ ...t, error: assistantDraft.error }));
             setStatus(null);
           } else if (event === "action") {
             if (data.type === "file") {
@@ -260,6 +463,7 @@ export function AgentChat({ userName }: { userName: string }) {
                 size: Number(data.size ?? 0),
                 data: String(data.data ?? ""),
               };
+              assistantDraft.files.push(file);
               patch((t) => ({ ...t, files: [...t.files, file] }));
             } else if (data.type === "open_url") {
               const action: AgentAction = {
@@ -268,6 +472,7 @@ export function AgentChat({ userName }: { userName: string }) {
                 label: String(data.label ?? data.url ?? ""),
                 autoplay: Boolean(data.autoplay),
               };
+              assistantDraft.actions.push(action);
               patch((t) => ({ ...t, actions: [...t.actions, action] }));
               // Браузер может заблокировать всплывающее окно — карточка с
               // кнопкой остаётся, поэтому действие не теряется.
@@ -279,9 +484,46 @@ export function AgentChat({ userName }: { userName: string }) {
           }
         }
       }
-    } catch {
-      patch((t) => ({ ...t, error: "Соединение с агентом прервалось" }));
+    } catch (caught) {
+      assistantDraft.error = userSaved
+        ? "Соединение с агентом прервалось"
+        : caught instanceof Error
+          ? caught.message
+          : "Не удалось сохранить сообщение";
+      patch((t) => ({ ...t, error: assistantDraft.error }));
     } finally {
+      if (userSaved) {
+        try {
+          const storedAssistant = await saveConversationMessage(activeId, {
+            role: "assistant",
+            content: assistantDraft.content,
+            reasoning: assistantDraft.reasoning,
+            error: assistantDraft.error,
+            actions: assistantDraft.actions,
+            files: assistantDraft.files.map(({ name, mime, size }) => ({ name, mime, size })),
+          });
+          setTurns((prev) =>
+            prev.map((turn) =>
+              turn.id === assistantId
+                ? {
+                    ...storedAssistant,
+                    // Сохраняем живые байты файлов в текущем сеансе для скачивания;
+                    // в базе остаются только имя, тип и размер.
+                    files: assistantDraft.files.length > 0 ? assistantDraft.files : storedAssistant.files,
+                  }
+                : turn,
+            ),
+          );
+          setConversations((prev) => {
+            const current = prev.find((item) => item.id === activeId);
+            if (!current) return prev;
+            const updated = { ...current, messagesCount: current.messagesCount + 1, updatedAt: new Date().toISOString() };
+            return [updated, ...prev.filter((item) => item.id !== activeId)];
+          });
+        } catch (caught) {
+          setError(caught instanceof Error ? caught.message : "Не удалось сохранить ответ агента");
+        }
+      }
       setRunning(false);
       setStatus(null);
       scrollDown();
@@ -339,6 +581,48 @@ export function AgentChat({ userName }: { userName: string }) {
           className="ml-auto rounded-lg border border-border bg-card px-2 py-1 font-medium text-muted transition hover:text-text"
         >
           Проверить
+        </button>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5 rounded-xl border border-border bg-card p-2">
+        <History size={13} className="ml-1 text-muted" />
+        <select
+          aria-label="История чатов агента"
+          value={conversationId ?? ""}
+          onChange={(event) => {
+            const id = Number(event.target.value);
+            if (id > 0) void selectConversation(id);
+          }}
+          disabled={historyLoading || conversations.length === 0}
+          className="h-8 min-w-0 flex-1 rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent disabled:opacity-60"
+        >
+          {conversations.length === 0 ? (
+            <option value="">{historyLoading ? "Загружаю историю…" : "Чатов пока нет"}</option>
+          ) : (
+            conversations.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.title || "Новый чат"} · {item.messagesCount} сообщ.
+              </option>
+            ))
+          )}
+        </select>
+        <button
+          type="button"
+          onClick={() => void startNewConversation()}
+          disabled={historyLoading || running}
+          className="flex h-8 items-center gap-1 rounded-lg border border-border bg-card2 px-2 text-[10px] font-medium text-muted transition hover:text-text disabled:opacity-40"
+        >
+          <MessageSquarePlus size={12} /> Новый чат
+        </button>
+        <button
+          type="button"
+          onClick={() => void deleteCurrentConversation()}
+          disabled={conversationId === null || historyLoading || running}
+          className="flex h-8 w-8 items-center justify-center rounded-lg border border-border bg-card2 text-muted transition hover:text-red-500 disabled:opacity-40"
+          title="Удалить этот чат"
+          aria-label="Удалить чат агента"
+        >
+          <Trash2 size={13} />
         </button>
       </div>
 
@@ -434,7 +718,11 @@ export function AgentChat({ userName }: { userName: string }) {
         </div>
 
         <div ref={listRef} className="h-[420px] space-y-3 overflow-y-auto p-3">
-          {turns.length === 0 ? (
+          {historyLoading ? (
+            <div className="flex h-full items-center justify-center gap-2 text-[11px] text-muted">
+              <Loader2 size={13} className="animate-spin" /> Загружаю переписку…
+            </div>
+          ) : turns.length === 0 ? (
             <div className="rounded-xl border border-dashed border-border bg-card2/50 p-4 text-xs">
               <p className="flex items-center gap-1.5 font-semibold">
                 <Bot size={14} className="text-accent2" /> {userName}, агент умеет не только отвечать
@@ -490,9 +778,9 @@ export function AgentChat({ userName }: { userName: string }) {
 
                   {turn.attached && turn.attached.length > 0 && (
                     <div className="flex flex-wrap gap-1">
-                      {turn.attached.map((file) => (
+                      {turn.attached.map((file, index) => (
                         <span
-                          key={file.name}
+                          key={`${file.name}-${index}`}
                           className="flex items-center gap-1 rounded-lg border border-border bg-card px-1.5 py-0.5 text-[10px] text-muted"
                         >
                           <FileText size={10} /> {file.name} · {formatBytes(file.size)}
@@ -515,19 +803,31 @@ export function AgentChat({ userName }: { userName: string }) {
                     </a>
                   ))}
 
-                  {turn.files.map((file, index) => (
-                    <a
-                      key={`${file.name}-${index}`}
-                      href={`data:${file.mime};base64,${file.data}`}
-                      download={file.name}
-                      className="flex items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-2 font-medium text-emerald-500 transition hover:bg-emerald-500/20"
-                    >
-                      <FileText size={14} />
-                      <span className="min-w-0 flex-1 truncate">{file.name}</span>
-                      <span className="text-[10px] text-muted">{formatBytes(file.size)}</span>
-                      <Download size={13} />
-                    </a>
-                  ))}
+                  {turn.files.map((file, index) =>
+                    file.data ? (
+                      <a
+                        key={`${file.name}-${index}`}
+                        href={`data:${file.mime};base64,${file.data}`}
+                        download={file.name}
+                        className="flex items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-2 font-medium text-emerald-500 transition hover:bg-emerald-500/20"
+                      >
+                        <FileText size={14} />
+                        <span className="min-w-0 flex-1 truncate">{file.name}</span>
+                        <span className="text-[10px] text-muted">{formatBytes(file.size)}</span>
+                        <Download size={13} />
+                      </a>
+                    ) : (
+                      <div
+                        key={`${file.name}-${index}`}
+                        className="flex items-center gap-2 rounded-xl border border-border bg-card px-2.5 py-2 text-muted"
+                        title="В историю сохраняется имя, а не содержимое файла"
+                      >
+                        <FileText size={14} />
+                        <span className="min-w-0 flex-1 truncate">{file.name}</span>
+                        <span className="text-[10px]">{formatBytes(file.size)} · файл не сохранён</span>
+                      </div>
+                    ),
+                  )}
 
                   {turn.error && (
                     <p className="flex items-start gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-2 py-1.5 text-[11px] text-red-500">
@@ -593,7 +893,7 @@ export function AgentChat({ userName }: { userName: string }) {
             <button
               type="button"
               onClick={() => fileRef.current?.click()}
-              disabled={running || reading}
+              disabled={running || reading || historyLoading || conversationId === null}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border bg-card2 text-muted transition hover:text-text disabled:opacity-40"
               title="Приложить файлы для анализа (до 5 по 10 МБ)"
               aria-label="Приложить файлы"
@@ -611,36 +911,22 @@ export function AgentChat({ userName }: { userName: string }) {
               }}
               rows={2}
               placeholder="Например: открой ютуб и включи видео про космос…"
-              className="max-h-32 min-h-10 min-w-0 flex-1 resize-y rounded-xl border border-border bg-card2 px-3 py-2 text-xs outline-none focus:border-accent focus:ring-2 focus:ring-[var(--ring)]"
+              disabled={historyLoading || conversationId === null}
+              className="max-h-32 min-h-10 min-w-0 flex-1 resize-y rounded-xl border border-border bg-card2 px-3 py-2 text-xs outline-none focus:border-accent focus:ring-2 focus:ring-[var(--ring)] disabled:opacity-60"
             />
             <button
               type="button"
               onClick={() => void send()}
-              disabled={running || text.trim().length === 0}
+              disabled={running || historyLoading || conversationId === null || (!text.trim() && attachments.length === 0)}
               className="flex h-10 shrink-0 items-center gap-1.5 rounded-xl bg-accent px-3 text-xs font-medium text-white transition disabled:opacity-40"
             >
               {running ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
               Запустить
             </button>
-            {turns.length > 0 && (
-              <button
-                type="button"
-                onClick={() => {
-                  setTurns([]);
-                  setError(null);
-                  setStatus(null);
-                }}
-                disabled={running}
-                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border bg-card2 text-muted transition hover:text-red-500 disabled:opacity-40"
-                title="Очистить диалог с агентом"
-              >
-                <Trash2 size={14} />
-              </button>
-            )}
           </div>
           <p className="mt-1.5 text-[10px] text-muted">
-            Скрепка — файлы для анализа (до 5 по 10 МБ): агент прочитает их и ответит файлом,
-            если он нужен. История не сохраняется в базе — это тестовый режим.
+            Скрепка — файлы для анализа (до 5 по 10 МБ). Переписка сохраняется в базе; в истории остаются
+            имена вложений и созданных файлов, но не сами байты файлов.
           </p>
         </div>
       </div>

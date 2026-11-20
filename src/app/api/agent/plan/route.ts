@@ -1,6 +1,7 @@
 import { getCurrentUser } from "@/lib/auth";
 import { normalizeBaseUrl } from "@/lib/ai";
 import { applyGenParams, normalizeGenParams } from "@/lib/genParams";
+import { DEFAULT_PLAN_PROMPT } from "@/lib/operatorPlan";
 
 /**
  * Планировщик оператора: `POST /api/agent/plan`.
@@ -18,30 +19,8 @@ export const runtime = "nodejs";
 
 const MAX_MESSAGES = 14;
 const MAX_CHARS = 6000;
+const MAX_SYSTEM_PROMPT_CHARS = 12_000;
 const REQUEST_TIMEOUT = 120_000;
-
-const PLAN_PROMPT = `Ты — планировщик заданий для бота, который управляет рабочим столом
-пользователя. Твоя работа — превратить просьбу в точный план действий, который
-бот сможет выполнить по скриншоту: открыть нужное окно, кликнуть в конкретное
-поле, набрать текст, нажать клавишу.
-
-Как отвечать:
-- по-русски, кратко и по делу;
-- если в просьбе не хватает данных (в каком чате писать, какой файл открыть,
-  что именно отправить) — задай 1–3 коротких вопроса и ничего не планируй;
-- когда данных достаточно — выдай ПЛАН нумерованным списком, по одному
-  действию на строку: «1. Открыть …, 2. Кликнуть в поле …, 3. Ввести …,
-  4. Нажать Enter». Указывай, что должно быть на экране и как проверить успех;
-- в конце добавь строку «Готово, когда: …» — по какому признаку считать
-  задание выполненным;
-- не выдумывай приложения и кнопки, которых нет в просьбе; не предлагай
-  удалять, оплачивать или отправлять что-то без прямого указания;
-- если задача и так ясная, всё равно перепиши её точнее — бот не понимает
-  намёков и работает только по шагам.
-
-Твой ответ пользователь прочитает и, если согласен, перенесёт в чат с
-действиями — он станет заданием бота. Не рассказывай про свои возможности,
-не извиняйся, не добавляй вступлений вроде «Конечно!».`;
 
 type IncomingFile = { name?: string; text?: string; note?: string };
 
@@ -56,6 +35,7 @@ export async function POST(req: Request) {
     | {
         messages?: Array<{ role?: string; content?: string }>;
         files?: IncomingFile[];
+        systemPrompt?: string;
         settings?: { baseUrl?: string; apiKey?: string; model?: string; params?: unknown };
       }
     | null;
@@ -72,6 +52,9 @@ export async function POST(req: Request) {
     return Response.json({ error: "Укажите модель в «Подключении»" }, { status: 400 });
   }
   const apiKey = (body?.settings?.apiKey ?? "").trim().slice(0, 400);
+  const systemPrompt =
+    (typeof body?.systemPrompt === "string" ? body.systemPrompt.trim().slice(0, MAX_SYSTEM_PROMPT_CHARS) : "") ||
+    DEFAULT_PLAN_PROMPT;
 
   const messages = (body?.messages ?? [])
     .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
@@ -99,7 +82,7 @@ export async function POST(req: Request) {
 
   const payload: Record<string, unknown> = {
     model,
-    messages: [{ role: "system", content: PLAN_PROMPT }, ...messages],
+    messages: [{ role: "system", content: systemPrompt }, ...messages],
     temperature: 0.3,
     max_tokens: 1200,
     stream: false,
