@@ -145,9 +145,11 @@ def self_test() -> int:
     off = settings_mod.LaunchSettings()
     off.set_value("operator", "verify", False)
     off.set_value("operator", "repeat_nudge", False)
+    off.set_value("operator", "self_reflect", False)
     off_args = commands.agent_args(operator, off)
-    check("оператор: выключение проверки и подсказок",
-          "--no-verify-actions" in off_args and "--no-repeat-nudge" in off_args)
+    check("оператор: выключение проверки, подсказок и саморазбора",
+          "--no-verify-actions" in off_args and "--no-repeat-nudge" in off_args
+          and "--no-self-reflect" in off_args)
 
     env = commands.agent_env(chat_agent, conf)
     check("агент: адрес, модель и ключ уходят в переменные",

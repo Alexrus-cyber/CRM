@@ -28,9 +28,15 @@ describe("команда запуска оператора", () => {
     expect(cmd).not.toContain("--no-verify-actions");
   });
 
-  it("выключенная проверка действий попадает в команду", () => {
-    const cmd = buildOperatorCommand({ provider: "local", gen, verifyActions: false });
+  it("выключенная проверка действий и саморазбор попадают в команду", () => {
+    const cmd = buildOperatorCommand({
+      provider: "local",
+      gen,
+      verifyActions: false,
+      selfReflect: false,
+    });
     expect(cmd).toContain("--no-verify-actions");
+    expect(cmd).toContain("--no-self-reflect");
   });
 
   it("пустые настройки не добавляют лишних флагов", () => {
