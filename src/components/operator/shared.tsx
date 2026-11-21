@@ -248,6 +248,12 @@ export function describeAction(raw: string): ParsedAction | null {
         title: `Экспорт из Sandbox: ${short(action.source, 40)} → ${short(action.destination, 40)}`,
         json: raw,
       };
+    case "inspect_screen":
+      return {
+        type,
+        title: "Снимок экрана ПК для Агента",
+        json: raw,
+      };
     case "hotkey":
       return {
         type,

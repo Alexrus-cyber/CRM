@@ -1664,6 +1664,39 @@ export async function getAgentEventFile(
   };
 }
 
+export async function getLatestAgentScreen(taskId: number): Promise<{
+  eventId: number;
+  summary: string;
+  meta: Record<string, unknown> | null;
+  dataUrl: string;
+  createdAt: string;
+} | null> {
+  const row = await q1(sql`
+    select id, text, action, file_mime, file_data, created_at
+    from agent_events
+    where task_id = ${taskId} and kind = 'screen'
+    order by id desc limit 1`);
+  if (!row) return null;
+  const data = String(row.file_data ?? "");
+  const mime = String(row.file_mime ?? "image/jpeg") || "image/jpeg";
+  let meta: Record<string, unknown> | null = null;
+  const rawAction = String(row.action ?? "");
+  if (rawAction.trim().startsWith("{")) {
+    try {
+      meta = JSON.parse(rawAction) as Record<string, unknown>;
+    } catch {
+      meta = null;
+    }
+  }
+  return {
+    eventId: toNum(row.id),
+    summary: String(row.text ?? ""),
+    meta,
+    dataUrl: data ? `data:${mime};base64,${data}` : "",
+    createdAt: toIso(row.created_at) ?? nowIso(),
+  };
+}
+
 /* --------------------------- чаты с ИИ и токены --------------------- */
 
 export type AiChatRow = {

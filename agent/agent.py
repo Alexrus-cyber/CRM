@@ -94,12 +94,18 @@ SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CR
    - formulate_operator_task — превратить просьбу пользователя (работа в программах, на экране,
      или управление персонажем в игре) в чёткое пошаговое задание для Оператора с подходящим
      режимом (autonomous | copilot | game) и правилом помощи после каждого шага;
+   - inspect_pc_screen — запросить у Настольного Оператора свежий снимок экрана ПК и информацию
+     об активном окне, когда тебе не хватает видимости на компьютере пользователя для решения
+     задачи (ВСЕГДА сначала спрашивает явное разрешение пользователя на сайте!);
    - call_operator — вызвать Оператора для выполнения действий на экране/ПК или помощи
      пользователю (ВСЕГДА спрашивает разрешение пользователя на сайте перед запуском!).
 
 Правила безопасности и поведения:
 - Создавая проект или сайт, ВСЕГДА сначала собирай структуру папок и файлов в Sandbox через
   `sandbox_create_project` или `sandbox_write_file`, а затем при необходимости запускай через `run_command`.
+- Если для ответа или выполнения задачи тебе не хватает видимости того, что сейчас открыто на ПК
+  пользователя, НЕ додумывай — вызови `inspect_pc_screen`, чтобы Оператор сделал снимок экрана
+  и прислал данные (это произойдёт строго после разрешения пользователя).
 - Если пользователь просит выполнить действия на экране, в программе или помочь в игре / управлять
   персонажем, сначала помоги сформулировать чёткую задачу (formulate_operator_task) и при готовности
   вызови Оператора через call_operator — запуск произойдёт только после согласия пользователя.
@@ -353,6 +359,37 @@ OPERATOR_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "inspect_pc_screen",
+            "description": (
+                "Запросить у Настольного Оператора свежий снимок экрана ПК и данные об активном окне, "
+                "когда для решения задачи не хватает видимости на компьютере пользователя (какое окно открыто, "
+                "какая ошибка на экране, что изображено в программе). Ничего не нажимает на ПК. "
+                "ВСЕГДА сначала запрашивает явное разрешение пользователя на сайте."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Понятное пользователю объяснение: зачем Агенту нужен снимок экрана",
+                    },
+                    "focus": {
+                        "type": "string",
+                        "description": "Что именно нужно рассмотреть/проверить на экране",
+                    },
+                    "operator_trust_level": {
+                        "type": "string",
+                        "enum": ["verified", "full"],
+                        "description": "Уровень доверия для Оператора (по умолчанию verified)",
+                    },
+                },
+                "required": ["reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "call_operator",
             "description": (
                 "Вызвать Настольного Оператора экрана для выполнения действий на компьютере пользователя "
@@ -552,6 +589,60 @@ def run_tool(
             "Запуск bash, работа с песочницей, перенос файлов и автозапуск Оператора отключены. "
             "Можно использовать formulate_operator_task или create_file."
         )
+
+    if name == "inspect_pc_screen":
+        reason = str(args.get("reason") or "Агенту нужен снимок экрана ПК для решения задачи").strip()
+        focus = str(args.get("focus") or "").strip()
+        op_trust = normalize_trust(args.get("operator_trust_level") or ("full" if trust == "full" else "verified"))
+        if op_trust == "none":
+            op_trust = "verified"
+
+        if approval_fn is None:
+            raise AgentError("Для снимка экрана через Оператора требуется разрешение пользователя на сайте")
+        decision = approval_fn(
+            {
+                "kind": "capture_screen",
+                "title": "Разрешить Оператору сделать снимок экрана ПК?",
+                "description": reason,
+                "task": focus or reason,
+                "mode": "inspect",
+                "maxSteps": 2,
+                "coachAfterEachStep": False,
+                "operatorTrustLevel": op_trust,
+            }
+        )
+        if not decision.get("approved"):
+            note = str(decision.get("note") or "").strip()
+            return (
+                "Пользователь отклонил снятие снимка экрана ПК"
+                + (f" ({note})" if note else "")
+                + ". Продолжай без просмотра экрана или попроси пользователя описать/прикрепить скриншот вручную.",
+                events,
+            )
+
+        screenshot = str(decision.get("screenshot") or "")
+        screen_summary = str(decision.get("screenSummary") or "").strip()
+        task_id = decision.get("taskId")
+        has_image = screenshot.startswith("data:image/")
+        events.append(
+            {
+                "type": "operator_screen",
+                "taskId": task_id,
+                "summary": screen_summary or "Снимок экрана ПК получен Оператором",
+                "hasImage": has_image,
+                **({"_image": screenshot} if has_image else {}),
+            }
+        )
+        parts = ["Снимок экрана ПК получен от Оператора."]
+        if task_id:
+            parts.append(f"ID задачи Оператора: #{task_id}.")
+        if screen_summary:
+            parts.append(f"Описание экрана: {screen_summary}")
+        if has_image:
+            parts.append("Изображение экрана приложено следующим сообщением для анализа.")
+        elif not screen_summary:
+            parts.append("Изображение не получено — попросите пользователя уточнить детали или проверить подключение Оператора.")
+        return " ".join(parts), events
 
     if name == "call_operator":
         task_text = str(args.get("task") or "").strip()
@@ -1235,7 +1326,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "Не указан approvalId"})
                 return
             extra: Dict[str, Any] = {}
-            for key in ("taskId", "taskPrompt", "mode", "coachMode", "operatorTrustLevel"):
+            for key in (
+                "taskId",
+                "taskPrompt",
+                "mode",
+                "coachMode",
+                "operatorTrustLevel",
+                "screenshot",
+                "screenSummary",
+            ):
                 if key in body and body[key] is not None:
                     extra[key] = body[key]
             ok = resolve_approval(
@@ -1490,6 +1589,9 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     break
 
+        def has_multimodal_images() -> bool:
+            return any(isinstance(item.get("content"), list) for item in messages)
+
         def strip_images() -> None:
             for item in messages:
                 content = item.get("content")
@@ -1521,9 +1623,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
             except AgentError as error:
                 detail = str(error).lower()
-                if images and ("image" in detail or "vision" in detail or "modality" in detail):
+                if has_multimodal_images() and ("image" in detail or "vision" in detail or "modality" in detail):
                     log("модель не принимает картинки — читаю только текст вложений")
-                    self.write(sse({"text": "Модель не принимает картинки — читаю текст файла"}, "status"))
+                    self.write(sse({"text": "Модель не принимает картинки — читаю текстовое описание"}, "status"))
                     strip_images()
                     images = []
                     continue
@@ -1566,6 +1668,7 @@ class Handler(BaseHTTPRequestHandler):
 
             call_results = []
             assistant_calls = []
+            captured_screen_images: List[Dict[str, Any]] = []
             for index, call in enumerate(tool_calls[:6]):
                 function = call.get("function") or {}
                 name = str(function.get("name") or "")
@@ -1588,6 +1691,9 @@ class Handler(BaseHTTPRequestHandler):
                     result_text, events = f"Ошибка инструмента: {error}", []
 
                 for event in events:
+                    img = event.pop("_image", None)
+                    if isinstance(img, str) and img.startswith("data:image/"):
+                        captured_screen_images.append({"type": "image_url", "image_url": {"url": img}})
                     if event["type"] == "file":
                         files += 1
                     else:
@@ -1607,14 +1713,31 @@ class Handler(BaseHTTPRequestHandler):
             if use_tools:
                 messages.append({"role": "assistant", "content": content, "tool_calls": assistant_calls})
                 messages.extend(call_results)
+                if captured_screen_images:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Снимок экрана ПК, переданный Оператором после разрешения пользователя:"},
+                                *captured_screen_images[:2],
+                            ],
+                        }
+                    )
             else:
                 messages.append({"role": "assistant", "content": content or "Использую инструмент."})
+                results_text = (
+                    "Результаты инструментов:\n"
+                    + "\n".join(item["content"] for item in call_results)
+                    + "\nЕсли нужно ещё действие — верни следующий JSON. Иначе коротко подтверди выполненное."
+                )
                 messages.append(
                     {
                         "role": "user",
-                        "content": "Результаты инструментов:\n"
-                        + "\n".join(item["content"] for item in call_results)
-                        + "\nЕсли нужно ещё действие — верни следующий JSON. Иначе коротко подтверди выполненное.",
+                        "content": (
+                            [{"type": "text", "text": results_text}, *captured_screen_images[:2]]
+                            if captured_screen_images
+                            else results_text
+                        ),
                     }
                 )
 
@@ -1837,6 +1960,54 @@ def self_test() -> int:
             "parse_coach_response извлекает guidanceForOperator и adviceForUser",
             parsed_coach["guidanceForOperator"] == "hold_key w 0.8s"
             and parsed_coach["adviceForUser"] == "Бежим вперёд к двери",
+        )
+
+        # 9. Снимок экрана ПК через Оператора (inspect_pc_screen) всегда спрашивает разрешение.
+        screen_asked: List[Dict[str, Any]] = []
+
+        def deny_screen(req: Dict[str, Any]) -> Dict[str, Any]:
+            screen_asked.append(req)
+            return {"approved": False, "note": "личный экран"}
+
+        deny_scr_txt, deny_scr_ev = run_tool(
+            "inspect_pc_screen",
+            {"reason": "Посмотреть открытую ошибку в IDE"},
+            trust_level="full",
+            approval_fn=deny_screen,
+            sandbox_root=root,
+        )
+        check(
+            "inspect_pc_screen даже при trust=full всегда запрашивает разрешение пользователя",
+            len(screen_asked) == 1
+            and screen_asked[0].get("kind") == "capture_screen"
+            and screen_asked[0].get("mode") == "inspect"
+            and "отклонил" in deny_scr_txt.lower()
+            and not deny_scr_ev,
+        )
+
+        ok_scr_txt, ok_scr_ev = run_tool(
+            "inspect_pc_screen",
+            {"reason": "Проверить окно ошибки", "focus": "текст ошибки в терминале"},
+            trust_level="verified",
+            approval_fn=lambda req: {
+                "approved": True,
+                "taskId": 88,
+                "screenshot": "data:image/jpeg;base64,/9j/4AAQ",
+                "screenSummary": "Активное окно: Terminal — Ошибка EADDRINUSE на порту 3000",
+            },
+            sandbox_root=root,
+        )
+        check(
+            "inspect_pc_screen по разрешению возвращает описание и прикладывает изображение",
+            "88" in ok_scr_txt
+            and "EADDRINUSE" in ok_scr_txt
+            and any(
+                e.get("type") == "operator_screen"
+                and e.get("taskId") == 88
+                and e.get("hasImage") is True
+                and str(e.get("_image") or "").startswith("data:image/")
+                for e in ok_scr_ev
+            ),
         )
 
     passed = sum(1 for item in checks if item)

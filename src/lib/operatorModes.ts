@@ -2,7 +2,7 @@
  * Режимы работы Оператора и пошаговой помощи после каждого действия.
  */
 
-export type OperatorTaskMode = "autonomous" | "copilot" | "game";
+export type OperatorTaskMode = "autonomous" | "copilot" | "game" | "inspect";
 export type OperatorCoachMode = "off" | "after_step" | "agent";
 export type OperatorTaskSource = "operator" | "agent";
 
@@ -79,7 +79,7 @@ export const OPERATOR_COACH_MODES: ReadonlyArray<{
 
 export function normalizeTaskMode(raw: unknown): OperatorTaskMode {
   const v = String(raw ?? "").trim().toLowerCase();
-  if (v === "copilot" || v === "game" || v === "autonomous") return v;
+  if (v === "copilot" || v === "game" || v === "autonomous" || v === "inspect") return v;
   return DEFAULT_OPERATOR_TASK_MODE;
 }
 
@@ -93,6 +93,16 @@ export function normalizeTaskSource(raw: unknown): OperatorTaskSource {
   return String(raw ?? "").trim().toLowerCase() === "agent" ? "agent" : "operator";
 }
 
+const INSPECT_MODE_OPTION: TaskModeOption = {
+  id: "inspect",
+  label: "Снимок экрана ПК для Агента",
+  shortLabel: "Снимок экрана",
+  description: "Оператор делает свежий снимок экрана и передаёт описание и картинку обратно в Агента.",
+  defaultSteps: 2,
+  badgeClass: "border-cyan-500/40 bg-cyan-500/10 text-cyan-400",
+};
+
 export function findTaskMode(mode: OperatorTaskMode): TaskModeOption {
+  if (mode === "inspect") return INSPECT_MODE_OPTION;
   return OPERATOR_TASK_MODES.find((item) => item.id === mode) ?? OPERATOR_TASK_MODES[0];
 }

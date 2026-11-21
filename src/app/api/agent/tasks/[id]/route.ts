@@ -1,6 +1,7 @@
 import {
   extendAgentTaskSteps,
   getAgentTask,
+  getLatestAgentScreen,
   listAgentEvents,
   respondAgentTaskApproval,
   setAgentTaskGuidance,
@@ -21,8 +22,11 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
   const task = await getAgentTask(me.id, Number(id) || 0);
   if (!task) return Response.json({ error: "Задание не найдено" }, { status: 404 });
 
-  const events = await listAgentEvents(task.id);
-  return Response.json({ task, events }, { headers: { "Cache-Control": "no-store" } });
+  const [events, latestScreen] = await Promise.all([
+    listAgentEvents(task.id),
+    getLatestAgentScreen(task.id),
+  ]);
+  return Response.json({ task, events, latestScreen }, { headers: { "Cache-Control": "no-store" } });
 }
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {

@@ -201,8 +201,15 @@ describe("ручная проверка подключения бота во в�
 
     render(<OperatorPanel />);
 
-    // Отображается карточка подтверждения опасного действия.
-    expect(await screen.findByText(/Подтвердите действие: launch_app calc/)).toBeTruthy();
+    // Отображается всплывающее уведомление подтверждения опасного действия справа внизу.
+    const approvalToast = await screen.findByRole("alertdialog", {
+      name: /Подтвердите действие: launch_app calc/,
+    });
+    const stackEl = document.getElementById("crm-approval-toast-stack");
+    expect(stackEl?.className).toContain("fixed");
+    expect(stackEl?.className).toContain("bottom-4");
+    expect(stackEl?.className).toContain("right-4");
+    expect(stackEl?.contains(approvalToast)).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: /Разрешить выполнение/ }));
     await waitFor(() =>
       expect(taskPosts.some((p) => p.url === "/api/agent/tasks/42" && p.body.action === "approve")).toBe(true),

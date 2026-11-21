@@ -59,7 +59,22 @@ function mockFetch() {
       const method = init?.method ?? "GET";
 
       if (url === "/api/ai/agent" && method === "GET") {
-        return json({ available: true, tools: [] });
+        return json({ available: true, tools: ["create_file", "inspect_pc_screen", "call_operator"] });
+      }
+      if (url === "/api/ai/agent/sandbox" && method === "GET") {
+        return json({
+          available: true,
+          root: "/tmp/sandbox",
+          projects: [
+            { name: "landing-site", files: 4 },
+            { name: "crm-widget", files: 2 },
+          ],
+          items: [
+            { path: "landing-site", type: "dir", size: 0 },
+            { path: "landing-site/index.html", type: "file", size: 240 },
+          ],
+          processes: [],
+        });
       }
       if (url === "/api/ai/agent/operator" && method === "POST") {
         const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
@@ -73,18 +88,19 @@ function mockFetch() {
             notes: "Выбран игровой режим с пошаговым ведением Агента.",
           });
         }
+        const isInspect = body.taskMode === "inspect";
         return json({
           ok: true,
           task: {
-            id: 77,
+            id: isInspect ? 88 : 77,
             prompt: String(body.prompt ?? ""),
             status: "queued",
-            maxSteps: Number(body.maxSteps ?? 30),
+            maxSteps: Number(body.maxSteps ?? (isInspect ? 2 : 30)),
             steps: 0,
             summary: "",
             trustLevel: String(body.trustLevel ?? "verified"),
             taskMode: String(body.taskMode ?? "copilot"),
-            coachMode: String(body.coachMode ?? "agent"),
+            coachMode: String(body.coachMode ?? (isInspect ? "off" : "agent")),
             source: "agent",
             guidanceNote: operatorTaskGuidance,
             createdAt: "2026-11-17T10:00:00.000Z",
@@ -118,6 +134,32 @@ function mockFetch() {
             guidanceNote: operatorTaskGuidance,
             createdAt: "2026-11-17T10:00:00.000Z",
             updatedAt: "2026-11-17T10:01:00.000Z",
+          },
+        });
+      }
+      if (url === "/api/agent/tasks/88" && method === "GET") {
+        return json({
+          task: {
+            id: 88,
+            prompt: "Покажи окно IDE",
+            status: "done",
+            maxSteps: 2,
+            steps: 1,
+            summary: "Снимок экрана ПК (1280×720). Активное окно: VS Code — Ошибка TypeScript",
+            trustLevel: "verified",
+            taskMode: "inspect",
+            coachMode: "off",
+            source: "agent",
+            createdAt: "2026-11-17T10:00:00.000Z",
+            updatedAt: "2026-11-17T10:00:02.000Z",
+          },
+          events: [],
+          latestScreen: {
+            eventId: 901,
+            summary: "Снимок экрана ПК (1280×720). Активное окно: VS Code — Ошибка TypeScript",
+            meta: { type: "inspect_screen", activeWindow: "VS Code" },
+            dataUrl: "data:image/jpeg;base64,/9j/4AAQ",
+            createdAt: "2026-11-17T10:00:02.000Z",
           },
         });
       }
@@ -475,5 +517,77 @@ describe("вкладка «Агент»", () => {
       expect(operatorCalls.some((c) => c.url === "/api/ai/agent/operator" && c.body.action === "formulate")).toBe(true),
     );
     expect(await screen.findByDisplayValue(/Открой окно игры, зажми W на 1 с и нажми E у двери/)).toBeTruthy();
+  });
+
+  it("корректно рендерит sandbox.projects формата {name, files} без ошибки React child", async () => {
+    render(<AgentChat userName="Тест" />);
+    expect(await screen.findByText(/Проекты: landing-site, crm-widget/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Sandbox \(2\)/i }));
+    expect(await screen.findByText("landing-site (4 ф.)")).toBeTruthy();
+    expect(screen.getByText("crm-widget (2 ф.)")).toBeTruthy();
+  });
+
+  it("показывает запрос разрешения внизу справа и передаёт снимок экрана от Оператора в Агента", async () => {
+    render(<AgentChat userName="Тест" />);
+    const textarea = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    await waitFor(() => expect((textarea as HTMLTextAreaElement).disabled).toBe(false));
+
+    const encoder = new TextEncoder();
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              'event: approval_required\ndata: {"approvalId":"appr-screen-1","kind":"capture_screen","title":"Разрешить Оператору сделать снимок экрана ПК?","description":"Нужно увидеть текст ошибки в IDE","task":"Покажи окно IDE","mode":"inspect","maxSteps":2,"operatorTrustLevel":"verified"}\n\n',
+            ),
+          );
+          while (approvalsSent.length === 0) {
+            await new Promise((r) => setTimeout(r, 10));
+          }
+          controller.enqueue(
+            encoder.encode(
+              'event: action\ndata: {"type":"operator_screen","taskId":88,"summary":"Активное окно: VS Code — Ошибка TypeScript","hasImage":true}\n\n',
+            ),
+          );
+          controller.enqueue(encoder.encode('event: text\ndata: {"text":"Вижу ошибку TypeScript в VS Code"}\n\n'));
+          controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    fireEvent.change(textarea, { target: { value: "посмотри какая ошибка у меня на экране" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    const toastDialog = await screen.findByRole("alertdialog", {
+      name: /Разрешить Оператору сделать снимок экрана ПК/,
+    });
+    const stackEl = document.getElementById("crm-approval-toast-stack");
+    expect(stackEl).toBeTruthy();
+    expect(stackEl?.className).toContain("fixed");
+    expect(stackEl?.className).toContain("bottom-4");
+    expect(stackEl?.className).toContain("right-4");
+    expect(stackEl?.contains(toastDialog)).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: /Разрешить Оператору снять экран/i }));
+
+    await waitFor(() =>
+      expect(
+        operatorCalls.some((c) => c.url === "/api/ai/agent/operator" && c.body.taskMode === "inspect"),
+      ).toBe(true),
+    );
+    await waitFor(() => expect(approvalsSent.length).toBe(1));
+    expect(approvalsSent[0]).toMatchObject({
+      approvalId: "appr-screen-1",
+      approved: true,
+      taskId: 88,
+      mode: "inspect",
+      screenshot: "data:image/jpeg;base64,/9j/4AAQ",
+    });
+    expect(String(approvalsSent[0].screenSummary)).toContain("VS Code");
+    expect(await screen.findByText(/Снимок экрана ПК передан Агенту \(#88\)/)).toBeTruthy();
+    expect(await screen.findByText("Вижу ошибку TypeScript в VS Code")).toBeTruthy();
   });
 });

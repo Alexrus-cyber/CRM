@@ -25,6 +25,8 @@ export async function POST(req: Request) {
         mode?: string;
         coachMode?: string;
         operatorTrustLevel?: string;
+        screenshot?: string;
+        screenSummary?: string;
       }
     | null;
 
@@ -32,6 +34,10 @@ export async function POST(req: Request) {
   if (!approvalId) {
     return Response.json({ error: "Не указан approvalId" }, { status: 400 });
   }
+
+  const rawScreenshot = typeof body?.screenshot === "string" ? body.screenshot : "";
+  const validScreenshot =
+    rawScreenshot.startsWith("data:image/") && rawScreenshot.length <= 2_800_000 ? rawScreenshot : "";
 
   try {
     const upstream = await fetch(`${AGENT_URL}/approve`, {
@@ -48,6 +54,10 @@ export async function POST(req: Request) {
         ...(typeof body?.coachMode === "string" ? { coachMode: body.coachMode.slice(0, 40) } : {}),
         ...(typeof body?.operatorTrustLevel === "string"
           ? { operatorTrustLevel: body.operatorTrustLevel.slice(0, 20) }
+          : {}),
+        ...(validScreenshot ? { screenshot: validScreenshot } : {}),
+        ...(typeof body?.screenSummary === "string"
+          ? { screenSummary: body.screenSummary.slice(0, 8000) }
           : {}),
       }),
       cache: "no-store",
