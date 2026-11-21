@@ -369,8 +369,11 @@ def build_mode_system_addon(task_mode: str, coach_mode: str) -> str:
         lines.append(
             "АКТИВЕН ИГРОВОЙ РЕЖИМ (game — управление персонажем и помощь в игре):\n"
             "- Для перемещения персонажа используй hold_key (w/a/s/d/space/shift, seconds 0.2..2.0), "
-            "key_down/key_up, sequence (комбинации вроде бег+прыжок или подойти+нажать E), "
-            "а для поворота камеры/прицела — move_mouse_rel(dx, dy) и mouse_down/mouse_up.\n"
+            "key_down/key_up, key (например e/space/1/tab), sequence (комбинации вроде бег+прыжок или подойти+нажать E), "
+            "а для поворота камеры в 3D-играх от 3-го лица (например Roblox) зажимай ПКМ: "
+            "sequence из mouse_down(right), move_mouse_rel(dx, dy) и mouse_up(right).\n"
+            "- На Windows клавиши hold_key/key_down/key отправляются аппаратным DirectInput-сканкодом прямо в активное окно игры: "
+            "если окно игры уже на переднем плане, не делай лишних кликов по пустому полю.\n"
             "- Держи фокус в окне игры, читай HUD/мини-карту/здоровье/подсказки на экране.\n"
             "- В поле next_advice всегда пиши конкретный следующий игровой ход."
         )
@@ -1339,6 +1342,64 @@ def self_test() -> int:
           and inspect_state["executed"] == 0
           and "1280×720" in inspect_state["summary"])
 
+    # Проверка Win32-структур SendInput (40 байт на 64-bit / 28 байт на 32-bit) и скан-кодов стрелок.
+    import ctypes
+    MouseInput, KeyBdInput, _, _, WinInput = _win32_input_types()
+    ptr_size = ctypes.sizeof(ctypes.c_size_t)
+    expected_input_size = 40 if ptr_size == 8 else 28
+    expected_mouse_size = 32 if ptr_size == 8 else 24
+    expected_kbd_size = 24 if ptr_size == 8 else 16
+    check("Win32 INPUT имеет точный размер для SendInput и корректные make-коды клавиш",
+          ctypes.sizeof(WinInput) == expected_input_size
+          and ctypes.sizeof(MouseInput) == expected_mouse_size
+          and ctypes.sizeof(KeyBdInput) == expected_kbd_size
+          and _win32_scancode_lookup("w") == (0x11, False)
+          and _win32_scancode_lookup("up") == (0x48, True)
+          and _win32_scancode_lookup("down") == (0x50, True)
+          and _win32_scancode_lookup("left") == (0x4B, True)
+          and _win32_scancode_lookup("right") == (0x4D, True)
+          and _win32_scancode_lookup("rshift") == (0x36, False))
+
+    # Проверка парсинга обрезанного JSON саморазбора и достаточного max_tokens у verify_action.
+    truncated_refl = (
+        '{\n  "question": "Почему персонаж не двигается?",\n'
+        '  "diagnosis": "Ввод не дошёл до окна или персонаж упёрся в преп'
+    )
+    parsed_trunc = Operator.parse_reflection(truncated_refl, "что не так?")
+    check("parse_reflection извлекает diagnosis из обрезанного JSON без вывода сырого текста",
+          parsed_trunc["question"] == "Почему персонаж не двигается?"
+          and "Ввод не дошёл" in parsed_trunc["diagnosis"]
+          and not parsed_trunc["diagnosis"].lstrip().startswith("{"))
+
+    verify_payloads: List[Dict[str, Any]] = []
+
+    class VerifyModelHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            if payload:
+                verify_payloads.append(dict(payload))
+            return {"choices": [{"message": {"content": '{"ok": true, "note": "персонаж сдвинулся"}'}}]}
+
+    verify_op = Operator(crm="", token="", base_url="http://127.0.0.1:8000/v1",
+                         model="sim-vl", api_key="", dry_run=False, assume_yes=True,
+                         max_steps=5, delay=0.0, poll=1.0, max_width=1600,
+                         verify_actions=True, self_reflect=False, text_only=False)
+    verify_op.model_http = VerifyModelHttp()  # type: ignore[assignment]
+    verify_op.screenshot = lambda: (  # type: ignore[method-assign]
+        "data:image/jpeg;base64,BBB",
+        {"width": 1280, "height": 720, "screen_width": 1920, "screen_height": 1080},
+    )
+    verdict = verify_op.verify_action(
+        {"type": "hold_key", "key": "w", "seconds": 1.0},
+        "удержание w (1.00 с)",
+        step_context="пройти вперёд",
+    )
+    check("verify_action использует достаточный max_tokens >= 1200 и возвращает валидный вердикт",
+          bool(verify_payloads)
+          and int(verify_payloads[0].get("max_tokens") or 0) >= 1200
+          and verdict is not None
+          and verdict.get("ok") is True)
+
     passed = sum(1 for item in checks if item)
     print("\n{}/{} проверок пройдено".format(passed, len(checks)))
     return 0 if passed == len(checks) else 1
@@ -1508,51 +1569,121 @@ def switch_keyboard_layout(target: str = "toggle") -> str:
     return "переключил раскладку (Alt+Shift)"
 
 
-_WIN_SCANCODES: Dict[str, int] = {
-    "escape": 0x01, "esc": 0x01, "1": 0x02, "2": 0x03, "3": 0x04, "4": 0x05, "5": 0x06,
-    "6": 0x07, "7": 0x08, "8": 0x09, "9": 0x0A, "0": 0x0B, "backspace": 0x0E, "tab": 0x0F,
-    "q": 0x10, "w": 0x11, "e": 0x12, "r": 0x13, "t": 0x14, "y": 0x15, "u": 0x16, "i": 0x17,
-    "o": 0x18, "p": 0x19, "enter": 0x1C, "return": 0x1C, "ctrl": 0x1D, "a": 0x1E, "s": 0x1F,
-    "d": 0x20, "f": 0x21, "g": 0x22, "h": 0x23, "j": 0x24, "k": 0x25, "l": 0x26,
-    "shift": 0x2A, "z": 0x2C, "x": 0x2D, "c": 0x2E, "v": 0x2F, "b": 0x30, "n": 0x31, "m": 0x32,
-    "alt": 0x38, "space": 0x39, "up": 0xC8, "left": 0xCB, "right": 0xCD, "down": 0xD0,
+_WIN_SCANCODES: Dict[str, Tuple[int, bool]] = {
+    "escape": (0x01, False), "esc": (0x01, False),
+    "1": (0x02, False), "2": (0x03, False), "3": (0x04, False), "4": (0x05, False), "5": (0x06, False),
+    "6": (0x07, False), "7": (0x08, False), "8": (0x09, False), "9": (0x0A, False), "0": (0x0B, False),
+    "-": (0x0C, False), "=": (0x0D, False), "backspace": (0x0E, False), "tab": (0x0F, False),
+    "q": (0x10, False), "w": (0x11, False), "e": (0x12, False), "r": (0x13, False), "t": (0x14, False),
+    "y": (0x15, False), "u": (0x16, False), "i": (0x17, False), "o": (0x18, False), "p": (0x19, False),
+    "[": (0x1A, False), "]": (0x1B, False), "enter": (0x1C, False), "return": (0x1C, False),
+    "ctrl": (0x1D, False), "lctrl": (0x1D, False), "rctrl": (0x1D, True),
+    "a": (0x1E, False), "s": (0x1F, False), "d": (0x20, False), "f": (0x21, False), "g": (0x22, False),
+    "h": (0x23, False), "j": (0x24, False), "k": (0x25, False), "l": (0x26, False),
+    ";": (0x27, False), "'": (0x28, False), "`": (0x29, False),
+    "shift": (0x2A, False), "lshift": (0x2A, False), "rshift": (0x36, False),
+    "z": (0x2C, False), "x": (0x2D, False), "c": (0x2E, False), "v": (0x2F, False),
+    "b": (0x30, False), "n": (0x31, False), "m": (0x32, False),
+    ",": (0x33, False), ".": (0x34, False), "/": (0x35, False),
+    "alt": (0x38, False), "lalt": (0x38, False), "ralt": (0x38, True),
+    "space": (0x39, False), "spacebar": (0x39, False), " ": (0x39, False),
+    "capslock": (0x3A, False),
+    "f1": (0x3B, False), "f2": (0x3C, False), "f3": (0x3D, False), "f4": (0x3E, False),
+    "f5": (0x3F, False), "f6": (0x40, False), "f7": (0x41, False), "f8": (0x42, False),
+    "f9": (0x43, False), "f10": (0x44, False), "f11": (0x57, False), "f12": (0x58, False),
+    "home": (0x47, True), "up": (0x48, True), "pageup": (0x49, True), "pgup": (0x49, True),
+    "left": (0x4B, True), "right": (0x4D, True),
+    "end": (0x4F, True), "down": (0x50, True), "pagedown": (0x51, True), "pgdn": (0x51, True),
+    "insert": (0x52, True), "delete": (0x53, True),
 }
+
+_WIN32_SENDINPUT_WARNED = False
+
+
+def _win32_scancode_lookup(key: str) -> Optional[Tuple[int, bool]]:
+    return _WIN_SCANCODES.get(str(key or "").strip().lower())
+
+
+def _win32_input_types() -> Tuple[Any, Any, Any, Any, Any]:
+    """Win32-структуры INPUT (ровно 40 байт на x64, 28 байт на x86 — иначе SendInput возвращает 0)."""
+    import ctypes
+
+    class MouseInput(ctypes.Structure):
+        _fields_ = [
+            ("dx", ctypes.c_int32),
+            ("dy", ctypes.c_int32),
+            ("mouseData", ctypes.c_uint32),
+            ("dwFlags", ctypes.c_uint32),
+            ("time", ctypes.c_uint32),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class KeyBdInput(ctypes.Structure):
+        _fields_ = [
+            ("wVk", ctypes.c_uint16),
+            ("wScan", ctypes.c_uint16),
+            ("dwFlags", ctypes.c_uint32),
+            ("time", ctypes.c_uint32),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class HardwareInput(ctypes.Structure):
+        _fields_ = [
+            ("uMsg", ctypes.c_uint32),
+            ("wParamL", ctypes.c_uint16),
+            ("wParamH", ctypes.c_uint16),
+        ]
+
+    class InputUnion(ctypes.Union):
+        _fields_ = [
+            ("mi", MouseInput),
+            ("ki", KeyBdInput),
+            ("hi", HardwareInput),
+        ]
+
+    class Input(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_uint32),
+            ("ii", InputUnion),
+        ]
+
+    return MouseInput, KeyBdInput, HardwareInput, InputUnion, Input
+
+
+def _win32_dispatch_input(inp: Any, InputCls: Any) -> bool:
+    global _WIN32_SENDINPUT_WARNED
+    import ctypes
+
+    ctypes.set_last_error(0)
+    sent = ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(InputCls))
+    if sent == 1:
+        return True
+    err = ctypes.get_last_error()
+    if not _WIN32_SENDINPUT_WARNED:
+        _WIN32_SENDINPUT_WARNED = True
+        hint = " (если игра запущена от администратора, запустите Оператора тоже от администратора)" if err == 5 else ""
+        log("[!] Win32 SendInput не доставил событие (sent={}, err={}{})".format(sent, err, hint))
+    return False
 
 
 def _win32_send_scancode(key: str, down: bool) -> bool:
     """Низкоуровневый DirectInput-сканкод на Windows (нужен для 3D-игр)."""
     if platform.system() != "Windows":
         return False
-    code = _WIN_SCANCODES.get(key.lower())
-    if code is None:
+    entry = _win32_scancode_lookup(key)
+    if entry is None:
         return False
+    code, extended = entry
     try:
-        import ctypes
-
-        PUL = ctypes.POINTER(ctypes.c_ulong)
-
-        class KeyBdInput(ctypes.Structure):
-            _fields_ = [
-                ("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
-                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", PUL),
-            ]
-
-        class InputUnion(ctypes.Union):
-            _fields_ = [("ki", KeyBdInput)]
-
-        class Input(ctypes.Structure):
-            _fields_ = [("type", ctypes.c_ulong), ("ii", InputUnion)]
-
+        _, KeyBdInput, _, InputUnion, Input = _win32_input_types()
         flags = 0x0008  # KEYEVENTF_SCANCODE
-        if code >= 0xC8:
+        if extended:
             flags |= 0x0001  # KEYEVENTF_EXTENDEDKEY
         if not down:
             flags |= 0x0002  # KEYEVENTF_KEYUP
-        extra = ctypes.c_ulong(0)
-        ii = InputUnion(ki=KeyBdInput(0, code & 0xFF, flags, 0, ctypes.pointer(extra)))
+        ii = InputUnion(ki=KeyBdInput(0, code & 0xFF, flags, 0, 0))
         inp = Input(1, ii)
-        ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
-        return True
+        return _win32_dispatch_input(inp, Input)
     except Exception:  # noqa: BLE001
         return False
 
@@ -1562,28 +1693,33 @@ def _win32_move_mouse_rel(dx: int, dy: int) -> bool:
     if platform.system() != "Windows":
         return False
     try:
-        import ctypes
-
-        PUL = ctypes.POINTER(ctypes.c_ulong)
-
-        class MouseInput(ctypes.Structure):
-            _fields_ = [
-                ("dx", ctypes.c_long), ("dy", ctypes.c_long),
-                ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
-                ("time", ctypes.c_ulong), ("dwExtraInfo", PUL),
-            ]
-
-        class InputUnion(ctypes.Union):
-            _fields_ = [("mi", MouseInput)]
-
-        class Input(ctypes.Structure):
-            _fields_ = [("type", ctypes.c_ulong), ("ii", InputUnion)]
-
-        extra = ctypes.c_ulong(0)
-        ii = InputUnion(mi=MouseInput(int(dx), int(dy), 0, 0x0001, 0, ctypes.pointer(extra)))
+        MouseInput, _, _, InputUnion, Input = _win32_input_types()
+        ii = InputUnion(mi=MouseInput(int(dx), int(dy), 0, 0x0001, 0, 0))
         inp = Input(0, ii)
-        ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
-        return True
+        return _win32_dispatch_input(inp, Input)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _win32_mouse_button(button: str, down: bool) -> bool:
+    """Нажатие/отпускание кнопки мыши через 40-байтный SendInput на Windows."""
+    if platform.system() != "Windows":
+        return False
+    btn = str(button or "left").strip().lower()
+    flag_map = {
+        "left": (0x0002, 0x0004),
+        "right": (0x0008, 0x0010),
+        "middle": (0x0020, 0x0040),
+    }
+    pair = flag_map.get(btn)
+    if not pair:
+        return False
+    try:
+        MouseInput, _, _, InputUnion, Input = _win32_input_types()
+        flag = pair[0] if down else pair[1]
+        ii = InputUnion(mi=MouseInput(0, 0, 0, flag, 0, 0))
+        inp = Input(0, ii)
+        return _win32_dispatch_input(inp, Input)
     except Exception:  # noqa: BLE001
         return False
 
@@ -1602,12 +1738,42 @@ def send_key_state(key: str, down: bool) -> None:
         pyautogui.keyUp(clean)
 
 
-def send_mouse_rel(dx: int, dy: int) -> None:
-    """Сдвигает мышь относительно текущей позиции (камера/прицел)."""
-    if _win32_move_mouse_rel(dx, dy):
+def send_key_tap(key: str, hold_seconds: float = 0.05) -> None:
+    """Нажимает и отпускает клавишу (с DirectInput-приоритетом на Windows)."""
+    clean = str(key or "").strip().lower()
+    if not clean:
+        return
+    if _win32_send_scancode(clean, down=True):
+        time.sleep(max(0.02, hold_seconds))
+        _win32_send_scancode(clean, down=False)
         return
     require_pyautogui()
-    pyautogui.moveRel(int(dx), int(dy), duration=0.08)
+    pyautogui.press(clean)
+
+
+def send_mouse_rel(dx: int, dy: int) -> None:
+    """Сдвигает мышь относительно текущей позиции (плавно при больших углах для 3D-камеры)."""
+    dx_i = int(dx)
+    dy_i = int(dy)
+    max_delta = max(abs(dx_i), abs(dy_i))
+    if max_delta > 30:
+        steps = min(14, max(3, max_delta // 25))
+        rem_x, rem_y = dx_i, dy_i
+        for i in range(steps):
+            left = steps - i
+            step_x = int(round(rem_x / left))
+            step_y = int(round(rem_y / left))
+            rem_x -= step_x
+            rem_y -= step_y
+            if not _win32_move_mouse_rel(step_x, step_y):
+                require_pyautogui()
+                pyautogui.moveRel(step_x, step_y, duration=0.01)
+            time.sleep(0.008)
+        return
+    if _win32_move_mouse_rel(dx_i, dy_i):
+        return
+    require_pyautogui()
+    pyautogui.moveRel(dx_i, dy_i, duration=0.08)
 
 
 def type_text(text: str) -> None:
@@ -1920,9 +2086,10 @@ class Operator:
             ]},
         ]
         payload: Dict[str, Any] = {"model": self.model, "messages": messages,
-                                   "temperature": 0, "max_tokens": 240, "stream": False}
+                                   "temperature": 0, "max_tokens": 1200, "stream": False}
         self.apply_generation(payload)
         payload["temperature"] = 0
+        payload["max_tokens"] = max(1200, int(payload.get("max_tokens") or 0))
         headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
         try:
             data = self.model_http.call("POST", "/chat/completions", payload, timeout=120,
@@ -1960,6 +2127,17 @@ class Operator:
                 "next_strategy": str(data.get("next_strategy") or "").strip()[:400],
             }
         cleaned = _strip_thinking(text)
+        # Если JSON оборвался по max_tokens, вытаскиваем хотя бы partial diagnosis/next_strategy.
+        if cleaned.lstrip().startswith("{"):
+            diag_m = re.search(r'"diagnosis"\s*:\s*"([^"\n]*)', cleaned)
+            strat_m = re.search(r'"next_strategy"\s*:\s*"([^"\n]*)', cleaned)
+            q_m = re.search(r'"question"\s*:\s*"([^"\n]*)', cleaned)
+            if diag_m or strat_m:
+                return {
+                    "question": (q_m.group(1) if q_m else default_question).strip()[:280],
+                    "diagnosis": (diag_m.group(1) if diag_m else "").strip()[:400],
+                    "next_strategy": (strat_m.group(1) if strat_m else "").strip()[:400],
+                }
         return {
             "question": default_question[:280],
             "diagnosis": cleaned[:400] if cleaned else "Предыдущее действие не дало ожидаемого результата.",
@@ -2011,12 +2189,13 @@ class Operator:
                     {"role": "user", "content": user_content},
                 ],
                 "temperature": 0.3,
-                "max_tokens": 360,
+                "max_tokens": 1200,
                 "stream": False,
             }
             self.apply_generation(payload)
             if (self.generation or {}).get("temperature") is None:
                 payload["temperature"] = 0.3
+            payload["max_tokens"] = max(1200, int(payload.get("max_tokens") or 0))
             headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
             try:
                 data = self.model_http.call("POST", "/chat/completions", payload, timeout=120,
@@ -2385,12 +2564,26 @@ class Operator:
             keys = [str(key).lower() for key in (action.get("keys") or []) if str(key).strip()]
             if not keys:
                 return "нет клавиш"
-            pyautogui.hotkey(*keys)
+            if platform.system() == "Windows" and all(_win32_scancode_lookup(k) is not None for k in keys):
+                pressed: List[str] = []
+                try:
+                    for k in keys:
+                        send_key_state(k, down=True)
+                        pressed.append(k)
+                        time.sleep(0.02)
+                    time.sleep(0.04)
+                finally:
+                    for k in reversed(pressed):
+                        send_key_state(k, down=False)
+                        time.sleep(0.015)
+            else:
+                require_pyautogui()
+                pyautogui.hotkey(*keys)
             return "нажато: " + " + ".join(keys)
 
         if kind == "key":
             key = str(action.get("key") or "enter").lower()
-            pyautogui.press(key)
+            send_key_tap(key, hold_seconds=0.05 if self.current_task_mode() == "game" else 0.03)
             return "нажата клавиша " + key
 
         if kind == "scroll":
@@ -2424,13 +2617,17 @@ class Operator:
             if action.get("x") is not None and action.get("y") is not None:
                 x, y = self.to_screen(action.get("x"), action.get("y"))
                 self.ensure_cursor(x, y)
-            pyautogui.mouseDown(button=button)
+            if not _win32_mouse_button(button, down=True):
+                require_pyautogui()
+                pyautogui.mouseDown(button=button)
             self._held_buttons.add(button)
             return "зажата кнопка мыши " + button
 
         if kind == "mouse_up":
             button = str(action.get("button") or "left").lower()
-            pyautogui.mouseUp(button=button)
+            if not _win32_mouse_button(button, down=False):
+                require_pyautogui()
+                pyautogui.mouseUp(button=button)
             self._held_buttons.discard(button)
             return "отпущена кнопка мыши " + button
 
@@ -2489,7 +2686,7 @@ class Operator:
             self._held_keys.discard(key)
         for btn in list(self._held_buttons):
             try:
-                if pyautogui is not None:
+                if not _win32_mouse_button(btn, down=False) and pyautogui is not None:
                     pyautogui.mouseUp(button=btn)
             except Exception:  # noqa: BLE001
                 pass
