@@ -4,7 +4,8 @@
 
 | Файл | Что это | Зависимости |
 | --- | --- | --- |
-| `agent.py` | агент для вкладки «Агент» на странице `/ai`: диалог, файлы, открытие сайтов и видео | нет, только стандартная библиотека Python |
+| `agent.py` | агент для вкладки «Агент» на странице `/ai`: диалог, файлы, песочница, интерактивный осмотр проектов | нет, только стандартная библиотека Python |
+| `browser_inspector.py` | интерактивный браузерный инспектор (`browse_project`): CDP поверх Chromium/Chrome/Edge без pip | нет (использует системный Chrome/Edge/Chromium) |
 | `desktop_operator.py` | бот-оператор рабочего стола: смотрит на экран, кликает, печатает, делает файлы | `pyautogui`, `Pillow`, `pyperclip` |
 | `fileforge.py` | сборка файлов (docx, xlsx, csv, md, html, svg, zip…) | нет |
 | `requirements.txt` | зависимости **оператора** | — |
@@ -22,7 +23,10 @@ JSON, urllib). CRM находит его по переменной `AGENT_URL`
 
 Инструменты: `create_file` (docx/xlsx/csv/md/html/svg/json/zip/txt),
 `open_website`, `play_youtube`, `sandbox_*` (изолированная песочница),
-`run_command`, `export_from_sandbox`, а также совместная работа с Оператором:
+`run_command`, `export_from_sandbox`, `browse_project` (интерактивно заходит
+на сайт/проект из Sandbox или по URL в изолированном headless Chromium/Chrome/Edge:
+кликает, наводит курсор, скроллит, проверяет мобильную и десктопную вёрстку,
+анимации и переходы, ошибки консоли/сети и скриншоты), а также совместная работа с Оператором:
 `formulate_operator_task` (помощь в формулировке задачи для экрана/игры),
 `inspect_pc_screen` (запрос снимка экрана ПК у Оператора, если не хватает видимости —
 строго с разрешения пользователя во всплывающем уведомлении) и
@@ -30,7 +34,7 @@ JSON, urllib). CRM находит его по переменной `AGENT_URL`
 + `POST /coach` для подсказок после каждого действия.
 
 Переменные: `AGENT_HOST`, `AGENT_PORT`, `AGENT_BASE_URL`, `AGENT_MODEL`,
-`AGENT_API_KEY`, `AGENT_WORKSPACE`, `AGENT_MAX_STEPS`, `AGENT_TIMEOUT`.
+`AGENT_API_KEY`, `AGENT_WORKSPACE`, `AGENT_MAX_STEPS`, `AGENT_TIMEOUT`, `AGENT_BROWSER_PATH`.
 
 ## Оператор рабочего стола (`desktop_operator.py`)
 

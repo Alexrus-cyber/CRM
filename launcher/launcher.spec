@@ -29,8 +29,8 @@ REPO = ROOT.parent                              # корень репозито�
 
 datas = []
 agents_src = REPO / "agent"
-for name in ("desktop_operator.py", "agent.py", "fileforge.py",
-             "requirements.txt", "OPERATOR.md", "README.md"):
+for name in ("desktop_operator.py", "agent.py", "fileforge.py", "sandbox.py",
+             "browser_inspector.py", "requirements.txt", "OPERATOR.md", "README.md"):
     candidate = agents_src / name
     if candidate.is_file():
         datas.append((str(candidate), "agents"))
