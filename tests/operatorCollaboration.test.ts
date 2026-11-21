@@ -107,6 +107,44 @@ describe("связка Агент ↔ Оператор, режимы и поша
     expect(fallback.source).toBe("heuristic");
     expect(fallback.guidanceForOperator).toContain("экран обновлён");
     expect(fallback.guidanceForOperator).toContain("hold_key");
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          phase?: string;
+          plannedAction?: { type?: string };
+          aimPoint?: { x?: number; y?: number };
+        };
+        expect(body.phase).toBe("before_action");
+        expect(body.plannedAction?.type).toBe("double_click");
+        expect(body.aimPoint).toEqual({ x: 340, y: 200 });
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            approved: false,
+            visionUsed: true,
+            reason: "крестик чуть выше кнопки",
+            guidanceForOperator: "Смести курсор на 20px ниже",
+            adviceForUser: "Поправляем наведение перед двойным кликом",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+    const beforeCheck = await requestAgentStepCoaching({
+      agentUrl: "http://127.0.0.1:8899",
+      taskPrompt: "Открой папку",
+      taskMode: "copilot",
+      phase: "before_action",
+      step: 1,
+      plannedAction: { type: "double_click", x: 340, y: 200 },
+      aimPoint: { x: 340, y: 200 },
+      screenshot: "data:image/jpeg;base64,AAA",
+    });
+    expect(beforeCheck.approved).toBe(false);
+    expect(beforeCheck.visionUsed).toBe(true);
+    expect(beforeCheck.reason).toContain("выше кнопки");
   });
 
   it("describeAction переводит игровые и интерактивные действия на русский", () => {
