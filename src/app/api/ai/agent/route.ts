@@ -1,8 +1,15 @@
-import { getRagFolder, listRagChunks, recordAgentUsage, searchRagChunks } from "@/db/repo";
+import {
+  getGithubConnectionWithSecret,
+  getRagFolder,
+  listRagChunks,
+  recordAgentUsage,
+  searchRagChunks,
+} from "@/db/repo";
 import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { estimateTokens, normalizeBaseUrl } from "@/lib/ai";
 import { AGENT_MAX_STEPS, isUnlimitedStepsRole, normalizeGenParams, resolveStepsForRole } from "@/lib/genParams";
+import { buildGithubRagSnapshot } from "@/lib/github";
 import {
   RAG_FULL_MAX_CHARS,
   formatFullRagContext,
@@ -77,6 +84,10 @@ export async function POST(req: Request) {
         ragFull?: boolean;
         ragChunks?: number;
         contextLimit?: number;
+        githubEnabled?: boolean;
+        githubOwner?: string;
+        githubRepo?: string;
+        githubBranch?: string;
       }
     | null;
 
@@ -182,6 +193,54 @@ export async function POST(req: Request) {
     }
   }
 
+  // Персональный GitHub-контекст и RAG по выбранному репозиторию текущего пользователя CRM.
+  const ghConn = await getGithubConnectionWithSecret(me.id).catch(() => null);
+  const useGithub = Boolean(ghConn && (body?.githubEnabled ?? ghConn.enabled));
+  const ghOwner = useGithub ? (String(body?.githubOwner || ghConn?.selectedOwner || "").trim()) : "";
+  const ghRepo = useGithub ? (String(body?.githubRepo || ghConn?.selectedRepo || "").trim()) : "";
+  const ghBranch = useGithub ? (String(body?.githubBranch || ghConn?.selectedBranch || "main").trim() || "main") : "";
+
+  let githubRagContext = "";
+  let githubMeta: {
+    login: string;
+    owner: string;
+    repo: string;
+    branch: string;
+    fileCount: number;
+    matchedFiles: string[];
+  } | null = null;
+
+  if (useGithub && ghConn && ghOwner && ghRepo) {
+    const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+    try {
+      const snap = await buildGithubRagSnapshot({
+        token: ghConn.token,
+        owner: ghOwner,
+        repo: ghRepo,
+        branch: ghBranch,
+        query: lastUser,
+      });
+      githubRagContext = snap.contextText;
+      githubMeta = {
+        login: ghConn.login,
+        owner: ghOwner,
+        repo: ghRepo,
+        branch: ghBranch,
+        fileCount: snap.fileCount,
+        matchedFiles: snap.matchedFiles,
+      };
+    } catch {
+      githubMeta = {
+        login: ghConn.login,
+        owner: ghOwner,
+        repo: ghRepo,
+        branch: ghBranch,
+        fileCount: 0,
+        matchedFiles: [],
+      };
+    }
+  }
+
   const params = normalizeGenParams(body?.params, { unlimited: unlimitedSteps });
   const maxSteps = resolveStepsForRole(me.role, body?.maxSteps, unlimitedSteps ? 0 : AGENT_MAX_STEPS);
   const trustLevel = normalizeTrustLevel(body?.trustLevel);
@@ -208,11 +267,27 @@ export async function POST(req: Request) {
       apiKey: (body?.settings?.apiKey ?? "").trim().slice(0, 400),
       model: (body?.settings?.model ?? "").trim().slice(0, 200),
     },
+    ...(useGithub && ghConn
+      ? {
+          github: {
+            userId: me.id,
+            login: ghConn.login,
+            name: ghConn.name,
+            email: ghConn.email,
+            token: ghConn.token,
+            owner: ghOwner,
+            repo: ghRepo,
+            branch: ghBranch,
+          },
+        }
+      : {}),
     context: {
       user: me.name,
       roleLabel: ROLE_LABELS[me.role] ?? me.role,
       today: new Date().toISOString().slice(0, 10),
       ...(ragContext ? { ragContext, ragMeta } : {}),
+      ...(githubRagContext ? { githubRagContext } : {}),
+      ...(githubMeta ? { githubMeta } : {}),
     },
   };
 
@@ -241,6 +316,7 @@ export async function POST(req: Request) {
     messages.reduce((sum, m) => sum + estimateTokens(m.content), 0) +
     estimateTokens(systemPrompt) +
     estimateTokens(ragContext) +
+    estimateTokens(githubRagContext) +
     attachments.reduce((sum, a) => sum + estimateTokens(a.text), 0);
   const modelName = payload.settings.model || "";
   const upstreamReader = upstream.body.getReader();

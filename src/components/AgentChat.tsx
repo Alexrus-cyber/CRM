@@ -24,6 +24,9 @@ import {
   FolderOutput,
   Gamepad2,
   Gauge,
+  GitCommitHorizontal,
+  GitMerge,
+  GitPullRequest,
   History,
   Loader2,
   MessageSquarePlus,
@@ -80,6 +83,7 @@ import {
   type OperatorTask,
 } from "./operator/shared";
 import { ApprovalToast } from "./ApprovalToast";
+import { GithubIcon, GithubIntegrationPanel, type GithubAccountPublic } from "./agent/GithubIntegrationPanel";
 
 /**
  * Вкладка «Агент» блока ИИ (только главный администратор).
@@ -103,7 +107,11 @@ type AgentAction = {
     | "operator_plan"
     | "operator_task"
     | "operator_screen"
-    | "browser_inspect";
+    | "browser_inspect"
+    | "github_edit"
+    | "github_commit"
+    | "github_pr"
+    | "github_merge";
   action?: string;
   url?: string;
   title?: string;
@@ -133,6 +141,18 @@ type AgentAction = {
   animationsCount?: number;
   errorsCount?: number;
   preview?: string;
+  owner?: string;
+  repo?: string;
+  branch?: string;
+  sha?: string;
+  number?: number;
+  method?: string;
+  pushed?: boolean;
+  authorLogin?: string;
+  message?: string;
+  head?: string;
+  base?: string;
+  bytes?: number;
 };
 
 type Turn = {
@@ -206,6 +226,27 @@ type PendingApproval = {
   maxSteps?: number;
   coachAfterEachStep?: boolean;
   operatorTrustLevel?: string;
+  github?: {
+    login?: string;
+    authorName?: string;
+    authorEmail?: string;
+    owner?: string;
+    repo?: string;
+    branch?: string;
+    message?: string;
+    push?: boolean;
+    files?: string[];
+    diffPreview?: string;
+    head?: string;
+    base?: string;
+    prTitle?: string;
+    prBody?: string;
+    draft?: boolean;
+    pullNumber?: number;
+    mergeMethod?: string;
+    mergeableState?: string;
+    url?: string;
+  };
 };
 
 type SandboxProject = { name: string; files?: number };
@@ -496,6 +537,15 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const [ragProgress, setRagProgress] = useState<{ done: number; total: number; phase: "read" | "upload" } | null>(null);
   const [ragOpen, setRagOpen] = useState(false);
 
+  // Персональное подключение GitHub (GitHub-RAG, правки кода, Commit / PR / Merge от своего лица).
+  const [ghAccount, setGhAccount] = useState<GithubAccountPublic | null>(null);
+  const [ghOauthAvailable, setGhOauthAvailable] = useState(false);
+  const [approvalGhCommitMsg, setApprovalGhCommitMsg] = useState("");
+  const [approvalGhBranch, setApprovalGhBranch] = useState("");
+  const [approvalGhPrTitle, setApprovalGhPrTitle] = useState("");
+  const [approvalGhPrBody, setApprovalGhPrBody] = useState("");
+  const [approvalGhMergeMethod, setApprovalGhMergeMethod] = useState<"merge" | "squash" | "rebase">("merge");
+
   // Песочница Sandbox и экспорт на ПК.
   const [sandbox, setSandbox] = useState<SandboxState | null>(null);
   const [sandboxOpen, setSandboxOpen] = useState(false);
@@ -606,6 +656,35 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       /* фоновая проверка — тихо игнорируем */
     }
   }, []);
+
+  const refreshGithubConnection = useCallback(async () => {
+    try {
+      const res = await fetch("/api/github/connection", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json().catch(() => null)) as {
+        connected?: boolean;
+        account?: GithubAccountPublic | null;
+        oauthAvailable?: boolean;
+      } | null;
+      if (!data) return;
+      setGhAccount(data.connected && data.account ? data.account : null);
+      setGhOauthAvailable(Boolean(data.oauthAvailable));
+    } catch {
+      /* тихо */
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshGithubConnection();
+    if (typeof window !== "undefined") {
+      const paramsUrl = new URLSearchParams(window.location.search);
+      if (paramsUrl.get("gh_connected") === "1") {
+        setNotice("GitHub-аккаунт успешно привязан через OAuth.");
+      } else if (paramsUrl.get("gh_error")) {
+        setError(`Ошибка GitHub OAuth: ${paramsUrl.get("gh_error")}`);
+      }
+    }
+  }, [refreshGithubConnection]);
 
   const refreshRagFolders = useCallback(async () => {
     try {
@@ -1413,6 +1492,23 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           approvalId: pendingApproval.approvalId,
           approved,
           destination: approvalDest.trim(),
+          ...(pendingApproval.kind === "github_commit"
+            ? {
+                commitMessage: approvalGhCommitMsg.trim() || pendingApproval.github?.message || "",
+                branch: approvalGhBranch.trim() || pendingApproval.github?.branch || "",
+              }
+            : {}),
+          ...(pendingApproval.kind === "github_pr"
+            ? {
+                prTitle: approvalGhPrTitle.trim() || pendingApproval.github?.prTitle || "",
+                prBody: approvalGhPrBody,
+              }
+            : {}),
+          ...(pendingApproval.kind === "github_merge"
+            ? {
+                mergeMethod: approvalGhMergeMethod,
+              }
+            : {}),
           ...(launchedTaskId !== undefined
             ? {
                 taskId: launchedTaskId,
@@ -1837,6 +1933,14 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           ragFull: ragPrefs.ragFull,
           ragChunks: ragPrefs.ragChunks,
           contextLimit,
+          ...(ghAccount && ghAccount.enabled && ghAccount.selectedOwner && ghAccount.selectedRepo
+            ? {
+                githubEnabled: true,
+                githubOwner: ghAccount.selectedOwner,
+                githubRepo: ghAccount.selectedRepo,
+                githubBranch: ghAccount.selectedBranch || "main",
+              }
+            : { githubEnabled: false }),
           attachments: attachments.map((file) => ({
             name: file.name,
             note: file.note,
@@ -1884,11 +1988,15 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           if (event === "status") {
             setStatus(String(data.text ?? ""));
           } else if (event === "approval_required") {
+            const ghPayload =
+              data.github && typeof data.github === "object"
+                ? (data.github as Record<string, unknown>)
+                : undefined;
             const req: PendingApproval = {
               approvalId: String(data.approvalId ?? ""),
               kind: String(data.kind ?? "command"),
               title: String(data.title ?? "Требуется подтверждение"),
-              description: String(data.description ?? ""),
+              description: String(data.description ?? data.reason ?? ""),
               command: data.command ? String(data.command) : undefined,
               cwd: data.cwd ? String(data.cwd) : undefined,
               url: data.url ? String(data.url) : undefined,
@@ -1901,6 +2009,29 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               coachAfterEachStep:
                 typeof data.coachAfterEachStep === "boolean" ? data.coachAfterEachStep : true,
               operatorTrustLevel: data.operatorTrustLevel ? String(data.operatorTrustLevel) : undefined,
+              github: ghPayload
+                ? {
+                    login: ghPayload.login ? String(ghPayload.login) : undefined,
+                    authorName: ghPayload.authorName ? String(ghPayload.authorName) : undefined,
+                    authorEmail: ghPayload.authorEmail ? String(ghPayload.authorEmail) : undefined,
+                    owner: ghPayload.owner ? String(ghPayload.owner) : undefined,
+                    repo: ghPayload.repo ? String(ghPayload.repo) : undefined,
+                    branch: ghPayload.branch ? String(ghPayload.branch) : undefined,
+                    message: ghPayload.message ? String(ghPayload.message) : undefined,
+                    push: typeof ghPayload.push === "boolean" ? ghPayload.push : undefined,
+                    files: Array.isArray(ghPayload.files) ? ghPayload.files.map(String) : undefined,
+                    diffPreview: ghPayload.diffPreview ? String(ghPayload.diffPreview) : undefined,
+                    head: ghPayload.head ? String(ghPayload.head) : undefined,
+                    base: ghPayload.base ? String(ghPayload.base) : undefined,
+                    prTitle: ghPayload.prTitle ? String(ghPayload.prTitle) : undefined,
+                    prBody: ghPayload.prBody ? String(ghPayload.prBody) : undefined,
+                    draft: typeof ghPayload.draft === "boolean" ? ghPayload.draft : undefined,
+                    pullNumber: typeof ghPayload.pullNumber === "number" ? ghPayload.pullNumber : undefined,
+                    mergeMethod: ghPayload.mergeMethod ? String(ghPayload.mergeMethod) : undefined,
+                    mergeableState: ghPayload.mergeableState ? String(ghPayload.mergeableState) : undefined,
+                    url: ghPayload.url ? String(ghPayload.url) : undefined,
+                  }
+                : undefined,
             };
             setPendingApproval(req);
             setScreenCapture(null);
@@ -1913,8 +2044,23 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             } else if (req.kind === "capture_screen") {
               setApprovalTaskDraft(req.task ?? req.description ?? "");
               setApprovalOpTrust(req.operatorTrustLevel === "full" ? "full" : "verified");
+            } else if (req.kind === "github_commit") {
+              setApprovalGhCommitMsg(req.github?.message ?? "");
+              setApprovalGhBranch(req.github?.branch ?? "");
+            } else if (req.kind === "github_pr") {
+              setApprovalGhPrTitle(req.github?.prTitle ?? "");
+              setApprovalGhPrBody(req.github?.prBody ?? "");
+            } else if (req.kind === "github_merge") {
+              const mm = req.github?.mergeMethod;
+              setApprovalGhMergeMethod(mm === "squash" || mm === "rebase" ? mm : "merge");
             }
             scrollDown();
+          } else if (event === "github") {
+            const ghRepoName = `${String(data.owner ?? "")}/${String(data.repo ?? "")}`;
+            const ghBr = String(data.branch ?? "main");
+            setNotice(
+              `GitHub-RAG: ${ghRepoName}@${ghBr} · аккаунт @${String(data.login ?? "")} (${Number(data.fileCount ?? 0)} файлов индекса).`,
+            );
           } else if (event === "rag") {
             setNotice(
               `RAG «${String(data.folderName ?? "папка")}»: подключено ${Number(data.hits ?? 0)} из ${Number(data.totalChunks ?? 0)} фрагментов${data.truncated ? " (обрезано по лимиту контекста)" : ""}.`,
@@ -1992,6 +2138,18 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 animationsCount: typeof data.animationsCount === "number" ? data.animationsCount : undefined,
                 errorsCount: typeof data.errorsCount === "number" ? data.errorsCount : undefined,
                 preview: typeof data.preview === "string" && data.preview.startsWith("data:image/") ? data.preview : undefined,
+                owner: data.owner ? String(data.owner) : undefined,
+                repo: data.repo ? String(data.repo) : undefined,
+                branch: data.branch ? String(data.branch) : undefined,
+                sha: data.sha ? String(data.sha) : undefined,
+                number: typeof data.number === "number" ? data.number : undefined,
+                method: data.method ? String(data.method) : undefined,
+                pushed: typeof data.pushed === "boolean" ? data.pushed : undefined,
+                authorLogin: data.authorLogin ? String(data.authorLogin) : undefined,
+                message: data.message ? String(data.message) : undefined,
+                head: data.head ? String(data.head) : undefined,
+                base: data.base ? String(data.base) : undefined,
+                bytes: typeof data.bytes === "number" ? data.bytes : undefined,
               };
               assistantDraft.actions.push(action);
               patch((t) => ({ ...t, actions: [...t.actions, action] }));
@@ -2146,6 +2304,28 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         <span className={cn("rounded-md border px-1.5 py-0.5 text-[10px] font-medium", trustMeta.badgeClass)}>
           {trustMeta.shortLabel}
         </span>
+        <button
+          type="button"
+          onClick={() => {
+            if (isTabs) setActiveTab("knowledge");
+          }}
+          className={cn(
+            "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium transition",
+            ghAccount && ghAccount.enabled && ghAccount.selectedRepo
+              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20"
+              : ghAccount
+                ? "border-amber-500/40 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20"
+                : "border-border bg-card2 text-muted hover:text-text",
+          )}
+          title="Открыть настройки GitHub-RAG и привязанного аккаунта"
+        >
+          <GithubIcon size={11} />
+          {ghAccount
+            ? ghAccount.selectedRepo
+              ? `@${ghAccount.login} · ${ghAccount.selectedOwner}/${ghAccount.selectedRepo}@${ghAccount.selectedBranch || "main"}`
+              : `GitHub @${ghAccount.login} · выберите репо`
+            : "Подключить GitHub"}
+        </button>
         {health?.endpoint && <span className="text-muted">· {health.endpoint}</span>}
         <div
           role="group"
@@ -2490,6 +2670,15 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             </p>
           </div>
         </div>
+
+        {/* Подключение персонального GitHub-аккаунта (GitHub-RAG, правки кода, Commit / PR / Merge) */}
+        <GithubIntegrationPanel
+          account={ghAccount}
+          oauthAvailable={ghOauthAvailable}
+          disabled={running}
+          onAccountChange={setGhAccount}
+          onNotify={(msg) => setNotice(msg)}
+        />
 
       {/* Панель настройки RAG-папки */}
       {ragOpen && (
@@ -3433,6 +3622,125 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                         </div>
                       );
                     }
+                    if (action.type === "github_edit") {
+                      return (
+                        <div
+                          key={`gh-edit-${index}`}
+                          className="flex items-center gap-2 rounded-xl border border-sky-500/35 bg-sky-500/10 px-2.5 py-2 text-[11px]"
+                        >
+                          <GithubIcon size={13} className="shrink-0 text-sky-400" />
+                          <span className="min-w-0 flex-1 truncate text-text">
+                            GitHub ({action.mode === "delete" ? "удалён" : action.mode === "create" ? "создан" : "обновлён"}):{" "}
+                            <span className="font-mono">{action.path}</span>
+                            {action.branch ? ` · ${action.branch}` : ""}
+                          </span>
+                        </div>
+                      );
+                    }
+                    if (action.type === "github_commit") {
+                      return (
+                        <div
+                          key={`gh-commit-${index}`}
+                          className="flex items-start gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-2 text-[11px]"
+                        >
+                          <GitCommitHorizontal size={13} className="mt-0.5 shrink-0 text-emerald-400" />
+                          <div className="min-w-0 flex-1 space-y-0.5">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-medium text-text">
+                                Commit {action.sha ? action.sha.slice(0, 7) : ""}
+                                {action.pushed ? " + Push" : ""} · {action.owner}/{action.repo}@{action.branch}
+                              </span>
+                              {action.authorLogin && (
+                                <span className="rounded bg-card px-1.5 py-0.5 text-[10px] text-emerald-400">
+                                  @{action.authorLogin}
+                                </span>
+                              )}
+                            </div>
+                            {action.message && <p className="text-[10px] text-muted">{action.message}</p>}
+                          </div>
+                          {action.url && (
+                            <a
+                              href={action.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="shrink-0 text-[10px] font-medium text-accent2 hover:underline"
+                            >
+                              Открыть
+                            </a>
+                          )}
+                        </div>
+                      );
+                    }
+                    if (action.type === "github_pr") {
+                      return (
+                        <div
+                          key={`gh-pr-${index}`}
+                          className="flex items-start gap-2 rounded-xl border border-violet-500/40 bg-violet-500/10 px-2.5 py-2 text-[11px]"
+                        >
+                          <GitPullRequest size={13} className="mt-0.5 shrink-0 text-violet-400" />
+                          <div className="min-w-0 flex-1 space-y-0.5">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-medium text-text">
+                                PR #{action.number}: {action.title}
+                              </span>
+                              {action.authorLogin && (
+                                <span className="rounded bg-card px-1.5 py-0.5 text-[10px] text-violet-300">
+                                  @{action.authorLogin}
+                                </span>
+                              )}
+                            </div>
+                            {(action.head || action.base) && (
+                              <p className="text-[10px] text-muted">
+                                {action.head} → {action.base}
+                              </p>
+                            )}
+                          </div>
+                          {action.url && (
+                            <a
+                              href={action.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="shrink-0 text-[10px] font-medium text-accent2 hover:underline"
+                            >
+                              Открыть PR
+                            </a>
+                          )}
+                        </div>
+                      );
+                    }
+                    if (action.type === "github_merge") {
+                      return (
+                        <div
+                          key={`gh-merge-${index}`}
+                          className="flex items-start gap-2 rounded-xl border border-emerald-500/45 bg-emerald-500/15 px-2.5 py-2 text-[11px]"
+                        >
+                          <GitMerge size={13} className="mt-0.5 shrink-0 text-emerald-400" />
+                          <div className="min-w-0 flex-1 space-y-0.5">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-medium text-text">
+                                Merge PR #{action.number} ({action.method || "merge"})
+                              </span>
+                              {action.authorLogin && (
+                                <span className="rounded bg-card px-1.5 py-0.5 text-[10px] text-emerald-300">
+                                  @{action.authorLogin}
+                                </span>
+                              )}
+                            </div>
+                            {action.title && <p className="text-[10px] text-muted">{action.title}</p>}
+                          </div>
+                          {action.url && (
+                            <a
+                              href={action.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="shrink-0 text-[10px] font-medium text-accent2 hover:underline"
+                            >
+                              Открыть PR
+                            </a>
+                          )}
+                        </div>
+                      );
+                    }
                     return (
                       <div
                         key={`act-${index}`}
@@ -3603,7 +3911,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 ? "Осмотр внешнего сайта"
                 : pendingApproval.kind === "call_operator"
                   ? "Запуск Оператора"
-                  : "Запрос разрешения"
+                  : pendingApproval.kind.startsWith("github_")
+                    ? `GitHub · @${pendingApproval.github?.login || ghAccount?.login || "аккаунт"}`
+                    : "Запрос разрешения"
           }
           title={pendingApproval.title}
           description={pendingApproval.description}
@@ -3670,7 +3980,15 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   className="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
                 >
                   <Check size={12} />{" "}
-                  {pendingApproval.kind === "call_operator" ? "Разрешить и запустить Оператора" : "Разрешить"}
+                  {pendingApproval.kind === "call_operator"
+                    ? "Разрешить и запустить Оператора"
+                    : pendingApproval.kind === "github_commit"
+                      ? `Подтвердить Commit${pendingApproval.github?.push ? " и Push" : ""} от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
+                      : pendingApproval.kind === "github_pr"
+                        ? `Создать PR от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
+                        : pendingApproval.kind === "github_merge"
+                          ? `Подтвердить Merge от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
+                          : "Разрешить"}
                 </button>
                 <button
                   type="button"
@@ -3789,6 +4107,121 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   </p>
                 </div>
               )}
+            </div>
+          )}
+          {pendingApproval.kind === "github_commit" && pendingApproval.github && (
+            <div className="space-y-2 text-[11px]">
+              <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted">
+                <span>
+                  Репозиторий: <b className="text-text">{pendingApproval.github.owner}/{pendingApproval.github.repo}</b>
+                </span>
+                <span>·</span>
+                <span>
+                  Автор: <b className="text-emerald-400">@{pendingApproval.github.login}</b>{" "}
+                  ({pendingApproval.github.authorName} &lt;{pendingApproval.github.authorEmail}&gt;)
+                </span>
+              </div>
+              <div className="grid gap-1.5 sm:grid-cols-3">
+                <label className="text-[10px] text-muted">
+                  Целевая ветка
+                  <Input
+                    value={approvalGhBranch}
+                    onChange={(e) => setApprovalGhBranch(e.target.value)}
+                    placeholder="main"
+                    className="mt-0.5 h-7 text-[11px]"
+                  />
+                </label>
+                <label className="text-[10px] text-muted sm:col-span-2">
+                  Сообщение коммита
+                  <Input
+                    value={approvalGhCommitMsg}
+                    onChange={(e) => setApprovalGhCommitMsg(e.target.value)}
+                    placeholder="feat: ..."
+                    className="mt-0.5 h-7 text-[11px]"
+                  />
+                </label>
+              </div>
+              {pendingApproval.github.files && pendingApproval.github.files.length > 0 && (
+                <div className="rounded-lg border border-border bg-card2 px-2 py-1.5 font-mono text-[10px] text-text">
+                  <p className="mb-1 font-sans text-[10px] font-medium text-muted">
+                    Изменённые файлы ({pendingApproval.github.files.length}):
+                  </p>
+                  <div className="max-h-24 overflow-auto">
+                    {pendingApproval.github.files.join("\n")}
+                  </div>
+                </div>
+              )}
+              {pendingApproval.github.diffPreview && (
+                <pre className="max-h-36 overflow-auto rounded-lg border border-border bg-card2 px-2 py-1.5 font-mono text-[10px] text-muted">
+                  {pendingApproval.github.diffPreview}
+                </pre>
+              )}
+            </div>
+          )}
+          {pendingApproval.kind === "github_pr" && pendingApproval.github && (
+            <div className="space-y-2 text-[11px]">
+              <p className="text-[10px] text-muted">
+                {pendingApproval.github.owner}/{pendingApproval.github.repo} ·{" "}
+                <span className="font-mono text-text">
+                  {pendingApproval.github.head} → {pendingApproval.github.base}
+                </span>{" "}
+                · от имени <b className="text-emerald-400">@{pendingApproval.github.login}</b>
+              </p>
+              <label className="block text-[10px] text-muted">
+                Заголовок Pull Request
+                <Input
+                  value={approvalGhPrTitle}
+                  onChange={(e) => setApprovalGhPrTitle(e.target.value)}
+                  className="mt-0.5 h-7 text-[11px]"
+                />
+              </label>
+              <label className="block text-[10px] text-muted">
+                Описание (Markdown)
+                <Textarea
+                  value={approvalGhPrBody}
+                  onChange={(e) => setApprovalGhPrBody(e.target.value)}
+                  rows={3}
+                  className="mt-0.5 text-[11px]"
+                />
+              </label>
+            </div>
+          )}
+          {pendingApproval.kind === "github_merge" && pendingApproval.github && (
+            <div className="space-y-2 text-[11px]">
+              <div className="rounded-lg border border-border bg-card2 px-2.5 py-2">
+                <p className="font-medium text-text">
+                  PR #{pendingApproval.github.pullNumber}: {pendingApproval.github.prTitle}
+                </p>
+                <p className="mt-0.5 text-[10px] text-muted">
+                  {pendingApproval.github.head} → {pendingApproval.github.base} · статус:{" "}
+                  <span className="font-mono">{pendingApproval.github.mergeableState || "ready"}</span>
+                </p>
+                {pendingApproval.github.url && (
+                  <a
+                    href={pendingApproval.github.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-1 inline-flex items-center gap-1 text-[10px] text-accent2 hover:underline"
+                  >
+                    Открыть PR на GitHub <ExternalLink size={10} />
+                  </a>
+                )}
+              </div>
+              <label className="flex items-center gap-2 text-[10px] text-muted">
+                <span>Способ Merge от имени @{pendingApproval.github.login}:</span>
+                <select
+                  value={approvalGhMergeMethod}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setApprovalGhMergeMethod(v === "squash" || v === "rebase" ? v : "merge");
+                  }}
+                  className="h-7 rounded-md border border-border bg-card2 px-2 text-[11px] text-text"
+                >
+                  <option value="merge">Create a merge commit (merge)</option>
+                  <option value="squash">Squash and merge (squash)</option>
+                  <option value="rebase">Rebase and merge (rebase)</option>
+                </select>
+              </label>
             </div>
           )}
         </ApprovalToast>
