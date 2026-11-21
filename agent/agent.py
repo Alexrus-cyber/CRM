@@ -1148,12 +1148,47 @@ def parse_coach_response(raw_text: str) -> Dict[str, str]:
     return {"guidanceForOperator": fallback, "adviceForUser": fallback}
 
 
+def parse_before_action_coach_response(raw_text: str) -> Dict[str, Any]:
+    """Разбирает ответ Агента перед кликом/вводом после наведения курсора."""
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", str(raw_text or ""), flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE).strip()
+    candidates = re.findall(r"\{[\s\S]*\}", cleaned)
+    for raw in reversed(candidates):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            approved_raw = obj.get("approved")
+            approved = bool(approved_raw) if approved_raw is not None else True
+            reason = str(obj.get("reason") or obj.get("why") or "").strip()[:400]
+            for_op = str(obj.get("guidanceForOperator") or obj.get("next_step") or obj.get("guidance") or "").strip()
+            for_user = str(obj.get("adviceForUser") or obj.get("user_advice") or "").strip()
+            msg = (for_op or reason or ("Наведение подтверждено." if approved else "Курсор не на цели."))[:600]
+            return {
+                "approved": approved,
+                "reason": reason or msg[:300],
+                "guidanceForOperator": msg,
+                "adviceForUser": (for_user or reason or msg)[:600],
+            }
+    fallback = cleaned[:400] if cleaned else "Наведение проверено."
+    return {
+        "approved": True,
+        "reason": fallback,
+        "guidanceForOperator": fallback,
+        "adviceForUser": fallback,
+    }
+
+
 def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Формулирует помощь Оператору и пользователю после выполненного шага."""
+    """Формулирует помощь Оператору и пользователю после шага или перед кликом после наведения."""
     task_prompt = str(body.get("taskPrompt") or "").strip()
     task_mode = str(body.get("taskMode") or "copilot").strip().lower()
+    phase = str(body.get("phase") or "after_step").strip().lower()
     step_num = int(body.get("step") or 0)
-    last_action = body.get("lastAction")
+    last_action = body.get("plannedAction") if phase == "before_action" else body.get("lastAction")
+    aim_point = body.get("aimPoint") if isinstance(body.get("aimPoint"), dict) else None
     last_result = str(body.get("lastResult") or "").strip()
     observation = str(body.get("observation") or "").strip()
     user_hint = str(body.get("userHint") or "").strip()
@@ -1166,6 +1201,17 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
     model = str(settings.get("model") or MODEL)
 
     if not model:
+        if phase == "before_action":
+            msg = "Модель Агента не настроена — проверка наведения передана Оператору."
+            return {
+                "ok": True,
+                "approved": True,
+                "visionUsed": False,
+                "reason": msg,
+                "guidanceForOperator": msg,
+                "adviceForUser": msg,
+                "source": "heuristic",
+            }
         hint = (
             "На основе результата шага оцени обновлённую сцену (hold_key / move_mouse_rel / sequence) и продолжай."
             if task_mode == "game"
@@ -1174,54 +1220,88 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
         msg = f"Шаг {step_num}: {last_result or observation or 'выполнен'}. {hint}"
         return {"ok": True, "guidanceForOperator": msg, "adviceForUser": msg, "source": "heuristic"}
 
-    lines = [
-        f"Главная задача: {task_prompt}",
-        f"Режим Оператора: {task_mode}",
-        f"Только что выполнен шаг #{step_num}",
-    ]
-    if last_action:
-        lines.append(f"Действие Оператора: {json.dumps(last_action, ensure_ascii=False)[:400]}")
-    if last_result:
-        lines.append(f"Результат действия: {last_result[:400]}")
-    if observation:
-        lines.append(f"Наблюдение с экрана: {observation[:400]}")
-    if user_hint:
-        lines.append(f"Пожелание пользователя: {user_hint[:400]}")
-    if history:
-        lines.append("Недавние шаги:\n" + "\n".join(str(x)[:200] for x in history[-6:]))
-    lines.append(
-        'Ответь строго JSON: {"guidanceForOperator":"чёткое следующее действие/тактика для Оператора","adviceForUser":"понятная подсказка пользователю, что сейчас делать"}'
-    )
+    if phase == "before_action":
+        lines = [
+            f"Главная задача: {task_prompt}",
+            f"Режим Оператора: {task_mode}",
+            f"Шаг #{step_num}: Оператор ТОЛЬКО НАВЁЛ курсор и ещё НЕ выполнил действие.",
+        ]
+        if aim_point:
+            lines.append(f"Точка наведения на экране: ({aim_point.get('x')}, {aim_point.get('y')})")
+        if last_action:
+            lines.append(f"Задуманное действие после подтверждения: {json.dumps(last_action, ensure_ascii=False)[:400]}")
+        if observation:
+            lines.append(f"Что Оператор рассчитывал найти под курсором: {observation[:400]}")
+        if user_hint:
+            lines.append(f"Пожелание пользователя: {user_hint[:400]}")
+        if history:
+            lines.append("Недавние шаги:\n" + "\n".join(str(x)[:200] for x in history[-6:]))
+        lines.append(
+            "Посмотри на красный крестик курсора на свежем скриншоте. Он точно наведён на нужный элемент/поле/кнопку? "
+            'Ответь строго JSON без markdown: {"approved":true|false,"reason":"что сейчас под крестиком и почему да/нет",'
+            '"guidanceForOperator":"если false — куда именно перенавести курсор или что сделать; если true — подтверждение",'
+            '"adviceForUser":"короткий статус для пользователя"}'
+        )
+        sys_msg = (
+            "Ты — Агент-наставник Настольного Оператора. Перед тем как Оператор кликнет, сделает двойной клик "
+            "или начнёт ввод текста, он наводит курсор и показывает тебе скриншот с красным крестиком. "
+            "Проверь, точно ли крестик попал на целевой элемент. Если мимо, перекрыто или опасная кнопка — ставь approved=false. "
+            "Отвечай строго JSON без markdown."
+        )
+    else:
+        lines = [
+            f"Главная задача: {task_prompt}",
+            f"Режим Оператора: {task_mode}",
+            f"Только что выполнен шаг #{step_num}",
+        ]
+        if last_action:
+            lines.append(f"Действие Оператора: {json.dumps(last_action, ensure_ascii=False)[:400]}")
+        if last_result:
+            lines.append(f"Результат действия: {last_result[:400]}")
+        if observation:
+            lines.append(f"Наблюдение с экрана: {observation[:400]}")
+        if user_hint:
+            lines.append(f"Пожелание пользователя: {user_hint[:400]}")
+        if history:
+            lines.append("Недавние шаги:\n" + "\n".join(str(x)[:200] for x in history[-6:]))
+        lines.append(
+            'Ответь строго JSON: {"guidanceForOperator":"чёткое следующее действие/тактика для Оператора","adviceForUser":"понятная подсказка пользователю, что сейчас делать"}'
+        )
+        sys_msg = (
+            "Ты — Агент-наставник Настольного Оператора. После КАЖДОГО шага Оператора помогаешь "
+            "ему понять, что делать дальше, а пользователю — что происходит. Для игр (game) используй "
+            "тактику управления персонажем (WASD удержание, камера move_mouse_rel, прыжок/взаимодействие). "
+            "Отвечай строго JSON без markdown."
+        )
+
     prompt_text = "\n".join(lines)
+    has_image = screenshot.startswith("data:image/")
     user_content: Any = (
         [{"type": "text", "text": prompt_text}, {"type": "image_url", "image_url": {"url": screenshot}}]
-        if screenshot.startswith("data:image/")
+        if has_image
         else prompt_text
     )
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "Ты — Агент-наставник Настольного Оператора. После КАЖДОГО шага Оператора помогаешь "
-                "ему понять, что делать дальше, а пользователю — что происходит. Для игр (game) используй "
-                "тактику управления персонажем (WASD удержание, камера move_mouse_rel, прыжок/взаимодействие). "
-                "Отвечай строго JSON без markdown."
-            ),
-        },
+        {"role": "system", "content": sys_msg},
         {"role": "user", "content": user_content},
     ]
+    vision_used = has_image
     try:
-        data = call_model(base_url, api_key, model, messages, None, {"temperature": 0.2, "maxTokens": 320})
+        data = call_model(base_url, api_key, model, messages, None, {"temperature": 0.2, "maxTokens": 600})
     except AgentError:
         if isinstance(user_content, list):
+            vision_used = False
             messages[1]["content"] = prompt_text
-            data = call_model(base_url, api_key, model, messages, None, {"temperature": 0.2, "maxTokens": 320})
+            data = call_model(base_url, api_key, model, messages, None, {"temperature": 0.2, "maxTokens": 600})
         else:
             raise
     choices = data.get("choices") or []
     raw = str((choices[0].get("message") or {}).get("content") or "") if choices else ""
+    if phase == "before_action":
+        parsed_before = parse_before_action_coach_response(raw)
+        return {"ok": True, **parsed_before, "visionUsed": vision_used, "source": "agent"}
     parsed = parse_coach_response(raw)
-    return {"ok": True, **parsed, "source": "agent"}
+    return {"ok": True, **parsed, "visionUsed": vision_used, "source": "agent"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1960,6 +2040,15 @@ def self_test() -> int:
             "parse_coach_response извлекает guidanceForOperator и adviceForUser",
             parsed_coach["guidanceForOperator"] == "hold_key w 0.8s"
             and parsed_coach["adviceForUser"] == "Бежим вперёд к двери",
+        )
+        parsed_aim = parse_before_action_coach_response(
+            '{"approved": false, "reason": "крестик левее кнопки", "guidanceForOperator": "Сдвинь правее на 30px"}'
+        )
+        check(
+            "parse_before_action_coach_response извлекает approved=false и корректировку",
+            parsed_aim["approved"] is False
+            and "левее" in parsed_aim["reason"]
+            and "30px" in parsed_aim["guidanceForOperator"],
         )
 
         # 9. Снимок экрана ПК через Оператора (inspect_pc_screen) всегда спрашивает разрешение.

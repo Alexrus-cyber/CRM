@@ -27,6 +27,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const body = (await req.json().catch(() => null)) as
     | {
         step?: number;
+        phase?: "after_step" | "before_action";
+        plannedAction?: unknown;
+        aimPoint?: { x?: number; y?: number };
         lastAction?: unknown;
         lastResult?: string;
         observation?: string;
@@ -37,11 +40,20 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       }
     | null;
 
+  const phase = body?.phase === "before_action" ? "before_action" : "after_step";
+
   // Если пользователь уже оставил новое указание на сайте, отдаём его сразу.
   const lastSeenId = String(body?.lastGuidanceId ?? "");
   if (task.guidanceNote && task.guidanceNote.id !== lastSeenId && task.guidanceNote.author === "user") {
     return Response.json(
-      { ok: true, guidance: task.guidanceNote, source: "user" },
+      {
+        ok: true,
+        guidance: task.guidanceNote,
+        approved: phase === "before_action" ? false : true,
+        reason: phase === "before_action" ? "Получено новое указание пользователя" : undefined,
+        visionUsed: true,
+        source: "user",
+      },
       { headers: { "Cache-Control": "no-store" } },
     );
   }
@@ -57,7 +69,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     agentUrl: AGENT_URL,
     taskPrompt: task.prompt,
     taskMode: task.taskMode,
+    phase,
     step: Number(body?.step ?? task.steps) || task.steps,
+    plannedAction: body?.plannedAction,
+    aimPoint: body?.aimPoint,
     lastAction: body?.lastAction,
     lastResult: body?.lastResult,
     observation: body?.observation,
@@ -65,8 +80,15 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     screenshot: typeof body?.screenshot === "string" ? body.screenshot : undefined,
   });
 
-  if (advice.source === "heuristic" && task.coachMode !== "agent") {
-    return Response.json({ ok: true, guidance: null, fallback: true });
+  if (advice.source === "heuristic" && (task.coachMode !== "agent" || phase === "before_action")) {
+    return Response.json({
+      ok: true,
+      guidance: null,
+      approved: true,
+      visionUsed: false,
+      fallback: true,
+      source: "heuristic",
+    });
   }
 
   const saved = await setAgentTaskGuidance(task.id, ownerId, {
@@ -80,6 +102,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     {
       ok: true,
       guidance: saved?.guidance ?? null,
+      approved: advice.approved ?? true,
+      reason: advice.reason ?? "",
+      visionUsed: advice.visionUsed ?? false,
       source: advice.source,
     },
     { headers: { "Cache-Control": "no-store" } },

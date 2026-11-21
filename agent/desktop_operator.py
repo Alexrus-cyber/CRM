@@ -523,6 +523,22 @@ def action_signature(action: Dict[str, Any]) -> str:
     return "|".join(parts)
 
 
+def action_aim_target(action: Dict[str, Any]) -> Optional[Tuple[Any, Any]]:
+    """Возвращает (x, y) цели на экране, если перед действием нужно сначала навести курсор."""
+    if not isinstance(action, dict):
+        return None
+    kind = str(action.get("type") or "").strip().lower()
+    if kind in ("click", "double_click", "right_click", "middle_click", "triple_click"):
+        return action.get("x", 0), action.get("y", 0)
+    if kind in ("type", "paste", "select_all_copy", "mouse_down", "scroll"):
+        if action.get("x") is not None and action.get("y") is not None:
+            return action.get("x"), action.get("y")
+        return None
+    if kind == "drag":
+        return action.get("fromX", 0), action.get("fromY", 0)
+    return None
+
+
 def action_label(action: Dict[str, Any]) -> str:
     """Короткое человеческое описание действия для подсказки."""
     kind = str(action.get("type") or "действие")
@@ -1399,6 +1415,209 @@ def self_test() -> int:
           and int(verify_payloads[0].get("max_tokens") or 0) >= 1200
           and verdict is not None
           and verdict.get("ok") is True)
+
+    # Проверка устойчивости к «В ответе модели нет action.type»: 3 ошибки прощаются, 4-я останавливает.
+    err3_state = {"calls": 0, "finished_status": ""}
+
+    class Err3CrmHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            if path == "/api/agent/bot/81" and method == "GET":
+                return {"task": {"id": 81, "status": "running", "maxSteps": 3, "trustLevel": "full"}, "attachments": []}
+            if path == "/api/agent/bot/81/finish" and method == "POST":
+                err3_state["finished_status"] = str((payload or {}).get("status") or "")
+                return {"ok": True}
+            return {"ok": True}
+
+    class Err3ModelHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            err3_state["calls"] += 1
+            if err3_state["calls"] <= 3:
+                return {"choices": [{"message": {"content": '{"thought": "думаю"}'}}]}
+            return {"choices": [{"message": {"content": '{"thought": "готово", "action": {"type": "finish", "summary": "выполнено после 3 сбоев"}}'}}]}
+
+    err3_op = Operator(crm="http://127.0.0.1:3000", token="crmop_" + "a" * 32,
+                       base_url="http://127.0.0.1:8000/v1", model="sim-vl", api_key="",
+                       dry_run=False, assume_yes=True, max_steps=3, delay=0.0, poll=1.0,
+                       max_width=1600, text_only=True, verify_actions=False,
+                       self_reflect=False, trust_level="full")
+    err3_op.crm = Err3CrmHttp()  # type: ignore[assignment]
+    err3_op.model_http = Err3ModelHttp()  # type: ignore[assignment]
+    err3_ok = err3_op.run(81, "Проверь повтор после 3 ошибок", 3)
+    check("3 ошибки «В ответе модели нет action.type» не останавливают бота",
+          err3_ok and err3_state["calls"] == 4 and err3_state["finished_status"] == "done")
+
+    err4_state = {"calls": 0, "finished_status": "", "summary": ""}
+
+    class Err4CrmHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            if path == "/api/agent/bot/82" and method == "GET":
+                return {"task": {"id": 82, "status": "running", "maxSteps": 5, "trustLevel": "full"}, "attachments": []}
+            if path == "/api/agent/bot/82/finish" and method == "POST":
+                err4_state["finished_status"] = str((payload or {}).get("status") or "")
+                err4_state["summary"] = str((payload or {}).get("summary") or "")
+                return {"ok": True}
+            return {"ok": True}
+
+    class Err4ModelHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            err4_state["calls"] += 1
+            return {"choices": [{"message": {"content": '{"thought": "без action.type"}'}}]}
+
+    err4_op = Operator(crm="http://127.0.0.1:3000", token="crmop_" + "a" * 32,
+                       base_url="http://127.0.0.1:8000/v1", model="sim-vl", api_key="",
+                       dry_run=False, assume_yes=True, max_steps=5, delay=0.0, poll=1.0,
+                       max_width=1600, text_only=True, verify_actions=False,
+                       self_reflect=False, trust_level="full")
+    err4_op.crm = Err4CrmHttp()  # type: ignore[assignment]
+    err4_op.model_http = Err4ModelHttp()  # type: ignore[assignment]
+    err4_ok = err4_op.run(82, "Проверь стоп на 4-й ошибке", 5)
+    check("при более чем 3 ошибках подряд (4-я ошибка) бот останавливается",
+          (not err4_ok) and err4_state["calls"] == 4
+          and err4_state["finished_status"] == "failed"
+          and "action.type" in err4_state["summary"])
+
+    # Проверка: сначала наведение -> совещание с Агентом -> только при подтверждении клик/двойной клик/ввод текста.
+    check("action_aim_target распознаёт клики, двойные клики, ввод с координатами и не трогает hold_key",
+          action_aim_target({"type": "click", "x": 10, "y": 20}) == (10, 20)
+          and action_aim_target({"type": "double_click", "x": 30, "y": 40}) == (30, 40)
+          and action_aim_target({"type": "type", "x": 50, "y": 60, "text": "abc"}) == (50, 60)
+          and action_aim_target({"type": "type", "text": "abc"}) is None
+          and action_aim_target({"type": "drag", "fromX": 70, "fromY": 80, "toX": 90, "toY": 95}) == (70, 80)
+          and action_aim_target({"type": "hold_key", "key": "w", "seconds": 0.5}) is None)
+
+    aim_trace: List[str] = []
+    aim_coach_reqs: List[Dict[str, Any]] = []
+    aim_executed: List[Dict[str, Any]] = []
+    aim_prompts: List[str] = []
+
+    class AimCrmHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            if path == "/api/agent/bot/83" and method == "GET":
+                return {
+                    "task": {
+                        "id": 83,
+                        "status": "running",
+                        "maxSteps": 6,
+                        "trustLevel": "full",
+                        "taskMode": "copilot",
+                        "coachMode": "after_step",
+                    },
+                    "attachments": [],
+                }
+            if path == "/api/agent/bot/83/coach" and method == "POST":
+                req = dict(payload or {})
+                aim_coach_reqs.append(req)
+                pt = req.get("aimPoint") or {}
+                aim_trace.append("coach:{}:{},{}".format(req.get("phase"), pt.get("x"), pt.get("y")))
+                if pt.get("x") == 300:
+                    return {
+                        "ok": True,
+                        "approved": False,
+                        "visionUsed": True,
+                        "source": "agent",
+                        "reason": "крестик левее иконки",
+                        "guidance": {"id": "g-aim-1", "text": "Смести курсор правее в (340, 200)"},
+                    }
+                return {
+                    "ok": True,
+                    "approved": True,
+                    "visionUsed": True,
+                    "source": "agent",
+                    "reason": "крестик точно на цели",
+                    "guidance": {"id": "g-aim-ok", "text": "Наведено точно, выполняй"},
+                }
+            if path == "/api/agent/bot/83/finish" and method == "POST":
+                aim_trace.append("finish:" + str((payload or {}).get("status") or ""))
+                return {"ok": True}
+            return {"ok": True}
+
+    class AimModelHttp:
+        def __init__(self) -> None:
+            self.step = 0
+
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            self.step += 1
+            msgs = (payload or {}).get("messages") or []
+            user_c = msgs[-1].get("content") if msgs else ""
+            txt = " ".join(str(p.get("text") or "") for p in user_c if isinstance(p, dict)) if isinstance(user_c, list) else str(user_c)
+            aim_prompts.append(txt)
+            if self.step == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "observation": "иконка", "thought": "двойной клик по иконке",
+                    "action": {"type": "double_click", "x": 300, "y": 200},
+                })}}]}
+            if self.step == 2:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "observation": "поправляю наведение", "thought": "сдвигаюсь правее",
+                    "action": {"type": "double_click", "x": 340, "y": 200},
+                })}}]}
+            if self.step == 3:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "observation": "поле поиска", "thought": "введу текст в поле",
+                    "action": {"type": "type", "x": 500, "y": 400, "text": "привет"},
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "observation": "готово", "thought": "завершаю",
+                "action": {"type": "finish", "summary": "наведено, кликнуто и введён текст"},
+            })}}]}
+
+    saved_mouse_aim, saved_req_aim = globals().get("pyautogui"), globals().get("require_pyautogui")
+    try:
+        fake_aim_mouse = FakeMouse(0)
+        globals()["pyautogui"] = fake_aim_mouse
+        globals()["require_pyautogui"] = lambda: None
+        aim_op = Operator(crm="http://127.0.0.1:3000", token="crmop_" + "a" * 32,
+                          base_url="http://127.0.0.1:8000/v1", model="sim-vl", api_key="",
+                          dry_run=False, assume_yes=True, max_steps=6, delay=0.0, poll=1.0,
+                          max_width=1920, text_only=False, vision_check=False, vision_forced=True,
+                          verify_actions=False, self_reflect=False, trust_level="full")
+        aim_op.crm = AimCrmHttp()  # type: ignore[assignment]
+        aim_op.model_http = AimModelHttp()  # type: ignore[assignment]
+        aim_op.screenshot = lambda: (  # type: ignore[method-assign]
+            "data:image/jpeg;base64,AIM",
+            {"width": 1920, "height": 1080, "screen_width": 1920, "screen_height": 1080},
+        )
+        orig_ensure = aim_op.ensure_cursor
+
+        def traced_ensure(x: int, y: int) -> None:
+            orig_ensure(x, y)
+            aim_trace.append("hover:{},{}".format(x, y))
+
+        aim_op.ensure_cursor = traced_ensure  # type: ignore[method-assign]
+
+        def traced_exec(act: Dict[str, Any]) -> str:
+            aim_executed.append(dict(act))
+            aim_trace.append("exec:{}:{},{}".format(act.get("type"), act.get("x"), act.get("y")))
+            return "executed:" + str(act.get("type"))
+
+        aim_op.execute = traced_exec  # type: ignore[method-assign]
+        aim_ok = aim_op.run(83, "Открой иконку и введи текст", 6)
+    finally:
+        globals()["pyautogui"], globals()["require_pyautogui"] = saved_mouse_aim, saved_req_aim
+
+    check("перед double_click и type бот сначала наводится, совещается с Агентом и кликает только при подтверждении",
+          aim_ok
+          and len(aim_coach_reqs) == 3
+          and all(r.get("phase") == "before_action" and r.get("askAgent") is True for r in aim_coach_reqs)
+          and len(aim_executed) == 2
+          and aim_executed[0] == {"type": "double_click", "x": 340, "y": 200}
+          and aim_executed[1] == {"type": "type", "x": 500, "y": 400, "text": "привет"}
+          and aim_trace[:7] == [
+              "hover:300,200",
+              "coach:before_action:300,200",
+              "hover:340,200",
+              "coach:before_action:340,200",
+              "exec:double_click:340,200",
+              "hover:500,400",
+              "coach:before_action:500,400",
+          ]
+          and "Смести курсор правее в (340, 200)" in aim_prompts[1])
 
     passed = sum(1 for item in checks if item)
     print("\n{}/{} проверок пройдено".format(passed, len(checks)))
@@ -2406,6 +2625,9 @@ class Operator:
         if not (0 <= int(x) < int(width) and 0 <= int(y) < int(height)):
             raise AgentError("точка ({}, {}) вне экрана {}×{} — действие отменено".format(
                 x, y, width, height))
+        cursor_x, cursor_y = pyautogui.position()
+        if abs(cursor_x - x) <= 3 and abs(cursor_y - y) <= 3:
+            return
         pyautogui.moveTo(x, y, duration=0.18)
         time.sleep(0.12)
         cursor_x, cursor_y = pyautogui.position()
@@ -2848,6 +3070,144 @@ class Operator:
         log("  [после шага] {}".format(hint[:220]))
         self.report("guidance", text, action)
 
+    def verify_aim(
+        self,
+        action: Dict[str, Any],
+        screen_point: Tuple[int, int],
+        screenshot: Optional[str],
+        decision: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Локальная проверка наведения (красного крестика) по свежему скриншоту, если Агент без vision/недоступен."""
+        if self.text_only or not self.model or not screenshot:
+            return {"approved": True, "reason": ""}
+        obs = str(decision.get("observation") or decision.get("thought") or "").strip()[:300]
+        prompt_text = (
+            "Перед выполнением действия «{}» курсор уже наведён в точку экрана ({}, {}) "
+            "и отмечен на свежем скриншоте красным крестиком.\n"
+            "Ожидаемая цель Оператора: {}\n"
+            "Посмотри на положение красного крестика: он действительно попал на нужную кнопку/поле/элемент "
+            "и можно сразу нажимать/вводить, или нужно сместить курсор?\n"
+            "Ответь ТОЛЬКО одним JSON-объектом без markdown:\n"
+            '{{"approved": true, "reason": "что под крестиком", "guidance": ""}}'
+        ).format(action_label(action), screen_point[0], screen_point[1], obs or "не указано")
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты проверяешь точность наведения курсора (красный крестик на скриншоте) "
+                        "перед кликом или вводом текста. Если крестик попал мимо цели, ставь approved=false "
+                        "и напиши в guidance куда сместить курсор."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_text},
+                        {"type": "image_url", "image_url": {"url": screenshot}},
+                    ],
+                },
+            ],
+            "temperature": 0,
+            "max_tokens": 600,
+            "stream": False,
+        }
+        self.apply_generation(payload)
+        payload["temperature"] = 0
+        payload["max_tokens"] = max(600, int(payload.get("max_tokens") or 0))
+        headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
+        try:
+            data = self.model_http.call("POST", "/chat/completions", payload, timeout=90, headers=headers)
+        except TaskCancelled:
+            raise
+        except AgentError:
+            return {"approved": True, "reason": ""}
+        choices = data.get("choices") or []
+        raw = str((choices[0].get("message") or {}).get("content") or "") if choices else ""
+        for obj in reversed(_extract_json_objects(raw)):
+            if "approved" in obj:
+                approved = bool(obj.get("approved"))
+                reason = str(obj.get("reason") or obj.get("why") or "").strip()[:300]
+                guidance = str(obj.get("guidance") or obj.get("guidanceForOperator") or "").strip()[:400]
+                return {"approved": approved, "reason": reason, "guidance": guidance}
+        return {"approved": True, "reason": ""}
+
+    def consult_before_action(
+        self,
+        task_id: Optional[int],
+        step_index: int,
+        action: Dict[str, Any],
+        screen_point: Tuple[int, int],
+        decision: Dict[str, Any],
+        screenshot: Optional[str],
+    ) -> Dict[str, Any]:
+        """Совещается с Агентом после наведения курсора и до выполнения клика/двойного клика/ввода."""
+        if not (self.has_crm and task_id):
+            return self.verify_aim(action, screen_point, screenshot, decision)
+
+        observation = str(decision.get("observation") or decision.get("thought") or "").strip()
+        try:
+            resp = self.crm.call(
+                "POST",
+                "/api/agent/bot/{}/coach".format(task_id),
+                {
+                    "step": step_index + 1,
+                    "phase": "before_action",
+                    "askAgent": True,
+                    "plannedAction": action,
+                    "aimPoint": {"x": screen_point[0], "y": screen_point[1]},
+                    "observation": observation[:400],
+                    "lastGuidanceId": self._last_guidance_id,
+                    "history": self.history[-8:],
+                    **({"screenshot": screenshot} if screenshot else {}),
+                },
+                timeout=35,
+            )
+        except TaskCancelled:
+            raise
+        except AgentError as error:
+            log("[!] совещание с Агентом перед кликом не удалось ({}) — проверяю сам".format(error))
+            return self.verify_aim(action, screen_point, screenshot, decision)
+
+        if not isinstance(resp, dict):
+            return self.verify_aim(action, screen_point, screenshot, decision)
+
+        g = resp.get("guidance") if isinstance(resp.get("guidance"), dict) else None
+        if g and g.get("id"):
+            self._last_guidance_id = str(g["id"])
+
+        source = str(resp.get("source") or "").strip().lower()
+        vision_used = bool(resp.get("visionUsed"))
+        guidance_text = str((g or {}).get("text") or "").strip()
+        reason = str(resp.get("reason") or (g or {}).get("userAdvice") or guidance_text).strip()
+
+        if source == "user" or (source in ("agent", "model") and vision_used):
+            approved = bool(resp.get("approved", True))
+            return {
+                "approved": approved,
+                "reason": reason[:300],
+                "guidance": (guidance_text or reason)[:400],
+                "source": source,
+            }
+
+        local_check = self.verify_aim(action, screen_point, screenshot, decision)
+        if not local_check.get("approved", True):
+            return {
+                "approved": False,
+                "reason": str(local_check.get("reason") or reason)[:300],
+                "guidance": str(local_check.get("guidance") or guidance_text or local_check.get("reason") or "")[:400],
+                "source": "operator_vision",
+            }
+        if source in ("agent", "model") and not bool(resp.get("approved", True)):
+            return {
+                "approved": False,
+                "reason": reason[:300],
+                "guidance": (guidance_text or reason)[:400],
+                "source": source,
+            }
+        return {"approved": True, "reason": reason[:300], "guidance": guidance_text[:400], "source": source or "operator"}
+
     def task_cancelled(self, task_id: Optional[int]) -> bool:
         """Спрашиваем CRM, не отменили ли задание, — до следующего шага."""
         if not (self.has_crm and task_id):
@@ -3044,6 +3404,7 @@ class Operator:
             self.report("info", "Прочитал вложения задания — учту их в шагах")
 
         index = 0
+        consecutive_errors = 0
         while True:
             if self.has_crm and task_id:
                 try:
@@ -3105,8 +3466,38 @@ class Operator:
                 task_mode=self.current_task_mode(),
                 pending_guidance=self.pending_guidance,
             )
-            decision = self.ask_model(step_prompt, screenshot,
-                                      self.attachment_images if index == 0 else None)
+            try:
+                decision = self.ask_model(step_prompt, screenshot,
+                                          self.attachment_images if index == 0 else None)
+                consecutive_errors = 0
+            except TaskCancelled:
+                raise
+            except AgentError as error:
+                consecutive_errors += 1
+                err_msg = str(error)
+                if consecutive_errors > 3:
+                    stop = "Ошибка повторилась {} раз подряд — останавливаю бота: {}".format(
+                        consecutive_errors, err_msg[:300])
+                    log(stop)
+                    self.report("error", stop)
+                    if self.has_crm and task_id:
+                        self.crm.call("POST", "/api/agent/bot/{}/finish".format(task_id),
+                                      {"status": "failed", "summary": stop[:400]})
+                    return False
+                retry_note = "Ошибка ответа модели ({}/3): {} — пробую ещё раз".format(
+                    consecutive_errors, err_msg[:260])
+                log("[!] " + retry_note)
+                self.report("error", retry_note)
+                self.history.append("ошибка шага ({}/3): {}".format(consecutive_errors, err_msg[:160]))
+                last_outcome = retry_note
+                self.pending_nudge = (
+                    "Предыдущий ответ завершился ошибкой («{}»). "
+                    "Ответь СТРОГО одним JSON-объектом с обязательным полем action.type "
+                    "(например {{\"thought\":\"...\",\"action\":{{\"type\":\"wait\",\"seconds\":1}}}})."
+                ).format(err_msg[:200])
+                time.sleep(min(1.5, max(0.3, self.delay)))
+                continue
+
             self.pending_nudge = ""
             self.pending_guidance = ""
             action = decision["action"]
@@ -3219,6 +3610,43 @@ class Operator:
             else:
                 prev_frame_sig = self._last_frame_sig
                 try:
+                    aim_target = action_aim_target(action)
+                    if aim_target is not None and self.has_crm and task_id and self.current_coach_mode() != "off":
+                        sx, sy = self.to_screen(aim_target[0], aim_target[1])
+                        self.ensure_cursor(sx, sy)
+                        aim_shot = screenshot
+                        if not self.text_only:
+                            try:
+                                aim_shot, _ = self.screenshot()
+                                prev_frame_sig = self._last_frame_sig
+                            except Exception:  # noqa: BLE001
+                                aim_shot = screenshot
+                        log("  наведение в ({}, {}) — совещаюсь с Агентом перед {}".format(
+                            sx, sy, action_label(action)))
+                        self.report("info", "Навёл курсор в ({}, {}) перед «{}» — совещаюсь с Агентом".format(
+                            sx, sy, action_label(action)), action)
+                        consult = self.consult_before_action(task_id, index, action, (sx, sy), decision, aim_shot)
+                        if not consult.get("approved", True):
+                            deny_reason = str(consult.get("reason") or "курсор не на цели").strip()
+                            guidance_fix = str(consult.get("guidance") or deny_reason).strip()
+                            log("  [совещание с Агентом] наведение отклонено: " + deny_reason[:220])
+                            self.report("info", "Наведение в ({}, {}) не подтверждено Агентом — действие отменено: {}".format(
+                                sx, sy, deny_reason[:240]), action)
+                            self.history.append("шаг {}: наведение ({}, {}) перед {} отменено — {}".format(
+                                index + 1, sx, sy, kind, deny_reason[:140]))
+                            self.pending_guidance = guidance_fix
+                            self.pending_nudge = (
+                                "Наведение в ({}, {}) перед «{}» не подтверждено: {}. "
+                                "Исправь координаты или способ: {}"
+                            ).format(sx, sy, action_label(action), deny_reason[:200], guidance_fix[:260])
+                            last_outcome = "наведение отменено Агентом: " + deny_reason[:160]
+                            last_screen_unchanged = True
+                            index += 1
+                            time.sleep(0.15 if self.current_task_mode() == "game" else max(0.2, self.delay))
+                            continue
+                        log("  [совещание с Агентом] наведение подтверждено — выполняю {}".format(
+                            action_label(action)))
+
                     result = self.execute(action)
                     log("  выполнено: " + result)
                     self.report("action", result, action)
