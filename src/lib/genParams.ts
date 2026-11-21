@@ -11,7 +11,7 @@
  *   ключ модели при этом по-прежнему остаётся у пользователя в браузере.
  */
 
-import { AI_REASONING_MODES, type ReasoningMode } from "./ai";
+import { AI_MAX_GENERATION_TOKENS, AI_REASONING_MODES, type ReasoningMode } from "./ai";
 
 export type GenParams = {
   /** Сколько «думать»: reasoning_effort у OpenAI-совместимых серверов. */
@@ -53,11 +53,11 @@ export function normalizeGenParams(raw: unknown): GenParams {
     : GEN_DEFAULT_PARAMS.reasoning;
   return {
     reasoning,
-    thinkingBudget: num(source.thinkingBudget, 64, 65536),
+    thinkingBudget: num(source.thinkingBudget, 64, AI_MAX_GENERATION_TOKENS),
     sendThinkingFlag: source.sendThinkingFlag !== false,
     temperature: num(source.temperature, 0, 2),
     topP: num(source.topP, 0, 1),
-    maxTokens: num(source.maxTokens, 1, 32768),
+    maxTokens: num(source.maxTokens, 1, AI_MAX_GENERATION_TOKENS),
     seed: num(source.seed, 0, 2 ** 31),
   };
 }

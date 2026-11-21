@@ -29,6 +29,8 @@ export const AI_MAX_FILES = 4;
 export const AI_MAX_FILE_BYTES = 20 * 1024 * 1024;
 /** Сколько сообщений истории отправлять модели. */
 export const AI_MAX_CONTEXT_MESSAGES = 30;
+/** Максимум токенов генерации (`max_tokens` и `thinking_budget`): современные модели поддерживают до 384K вывода. */
+export const AI_MAX_GENERATION_TOKENS = 384_000;
 
 const IMAGE_MIME = /^image\/(png|jpe?g|webp|gif|bmp)$/i;
 const TEXT_MIME =
@@ -152,10 +154,10 @@ export function normalizeParams(raw: unknown): AiParams {
     system: typeof source.system === "string" ? source.system.slice(0, 8000) : AI_DEFAULT_PARAMS.system,
     temperature: num(source.temperature, 0, 2),
     topP: num(source.topP, 0, 1),
-    maxTokens: num(source.maxTokens, 1, 32768),
+    maxTokens: num(source.maxTokens, 1, AI_MAX_GENERATION_TOKENS),
     seed: num(source.seed, 0, 2 ** 31),
     reasoning,
-    thinkingBudget: num(source.thinkingBudget, 64, 65536),
+    thinkingBudget: num(source.thinkingBudget, 64, AI_MAX_GENERATION_TOKENS),
     sendThinkingFlag: source.sendThinkingFlag !== false,
     ragChunks: num(source.ragChunks, 0, 50) ?? AI_DEFAULT_PARAMS.ragChunks,
     ragFull: source.ragFull === true,

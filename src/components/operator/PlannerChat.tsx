@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
 import {
   ArrowRight,
   Check,
@@ -17,6 +17,7 @@ import {
 import { Badge, Button, Card, Textarea } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import { DEFAULT_PLAN_PROMPT } from "@/lib/operatorPlan";
+import { extractClipboardFiles, hasTransferFiles } from "@/lib/clipboardFiles";
 import { formatFileSize, readOperatorFiles, type OperatorAttachment } from "./files";
 import type { GenParams } from "@/lib/genParams";
 
@@ -85,11 +86,13 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
   const [historyLoading, setHistoryLoading] = useState(true);
   const [text, setText] = useState("");
   const [files, setFiles] = useState<OperatorAttachment[]>([]);
+  const [dragging, setDragging] = useState(false);
   const [sending, setSending] = useState(false);
   const [transferring, setTransferring] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const counter = useRef(0);
+  const dragDepthRef = useRef(0);
   const fileRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const activeIdRef = useRef<number | null>(null);
@@ -273,7 +276,9 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
   };
 
   const send = async () => {
-    const value = text.trim();
+    const typed = text.trim();
+    const value =
+      typed || (files.length > 0 ? "Проанализируй приложенные материалы и предложи план действий." : "");
     const activeId = conversationId;
     if (!value || sending || historyLoading || activeId === null) return;
     const userMessage: PlanMessage = {
@@ -316,7 +321,12 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages: history.map((message) => ({ role: message.role, content: message.text })),
-          files: files.map((file) => ({ name: file.name, text: file.text, note: file.note })),
+          files: files.map((file) => ({
+            name: file.name,
+            text: file.text,
+            note: file.note,
+            ...(file.image ? { image: file.image } : {}),
+          })),
           systemPrompt,
           settings: { baseUrl, apiKey, model, params },
         }),
@@ -361,6 +371,42 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
     const { files: added, errors } = await readOperatorFiles(files, list);
     setFiles((prev) => [...prev, ...added]);
     if (errors.length > 0) setError(errors[0]);
+  };
+
+  const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const { files: pasted, hasPlainText } = extractClipboardFiles(event.clipboardData);
+    if (pasted.length === 0) return;
+    if (!hasPlainText) event.preventDefault();
+    void attach(pasted);
+  };
+
+  const handleDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setDragging(true);
+  };
+
+  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    if (!dragging) setDragging(true);
+  };
+
+  const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragging(false);
+  };
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    dragDepthRef.current = 0;
+    setDragging(false);
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    const dropped = Array.from(event.dataTransfer.files ?? []);
+    if (dropped.length > 0) void attach(dropped);
   };
 
   const transfer = async (message: PlanMessage) => {
@@ -568,11 +614,15 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
 
       {files.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1">
-          {files.map((file) => (
+          {files.map((file, idx) => (
             <span
-              key={`${file.name}-${file.size}`}
+              key={`${file.name}-${file.size}-${idx}`}
               className="flex items-center gap-1 rounded-lg border border-border bg-card2 px-1.5 py-0.5 text-[10px] text-muted"
             >
+              {file.image && (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={file.image} alt={file.name} className="h-4 w-4 rounded object-cover" />
+              )}
               {file.name} · {formatFileSize(file.size)}
               <button
                 type="button"
@@ -587,7 +637,16 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
         </div>
       )}
 
-      <div className="mt-2 flex items-end gap-1.5">
+      <div
+        onDragEnter={handleDragEnter}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        className={cn(
+          "relative mt-2 flex items-end gap-1.5 rounded-xl transition",
+          dragging && "bg-accent/10 p-1 ring-2 ring-accent/60",
+        )}
+      >
         <input
           ref={fileRef}
           type="file"
@@ -613,6 +672,7 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
         <Textarea
           value={text}
           onChange={(event) => setText(event.target.value)}
+          onPaste={handlePaste}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
@@ -620,14 +680,14 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
             }
           }}
           rows={2}
-          placeholder="Что нужно сделать? Enter — отправить, Shift+Enter — новая строка"
+          placeholder="Что нужно сделать? Enter — отправить, Ctrl+V — вставить фото или перетащите файл"
           disabled={historyLoading || conversationId === null}
           className="min-w-0 flex-1 text-[11px]"
         />
         <Button
           size="icon"
           onClick={() => void send()}
-          disabled={sending || historyLoading || !text.trim() || conversationId === null}
+          disabled={sending || historyLoading || (!text.trim() && files.length === 0) || conversationId === null}
           aria-label="Отправить"
         >
           {sending ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}

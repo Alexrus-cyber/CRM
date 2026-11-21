@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type ChangeEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type ClipboardEvent, type DragEvent, type ReactNode } from "react";
 import {
   AlertTriangle,
   Bot,
@@ -35,6 +35,7 @@ import {
   AI_DEFAULT_PARAMS,
   AI_MAX_FILE_BYTES,
   AI_MAX_FILES,
+  AI_MAX_GENERATION_TOKENS,
   AI_REASONING_MODES,
   AI_STORAGE_PARAMS,
   AI_STORAGE_SETTINGS,
@@ -46,6 +47,8 @@ import {
   type AiSettings,
   type ReasoningMode,
 } from "@/lib/ai";
+import { LiveReasoningBox } from "./LiveReasoningBox";
+import { extractClipboardFiles, hasTransferFiles } from "@/lib/clipboardFiles";
 import { extractFile, imageToDataUrl } from "@/lib/fileExtract";
 import { RAG_CHARS_PER_TOKEN, snippet, splitIntoChunks } from "@/lib/rag";
 import { formatTokenCount, type AiRolePolicy } from "@/lib/aiPolicy";
@@ -249,6 +252,7 @@ export function AiChatClient({ userName }: { userName: string }) {
   const [text, setText] = useState("");
   const [pending, setPending] = useState<PendingFile[]>([]);
   const [extracting, setExtracting] = useState(0);
+  const [dragging, setDragging] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -266,6 +270,8 @@ export function AiChatClient({ userName }: { userName: string }) {
   const [ragError, setRagError] = useState<string | null>(null);
 
   const listRef = useRef<HTMLDivElement>(null);
+  const dragDepthRef = useRef(0);
+  const autoScrollPausedRef = useRef(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const dirRef = useRef<HTMLInputElement>(null);
@@ -289,8 +295,20 @@ export function AiChatClient({ userName }: { userName: string }) {
 
   useEffect(() => {
     const node = listRef.current;
-    if (node) node.scrollTop = node.scrollHeight;
+    if (!node || autoScrollPausedRef.current) return;
+    node.scrollTop = node.scrollHeight;
   }, [bubbles]);
+
+  useEffect(() => {
+    if (!streaming) return;
+    const timer = window.setInterval(() => {
+      const node = listRef.current;
+      if (node && !autoScrollPausedRef.current) {
+        node.scrollTop = node.scrollHeight;
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [streaming]);
 
   useEffect(() => () => {
     for (const url of previewsRef.current) URL.revokeObjectURL(url);
@@ -700,9 +718,7 @@ export function AiChatClient({ userName }: { userName: string }) {
 
   /* ------------------------------- вложения ------------------------------ */
 
-  const addFiles = async (event: ChangeEvent<HTMLInputElement>) => {
-    const picked = Array.from(event.target.files ?? []);
-    event.target.value = "";
+  const appendFiles = async (picked: File[]) => {
     if (picked.length === 0) return;
     setError(null);
 
@@ -743,6 +759,48 @@ export function AiChatClient({ userName }: { userName: string }) {
       }
     }
     setPending((prev) => [...prev, ...added]);
+  };
+
+  const addFiles = async (event: ChangeEvent<HTMLInputElement>) => {
+    const picked = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    await appendFiles(picked);
+  };
+
+  const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const { files, hasPlainText } = extractClipboardFiles(event.clipboardData);
+    if (files.length === 0) return;
+    if (!hasPlainText) event.preventDefault();
+    void appendFiles(files);
+  };
+
+  const handleDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setDragging(true);
+  };
+
+  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    if (!dragging) setDragging(true);
+  };
+
+  const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragging(false);
+  };
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    dragDepthRef.current = 0;
+    setDragging(false);
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    const dropped = Array.from(event.dataTransfer.files ?? []);
+    if (dropped.length > 0) void appendFiles(dropped);
   };
 
   const removePending = (id: string) => {
@@ -814,6 +872,7 @@ export function AiChatClient({ userName }: { userName: string }) {
     }
     setError(null);
     setNotice(null);
+    autoScrollPausedRef.current = false;
 
     let activeChat = chat;
     if (!activeChat) {
@@ -1302,12 +1361,13 @@ export function AiChatClient({ userName }: { userName: string }) {
                 <Input
                   type="number"
                   min={64}
+                  max={AI_MAX_GENERATION_TOKENS}
                   step={64}
                   value={params.thinkingBudget ?? ""}
                   onChange={(event) =>
                     updateParams({ thinkingBudget: event.target.value === "" ? null : Number(event.target.value) })
                   }
-                  placeholder="Например, 2048"
+                  placeholder="до 384000"
                 />
               </Field>
             )}
@@ -1449,11 +1509,12 @@ export function AiChatClient({ userName }: { userName: string }) {
                   <Input
                     type="number"
                     min={1}
+                    max={AI_MAX_GENERATION_TOKENS}
                     step={64}
                     value={params.maxTokens ?? ""}
                     onChange={(event) => updateParams({ maxTokens: event.target.value === "" ? null : Number(event.target.value) })}
                     className="h-9 text-xs"
-                    placeholder="—"
+                    placeholder="до 384000"
                   />
                 </Field>
                 <Field label="seed">
@@ -1712,8 +1773,32 @@ export function AiChatClient({ userName }: { userName: string }) {
             </div>
           }
         >
-          <div className="flex h-[520px] flex-col overflow-hidden rounded-xl border border-border bg-card2/30 sm:h-[620px]">
-            <div ref={listRef} className="flex-1 space-y-3 overflow-y-auto px-2.5 py-3 sm:px-4">
+          <div
+            onDragEnter={handleDragEnter}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            className={cn(
+              "relative flex h-[520px] flex-col overflow-hidden rounded-xl border bg-card2/30 transition sm:h-[620px]",
+              dragging ? "border-accent ring-2 ring-[var(--ring)]" : "border-border",
+            )}
+          >
+            {dragging && (
+              <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-xl border-2 border-dashed border-accent bg-accent/10 backdrop-blur-[1px]">
+                <p className="rounded-xl border border-accent/40 bg-card px-4 py-2 text-xs font-medium text-text shadow">
+                  Отпустите файл или картинку, чтобы приложить к сообщению
+                </p>
+              </div>
+            )}
+            <div
+              ref={listRef}
+              onScroll={() => {
+                const el = listRef.current;
+                if (!el) return;
+                autoScrollPausedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight > 220;
+              }}
+              className="flex-1 space-y-3 overflow-y-auto px-2.5 py-3 sm:px-4"
+            >
               {bubbles.length === 0 && (
                 <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center">
                   <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-[#7c5cff] to-[#a78bfa] text-white">
@@ -1722,14 +1807,15 @@ export function AiChatClient({ userName }: { userName: string }) {
                   <p className="text-sm font-medium">{chat?.title ?? "Новый чат"} готов к работе</p>
                   <p className="max-w-md text-xs text-muted">
                     Выберите модель, при желании папку RAG и тип раздумий. Можно приложить любые файлы до{" "}
-                    {formatBytes(AI_MAX_FILE_BYTES)} — текст, docx/xlsx/pptx, pdf, картинки.
+                    {formatBytes(AI_MAX_FILE_BYTES)} — текст, docx/xlsx/pptx, pdf, картинки (также работают Ctrl+V и drag-and-drop).
                   </p>
                 </div>
               )}
 
-              {bubbles.map((bubble) => {
+              {bubbles.map((bubble, bubbleIndex) => {
                 const mine = bubble.role === "user";
-                const emptyStreaming = streaming && !mine && !bubble.text;
+                const isLastStreaming = streaming && !mine && bubbleIndex === bubbles.length - 1;
+                const emptyStreaming = isLastStreaming && !bubble.text;
                 return (
                   <div key={bubble.id} className={cn("flex items-end gap-2", mine && "flex-row-reverse")}>
                     {mine ? (
@@ -1750,13 +1836,12 @@ export function AiChatClient({ userName }: { userName: string }) {
                       )}
                     >
                       {!mine && bubble.reasoning.trim() && (
-                        <details className="mb-2 rounded-lg border border-border/70 bg-card2/60 px-2 py-1.5 text-[11px] text-muted">
-                          <summary className="cursor-pointer select-none text-[11px] font-medium">
-                            Размышления · {bubble.reasoning.length} симв.
-                            {emptyStreaming && <span className="ml-1 inline-block animate-pulse">…</span>}
-                          </summary>
-                          <p className="mt-1 max-h-56 overflow-y-auto whitespace-pre-wrap break-words">{bubble.reasoning}</p>
-                        </details>
+                        <LiveReasoningBox
+                          text={bubble.reasoning}
+                          streaming={isLastStreaming}
+                          className="mb-2 rounded-lg border-border/70 bg-card2/60"
+                          bodyClassName="max-h-56"
+                        />
                       )}
                       {emptyStreaming ? (
                         <span className="flex items-center gap-1.5 text-xs text-muted">
@@ -1902,6 +1987,7 @@ export function AiChatClient({ userName }: { userName: string }) {
                   ref={inputRef}
                   value={text}
                   onChange={(event) => setText(event.target.value)}
+                  onPaste={handlePaste}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
@@ -1909,7 +1995,7 @@ export function AiChatClient({ userName }: { userName: string }) {
                     }
                   }}
                   rows={1}
-                  placeholder="Спросите модель... (Enter — отправить, Shift+Enter — перенос)"
+                  placeholder="Спросите модель... (Enter — отправить, Ctrl+V — вставить картинку, или перетащите файл)"
                   className="max-h-32 min-h-[40px] min-w-0 flex-1 resize-none rounded-xl border border-border bg-card2 px-3 py-2 text-sm outline-none focus:border-accent"
                 />
                 {streaming ? (
