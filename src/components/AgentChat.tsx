@@ -51,7 +51,6 @@ import { LiveReasoningBox } from "./LiveReasoningBox";
 import { TrustSelector } from "./TrustSelector";
 import { extractClipboardFiles, hasTransferFiles } from "@/lib/clipboardFiles";
 import {
-  AGENT_MAX_STEPS,
   GEN_DEFAULT_PARAMS,
   decodeGenParams,
   type GenParams,
@@ -321,6 +320,12 @@ function decodeSystemPrompt(raw: string): string {
   }
 }
 
+function decodeAgentSteps(raw: string): number {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.floor(parsed);
+}
+
 function decodeSettings(raw: string): AiSettings {
   const parsed = JSON.parse(raw) as Partial<AiSettings>;
   return {
@@ -380,7 +385,11 @@ export function AgentChat({ userName }: { userName: string }) {
     DEFAULT_RAG_PREFS,
     decodeRagPrefs,
   );
-  const [maxSteps, setMaxSteps] = useStoredNumber("crm.ai.agent.steps.v1", 20);
+  const [maxSteps, setMaxSteps] = useStoredJson<number>(
+    "crm.ai.agent.steps.v1",
+    0,
+    decodeAgentSteps,
+  );
   const [contextLimit, setContextLimit] = useStoredNumber(
     "crm.ai.agent.context_limit.v1",
     DEFAULT_AGENT_CONTEXT_LIMIT,
@@ -1344,7 +1353,7 @@ export function AgentChat({ userName }: { userName: string }) {
       if (!opGoal) setOpGoal(goal);
       setOpDraftPrompt(data.prompt);
       setOpDraftMode(normalizeTaskMode(data.taskMode));
-      setOpDraftSteps(Math.min(AGENT_MAX_STEPS, Math.max(5, Number(data.maxSteps ?? 30) || 30)));
+      setOpDraftSteps(Math.max(0, Math.floor(Number(data.maxSteps ?? 0) || 0)));
       setOpDraftNotes(String(data.notes ?? ""));
       setOpBridgeOpen(true);
     } catch {
@@ -1357,7 +1366,7 @@ export function AgentChat({ userName }: { userName: string }) {
   const launchOperatorFromDraft = async (
     promptText: string,
     mode: OperatorTaskMode,
-    stepsLimit = 30,
+    stepsLimit = 0,
   ) => {
     const clean = promptText.trim();
     if (!clean || opLaunching) return;
@@ -1372,7 +1381,7 @@ export function AgentChat({ userName }: { userName: string }) {
           prompt: clean,
           taskMode: mode,
           coachMode: "agent",
-          maxSteps: Math.min(AGENT_MAX_STEPS, Math.max(5, stepsLimit)),
+          maxSteps: stepsLimit <= 0 ? 0 : Math.floor(stepsLimit),
           trustLevel: trustLevel === "full" ? "full" : "verified",
         }),
       });
@@ -1686,7 +1695,7 @@ export function AgentChat({ userName }: { userName: string }) {
           params,
           ...(systemPrompt.trim() ? { systemPrompt: systemPrompt.trim() } : {}),
           trustLevel,
-          maxSteps: Math.min(AGENT_MAX_STEPS, Math.max(1, maxSteps)),
+          maxSteps: maxSteps <= 0 ? 0 : Math.floor(maxSteps),
           ragFolderId: ragPrefs.folderId,
           ragFull: ragPrefs.ragFull,
           ragChunks: ragPrefs.ragChunks,
@@ -2447,13 +2456,12 @@ export function AgentChat({ userName }: { userName: string }) {
                 </button>
               ))}
               <label className="ml-auto flex items-center gap-1 text-[10px] text-muted">
-                шагов
+                шагов (0 — без лимита)
                 <Input
                   type="number"
-                  min={5}
-                  max={AGENT_MAX_STEPS}
+                  min={0}
                   value={opDraftSteps}
-                  onChange={(e) => setOpDraftSteps(Math.min(AGENT_MAX_STEPS, Math.max(5, Number(e.target.value) || 30)))}
+                  onChange={(e) => setOpDraftSteps(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
                   className="h-7 w-16 px-1.5 text-[10px]"
                 />
               </label>
@@ -2533,7 +2541,7 @@ export function AgentChat({ userName }: { userName: string }) {
                 </span>
               )}
               <span className="text-[10px] text-muted">
-                шагов {opTask.steps}/{opTask.maxSteps}
+                {opTask.maxSteps <= 0 ? `шагов ${opTask.steps} · без лимита` : `шагов ${opTask.steps}/${opTask.maxSteps}`}
               </span>
               <div className="ml-auto flex flex-wrap items-center gap-1.5">
                 <button
@@ -2706,22 +2714,36 @@ export function AgentChat({ userName }: { userName: string }) {
             />
           </div>
 
-          <label className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
-            Лимит шагов агента
-            <Input
-              type="number"
-              min={1}
-              max={AGENT_MAX_STEPS}
-              value={maxSteps}
-              onChange={(event) =>
-                setMaxSteps(Math.min(AGENT_MAX_STEPS, Math.max(1, Number(event.target.value) || 1)))
-              }
-              className="h-8 w-20 px-2 text-[11px]"
-            />
-            <span className="text-[10px]">
-              сколько раз агент может вызвать инструменты (до {AGENT_MAX_STEPS})
-            </span>
-          </label>
+          <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
+            <label className="flex items-center gap-1.5 text-text">
+              <input
+                type="checkbox"
+                checked={maxSteps <= 0}
+                onChange={(event) => setMaxSteps(event.target.checked ? 0 : 20)}
+                className="h-3.5 w-3.5 accent-[#7c5cff]"
+              />
+              Без лимита шагов
+            </label>
+            {maxSteps > 0 ? (
+              <>
+                <Input
+                  type="number"
+                  min={1}
+                  aria-label="Лимит шагов агента"
+                  value={maxSteps}
+                  onChange={(event) => setMaxSteps(Math.max(1, Math.floor(Number(event.target.value) || 1)))}
+                  className="h-8 w-24 px-2 text-[11px]"
+                />
+                <span className="text-[10px]">
+                  ограничение вызовов инструментов (для главного админа потолка нет)
+                </span>
+              </>
+            ) : (
+              <span className="text-[10px] text-emerald-500">
+                Главный администратор: ограничений на шаги нет
+              </span>
+            )}
+          </div>
         </div>
       </GenSettings>
 

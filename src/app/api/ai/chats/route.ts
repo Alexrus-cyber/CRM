@@ -12,13 +12,14 @@ export async function GET() {
 
   const [chats, override] = await Promise.all([listAiChats(me.id, 100), getAiQuotaOverride(me.id)]);
   const policy = aiPolicyFor(me.role, override?.monthlyLimit ?? null);
+  const perChatLimit = policy.perChatTokens !== null && policy.perChatTokens > 0 ? policy.perChatTokens : null;
   return Response.json({
     chats: chats.map((chat) => ({
       ...chat,
-      tokensLeft: Math.max(policy.perChatTokens - chat.tokensTotal, 0),
-      tokensLimit: policy.perChatTokens,
+      tokensLeft: perChatLimit === null ? null : Math.max(perChatLimit - chat.tokensTotal, 0),
+      tokensLimit: perChatLimit,
     })),
-    perChatTokens: policy.perChatTokens,
+    perChatTokens: perChatLimit,
   });
 }
 
@@ -37,8 +38,9 @@ export async function POST(req: Request) {
 
   const [chat, override] = await Promise.all([createAiChat(me.id, title), getAiQuotaOverride(me.id)]);
   const policy = aiPolicyFor(me.role, override?.monthlyLimit ?? null);
+  const perChatLimit = policy.perChatTokens !== null && policy.perChatTokens > 0 ? policy.perChatTokens : null;
   return Response.json({
-    chat: { ...chat, tokensLeft: policy.perChatTokens, tokensLimit: policy.perChatTokens },
+    chat: { ...chat, tokensLeft: perChatLimit, tokensLimit: perChatLimit },
   });
 }
 

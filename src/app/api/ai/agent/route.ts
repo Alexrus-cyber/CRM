@@ -1,7 +1,7 @@
 import { getRagFolder, listRagChunks, searchRagChunks } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 import { estimateTokens, normalizeBaseUrl } from "@/lib/ai";
-import { AGENT_MAX_STEPS, normalizeGenParams } from "@/lib/genParams";
+import { AGENT_MAX_STEPS, isUnlimitedStepsRole, normalizeGenParams, resolveStepsForRole } from "@/lib/genParams";
 import {
   RAG_FULL_MAX_CHARS,
   formatFullRagContext,
@@ -170,10 +170,8 @@ export async function POST(req: Request) {
   }
 
   const params = normalizeGenParams(body?.params);
-  const maxSteps = Math.min(
-    AGENT_MAX_STEPS,
-    Math.max(1, Number.isFinite(body?.maxSteps) ? Number(body?.maxSteps) : AGENT_MAX_STEPS),
-  );
+  const unlimitedSteps = isUnlimitedStepsRole(me.role);
+  const maxSteps = resolveStepsForRole(me.role, body?.maxSteps, unlimitedSteps ? 0 : AGENT_MAX_STEPS);
   const trustLevel = normalizeTrustLevel(body?.trustLevel);
   const runId = typeof body?.runId === "string" && body.runId.trim() ? body.runId.trim().slice(0, 80) : undefined;
   const systemPrompt =
@@ -186,6 +184,7 @@ export async function POST(req: Request) {
     params,
     ...(systemPrompt ? { systemPrompt } : {}),
     maxSteps,
+    unlimited: unlimitedSteps,
     trustLevel,
     ...(runId ? { runId } : {}),
     settings: {

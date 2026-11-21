@@ -1,5 +1,6 @@
-import { getAgentTask, listAgentEvents } from "@/db/repo";
+import { getAgentTask, getUserRoleById, listAgentEvents } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
+import { isUnlimitedStepsRole } from "@/lib/genParams";
 
 /**
  * Статус задания для бота: `GET /api/agent/bot/<id>`.
@@ -20,7 +21,8 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
   if (!task) return Response.json({ error: "Задание не найдено" }, { status: 404 });
 
   // Вложения задания: бот скачивает их отдельным маршрутом по eventId.
-  const events = await listAgentEvents(task.id);
+  const [events, ownerRole] = await Promise.all([listAgentEvents(task.id), getUserRoleById(ownerId)]);
+  const unlimited = isUnlimitedStepsRole(ownerRole);
   const attachments = events
     .filter((event) => event.kind === "attachment" && event.hasFile)
     .map((event) => ({
@@ -37,6 +39,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         status: task.status,
         steps: task.steps,
         maxSteps: task.maxSteps,
+        unlimited,
         summary: task.summary,
         trustLevel: task.trustLevel,
         taskMode: task.taskMode,

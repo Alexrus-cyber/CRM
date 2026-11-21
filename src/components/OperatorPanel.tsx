@@ -34,9 +34,7 @@ import { useStoredJson } from "@/lib/useStoredValue";
 import { GenSettings } from "./GenSettings";
 import { TrustSelector } from "./TrustSelector";
 import {
-  AGENT_MAX_STEPS,
   GEN_DEFAULT_PARAMS,
-  OPERATOR_MAX_EXTEND_STEPS,
   decodeGenParams,
   type GenParams,
 } from "@/lib/genParams";
@@ -182,7 +180,7 @@ export function OperatorPanel() {
   const taskFileRef = useRef<HTMLInputElement>(null);
   const [prompt, setPrompt] = useState("");
   const [taskFiles, setTaskFiles] = useState<OperatorAttachment[]>([]);
-  const [maxSteps, setMaxSteps] = useState(15);
+  const [maxSteps, setMaxSteps] = useState(0);
   // Раздумья и генерация: общие для планировщика и команды запуска бота.
   const [genParams, setGenParams] = useStoredJson<GenParams>(
     "crm.ai.operator.params.v1",
@@ -473,7 +471,7 @@ export function OperatorPanel() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           prompt: text,
-          maxSteps: Math.max(maxSteps, 1),
+          maxSteps: maxSteps <= 0 ? 0 : Math.floor(maxSteps),
           trustLevel,
           taskMode,
           coachMode,
@@ -677,7 +675,10 @@ export function OperatorPanel() {
     () => parsePendingApproval(activeTask?.pendingApproval),
     [activeTask?.pendingApproval],
   );
-  const progress = activeTask ? Math.min(100, Math.round((activeTask.steps / Math.max(activeTask.maxSteps, 1)) * 100)) : 0;
+  const progress =
+    activeTask && activeTask.maxSteps > 0
+      ? Math.min(100, Math.round((activeTask.steps / Math.max(activeTask.maxSteps, 1)) * 100))
+      : 0;
   const finished = activeTask ? ["done", "failed", "cancelled"].includes(activeTask.status) : false;
 
   const effectiveToken = (connection?.token.trim() || tokenInput.trim()).trim();
@@ -878,7 +879,7 @@ export function OperatorPanel() {
                 <span className="flex flex-wrap items-center gap-2">
                   2. Выполнение
                   <Badge className="border-border text-muted">
-                    <Play size={11} /> шагов: до {maxSteps}
+                    <Play size={11} /> {maxSteps <= 0 ? "шагов: без лимита" : `шагов: до ${maxSteps}`}
                   </Badge>
                   <Badge className={findTaskMode(taskMode).badgeClass}>
                     {taskMode === "game" ? <Gamepad2 size={11} /> : <Compass size={11} />}
@@ -903,7 +904,7 @@ export function OperatorPanel() {
                       type="button"
                       onClick={() => {
                         setTaskMode(m.id);
-                        if (m.id === "game" && maxSteps < 40) setMaxSteps(50);
+                        if (m.id === "game" && maxSteps > 0 && maxSteps < 40) setMaxSteps(50);
                         if (m.id !== "autonomous" && coachMode === "off") setCoachMode("agent");
                       }}
                       title={m.description}
@@ -993,19 +994,29 @@ export function OperatorPanel() {
               )}
 
               <div className="mt-3 flex flex-wrap items-center gap-2">
-                <label className="flex items-center gap-1.5 text-[11px] text-muted">
-                  Лимит шагов
-                  <Input
-                    type="number"
-                    min={1}
-                    max={AGENT_MAX_STEPS}
-                    value={maxSteps}
-                    onChange={(event) =>
-                      setMaxSteps(Math.min(AGENT_MAX_STEPS, Math.max(1, Number(event.target.value) || 15)))
-                    }
-                    className="h-8 w-16 px-2 text-[11px]"
+                <label className="flex items-center gap-1.5 text-[11px] text-text">
+                  <input
+                    type="checkbox"
+                    checked={maxSteps <= 0}
+                    onChange={(event) => setMaxSteps(event.target.checked ? 0 : 15)}
+                    className="h-3.5 w-3.5 accent-[#7c5cff]"
                   />
+                  Без лимита шагов
                 </label>
+                {maxSteps > 0 && (
+                  <label className="flex items-center gap-1.5 text-[11px] text-muted">
+                    Лимит шагов
+                    <Input
+                      type="number"
+                      min={1}
+                      value={maxSteps}
+                      onChange={(event) =>
+                        setMaxSteps(Math.max(1, Math.floor(Number(event.target.value) || 15)))
+                      }
+                      className="h-8 w-20 px-2 text-[11px]"
+                    />
+                  </label>
+                )}
                 <input
                   ref={taskFileRef}
                   type="file"
@@ -1111,28 +1122,32 @@ export function OperatorPanel() {
               >
                 <div className="flex items-center gap-2 text-[10px] text-muted">
                   <span>
-                    шаг {activeTask.steps}/{activeTask.maxSteps}
+                    {activeTask.maxSteps <= 0
+                      ? `шаг ${activeTask.steps} · без лимита`
+                      : `шаг ${activeTask.steps}/${activeTask.maxSteps}`}
                   </span>
-                  <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-card2">
-                    <div
-                      className={cn(
-                        "h-full rounded-full transition-all",
-                        activeTask.status === "failed"
-                          ? "bg-red-500"
-                          : activeTask.status === "done"
-                            ? "bg-emerald-500"
-                            : "bg-accent",
-                      )}
-                      style={{ width: `${Math.max(progress, 2)}%` }}
-                    />
-                  </div>
-                  {!finished && activeTask.maxSteps < OPERATOR_MAX_EXTEND_STEPS && (
+                  {activeTask.maxSteps > 0 && (
+                    <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-card2">
+                      <div
+                        className={cn(
+                          "h-full rounded-full transition-all",
+                          activeTask.status === "failed"
+                            ? "bg-red-500"
+                            : activeTask.status === "done"
+                              ? "bg-emerald-500"
+                              : "bg-accent",
+                        )}
+                        style={{ width: `${Math.max(progress, 2)}%` }}
+                      />
+                    </div>
+                  )}
+                  {!finished && activeTask.maxSteps > 0 && (
                     <button
                       type="button"
                       onClick={() => void extendSteps(activeTask.id, 20)}
                       disabled={actionBusy}
                       className="flex shrink-0 items-center gap-0.5 rounded-md border border-accent/40 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent2 hover:bg-accent/20 disabled:opacity-50"
-                      title="Продлить лимит шагов этой задачи без потери контекста (до 2000)"
+                      title="Продлить лимит шагов этой задачи без потери контекста"
                     >
                       <Plus size={10} /> +20 шагов
                     </button>
@@ -1350,7 +1365,7 @@ export function OperatorPanel() {
                     <span className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10px] text-muted">
                       <StatusChip status={task.status} />
                       <span>
-                        шагов {task.steps}/{task.maxSteps}
+                        {task.maxSteps <= 0 ? `шагов ${task.steps} · без лимита` : `шагов ${task.steps}/${task.maxSteps}`}
                       </span>
                       <span>{formatDateTime(task.createdAt)}</span>
                       {task.summary && <span className="truncate">· {task.summary}</span>}

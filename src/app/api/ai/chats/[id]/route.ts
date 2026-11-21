@@ -18,12 +18,13 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
   const override = await getAiQuotaOverride(me.id);
   const policy = aiPolicyFor(me.role, override?.monthlyLimit ?? null);
+  const perChatLimit = policy.perChatTokens !== null && policy.perChatTokens > 0 ? policy.perChatTokens : null;
 
   return Response.json({
     chat: {
       ...chat,
-      tokensLeft: Math.max(policy.perChatTokens - chat.tokensTotal, 0),
-      tokensLimit: policy.perChatTokens,
+      tokensLeft: perChatLimit === null ? null : Math.max(perChatLimit - chat.tokensTotal, 0),
+      tokensLimit: perChatLimit,
     },
     messages: await listAiChatMessages(id),
   });

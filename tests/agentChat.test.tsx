@@ -7,6 +7,7 @@ type Sent = {
   params?: Record<string, unknown>;
   systemPrompt?: string;
   trustLevel?: string;
+  maxSteps?: number;
   ragFolderId?: number;
   ragFull?: boolean;
   ragChunks?: number;
@@ -761,5 +762,27 @@ describe("вкладка «Агент»", () => {
 
     gate.release?.();
     expect(await screen.findByText("Готово")).toBeTruthy();
+  });
+
+  it("по умолчанию отправляет maxSteps = 0 (без лимита) и позволяет задать число > 500", async () => {
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/);
+    fireEvent.change(chatBox, { target: { value: "Тест без лимита" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    await waitFor(() => expect(sent.length).toBe(1));
+    expect(sent[0].maxSteps).toBe(0);
+
+    const toggle = screen.getByLabelText("Без лимита шагов") as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+    fireEvent.click(toggle);
+
+    const stepsInput = await screen.findByLabelText("Лимит шагов агента");
+    fireEvent.change(stepsInput, { target: { value: "800" } });
+    fireEvent.change(chatBox, { target: { value: "Тест 800 шагов" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    await waitFor(() => expect(sent.length).toBe(2));
+    expect(sent[1].maxSteps).toBe(800);
   });
 });

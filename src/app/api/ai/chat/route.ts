@@ -268,7 +268,7 @@ export async function POST(req: Request) {
   if (chatId > 0) {
     chat = await getAiChat(me.id, chatId);
     if (!chat) return Response.json({ error: "Чат не найден" }, { status: 404 });
-    if (policy.perChatTokens > 0 && chat.tokensTotal >= policy.perChatTokens) {
+    if (policy.perChatTokens !== null && policy.perChatTokens > 0 && chat.tokensTotal >= policy.perChatTokens) {
       return Response.json(
         {
           error:
@@ -374,7 +374,7 @@ export async function POST(req: Request) {
     const summary = {
       usage: { prompt, completion, total, estimated: !usage },
       reasoningDowngraded,
-      chat: null as (AiChatRow & { tokensLeft: number; tokensLimit: number }) | null,
+      chat: null as (AiChatRow & { tokensLeft: number | null; tokensLimit: number | null }) | null,
       monthly: { used: 0, limit: policy.monthlyTokens, left: null as number | null },
     };
     try {
@@ -396,11 +396,12 @@ export async function POST(req: Request) {
         await renameAiChat(me.id, chatId, userMessage.trim().slice(0, 60));
       }
       const fresh = await recordAiUsage({ userId: me.id, chatId, prompt, completion });
+      const perChatLimit = policy.perChatTokens !== null && policy.perChatTokens > 0 ? policy.perChatTokens : null;
       summary.chat = fresh.chat
         ? {
             ...fresh.chat,
-            tokensLeft: Math.max(policy.perChatTokens - fresh.chat.tokensTotal, 0),
-            tokensLimit: policy.perChatTokens,
+            tokensLeft: perChatLimit === null ? null : Math.max(perChatLimit - fresh.chat.tokensTotal, 0),
+            tokensLimit: perChatLimit,
           }
         : null;
       summary.monthly = {

@@ -25,6 +25,7 @@ export async function GET() {
       role: policy.role,
       perChatTokens: policy.perChatTokens,
       monthlyTokens: monthlyLimit,
+      maxSteps: policy.maxSteps,
       rag: policy.rag,
       reasoning: policy.reasoning,
       summary: policy.summary,

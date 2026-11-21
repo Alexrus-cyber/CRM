@@ -1,7 +1,7 @@
 import { addAgentEvent, createAgentTask } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 import { aiAuthHeaders, aiEndpoint, normalizeBaseUrl } from "@/lib/ai";
-import { AGENT_MAX_STEPS } from "@/lib/genParams";
+import { isUnlimitedStepsRole, resolveStepsForRole } from "@/lib/genParams";
 import {
   normalizeCoachMode,
   normalizeTaskMode,
@@ -130,7 +130,7 @@ export async function POST(req: Request) {
                 prompt: prompt.slice(0, MAX_PROMPT),
                 taskMode: normalizeTaskMode(parsed.taskMode),
                 coachMode: normalizeCoachMode(parsed.coachMode || "agent"),
-                maxSteps: Math.min(AGENT_MAX_STEPS, Math.max(5, Number(parsed.maxSteps ?? 30) || 30)),
+                maxSteps: resolveStepsForRole(me.role, parsed.maxSteps, 30),
                 notes: String(parsed.notes ?? "").trim().slice(0, 400),
                 source: "model",
               },
@@ -156,7 +156,7 @@ export async function POST(req: Request) {
   const maxSteps =
     taskMode === "inspect"
       ? 2
-      : Math.min(AGENT_MAX_STEPS, Math.max(1, Number(body?.maxSteps ?? 30) || 30));
+      : resolveStepsForRole(me.role, body?.maxSteps, isUnlimitedStepsRole(me.role) ? 0 : 30);
 
   const task = await createAgentTask(me.id, prompt, maxSteps, trustLevel, {
     taskMode,

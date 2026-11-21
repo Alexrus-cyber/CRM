@@ -10,7 +10,7 @@ import {
   formatTranscriptMarkdown,
   shouldAutoRollover,
 } from "@/lib/transcripts";
-import { OPERATOR_MAX_EXTEND_STEPS } from "@/lib/genParams";
+import { AGENT_MAX_STEPS } from "@/lib/genParams";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crm-trust-tr-"));
 process.env.SQLITE_PATH = path.join(dir, "crm.sqlite");
@@ -18,6 +18,7 @@ process.env.DATABASE_URL = "";
 
 let userId = 0;
 let otherUserId = 0;
+let regularAdminId = 0;
 let repo: typeof import("@/db/repo");
 let db: typeof import("@/db");
 
@@ -29,11 +30,14 @@ beforeAll(async () => {
     insert into users (email, password_hash, name, role, created_at, updated_at)
     values
       ('admin1@example.com', 'x', 'Admin', 'super_admin', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'),
-      ('admin2@example.com', 'x', 'Other', 'super_admin', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`);
+      ('admin2@example.com', 'x', 'Other', 'super_admin', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'),
+      ('plainadmin@example.com', 'x', 'Plain Admin', 'admin', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`);
   const first = await db.q1<{ id: number }>(sql`select id from users where email = 'admin1@example.com'`);
   const second = await db.q1<{ id: number }>(sql`select id from users where email = 'admin2@example.com'`);
+  const plainAdmin = await db.q1<{ id: number }>(sql`select id from users where email = 'plainadmin@example.com'`);
   userId = Number(first?.id);
   otherUserId = Number(second?.id);
+  regularAdminId = Number(plainAdmin?.id);
 });
 
 afterAll(() => {
@@ -76,7 +80,7 @@ describe("уровни доверия ИИ и оценка контекста/Su
 });
 
 describe("БД: подтверждения оператора, расширение шагов на месте и архив переписок", () => {
-  it("управляет очередью подтверждений, продлением шагов до 2000 и активностью бота", async () => {
+  it("управляет очередью подтверждений, безлимитными шагами для super_admin, пределом 500 для admin и активностью бота", async () => {
     const conn = await repo.createAgentConnection(userId, "Локальный", "http://localhost:3000");
     const createdToken = await repo.createAgentConnectionToken(userId, conn.id, "Тест");
     await repo.findAgentTokenOwner(createdToken!.token);
@@ -117,9 +121,17 @@ describe("БД: подтверждения оператора, расширен�
     expect(extended?.status).toBe("running");
     expect(extended?.maxSteps).toBe(30);
 
-    // Жёсткий потолок не превышает OPERATOR_MAX_EXTEND_STEPS (2000).
-    const capped = await repo.extendAgentTaskSteps(task.id, userId, 5000);
-    expect(capped?.maxSteps).toBe(OPERATOR_MAX_EXTEND_STEPS);
+    // Главный админ (super_admin) не имеет потолка 500/2000 при продлении и поддерживает maxSteps = 0 (без лимита).
+    const superExpanded = await repo.extendAgentTaskSteps(task.id, userId, 5000);
+    expect(superExpanded?.maxSteps).toBe(5030);
+    const superUnlimited = await repo.createAgentTask(userId, "Безлимитная задача", 0, "full");
+    expect(superUnlimited.maxSteps).toBe(0);
+
+    // Обычный администратор (admin) ограничен пределом AGENT_MAX_STEPS = 500.
+    const adminTask = await repo.createAgentTask(regularAdminId, "Задача обычного админа", 900, "verified");
+    expect(adminTask.maxSteps).toBe(AGENT_MAX_STEPS);
+    const adminExtended = await repo.extendAgentTaskSteps(adminTask.id, regularAdminId, 200);
+    expect(adminExtended?.maxSteps).toBe(AGENT_MAX_STEPS);
   });
 
   it("сохраняет полные стенограммы переписки с изоляцией по пользователям", async () => {

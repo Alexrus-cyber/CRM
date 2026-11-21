@@ -115,8 +115,8 @@ type ChatInfo = {
   tokensTotal: number;
   tokensPrompt: number;
   tokensCompletion: number;
-  tokensLeft: number;
-  tokensLimit: number;
+  tokensLeft: number | null;
+  tokensLimit: number | null;
   messagesCount: number;
   createdAt: string;
   updatedAt: string;
@@ -831,10 +831,12 @@ export function AiChatClient({ userName }: { userName: string }) {
   const overLimit = limit > 0 && contextTokens >= limit;
 
   const policy = usage?.policy ?? null;
-  const chatLimit = chat?.tokensLimit ?? policy?.perChatTokens ?? 0;
-  const chatLeft = chat ? Math.max(chatLimit - chat.tokensTotal, 0) : chatLimit;
-  const chatUsedPercent = chatLimit > 0 ? Math.min(100, Math.round(((chat?.tokensTotal ?? 0) / chatLimit) * 100)) : 0;
-  const chatExhausted = Boolean(chat && chatLimit > 0 && chat.tokensTotal >= chatLimit);
+  const chatLimit = chat ? chat.tokensLimit : (policy?.perChatTokens ?? null);
+  const chatUnlimited = chatLimit === null || chatLimit <= 0;
+  const chatLeft = chatUnlimited ? null : chat ? Math.max(chatLimit - chat.tokensTotal, 0) : chatLimit;
+  const chatUsedPercent =
+    !chatUnlimited && chatLimit ? Math.min(100, Math.round(((chat?.tokensTotal ?? 0) / chatLimit) * 100)) : 0;
+  const chatExhausted = Boolean(!chatUnlimited && chat && chatLimit !== null && chat.tokensTotal >= chatLimit);
   const monthLimit = usage?.monthly.limit ?? null;
   const monthUsed = usage?.monthly.used ?? 0;
   const monthLeft = usage?.monthly.left ?? null;
@@ -1215,7 +1217,8 @@ export function AiChatClient({ userName }: { userName: string }) {
               <div className="max-h-64 space-y-1.5 overflow-y-auto pr-0.5">
                 {chats.map((item) => {
                   const active = item.id === chat?.id;
-                  const left = Math.max(item.tokensLimit - item.tokensTotal, 0);
+                  const itemUnlimited = item.tokensLimit === null || item.tokensLimit <= 0;
+                  const left = itemUnlimited ? null : Math.max(item.tokensLimit! - item.tokensTotal, 0);
                   return (
                     <div
                       key={item.id}
@@ -1233,7 +1236,10 @@ export function AiChatClient({ userName }: { userName: string }) {
                         <p className="truncate text-[11px] font-medium">{item.title}</p>
                         <p className="truncate text-[10px] text-muted">
                           {new Date(item.updatedAt).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
-                          {" · "}осталось {formatTokenCount(left)}
+                          {" · "}
+                          {itemUnlimited
+                            ? `${formatTokenCount(item.tokensTotal)} · без лимита`
+                            : `осталось ${formatTokenCount(left)}`}
                         </p>
                       </button>
                       <button
@@ -1392,7 +1398,7 @@ export function AiChatClient({ userName }: { userName: string }) {
           icon={<Gauge size={14} className="text-accent2" />}
           action={
             <Badge className={cn("border-border", chatExhausted && "border-red-500/40 bg-red-500/10 text-red-500")}>
-              осталось {formatTokenCount(chatLeft)}
+              {chatUnlimited ? "без лимита" : `осталось ${formatTokenCount(chatLeft)}`}
             </Badge>
           }
         >
@@ -1401,18 +1407,20 @@ export function AiChatClient({ userName }: { userName: string }) {
               <div className="mb-1 flex items-center justify-between text-[11px]">
                 <span className="text-muted">Токены чата</span>
                 <span className={cn("font-medium", chatExhausted && "text-red-500")}>
-                  {formatTokenCount(chat?.tokensTotal ?? 0)} / {formatTokenCount(chatLimit)}
+                  {formatTokenCount(chat?.tokensTotal ?? 0)} / {chatUnlimited ? "без лимита" : formatTokenCount(chatLimit)}
                 </span>
               </div>
-              <div className="h-1.5 overflow-hidden rounded-full bg-card2">
-                <div
-                  className={cn(
-                    "h-full rounded-full transition-all",
-                    chatExhausted ? "bg-red-500" : chatUsedPercent > 80 ? "bg-amber-500" : "bg-emerald-500",
-                  )}
-                  style={{ width: `${Math.max(chatUsedPercent, 2)}%` }}
-                />
-              </div>
+              {!chatUnlimited && (
+                <div className="h-1.5 overflow-hidden rounded-full bg-card2">
+                  <div
+                    className={cn(
+                      "h-full rounded-full transition-all",
+                      chatExhausted ? "bg-red-500" : chatUsedPercent > 80 ? "bg-amber-500" : "bg-emerald-500",
+                    )}
+                    style={{ width: `${Math.max(chatUsedPercent, 2)}%` }}
+                  />
+                </div>
+              )}
               <p className="mt-1 text-[10px] text-muted">
                 {chat ? `Чат «${chat.title}»` : "Чат ещё не создан"} · «Новый чат» обнуляет счётчик
               </p>
@@ -1754,7 +1762,7 @@ export function AiChatClient({ userName }: { userName: string }) {
               {chat?.title ?? "Новый чат"}
               <Badge className="border-border text-muted">{settings.model.trim() || "модель не выбрана"}</Badge>
               <Badge className={cn("border-border", chatExhausted ? "bg-red-500/10 text-red-500" : "text-muted")}>
-                осталось {formatTokenCount(chatLeft)}
+                {chatUnlimited ? "без лимита" : `осталось ${formatTokenCount(chatLeft)}`}
               </Badge>
               <Badge className="border-amber-500/40 bg-amber-500/10 text-amber-500">Harness</Badge>
               {activeFolder && <Badge className="border-emerald-500/40 bg-emerald-500/10 text-emerald-500">RAG</Badge>}
@@ -2024,7 +2032,9 @@ export function AiChatClient({ userName }: { userName: string }) {
                 </span>
                 <span className={cn("flex items-center gap-1", chatExhausted && "text-red-500")}>
                   <Gauge size={10} />
-                  чат: осталось {formatTokenCount(chatLeft)} из {formatTokenCount(chatLimit)}
+                  {chatUnlimited
+                    ? `чат: ${formatTokenCount(chat?.tokensTotal ?? 0)} / без лимита`
+                    : `чат: осталось ${formatTokenCount(chatLeft)} из ${formatTokenCount(chatLimit)}`}
                 </span>
                 <span className={cn("flex items-center gap-1", monthExhausted && "text-red-500")}>
                   месяц: {formatTokenCount(monthUsed)}
