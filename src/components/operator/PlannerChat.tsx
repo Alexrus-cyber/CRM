@@ -59,6 +59,7 @@ type Props = {
   apiKey: string;
   providerLabel: string;
   params: GenParams;
+  unlimited?: boolean;
   onTransfer: (prompt: string, files: OperatorAttachment[]) => Promise<void>;
   onOpenSetup: () => void;
 };
@@ -75,7 +76,7 @@ function decodeMessage(message: StoredMessage): PlanMessage {
   };
 }
 
-export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onTransfer, onOpenSetup }: Props) {
+export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, unlimited = false, onTransfer, onOpenSetup }: Props) {
   const [conversations, setConversations] = useState<PlanConversation[]>([]);
   const [conversationId, setConversationId] = useState<number | null>(null);
   const [messages, setMessages] = useState<PlanMessage[]>([]);
@@ -368,7 +369,7 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
   const attach = async (list: FileList | File[]) => {
     if (list.length === 0) return;
     setError(null);
-    const { files: added, errors } = await readOperatorFiles(files, list);
+    const { files: added, errors } = await readOperatorFiles(files, list, { unlimited });
     setFiles((prev) => [...prev, ...added]);
     if (errors.length > 0) setError(errors[0]);
   };
@@ -663,7 +664,7 @@ export function PlannerChat({ baseUrl, model, apiKey, providerLabel, params, onT
           size="icon"
           variant="ghost"
           onClick={() => fileRef.current?.click()}
-          title="Приложить файлы (до 5 по 10 МБ)"
+          title={unlimited ? "Приложить файлы (без лимита)" : "Приложить файлы (до 5 по 10 МБ)"}
           aria-label="Приложить файлы"
           disabled={historyLoading || sending}
         >

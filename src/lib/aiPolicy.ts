@@ -41,8 +41,12 @@ export type AiRolePolicy = {
   chatsUnlimited: boolean;
 };
 
-const FULL_REASONING: ReasoningMode[] = ["default", "off", "low", "medium", "high", "budget"];
+const FULL_REASONING: ReasoningMode[] = ["default", "off", "low", "medium", "high", "max", "budget"];
 const LIGHT_REASONING: ReasoningMode[] = ["off", "low"];
+
+export function isUnlimitedAiRole(role: string | null | undefined): boolean {
+  return role === "super_admin";
+}
 
 export const AI_ROLE_POLICY: Record<Role, AiRolePolicy> = {
   super_admin: {
@@ -52,7 +56,7 @@ export const AI_ROLE_POLICY: Record<Role, AiRolePolicy> = {
     maxSteps: null,
     rag: true,
     reasoning: FULL_REASONING,
-    summary: "Без лимитов: любые режимы раздумий и RAG, без ограничений по токенам и шагам",
+    summary: "Без лимитов на всё: любые режимы раздумий (включая Max), RAG, файлы, контекст, токены и шаги",
     chatsUnlimited: true,
   },
   admin: {

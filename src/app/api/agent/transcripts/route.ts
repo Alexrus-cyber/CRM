@@ -19,7 +19,7 @@ export async function GET() {
   const auth = await adminUser();
   if (auth.response) return auth.response;
 
-  const transcripts = await listAgentTranscripts(auth.user.id, 40);
+  const transcripts = await listAgentTranscripts(auth.user.id, 500);
   return Response.json({ transcripts }, { headers: { "Cache-Control": "no-store" } });
 }
 

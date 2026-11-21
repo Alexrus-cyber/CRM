@@ -14,13 +14,13 @@ export const dynamic = "force-dynamic";
 
 export default async function AiPage() {
   const user = await requireUser();
+  const isSuperAdmin = user.role === "super_admin";
   const [usage, override, chats] = await Promise.all([
     getAiUsage(user.id),
     getAiQuotaOverride(user.id),
-    listAiChats(user.id, 200),
+    listAiChats(user.id, isSuperAdmin ? 1000 : 200),
   ]);
   const policy = aiPolicyFor(user.role, override?.monthlyLimit ?? null);
-  const isSuperAdmin = user.role === "super_admin";
 
   const tabs: AiTab[] = [
     {
@@ -28,7 +28,7 @@ export default async function AiPage() {
       label: "Чат с моделью",
       hint: "Обычный диалог: файлы, картинки, RAG, режимы раздумий",
       icon: <MessagesSquare size={14} />,
-      content: <LazyAiChat userName={user.name} />,
+      content: <LazyAiChat userName={user.name} unlimited={isSuperAdmin} />,
     },
   ];
 
@@ -38,14 +38,14 @@ export default async function AiPage() {
       label: "Агент",
       hint: "Эксперимент: агент создаёт файлы и управляет экраном",
       icon: <Bot size={14} />,
-      content: <AgentChat userName={user.name} />,
+      content: <AgentChat userName={user.name} unlimited />,
     });
     tabs.push({
       id: "operator",
       label: "Оператор",
       hint: "Бот, который управляет рабочим столом и возвращает файлы в чат",
       icon: <MonitorCog size={14} />,
-      content: <OperatorPanel />,
+      content: <OperatorPanel unlimited />,
     });
   }
 

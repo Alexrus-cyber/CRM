@@ -90,7 +90,6 @@ export async function POST(req: Request) {
         body: JSON.stringify({
           model,
           temperature: 0.25,
-          max_tokens: 650,
           stream: false,
           messages: [
             {
@@ -105,7 +104,7 @@ export async function POST(req: Request) {
               role: "user",
               content:
                 `Просьба пользователя: ${goal}` +
-                (body?.contextSummary ? `\nКонтекст чата:\n${String(body.contextSummary).slice(0, 2000)}` : ""),
+                (body?.contextSummary ? `\nКонтекст чата:\n${String(body.contextSummary)}` : ""),
             },
           ],
         }),
@@ -127,11 +126,11 @@ export async function POST(req: Request) {
           if (prompt) {
             return Response.json(
               {
-                prompt: prompt.slice(0, MAX_PROMPT),
+                prompt,
                 taskMode: normalizeTaskMode(parsed.taskMode),
                 coachMode: normalizeCoachMode(parsed.coachMode || "agent"),
                 maxSteps: resolveStepsForRole(me.role, parsed.maxSteps, 30),
-                notes: String(parsed.notes ?? "").trim().slice(0, 400),
+                notes: String(parsed.notes ?? "").trim().slice(0, 800),
                 source: "model",
               },
               { headers: { "Cache-Control": "no-store" } },
@@ -148,7 +147,9 @@ export async function POST(req: Request) {
   // Запуск задачи Оператора после явного разрешения пользователя.
   const prompt = String(body?.prompt ?? "").trim();
   if (!prompt) return Response.json({ error: "Укажите задачу для Оператора" }, { status: 400 });
-  if (prompt.length > MAX_PROMPT) return Response.json({ error: "Слишком длинное задание" }, { status: 400 });
+  if (!isUnlimitedStepsRole(me.role) && prompt.length > MAX_PROMPT) {
+    return Response.json({ error: "Слишком длинное задание" }, { status: 400 });
+  }
 
   const taskMode = normalizeTaskMode(body?.taskMode ?? body?.mode);
   const coachMode = taskMode === "inspect" ? "off" : normalizeCoachMode(body?.coachMode ?? "agent");

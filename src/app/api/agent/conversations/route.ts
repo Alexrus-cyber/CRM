@@ -30,7 +30,7 @@ export async function GET(req: Request) {
   const kind = new URL(req.url).searchParams.get("kind");
   if (!isKind(kind)) return Response.json({ error: "Укажите тип чата: plan или agent" }, { status: 400 });
 
-  const conversations = await listAgentConversations(auth.user.id, kind);
+  const conversations = await listAgentConversations(auth.user.id, kind, 1000);
   return Response.json(
     {
       conversations: conversations.map(({ id, kind, title, messagesCount, createdAt, updatedAt }) => ({
@@ -63,7 +63,7 @@ export async function POST(req: Request) {
     (kind === "plan" ? "Новый план" : "Новый чат");
   const systemPrompt =
     kind === "plan"
-      ? (typeof body.systemPrompt === "string" ? body.systemPrompt.trim().slice(0, 12_000) : "") || DEFAULT_PLAN_PROMPT
+      ? (typeof body.systemPrompt === "string" ? body.systemPrompt.trim() : "") || DEFAULT_PLAN_PROMPT
       : "";
   const conversation = await createAgentConversation(auth.user.id, kind, title, systemPrompt);
   return Response.json({ conversation }, { headers: { "Cache-Control": "no-store" } });

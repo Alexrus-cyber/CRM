@@ -14,7 +14,7 @@ const AiChatClient = dynamic(() => import("./AiChatClient").then((module) => mod
   loading: () => <AiChatSkeleton />,
 });
 
-export function LazyAiChat({ userName }: { userName: string }) {
+export function LazyAiChat({ userName, unlimited = false }: { userName: string; unlimited?: boolean }) {
   return (
     <LazyMount
       minHeight={520}
@@ -22,7 +22,7 @@ export function LazyAiChat({ userName }: { userName: string }) {
       label="Загружаем чат с ИИ..."
       fallback={<AiChatSkeleton />}
     >
-      <AiChatClient userName={userName} />
+      <AiChatClient userName={userName} unlimited={unlimited} />
     </LazyMount>
   );
 }

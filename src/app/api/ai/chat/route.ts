@@ -200,9 +200,10 @@ export async function POST(req: Request) {
   let ragQuery = "";
   let chatId = 0;
   let attachmentsJson = "[]";
+  const unlimited = me.role === "super_admin";
   try {
     const raw = await req.text();
-    if (raw.length > MAX_BODY_BYTES) {
+    if (!unlimited && raw.length > MAX_BODY_BYTES) {
       return Response.json({ error: "Слишком большой запрос: уменьшите вложение" }, { status: 413 });
     }
     const body = JSON.parse(raw) as {
@@ -214,25 +215,35 @@ export async function POST(req: Request) {
       chatId?: unknown;
       attachments?: unknown;
     };
-    params = normalizeParams(body.params);
-    ragContext = typeof body.ragContext === "string" ? body.ragContext.slice(0, MAX_RAG_CONTEXT_CHARS) : "";
+    params = normalizeParams(body.params, { unlimited });
+    ragContext =
+      typeof body.ragContext === "string"
+        ? unlimited
+          ? body.ragContext
+          : body.ragContext.slice(0, MAX_RAG_CONTEXT_CHARS)
+        : "";
     ragFolderId = Number(body.ragFolderId ?? 0) || 0;
-    ragQuery = typeof body.ragQuery === "string" ? body.ragQuery.slice(0, 4000) : "";
+    ragQuery =
+      typeof body.ragQuery === "string"
+        ? unlimited
+          ? body.ragQuery
+          : body.ragQuery.slice(0, 4000)
+        : "";
     chatId = Number(body.chatId ?? 0) || 0;
     if (Array.isArray(body.attachments)) {
-      attachmentsJson = JSON.stringify(
-        body.attachments
-          .slice(0, 8)
-          .map((item) => {
-            const meta = (item ?? {}) as { name?: unknown; kind?: unknown; size?: unknown; note?: unknown };
-            return {
-              name: String(meta.name ?? "").slice(0, 200),
-              kind: String(meta.kind ?? "text").slice(0, 20),
-              size: Number(meta.size ?? 0) || 0,
-              note: String(meta.note ?? "").slice(0, 200),
-            };
-          }),
-      ).slice(0, 4000);
+      const items = unlimited ? body.attachments : body.attachments.slice(0, 8);
+      const serialized = JSON.stringify(
+        items.map((item) => {
+          const meta = (item ?? {}) as { name?: unknown; kind?: unknown; size?: unknown; note?: unknown };
+          return {
+            name: String(meta.name ?? "").slice(0, 200),
+            kind: String(meta.kind ?? "text").slice(0, 20),
+            size: Number(meta.size ?? 0) || 0,
+            note: String(meta.note ?? "").slice(0, 200),
+          };
+        }),
+      );
+      attachmentsJson = unlimited ? serialized : serialized.slice(0, 4000);
     }
     messages = (body.messages ?? []).filter(
       (m) => m && (m.role === "user" || m.role === "assistant" || m.role === "system"),
@@ -329,7 +340,7 @@ export async function POST(req: Request) {
             estimatePromptTokens(messages.filter((message) => message.role !== "system")) +
             (params.system.trim() ? estimateTokens(params.system) : 0);
           const reserve = params.maxTokens ?? RAG_FULL_RESERVE_TOKENS;
-          const budgetChars = ragBudgetChars(params.contextLimit, usedTokens, reserve);
+          const budgetChars = ragBudgetChars(params.contextLimit, usedTokens, reserve, unlimited);
           const packed = formatFullRagContext(ordered, budgetChars);
           if (packed.used > 0) {
             ragContext = packed.text;
@@ -340,7 +351,7 @@ export async function POST(req: Request) {
       } else if (query) {
         const hits = await searchRagChunks(ragFolderId, query, params.ragChunks);
         if (hits.length > 0) {
-          ragContext = formatRagContext(hits, MAX_RAG_CONTEXT_CHARS);
+          ragContext = formatRagContext(hits, unlimited ? Number.MAX_SAFE_INTEGER : MAX_RAG_CONTEXT_CHARS);
           ragHits = hits.length;
         }
       }
@@ -360,7 +371,7 @@ export async function POST(req: Request) {
   if (messages.length === 0) {
     return Response.json({ error: "Пустой запрос" }, { status: 400 });
   }
-  const trimmed = messages.slice(-AI_MAX_CONTEXT_MESSAGES);
+  const trimmed = unlimited ? messages : messages.slice(-AI_MAX_CONTEXT_MESSAGES);
   const estimatedPrompt = estimatePromptTokens(trimmed);
 
   /**

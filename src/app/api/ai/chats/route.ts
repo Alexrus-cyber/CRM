@@ -10,7 +10,10 @@ export async function GET() {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
-  const [chats, override] = await Promise.all([listAiChats(me.id, 100), getAiQuotaOverride(me.id)]);
+  const [chats, override] = await Promise.all([
+    listAiChats(me.id, me.role === "super_admin" ? 1000 : 100),
+    getAiQuotaOverride(me.id),
+  ]);
   const policy = aiPolicyFor(me.role, override?.monthlyLimit ?? null);
   const perChatLimit = policy.perChatTokens !== null && policy.perChatTokens > 0 ? policy.perChatTokens : null;
   return Response.json({

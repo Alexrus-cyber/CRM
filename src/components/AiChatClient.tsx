@@ -52,6 +52,11 @@ import { extractClipboardFiles, hasTransferFiles } from "@/lib/clipboardFiles";
 import { extractFile, imageToDataUrl } from "@/lib/fileExtract";
 import { RAG_CHARS_PER_TOKEN, snippet, splitIntoChunks } from "@/lib/rag";
 import { formatTokenCount, type AiRolePolicy } from "@/lib/aiPolicy";
+import {
+  buildReasoningOptions,
+  pickCapabilitiesForModel,
+  type ModelCapabilities,
+} from "@/lib/modelCapabilities";
 import { useStoredJson, useStoredNumber } from "@/lib/useStoredValue";
 import type { Role } from "@/db/schema";
 
@@ -234,18 +239,21 @@ const ATTACHMENT_ICON: Record<AttKind, ReactNode> = {
   unreadable: <AlertTriangle size={10} />,
 };
 
-export function AiChatClient({ userName }: { userName: string }) {
+export function AiChatClient({ userName, unlimited = false }: { userName: string; unlimited?: boolean }) {
   const [settings, setSettings] = useStoredJson<AiSettings>(
     AI_STORAGE_SETTINGS,
     DEFAULT_SETTINGS,
     decodeSettings,
   );
-  const [params, setParams] = useStoredJson<AiParams>(AI_STORAGE_PARAMS, AI_DEFAULT_PARAMS, decodeParams);
+  const [params, setParams] = useStoredJson<AiParams>(AI_STORAGE_PARAMS, AI_DEFAULT_PARAMS, (raw) =>
+    normalizeParams(JSON.parse(raw), { unlimited }),
+  );
   const [showKey, setShowKey] = useState(false);
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
   const [chat, setChat] = useState<ChatInfo | null>(null);
   const [chats, setChats] = useState<ChatInfo[]>([]);
   const [usage, setUsage] = useState<UsageInfo | null>(null);
+  const isUnlimited = unlimited || usage?.role === "super_admin";
   const [historyOpen, setHistoryOpen] = useState(true);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [contextTokens, setContextTokens] = useState(0);
@@ -257,6 +265,7 @@ export function AiChatClient({ userName }: { userName: string }) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [models, setModels] = useState<string[]>([]);
+  const [capabilitiesByModel, setCapabilitiesByModel] = useState<Record<string, ModelCapabilities>>({});
   const [checking, setChecking] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(true);
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -561,10 +570,10 @@ export function AiChatClient({ userName }: { userName: string }) {
       for (let index = 0; index < files.length; index += 1) {
         const file = files[index];
         const path = (file.webkitRelativePath || file.name).slice(0, 300);
-        if (file.size > AI_MAX_FILE_BYTES) {
+        if (!isUnlimited && file.size > AI_MAX_FILE_BYTES) {
           skipped += 1;
         } else {
-          const extracted = await extractFile(file);
+          const extracted = await extractFile(file, isUnlimited ? { maxChars: null } : {});
           if (extracted.kind === "text" && extracted.text.trim()) {
             items.push({ path, chunks: splitIntoChunks(extracted.text) });
           } else {
@@ -690,17 +699,32 @@ export function AiChatClient({ userName }: { userName: string }) {
     setNotice(null);
     setModels([]);
     try {
-      const res = await fetch(`/api/ai/models?base=${encodeURIComponent(settings.baseUrl)}`, {
+      const modelQuery = settings.model.trim() ? `&model=${encodeURIComponent(settings.model.trim())}` : "";
+      const res = await fetch(`/api/ai/models?base=${encodeURIComponent(settings.baseUrl)}${modelQuery}`, {
         headers: settings.apiKey.trim() ? { "x-ai-key": settings.apiKey } : undefined,
         cache: "no-store",
       });
-      const data = (await res.json().catch(() => ({}))) as { models?: string[]; error?: string };
+      const data = (await res.json().catch(() => ({}))) as {
+        models?: string[];
+        capabilitiesByModel?: Record<string, ModelCapabilities>;
+        selectedCapabilities?: ModelCapabilities;
+        error?: string;
+      };
       if (!res.ok) {
         setError(data.error ?? `Сервер ответил ${res.status}`);
         return;
       }
       const list = data.models ?? [];
       setModels(list);
+      if (data.capabilitiesByModel || data.selectedCapabilities) {
+        setCapabilitiesByModel((prev) => ({
+          ...prev,
+          ...(data.capabilitiesByModel ?? {}),
+          ...(data.selectedCapabilities && settings.model.trim()
+            ? { [settings.model.trim()]: data.selectedCapabilities }
+            : {}),
+        }));
+      }
       if (list.length === 0) {
         setNotice("Подключение есть, но сервер не вернул список моделей. Впишите имя модели вручную.");
       } else if (!settings.model.trim() || !list.includes(settings.model)) {
@@ -722,25 +746,28 @@ export function AiChatClient({ userName }: { userName: string }) {
     if (picked.length === 0) return;
     setError(null);
 
-    const room = AI_MAX_FILES - pending.length;
-    if (room <= 0) {
-      setError(`Можно приложить не больше ${AI_MAX_FILES} файлов к одному вопросу`);
-      return;
-    }
-    const accepted = picked.slice(0, room);
-    if (picked.length > accepted.length) {
-      setError(`Взяли первые ${accepted.length} файлов: больше ${AI_MAX_FILES} за раз нельзя`);
+    let accepted = picked;
+    if (!isUnlimited) {
+      const room = AI_MAX_FILES - pending.length;
+      if (room <= 0) {
+        setError(`Можно приложить не больше ${AI_MAX_FILES} файлов к одному вопросу`);
+        return;
+      }
+      accepted = picked.slice(0, room);
+      if (picked.length > accepted.length) {
+        setError(`Взяли первые ${accepted.length} файлов: больше ${AI_MAX_FILES} за раз нельзя`);
+      }
     }
 
     setExtracting(accepted.length);
     const added: PendingFile[] = [];
     for (const file of accepted) {
       try {
-        if (file.size > AI_MAX_FILE_BYTES) {
+        if (!isUnlimited && file.size > AI_MAX_FILE_BYTES) {
           setError(`Файл «${file.name}» больше ${formatBytes(AI_MAX_FILE_BYTES)}`);
           continue;
         }
-        const extracted = await extractFile(file);
+        const extracted = await extractFile(file, isUnlimited ? { maxChars: null } : {});
         const preview = extracted.kind === "image" ? URL.createObjectURL(file) : null;
         if (preview) previewsRef.current.push(preview);
         added.push({
@@ -841,7 +868,8 @@ export function AiChatClient({ userName }: { userName: string }) {
   const monthUsed = usage?.monthly.used ?? 0;
   const monthLeft = usage?.monthly.left ?? null;
   const monthExhausted = monthLimit !== null && monthUsed >= monthLimit;
-  const reasoningOptions = AI_REASONING_MODES.filter((mode) => policy?.reasoning.includes(mode.value) ?? true);
+  const modelCapabilities = pickCapabilitiesForModel(capabilitiesByModel, settings.model);
+  const reasoningOptions = buildReasoningOptions(modelCapabilities, policy?.reasoning);
 
   const newChat = async () => {
     if (streaming) abortRef.current?.abort();
@@ -1354,6 +1382,7 @@ export function AiChatClient({ userName }: { userName: string }) {
           icon={<Brain size={14} className="text-accent2" />}
         >
           <div className="space-y-3">
+            <p className="text-[10px] leading-snug text-muted">{modelCapabilities.note}</p>
             <Combobox
               aria-label="Тип раздумий"
               value={params.reasoning}
@@ -1366,14 +1395,14 @@ export function AiChatClient({ userName }: { userName: string }) {
               <Field label="Бюджет раздумий, токенов">
                 <Input
                   type="number"
-                  min={64}
-                  max={AI_MAX_GENERATION_TOKENS}
+                  min={isUnlimited ? 1 : 64}
+                  max={isUnlimited ? undefined : AI_MAX_GENERATION_TOKENS}
                   step={64}
                   value={params.thinkingBudget ?? ""}
                   onChange={(event) =>
                     updateParams({ thinkingBudget: event.target.value === "" ? null : Number(event.target.value) })
                   }
-                  placeholder="до 384000"
+                  placeholder={isUnlimited ? "без лимита" : "до 384000"}
                 />
               </Field>
             )}
@@ -1517,12 +1546,12 @@ export function AiChatClient({ userName }: { userName: string }) {
                   <Input
                     type="number"
                     min={1}
-                    max={AI_MAX_GENERATION_TOKENS}
+                    max={isUnlimited ? undefined : AI_MAX_GENERATION_TOKENS}
                     step={64}
                     value={params.maxTokens ?? ""}
                     onChange={(event) => updateParams({ maxTokens: event.target.value === "" ? null : Number(event.target.value) })}
                     className="h-9 text-xs"
-                    placeholder="до 384000"
+                    placeholder={isUnlimited ? "без лимита" : "до 384000"}
                   />
                 </Field>
                 <Field label="seed">
@@ -1540,7 +1569,7 @@ export function AiChatClient({ userName }: { userName: string }) {
                   <Input
                     type="number"
                     min={0}
-                    max={50}
+                    max={isUnlimited ? undefined : 50}
                     step={1}
                     value={params.ragChunks}
                     disabled={params.ragFull}
@@ -1737,7 +1766,7 @@ export function AiChatClient({ userName }: { userName: string }) {
             {!activeFolder && folders.length === 0 && !ragBusy && (
               <p className="text-[11px] text-muted">
                 Выберите папку с документацией или кодом: текст, docx, xlsx, pptx, pdf и rtf разбираются в браузере и
-                загружаются в базу частями. Лимит на файл — {formatBytes(AI_MAX_FILE_BYTES)}.
+                загружаются в базу частями.{isUnlimited ? " Для вашей роли лимит на файлы снят." : ` Лимит на файл — ${formatBytes(AI_MAX_FILE_BYTES)}.`}
               </p>
             )}
           </div>
@@ -1814,8 +1843,8 @@ export function AiChatClient({ userName }: { userName: string }) {
                   </span>
                   <p className="text-sm font-medium">{chat?.title ?? "Новый чат"} готов к работе</p>
                   <p className="max-w-md text-xs text-muted">
-                    Выберите модель, при желании папку RAG и тип раздумий. Можно приложить любые файлы до{" "}
-                    {formatBytes(AI_MAX_FILE_BYTES)} — текст, docx/xlsx/pptx, pdf, картинки (также работают Ctrl+V и drag-and-drop).
+                    Выберите модель, при желании папку RAG и тип раздумий. Можно приложить любые файлы
+                    {isUnlimited ? " (без лимита)" : ` до ${formatBytes(AI_MAX_FILE_BYTES)}`} — текст, docx/xlsx/pptx, pdf, картинки (также работают Ctrl+V и drag-and-drop).
                   </p>
                 </div>
               )}
@@ -1986,7 +2015,11 @@ export function AiChatClient({ userName }: { userName: string }) {
               <div className="flex items-end gap-2">
                 <label
                   className="flex h-10 w-10 shrink-0 cursor-pointer items-center justify-center rounded-xl border border-border bg-card2 text-muted transition hover:text-text"
-                  title={`Любой файл до ${formatBytes(AI_MAX_FILE_BYTES)}: текст, docx/xlsx/pptx, pdf, картинки`}
+                  title={
+                    isUnlimited
+                      ? "Любые файлы без лимита: текст, docx/xlsx/pptx, pdf, картинки"
+                      : `Любой файл до ${formatBytes(AI_MAX_FILE_BYTES)}: текст, docx/xlsx/pptx, pdf, картинки`
+                  }
                 >
                   {extracting > 0 ? <Loader2 size={16} className="animate-spin" /> : <Paperclip size={16} />}
                   <input ref={fileRef} type="file" multiple className="hidden" onChange={(event) => void addFiles(event)} />

@@ -1379,10 +1379,10 @@ export async function createAgentTask(
   };
 }
 
-export async function listAgentTasks(userId: number, limit = 12): Promise<AgentTaskRow[]> {
+export async function listAgentTasks(userId: number, limit = 100): Promise<AgentTaskRow[]> {
   const rows = await q(sql`
     select id, user_id, prompt, status, max_steps, steps, summary, trust_level, task_mode, source, coach_mode, guidance_note, pending_approval, approval_response, created_at, updated_at
-    from agent_tasks where user_id = ${userId} order by id desc limit ${limit}`);
+    from agent_tasks where user_id = ${userId} order by id desc limit ${Math.max(1, Math.floor(limit))}`);
   return rows.map(mapAgentTask);
 }
 
@@ -1408,13 +1408,13 @@ export async function setAgentTaskGuidance(
   const task = await getAgentTask(userId, taskId);
   if (!task || task.status === "cancelled" || task.status === "done") return null;
   const now = nowIso();
-  const cleanText = String(input.text ?? "").trim().slice(0, 2000);
+  const cleanText = String(input.text ?? "").trim();
   if (!cleanText) return null;
   const guidance: TaskGuidanceNote = {
     id: input.id || `guid_${taskId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     author: input.author,
     text: cleanText,
-    ...(input.userAdvice?.trim() ? { userAdvice: input.userAdvice.trim().slice(0, 1000) } : {}),
+    ...(input.userAdvice?.trim() ? { userAdvice: input.userAdvice.trim() } : {}),
     createdAt: now,
   };
   await q(sql`
@@ -1659,11 +1659,18 @@ export async function addAgentEvent(input: {
 }
 
 /** События задачи без base64-данных файлов — их отдаём отдельным маршрутом. */
-export async function listAgentEvents(taskId: number, limit = 200): Promise<AgentEventRow[]> {
-  const rows = await q(sql`
-    select id, task_id, kind, text, action, file_name, file_mime, file_size, created_at,
-      case when file_data = '' then 0 else 1 end as has_file
-    from agent_events where task_id = ${taskId} order by id asc limit ${limit}`);
+export async function listAgentEvents(taskId: number, limit = 10_000): Promise<AgentEventRow[]> {
+  const safeLimit = Math.floor(Number(limit));
+  const rows =
+    safeLimit > 0
+      ? await q(sql`
+          select id, task_id, kind, text, action, file_name, file_mime, file_size, created_at,
+            case when file_data = '' then 0 else 1 end as has_file
+          from agent_events where task_id = ${taskId} order by id asc limit ${safeLimit}`)
+      : await q(sql`
+          select id, task_id, kind, text, action, file_name, file_mime, file_size, created_at,
+            case when file_data = '' then 0 else 1 end as has_file
+          from agent_events where task_id = ${taskId} order by id asc`);
   return rows.map((r) => ({
     id: toNum(r.id),
     taskId: toNum(r.task_id),
@@ -1759,10 +1766,11 @@ function mapAiChat(row: Raw): AiChatRow {
 }
 
 export async function listAiChats(userId: number, limit = 50): Promise<AiChatRow[]> {
+  const safeLimit = Math.max(1, Math.floor(limit));
   const rows = await q(sql`select c.id, c.user_id, c.title, c.tokens_prompt, c.tokens_completion,
       c.created_at, c.updated_at,
       (select count(*) from ai_chat_messages m where m.chat_id = c.id) as messages_count
-    from ai_chats c where c.user_id = ${userId} order by c.updated_at desc limit ${Math.max(1, Math.min(limit, 200))}`);
+    from ai_chats c where c.user_id = ${userId} order by c.updated_at desc limit ${safeLimit}`);
   return rows.map(mapAiChat);
 }
 
@@ -2042,9 +2050,14 @@ export type RagChunkRow = { id: number; path: string; text: string };
  * контекст уходит не топ-N, а весь индекс (насколько позволяет контекст модели).
  * `limit` — страховка от гигантских папок, а не смысловое ограничение.
  */
-export async function listRagChunks(folderId: number, limit = 50_000): Promise<RagChunkRow[]> {
-  const rows = await q(sql`select id, path, text from ai_rag_chunks
-    where folder_id = ${folderId} order by path, chunk_index, id limit ${Math.max(1, Math.floor(limit))}`);
+export async function listRagChunks(folderId: number, limit = 0): Promise<RagChunkRow[]> {
+  const safeLimit = Math.floor(Number(limit));
+  const rows =
+    safeLimit > 0
+      ? await q(sql`select id, path, text from ai_rag_chunks
+          where folder_id = ${folderId} order by path, chunk_index, id limit ${safeLimit}`)
+      : await q(sql`select id, path, text from ai_rag_chunks
+          where folder_id = ${folderId} order by path, chunk_index, id`);
   return rows.map((row) => ({ id: toNum(row.id), path: String(row.path), text: String(row.text) }));
 }
 
@@ -2207,13 +2220,13 @@ function mapAgentConversation(row: Raw): AgentConversationRow {
 export async function listAgentConversations(
   userId: number,
   kind: AgentConversationKind,
-  limit = 100,
+  limit = 500,
 ): Promise<AgentConversationRow[]> {
   const rows = await q(sql`select c.*,
       (select count(*) from agent_conversation_messages m where m.conversation_id = c.id) as messages_count
     from agent_conversations c
     where c.user_id = ${userId} and c.kind = ${kind}
-    order by c.updated_at desc, c.id desc limit ${Math.max(1, Math.min(limit, 200))}`);
+    order by c.updated_at desc, c.id desc limit ${Math.max(1, Math.floor(limit))}`);
   return rows.map(mapAgentConversation);
 }
 
@@ -2363,7 +2376,7 @@ export async function syncOperatorTaskToConversation(
 ): Promise<number | null> {
   const task = await getAgentTask(userId, taskId);
   if (!task) return null;
-  const events = await listAgentEvents(task.id, 300);
+  const events = await listAgentEvents(task.id, 0);
 
   const marker = `operator_task:${task.id}`;
   const cleanPromptTitle = task.prompt.replace(/\s+/g, " ").trim().slice(0, 64);
@@ -2461,8 +2474,8 @@ export async function syncOperatorTaskToConversation(
     dialogueLines.push("Ожидаю первого шага и размышлений Оператора…");
   }
 
-  const assistantContent = dialogueLines.join("\n").slice(0, 50_000);
-  const assistantReasoning = reasoningLines.join("\n\n").slice(0, 50_000);
+  const assistantContent = dialogueLines.join("\n");
+  const assistantReasoning = reasoningLines.join("\n\n");
   const assistantActions = JSON.stringify([
     {
       type: "operator_task",
@@ -2471,8 +2484,8 @@ export async function syncOperatorTaskToConversation(
       mode: task.taskMode,
     },
   ]);
-  const assistantFiles = JSON.stringify(filesMeta.slice(0, 20));
-  const assistantError = task.status === "failed" ? (task.summary || lastErrorText).slice(0, 2000) : "";
+  const assistantFiles = JSON.stringify(filesMeta);
+  const assistantError = task.status === "failed" ? (task.summary || lastErrorText) : "";
 
   const existing = await listAgentConversationMessages(conv.id);
   const now = nowIso();
@@ -2481,7 +2494,7 @@ export async function syncOperatorTaskToConversation(
       userId,
       conversationId: conv.id,
       role: "user",
-      content: userContent.slice(0, 50_000),
+      content: userContent,
     });
     await insertAgentConversationMessage({
       userId,
@@ -2560,11 +2573,11 @@ export async function createAgentTranscript(input: {
   content: string;
 }): Promise<AgentTranscriptRow> {
   const createdAt = nowIso();
-  const content = String(input.content ?? "").slice(0, 2_000_000);
+  const content = String(input.content ?? "");
   const chars = content.length;
   const row = await q1<{ id: number }>(sql`
     insert into agent_transcripts (user_id, conversation_id, title, summary, file_name, content, chars, created_at)
-    values (${input.userId}, ${input.conversationId}, ${input.title.slice(0, 160)}, ${input.summary.slice(0, 20_000)},
+    values (${input.userId}, ${input.conversationId}, ${input.title.slice(0, 160)}, ${input.summary},
             ${input.fileName.slice(0, 160)}, ${content}, ${chars}, ${createdAt})
     returning id`);
   return {
@@ -2572,7 +2585,7 @@ export async function createAgentTranscript(input: {
     userId: input.userId,
     conversationId: input.conversationId,
     title: input.title.slice(0, 160),
-    summary: input.summary.slice(0, 20_000),
+    summary: input.summary,
     fileName: input.fileName.slice(0, 160),
     content,
     chars,
@@ -2582,14 +2595,14 @@ export async function createAgentTranscript(input: {
 
 export async function listAgentTranscripts(
   userId: number,
-  limit = 40,
+  limit = 500,
 ): Promise<Array<Omit<AgentTranscriptRow, "content">>> {
   const rows = await q(sql`
     select id, user_id, conversation_id, title, summary, file_name, chars, created_at
     from agent_transcripts
     where user_id = ${userId}
     order by id desc
-    limit ${Math.max(1, Math.min(limit, 100))}`);
+    limit ${Math.max(1, Math.floor(limit))}`);
   return rows.map((row) => ({
     id: toNum(row.id),
     userId: toNum(row.user_id),

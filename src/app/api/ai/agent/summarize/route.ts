@@ -25,8 +25,8 @@ export async function POST(req: Request) {
       }
     | null;
 
-  const title = String(body?.title ?? "Чат агента").slice(0, 160);
-  const turns = Array.isArray(body?.turns) ? body.turns.slice(-100) : [];
+  const title = String(body?.title ?? "Чат агента").slice(0, 240);
+  const turns = Array.isArray(body?.turns) ? body.turns : [];
   if (turns.length === 0) {
     return Response.json({ error: "Нет сообщений для Summary" }, { status: 400 });
   }
@@ -47,7 +47,7 @@ export async function POST(req: Request) {
       const actions = t.actions?.length
         ? ` [действия: ${t.actions.map((a) => a.label || a.type).join(", ")}]`
         : "";
-      return `${idx + 1}. ${who}${files}${actions}: ${String(t.content ?? "").slice(0, 2000)}`;
+      return `${idx + 1}. ${who}${files}${actions}: ${String(t.content ?? "")}`;
     })
     .join("\n");
 
@@ -58,7 +58,6 @@ export async function POST(req: Request) {
       body: JSON.stringify({
         model,
         temperature: 0.2,
-        max_tokens: 900,
         stream: false,
         messages: [
           {
@@ -71,7 +70,7 @@ export async function POST(req: Request) {
           },
           {
             role: "user",
-            content: `Чат: ${title}\n\nПереписка:\n${dialog.slice(0, 40_000)}`,
+            content: `Чат: ${title}\n\nПереписка:\n${dialog}`,
           },
         ],
       }),

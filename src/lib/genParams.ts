@@ -71,11 +71,18 @@ export function resolveStepsForRole(
   return Math.min(AGENT_MAX_STEPS, Math.max(1, Math.floor(parsed)));
 }
 
-export function normalizeGenParams(raw: unknown): GenParams {
+export type NormalizeGenParamsOptions = {
+  /** Снять потолок maxTokens/thinkingBudget для Главного администратора (`super_admin`). */
+  unlimited?: boolean;
+};
+
+export function normalizeGenParams(raw: unknown, options: NormalizeGenParamsOptions = {}): GenParams {
   const source = (raw ?? {}) as Partial<GenParams>;
+  const unlimited = options.unlimited === true;
+  const maxGen = unlimited ? Number.MAX_SAFE_INTEGER : AI_MAX_GENERATION_TOKENS;
   const num = (value: unknown, min: number, max: number): number | null => {
     const parsed = typeof value === "number" ? value : Number(value);
-    if (value === null || value === "" || !Number.isFinite(parsed)) return null;
+    if (value === null || value === undefined || value === "" || !Number.isFinite(parsed)) return null;
     return Math.min(Math.max(parsed, min), max);
   };
   const reasoning = AI_REASONING_MODES.some((mode) => mode.value === source.reasoning)
@@ -83,11 +90,11 @@ export function normalizeGenParams(raw: unknown): GenParams {
     : GEN_DEFAULT_PARAMS.reasoning;
   return {
     reasoning,
-    thinkingBudget: num(source.thinkingBudget, 64, AI_MAX_GENERATION_TOKENS),
+    thinkingBudget: num(source.thinkingBudget, unlimited ? 1 : 64, maxGen),
     sendThinkingFlag: source.sendThinkingFlag !== false,
     temperature: num(source.temperature, 0, 2),
     topP: num(source.topP, 0, 1),
-    maxTokens: num(source.maxTokens, 1, AI_MAX_GENERATION_TOKENS),
+    maxTokens: num(source.maxTokens, 1, maxGen),
     seed: num(source.seed, 0, 2 ** 31),
   };
 }
@@ -99,9 +106,9 @@ export function normalizeGenParams(raw: unknown): GenParams {
  * ждёт объект. Без `JSON.parse` настройки каждый раз «сбрасывались» в
  * значения по умолчанию — интерфейс выглядел неактивным.
  */
-export function decodeGenParams(raw: string): GenParams {
+export function decodeGenParams(raw: string, options: NormalizeGenParamsOptions = {}): GenParams {
   try {
-    return normalizeGenParams(JSON.parse(raw));
+    return normalizeGenParams(JSON.parse(raw), options);
   } catch {
     return { ...GEN_DEFAULT_PARAMS };
   }
@@ -111,8 +118,12 @@ export function decodeGenParams(raw: string): GenParams {
  * Поля для `/chat/completions`. Передаём только заданное: строгие сборки
  * отвергают незнакомые параметры, а не игнорируют их.
  */
-export function applyGenParams(body: Record<string, unknown>, params: GenParams): void {
-  const normalized = normalizeGenParams(params);
+export function applyGenParams(
+  body: Record<string, unknown>,
+  params: GenParams,
+  options: NormalizeGenParamsOptions = {},
+): void {
+  const normalized = normalizeGenParams(params, options);
   if (normalized.temperature !== null) body.temperature = normalized.temperature;
   if (normalized.topP !== null) body.top_p = normalized.topP;
   if (normalized.maxTokens !== null) body.max_tokens = normalized.maxTokens;

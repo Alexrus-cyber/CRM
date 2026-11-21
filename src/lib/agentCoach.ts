@@ -86,7 +86,10 @@ export function resolveAdaptiveCoachParams(
     else effReasoning = userReasoning;
   }
 
-  const minTokens = effReasoning === "medium" || effReasoning === "high" || effReasoning === "budget" ? 900 : 600;
+  const minTokens =
+    effReasoning === "medium" || effReasoning === "high" || effReasoning === "max" || effReasoning === "budget"
+      ? 900
+      : 600;
   const effMaxTokens = base.maxTokens !== null ? Math.max(minTokens, base.maxTokens) : minTokens;
 
   const params: GenParams = {

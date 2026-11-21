@@ -200,8 +200,11 @@ def extract_attachment_text(name: str, data: bytes, limit: int = 4000) -> str:
     """Текст вложения для модели: txt/csv/md читаем, docx/xlsx — из XML, PDF — нет.
 
     Бот работает без внешних библиотек, поэтому «офисные» форматы разбираем как
-    zip с XML — этого достаточно для плана действий.
+    zip с XML — этого достаточно для плана действий. При `limit <= 0` текст не обрезается.
     """
+    def _cap(value: str) -> str:
+        return value if limit <= 0 else value[:limit]
+
     lowered = (name or "").lower()
     extension = "." + lowered.rsplit(".", 1)[-1] if "." in lowered else ""
     if extension in IMAGE_EXTENSIONS:
@@ -217,16 +220,16 @@ def extract_attachment_text(name: str, data: bytes, limit: int = 4000) -> str:
                         xml = archive.read(entry).decode("utf-8", "replace")
                         parts.append(re.sub(r"<[^>]+>", " ", xml))
                 text = re.sub(r"\s+", " ", " ".join(parts)).strip()
-                return text[:limit] or "[пустой документ]"
+                return _cap(text) or "[пустой документ]"
         except (zipfile.BadZipFile, KeyError, OSError):
             return "[не удалось прочитать архив]"
     if extension in TEXT_EXTENSIONS or not extension:
         try:
-            return data.decode("utf-8", "replace")[:limit]
+            return _cap(data.decode("utf-8", "replace"))
         except Exception:  # noqa: BLE001
             return "[не удалось прочитать как текст]"
     try:
-        return data.decode("utf-8", "replace")[:limit]
+        return _cap(data.decode("utf-8", "replace"))
     except Exception:  # noqa: BLE001
         return "[двоичный файл: содержимое недоступно]"
 
@@ -2025,6 +2028,34 @@ def self_test() -> int:
           and len(resilient_calls) == 2 and "reasoning_effort" not in resilient_calls[1]
           and isinstance(resilient_res, dict))
 
+    # Проверка 4: reasoning="max" и каскадный откат "max" -> "high" -> strip + неограниченное чтение вложений (limit=0).
+    max_op = Operator(crm="", token="", base_url="http://127.0.0.1:8000/v1", model="sim-vl",
+                      api_key="", dry_run=False, assume_yes=False, max_steps=5, delay=0.0, poll=1.0,
+                      max_width=1600, text_only=True, vision_check=False,
+                      generation={"reasoning": "max", "sendThinkingFlag": True})
+    max_p: Dict[str, Any] = {}
+    max_op.apply_generation(max_p, stuck_level=0)
+    cascade_calls: List[Optional[str]] = []
+
+    class CascadeModelHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 180, headers: Optional[dict] = None) -> Dict[str, Any]:
+            effort = (payload or {}).get("reasoning_effort")
+            cascade_calls.append(effort)
+            if effort in ("max", "high"):
+                raise AgentError("модель POST ... → HTTP 400: unsupported reasoning_effort=" + str(effort))
+            return {"choices": [{"message": {"content": "cascade_ok"}}]}
+
+    max_op.model_http = CascadeModelHttp()  # type: ignore[assignment]
+    cascade_res = max_op._model_call_resilient(dict(max_p, model="sim", messages=[]), {})
+    big_txt = ("строка " * 3000).encode("utf-8")
+    unlim_read = extract_attachment_text("big.txt", big_txt, limit=0)
+    check("режим max каскадно откатывается max -> high -> strip, а limit=0 читает вложения без обрезки",
+          max_p.get("reasoning_effort") == "max"
+          and cascade_calls == ["max", "high", None]
+          and cascade_res.get("choices", [{}])[0].get("message", {}).get("content") == "cascade_ok"
+          and len(unlim_read) >= len(big_txt.decode("utf-8")))
+
     # Политика шагов: безлимит (0 / >500) только для unlimited=True, остальные ограничены 500.
     unlim_state = {"step": 0, "step_limit_asked": False, "finished": False}
 
@@ -2639,7 +2670,7 @@ class Operator:
     # ------------------------------------------------------------- модель
     def _model_call_resilient(self, payload: Dict[str, Any], headers: Dict[str, str],
                               timeout: int = 180) -> Dict[str, Any]:
-        """Вызывает модель; при отказе API на reasoning/thinking полях повторяет без них."""
+        """Вызывает модель; при отказе API на max/reasoning/thinking полях мягко откатывается."""
         try:
             return self.model_http.call("POST", "/chat/completions", payload, timeout=timeout, headers=headers)
         except AgentError as error:
@@ -2650,6 +2681,22 @@ class Operator:
             if has_tuning and ("400" in detail or "422" in detail) and any(
                 w in detail for w in ("reasoning", "thinking", "chat_template", "unknown", "unsupported", "extra", "invalid")
             ):
+                if payload.get("reasoning_effort") == "max":
+                    fallback_high = dict(payload)
+                    fallback_high["reasoning_effort"] = "high"
+                    log("[!] Модель не приняла reasoning_effort=max — пробую high")
+                    try:
+                        return self.model_http.call("POST", "/chat/completions", fallback_high, timeout=timeout, headers=headers)
+                    except AgentError as inner_err:
+                        detail = str(inner_err).lower()
+                        if not (
+                            ("400" in detail or "422" in detail)
+                            and any(
+                                w in detail
+                                for w in ("reasoning", "thinking", "chat_template", "unknown", "unsupported", "extra", "invalid")
+                            )
+                        ):
+                            raise
                 stripped = {
                     k: v
                     for k, v in payload.items()
@@ -2667,7 +2714,8 @@ class Operator:
         parts: List[Dict[str, Any]] = []
         if screenshot and not self.text_only:
             parts.append({"type": "image_url", "image_url": {"url": screenshot}})
-        for image in (extra_images or [])[:3]:
+        images_list = extra_images or []
+        for image in (images_list if self._task_unlimited else images_list[:3]):
             if image.startswith("data:image/"):
                 parts.append({"type": "image_url", "image_url": {"url": image}})
         sys_prompt = SYSTEM_PROMPT + build_mode_system_addon(self.current_task_mode(), self.current_coach_mode())
@@ -2729,8 +2777,8 @@ class Operator:
             else:
                 payload["temperature"] = round(min(1.3, max(base_temp + 0.5, 0.75)), 2)
 
-        reasoning = str(gen.get("reasoning") or "default")
-        if reasoning not in ("default", "off", "low", "medium", "high", "budget"):
+        reasoning = str(gen.get("reasoning") or "default").strip().lower()
+        if reasoning not in ("default", "off", "low", "medium", "high", "max", "budget"):
             reasoning = "default"
         if reasoning == "default":
             if stuck_level >= 2:
@@ -3517,7 +3565,8 @@ class Operator:
         if not attachments:
             return ""
         blocks = []
-        for item in attachments[:5]:
+        unlimited = bool(self._task_unlimited)
+        for item in (attachments if unlimited else attachments[:5]):
             name = str(item.get("name") or "файл")
             event_id = int(item.get("id") or 0)
             try:
@@ -3527,11 +3576,11 @@ class Operator:
             except AgentError as error:
                 blocks.append("--- {}: не удалось скачать ({}) ---".format(name, error))
                 continue
-            text = extract_attachment_text(name, data)
+            text = extract_attachment_text(name, data, limit=0 if unlimited else 4000)
             mime = str(item.get("mime") or "")
             is_image = mime.startswith("image/") or name.lower().endswith(
                 (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"))
-            if is_image and len(self.attachment_images) < 3 and len(data) <= 3_000_000:
+            if is_image and (unlimited or (len(self.attachment_images) < 3 and len(data) <= 3_000_000)):
                 self.attachment_images.append(
                     "data:{};base64,{}".format(mime or "image/png",
                                                base64.b64encode(data).decode("ascii")))
@@ -4573,7 +4622,7 @@ def parse_args() -> argparse.Namespace:
                         help="предел токенов ответа модели")
     parser.add_argument("--seed", type=int, default=None, help="seed генерации")
     parser.add_argument("--reasoning", default="default",
-                        choices=["default", "off", "low", "medium", "high", "budget"],
+                        choices=["default", "off", "low", "medium", "high", "max", "budget"],
                         help="режим раздумий модели (reasoning_effort)")
     parser.add_argument("--thinking-budget", type=int, default=None,
                         help="бюджет раздумий в токенах для --reasoning budget")

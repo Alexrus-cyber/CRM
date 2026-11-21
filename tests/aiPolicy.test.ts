@@ -5,16 +5,22 @@ import {
   chatTokensLeft,
   formatStepLimit,
   formatTokenCount,
+  isUnlimitedAiRole,
   roleStepLimit,
 } from "@/lib/aiPolicy";
 import { AGENT_MAX_STEPS } from "@/lib/genParams";
 
 describe("политика лимитов ИИ по ролям", () => {
-  it("у главного админа (super_admin) нет ограничений по токенам и шагам", () => {
+  it("у главного админа (super_admin) нет ограничений по токенам, файлам, RAG и шагам и доступен режим max", () => {
     const superPolicy = aiPolicyFor("super_admin");
+    expect(isUnlimitedAiRole("super_admin")).toBe(true);
+    expect(isUnlimitedAiRole("admin")).toBe(false);
     expect(superPolicy.perChatTokens).toBeNull();
     expect(superPolicy.monthlyTokens).toBeNull();
     expect(superPolicy.maxSteps).toBeNull();
+    expect(superPolicy.rag).toBe(true);
+    expect(superPolicy.chatsUnlimited).toBe(true);
+    expect(superPolicy.reasoning).toContain("max");
     expect(roleStepLimit("super_admin")).toBeNull();
     expect(chatTokensLeft({ tokensTotal: 9_999_999 }, superPolicy)).toBe(Number.POSITIVE_INFINITY);
     expect(formatTokenCount(superPolicy.perChatTokens)).toBe("без лимита");

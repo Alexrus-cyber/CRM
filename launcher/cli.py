@@ -28,7 +28,7 @@ if __package__ in (None, ""):  # запуск из исходников: python 
 
 from launcher import APP_NAME, APP_VERSION  # noqa: E402
 from launcher import bundle, commands, deps, runner, settings as settings_mod  # noqa: E402
-from launcher.catalog import DEFAULT_AGENTS, PROVIDER_PRESETS, agent_by_id, load_catalog  # noqa: E402
+from launcher.catalog import DEFAULT_AGENTS, PROVIDER_PRESETS, REASONING_MODES, agent_by_id, load_catalog  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -166,7 +166,11 @@ def self_test() -> int:
     mode_conf = settings_mod.LaunchSettings()
     mode_conf.set_value("operator", "task_mode", "game")
     mode_conf.set_value("operator", "coach_mode", "agent")
+    mode_conf.reasoning = "max"
     mode_args = commands.agent_args(operator, mode_conf)
+    check("лаунчер: режим раздумий max передаётся в --reasoning",
+          any(val == "max" for val, _ in REASONING_MODES)
+          and "--reasoning" in mode_args and "max" in mode_args)
     check("оператор: режим игры и советчик Агента передаются --task-mode и --coach",
           "--task-mode" in mode_args and "game" in mode_args
           and "--coach" in mode_args and "agent" in mode_args)

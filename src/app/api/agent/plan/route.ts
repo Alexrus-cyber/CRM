@@ -53,31 +53,30 @@ export async function POST(req: Request) {
   }
   const apiKey = (body?.settings?.apiKey ?? "").trim().slice(0, 400);
   const systemPrompt =
-    (typeof body?.systemPrompt === "string" ? body.systemPrompt.trim().slice(0, MAX_SYSTEM_PROMPT_CHARS) : "") ||
+    (typeof body?.systemPrompt === "string" ? body.systemPrompt.trim() : "") ||
     DEFAULT_PLAN_PROMPT;
 
   const messages: Array<{ role: "user" | "assistant"; content: string | Array<Record<string, unknown>> }> = (
     body?.messages ?? []
   )
     .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-    .slice(-MAX_MESSAGES)
-    .map((m) => ({ role: m.role as "user" | "assistant", content: String(m.content).slice(0, MAX_CHARS) }));
+    .map((m) => ({ role: m.role as "user" | "assistant", content: String(m.content) }));
   if (messages.length === 0) return Response.json({ error: "Пустой запрос" }, { status: 400 });
 
   // Файлы уже распознаны в браузере: сюда приходит текст или data-URL картинки.
-  const files = (body?.files ?? []).slice(0, 5);
+  const files = Array.isArray(body?.files) ? body.files : [];
   if (files.length > 0) {
     const last = [...messages].reverse().find((m) => m.role === "user");
     if (last && typeof last.content === "string") {
       const blocks: string[] = [];
       const images: Array<{ name: string; url: string }> = [];
       for (const file of files) {
-        const name = String(file.name ?? "файл").slice(0, 160);
-        const text = String(file.text ?? "").slice(0, 4000);
-        const note = String(file.note ?? "").slice(0, 200);
+        const name = String(file.name ?? "файл").slice(0, 240);
+        const text = String(file.text ?? "");
+        const note = String(file.note ?? "").slice(0, 240);
         const image =
           typeof file.image === "string" && file.image.startsWith("data:image/")
-            ? file.image.slice(0, 6_000_000)
+            ? file.image
             : "";
         if (image) {
           images.push({ name, url: image });
@@ -89,7 +88,7 @@ export async function POST(req: Request) {
       }
       const combinedText =
         blocks.length > 0
-          ? `${last.content}\n\nФайлы от пользователя:\n${blocks.join("\n\n")}`.slice(0, MAX_CHARS * 2)
+          ? `${last.content}\n\nФайлы от пользователя:\n${blocks.join("\n\n")}`
           : last.content;
       if (images.length > 0) {
         last.content = [
@@ -106,12 +105,11 @@ export async function POST(req: Request) {
     model,
     messages: [{ role: "system", content: systemPrompt }, ...messages],
     temperature: 0.3,
-    max_tokens: 1200,
     stream: false,
   };
   // Настройки «Раздумья и генерация» с вкладки «Оператор»: значения из
   // интерфейса важнее дефолтов, иначе планировщик думает иначе, чем бот.
-  applyGenParams(payload, normalizeGenParams(body?.settings?.params));
+  applyGenParams(payload, normalizeGenParams(body?.settings?.params, { unlimited: true }), { unlimited: true });
 
   try {
     const res = await fetch(`${baseUrl}/chat/completions`, {
