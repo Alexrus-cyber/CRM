@@ -1,4 +1,4 @@
-import { addAgentEvent, getAgentTask, setAgentTaskStatus } from "@/db/repo";
+import { addAgentEvent, getAgentTask, setAgentTaskStatus, syncOperatorTaskToConversation } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
 
 /** Завершение задания: done, failed или cancelled. */
@@ -28,5 +28,6 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   await setAgentTaskStatus(task.id, ownerId, status, summary);
   await addAgentEvent({ taskId: task.id, kind: "info", text: summary || `Задание завершено: ${status}` });
-  return Response.json({ ok: true });
+  const conversationId = await syncOperatorTaskToConversation(ownerId, task.id);
+  return Response.json({ ok: true, conversationId });
 }

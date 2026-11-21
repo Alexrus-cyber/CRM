@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { sql } from "drizzle-orm";
-import { requestAgentStepCoaching } from "@/lib/agentCoach";
+import { requestAgentStepCoaching, resolveAdaptiveCoachParams } from "@/lib/agentCoach";
 import { normalizeTaskMode } from "@/lib/operatorModes";
 import { describeAction } from "@/components/operator/shared";
 
@@ -161,6 +161,9 @@ describe("связка Агент ↔ Оператор, режимы и поша
     expect(describeAction(JSON.stringify({ type: "mouse_down", button: "left" }))?.title).toContain("Зажата кнопка");
     expect(describeAction(JSON.stringify({ type: "key_down", key: "shift" }))?.title).toContain("Зажата клавиша shift");
     expect(describeAction(JSON.stringify({ type: "inspect_screen" }))?.title).toContain("Снимок экрана ПК");
+    expect(describeAction(JSON.stringify({ type: "pc_command", command: "dir C:\\" }))?.title).toContain(
+      "Команда на ПК (с разрешения)",
+    );
   });
 
   it("сохраняет снимок экрана Оператора (kind=screen) и возвращает его через getLatestAgentScreen", async () => {
@@ -188,5 +191,137 @@ describe("связка Агент ↔ Оператор, режимы и поша
     expect(latest?.summary).toContain("Terminal");
     expect(latest?.dataUrl).toBe("data:image/jpeg;base64,/9j/4AAQ");
     expect(latest?.meta).toMatchObject({ activeWindow: "Terminal", width: 1280, height: 720 });
+  });
+
+  it("resolveAdaptiveCoachParams уважает настройки человека и повышает reasoning/temperature при зацикливании", async () => {
+    const clean = resolveAdaptiveCoachParams(
+      { reasoning: "off", temperature: 0.1, maxTokens: 1200 },
+      { repeatStreak: 0, failedChecks: 0, phase: "after_step" },
+    );
+    expect(clean.params.reasoning).toBe("off");
+    expect(clean.params.temperature).toBe(0.1);
+    expect(clean.params.maxTokens).toBe(1200);
+
+    const defaulted = resolveAdaptiveCoachParams(
+      { reasoning: "default" },
+      { repeatStreak: 0, failedChecks: 0, phase: "after_step" },
+    );
+    expect(defaulted.params.reasoning).toBe("medium");
+    expect(defaulted.params.maxTokens).toBeGreaterThanOrEqual(900);
+
+    const beforeStuck = resolveAdaptiveCoachParams(
+      { reasoning: "default", temperature: 0.15 },
+      { repeatStreak: 3, failedChecks: 1, phase: "before_action" },
+    );
+    expect(beforeStuck.params.reasoning).toBe("high");
+    expect(beforeStuck.params.temperature).toBeGreaterThanOrEqual(0.55);
+
+    const payloads: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/coach")) {
+          return new Response("agent down", { status: 503 });
+        }
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        payloads.push(body);
+        if (payloads.length === 1) {
+          return new Response(JSON.stringify({ error: "unsupported field reasoning_effort" }), { status: 400 });
+        }
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    approved: true,
+                    reason: "В выделенной строке кнопка Сохранить",
+                    guidanceForOperator: "Клик по кнопке Сохранить подтверждён",
+                    adviceForUser: "Нажимаем Сохранить",
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+
+    const modelRes = await requestAgentStepCoaching({
+      agentUrl: "http://127.0.0.1:8899",
+      taskPrompt: "Сохрани файл",
+      taskMode: "copilot",
+      phase: "before_action",
+      step: 2,
+      repeatStreak: 3,
+      cursorContext: "активное окно: Блокнот | элемент: Сохранить",
+      screenshot: "data:image/jpeg;base64,AAA",
+      cursorCrop: "data:image/jpeg;base64,BBB",
+      params: { reasoning: "default", temperature: 0.15 },
+      settings: { baseUrl: "http://127.0.0.1:8888/v1", model: "strict-vlm" },
+    });
+    expect(modelRes.source).toBe("model");
+    expect(modelRes.approved).toBe(true);
+    expect(modelRes.visionUsed).toBe(true);
+    expect(payloads).toHaveLength(2);
+    expect(payloads[0].reasoning_effort).toBe("high");
+    expect(payloads[1].reasoning_effort).toBeUndefined();
+  });
+
+  it("syncOperatorTaskToConversation сохраняет мысли, шаги и итог Оператора как обновляемый чат Агента", async () => {
+    const task = await repo.createAgentTask(userId, "Открой заметки и проверь список дел", 20, "verified", {
+      taskMode: "copilot",
+      coachMode: "agent",
+      source: "agent",
+    });
+
+    await repo.addAgentEvent({
+      taskId: task.id,
+      kind: "thought",
+      text: "Вижу окно рабочего стола, навожу курсор на значок Заметки",
+    });
+    await repo.addAgentEvent({
+      taskId: task.id,
+      kind: "action",
+      text: "Двойной клик (120, 240)",
+      action: JSON.stringify({ type: "double_click", x: 120, y: 240 }),
+    });
+
+    const convId1 = await repo.syncOperatorTaskToConversation(userId, task.id);
+    expect(convId1).toBeTruthy();
+
+    // Симулируем продолжение диалога пользователем в этом чате, затем новое событие Оператора.
+    await repo.insertAgentConversationMessage({
+      userId,
+      conversationId: convId1!,
+      role: "user",
+      content: "А какой последний пункт в заметках?",
+    });
+
+    await repo.addAgentEvent({
+      taskId: task.id,
+      kind: "thought",
+      text: "Окно Заметок открылось, вижу пункт Позвонить клиенту",
+    });
+    await repo.setAgentTaskStatus(task.id, userId, "done", "Заметки открыты и проверены");
+
+    const convId2 = await repo.syncOperatorTaskToConversation(userId, task.id);
+    expect(convId2).toBe(convId1);
+
+    const found = await repo.findOperatorTaskConversation(userId, task.id);
+    expect(found?.id).toBe(convId1);
+
+    const msgs = await repo.listAgentConversationMessages(convId1!);
+    expect(msgs).toHaveLength(3);
+    expect(msgs[0].role).toBe("user");
+    expect(msgs[0].content).toContain("Открой заметки");
+    expect(msgs[1].role).toBe("assistant");
+    expect(msgs[1].reasoning).toContain("Окно Заметок открылось");
+    expect(msgs[1].content).toContain("Двойной клик (120, 240)");
+    expect(msgs[1].content).toContain("Заметки открыты и проверены");
+    expect(msgs[2].role).toBe("user");
+    expect(msgs[2].content).toContain("какой последний пункт");
   });
 });

@@ -1,7 +1,8 @@
-import { getAgentTask, setAgentTaskGuidance } from "@/db/repo";
+import { getAgentTask, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
 import { requestAgentStepCoaching } from "@/lib/agentCoach";
 import { AGENT_URL } from "@/app/api/ai/agent/route";
+import type { GenParams } from "@/lib/genParams";
 
 /**
  * Пошаговое сопровождение Оператора после каждого действия:
@@ -33,6 +34,11 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         lastAction?: unknown;
         lastResult?: string;
         observation?: string;
+        cursorContext?: string;
+        cursorCrop?: string;
+        repeatStreak?: number;
+        failedChecks?: number;
+        params?: Partial<GenParams>;
         lastGuidanceId?: string;
         history?: string[];
         screenshot?: string;
@@ -76,6 +82,11 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     lastAction: body?.lastAction,
     lastResult: body?.lastResult,
     observation: body?.observation,
+    cursorContext: typeof body?.cursorContext === "string" ? body.cursorContext : undefined,
+    cursorCrop: typeof body?.cursorCrop === "string" ? body.cursorCrop : undefined,
+    repeatStreak: Number(body?.repeatStreak ?? 0) || 0,
+    failedChecks: Number(body?.failedChecks ?? 0) || 0,
+    params: body?.params ?? null,
     history: Array.isArray(body?.history) ? body.history.map((s) => String(s)).slice(-10) : [],
     screenshot: typeof body?.screenshot === "string" ? body.screenshot : undefined,
   });
@@ -87,6 +98,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       approved: true,
       visionUsed: false,
       fallback: true,
+      tuned: advice.tuned,
       source: "heuristic",
     });
   }
@@ -97,6 +109,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     userAdvice: advice.adviceForUser,
     addEvent: true,
   });
+  await syncOperatorTaskToConversation(ownerId, task.id);
 
   return Response.json(
     {
@@ -105,6 +118,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       approved: advice.approved ?? true,
       reason: advice.reason ?? "",
       visionUsed: advice.visionUsed ?? false,
+      tuned: advice.tuned,
       source: advice.source,
     },
     { headers: { "Cache-Control": "no-store" } },

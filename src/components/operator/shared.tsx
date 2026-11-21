@@ -20,6 +20,7 @@ import {
   PauseCircle,
   ScrollText,
   Sparkles,
+  Terminal,
   Timer,
   Type as TypeIcon,
 } from "lucide-react";
@@ -183,6 +184,9 @@ export function ActionGlyph({ type, size = 14 }: { type: string; size?: number }
       return <Globe size={size} />;
     case "make_file":
       return <FileText size={size} />;
+    case "pc_command":
+    case "run_command":
+      return <Terminal size={size} />;
     case "finish":
       return <Flag size={size} />;
     default:
@@ -236,6 +240,8 @@ export function describeAction(raw: string): ParsedAction | null {
       return { type, title: `Записать в буфер: «${short(action.text, 60)}»`, json: raw };
     case "launch_app":
       return { type, title: `Запуск приложения: ${short(action.app ?? action.path, 60)}`, json: raw };
+    case "pc_command":
+      return { type, title: `Команда на ПК (с разрешения): ${short(action.command, 80)}`, json: raw };
     case "run_command":
       return { type, title: `Команда Sandbox: ${short(action.command, 80)}`, json: raw };
     case "sandbox_write_file":

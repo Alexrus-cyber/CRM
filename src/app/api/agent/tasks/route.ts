@@ -1,4 +1,4 @@
-import { addAgentEvent, createAgentTask, listAgentTasks } from "@/db/repo";
+import { addAgentEvent, createAgentTask, listAgentTasks, syncOperatorTaskToConversation } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 import { AGENT_MAX_STEPS } from "@/lib/genParams";
 import { normalizeCoachMode, normalizeTaskMode, normalizeTaskSource } from "@/lib/operatorModes";
@@ -80,5 +80,6 @@ export async function POST(req: Request) {
     });
   }
 
-  return Response.json({ task });
+  const conversationId = await syncOperatorTaskToConversation(me.id, task.id);
+  return Response.json({ task, conversationId });
 }

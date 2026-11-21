@@ -584,7 +584,7 @@ export function OperatorPanel() {
       const res = await fetch("/api/ai/agent/coach", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ taskId: id, userHint: guidanceInput.trim() }),
+        body: JSON.stringify({ taskId: id, userHint: guidanceInput.trim(), params: genParams }),
       });
       const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
       if (!res.ok) {
@@ -1088,6 +1088,9 @@ export function OperatorPanel() {
                         Агент подсказывает
                       </span>
                     )}
+                    <span className="rounded-md border border-accent/30 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent2">
+                      сохраняется в чатах «Агента»
+                    </span>
                     <span className="text-[10px] font-normal text-muted">
                       {formatDateTime(activeTask.createdAt)}
                     </span>

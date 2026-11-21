@@ -86,8 +86,9 @@ SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CR
    - sandbox_mkdir / sandbox_write_file / sandbox_read_file / sandbox_list — работа с файлами в Sandbox;
    - run_command — выполнить bash/shell-команду или запустить проект/сервер внутри Sandbox
      (для веб-сервера передай background=true, например `python3 -m http.server 8123` или `npm run dev`).
-4. pc_command — выполнить команду на ПК (когда пользователь явно просит действие вне Sandbox,
-   ускоряющее работу).
+4. pc_command — выполнить команду/скрипт непосредственно на ПК пользователя (PowerShell/cmd/bash,
+   установка, запуск программ, системная диагностика — ВСЕГДА сначала запрашивает явное
+   разрешение пользователя на сайте, даже при полном доверии).
 5. export_from_sandbox — скопировать или перенести готовые файлы/проект из Sandbox в папку,
    которую указал пользователь (только после согласия пользователя).
 6. Совместная работа с Настольным Оператором экрана:
@@ -872,26 +873,26 @@ def run_tool(
         description = str(args.get("description") or "").strip()
         if not command:
             raise AgentError("Пустая команда для ПК")
-        if trust == "verified":
-            if approval_fn is None:
-                raise AgentError("Требуется подтверждение пользователя на сайте для команды на ПК")
-            decision = approval_fn(
-                {
-                    "kind": "pc_command",
-                    "title": "Разрешить действие на компьютере?",
-                    "description": description or "Команда на ПК (вне песочницы) для ускорения работы",
-                    "command": command,
-                    "cwd": "~",
-                }
+        # Команды на ПК (вне Sandbox) ВСЕГДА требуют явного разрешения пользователя на сайте.
+        if approval_fn is None:
+            raise AgentError("Требуется подтверждение пользователя на сайте для команды на ПК")
+        decision = approval_fn(
+            {
+                "kind": "pc_command",
+                "title": "Разрешить команду на компьютере?",
+                "description": description or "Команда на ПК (вне песочницы) — полная работа с разрешения пользователя",
+                "command": command,
+                "cwd": "~",
+            }
+        )
+        if not decision.get("approved"):
+            note = str(decision.get("note") or "").strip()
+            return (
+                f"Пользователь отклонил команду на ПК «{command}»"
+                + (f" ({note})" if note else "")
+                + ".",
+                events,
             )
-            if not decision.get("approved"):
-                note = str(decision.get("note") or "").strip()
-                return (
-                    f"Пользователь отклонил команду на ПК «{command}»"
-                    + (f" ({note})" if note else "")
-                    + ".",
-                    events,
-                )
 
         try:
             res = sandbox_mod.run_pc_command(command)
@@ -1019,6 +1020,88 @@ def apply_generation(payload: Dict[str, Any], params: Dict[str, Any]) -> None:
         payload["chat_template_kwargs"] = {"enable_thinking": reasoning != "off"}
 
 
+def resolve_adaptive_coach_params(
+    user_params: Optional[Dict[str, Any]],
+    repeat_streak: int = 0,
+    failed_checks: int = 0,
+    phase: str = "after_step",
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Настраивает reasoning (medium и выше) и адаптивную temperature от зацикливания.
+
+    Приоритет:
+      1. Сначала стоит человеческая настройка (`user_params`: temperature, reasoning и т.д.).
+      2. Затем Агент сам улучшает качество ответа: reasoning medium+ (default → medium,
+         при before_action или зацикливании → high) и плавно поднимает temperature от цикла,
+         если настройка модели это позволяет (fallback при отказе API — в call_model).
+    """
+    src = user_params if isinstance(user_params, dict) else {}
+    resolved: Dict[str, Any] = dict(src)
+    stuck_level = max(0, int(repeat_streak or 0) - 1, int(failed_checks or 0))
+
+    raw_temp = src.get("temperature")
+    user_temp: Optional[float] = None
+    if raw_temp is not None and raw_temp != "":
+        try:
+            user_temp = max(0.0, min(2.0, float(raw_temp)))
+        except (TypeError, ValueError):
+            user_temp = None
+
+    base_temp = user_temp if user_temp is not None else 0.2
+    if stuck_level == 0:
+        eff_temp = base_temp
+    elif stuck_level == 1:
+        eff_temp = round(min(1.2, max(base_temp, base_temp + 0.2)), 2)
+    elif stuck_level == 2:
+        eff_temp = round(min(1.25, max(base_temp + 0.35, 0.55)), 2)
+    else:
+        eff_temp = round(min(1.3, max(base_temp + 0.5, 0.75)), 2)
+    resolved["temperature"] = eff_temp
+
+    user_reasoning = str(src.get("reasoning") or "default").strip().lower()
+    if user_reasoning not in ("default", "off", "low", "medium", "high", "budget"):
+        user_reasoning = "default"
+
+    if user_reasoning == "default":
+        eff_reasoning = "high" if (stuck_level >= 1 or phase == "before_action") else "medium"
+    elif user_reasoning == "medium":
+        eff_reasoning = "high" if stuck_level >= 2 else "medium"
+    elif user_reasoning in ("off", "low"):
+        # Сначала уважаем выбор пользователя, но при зацикливании пытаемся поднять качество.
+        if stuck_level >= 2:
+            eff_reasoning = "high"
+        elif stuck_level == 1:
+            eff_reasoning = "medium"
+        else:
+            eff_reasoning = user_reasoning
+    else:
+        eff_reasoning = user_reasoning
+
+    resolved["reasoning"] = eff_reasoning
+
+    raw_max_tokens = src.get("maxTokens")
+    user_max_tokens: Optional[int] = None
+    if raw_max_tokens is not None and raw_max_tokens != "":
+        try:
+            user_max_tokens = int(float(raw_max_tokens))
+        except (TypeError, ValueError):
+            user_max_tokens = None
+
+    min_tokens = 900 if eff_reasoning in ("medium", "high", "budget") else 600
+    resolved["maxTokens"] = max(min_tokens, user_max_tokens) if user_max_tokens is not None else min_tokens
+
+    if "sendThinkingFlag" not in resolved:
+        resolved["sendThinkingFlag"] = True
+
+    meta = {
+        "reasoning": eff_reasoning,
+        "temperature": eff_temp,
+        "stuckLevel": stuck_level,
+        "userReasoning": user_reasoning,
+        "userTemperature": user_temp,
+    }
+    return resolved, meta
+
+
 def call_model(
     base_url: str,
     api_key: str,
@@ -1040,24 +1123,45 @@ def call_model(
     if not payload["model"]:
         raise AgentError("Не указана модель: выберите её в интерфейсе или задайте AGENT_MODEL")
 
-    request = urllib.request.Request(
-        chat_url(base_url),
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    if api_key:
-        request.add_header("Authorization", f"Bearer {api_key}")
+    def _post(body_payload: Dict[str, Any]) -> str:
+        request = urllib.request.Request(
+            chat_url(base_url),
+            data=json.dumps(body_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        if api_key:
+            request.add_header("Authorization", f"Bearer {api_key}")
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                return response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")[:400]
+            raise AgentError(f"Модель вернула ошибку {error.code}: {detail}") from error
+        except urllib.error.URLError as error:
+            raise AgentError(
+                f"Не удалось связаться с моделью по адресу {chat_url(base_url)}: {error.reason}"
+            ) from error
+
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            body = response.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", "replace")[:400]
-        raise AgentError(f"Модель вернула ошибку {error.code}: {detail}") from error
-    except urllib.error.URLError as error:
-        raise AgentError(
-            f"Не удалось связаться с моделью по адресу {chat_url(base_url)}: {error.reason}"
-        ) from error
+        body = _post(payload)
+    except AgentError as error:
+        detail = str(error).lower()
+        has_tuning = any(
+            k in payload for k in ("reasoning_effort", "thinking_budget", "chat_template_kwargs")
+        )
+        if has_tuning and ("400" in detail or "422" in detail) and any(
+            w in detail for w in ("reasoning", "thinking", "chat_template", "unknown", "unsupported", "extra", "invalid")
+        ):
+            stripped = {
+                k: v
+                for k, v in payload.items()
+                if k not in ("reasoning_effort", "thinking_budget", "chat_template_kwargs")
+            }
+            log("модель не принимает параметры reasoning/thinking — повторяю без них")
+            body = _post(stripped)
+        else:
+            raise
 
     try:
         return json.loads(body)
@@ -1192,9 +1296,21 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
     last_result = str(body.get("lastResult") or "").strip()
     observation = str(body.get("observation") or "").strip()
     user_hint = str(body.get("userHint") or "").strip()
+    cursor_context = str(body.get("cursorContext") or "").strip()
+    cursor_crop = str(body.get("cursorCrop") or "").strip()
     history = body.get("history") if isinstance(body.get("history"), list) else []
     screenshot = str(body.get("screenshot") or "")
     settings = body.get("settings") if isinstance(body.get("settings"), dict) else {}
+    user_params = body.get("params") if isinstance(body.get("params"), dict) else {}
+    repeat_streak = int(body.get("repeatStreak") or 0)
+    failed_checks = int(body.get("failedChecks") or 0)
+
+    coach_params, tuned_meta = resolve_adaptive_coach_params(
+        user_params,
+        repeat_streak=repeat_streak,
+        failed_checks=failed_checks,
+        phase=phase,
+    )
 
     base_url = str(settings.get("baseUrl") or BASE_URL)
     api_key = str(settings.get("apiKey") or API_KEY)
@@ -1210,6 +1326,7 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
                 "reason": msg,
                 "guidanceForOperator": msg,
                 "adviceForUser": msg,
+                "tuned": tuned_meta,
                 "source": "heuristic",
             }
         hint = (
@@ -1218,7 +1335,7 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
             else "Проверь изменение на экране и переходи к следующему шагу или подскажи пользователю."
         )
         msg = f"Шаг {step_num}: {last_result or observation or 'выполнен'}. {hint}"
-        return {"ok": True, "guidanceForOperator": msg, "adviceForUser": msg, "source": "heuristic"}
+        return {"ok": True, "guidanceForOperator": msg, "adviceForUser": msg, "tuned": tuned_meta, "source": "heuristic"}
 
     if phase == "before_action":
         lines = [
@@ -1228,6 +1345,8 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
         ]
         if aim_point:
             lines.append(f"Точка наведения на экране: ({aim_point.get('x')}, {aim_point.get('y')})")
+        if cursor_context:
+            lines.append(f"Признаки окружения и выделенной строки: {cursor_context[:400]}")
         if last_action:
             lines.append(f"Задуманное действие после подтверждения: {json.dumps(last_action, ensure_ascii=False)[:400]}")
         if observation:
@@ -1236,16 +1355,24 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
             lines.append(f"Пожелание пользователя: {user_hint[:400]}")
         if history:
             lines.append("Недавние шаги:\n" + "\n".join(str(x)[:200] for x in history[-6:]))
+        if repeat_streak >= 2 or failed_checks >= 1:
+            lines.append(
+                f"Внимание: серия повторов={repeat_streak}, неудачных проверок={failed_checks}. "
+                "Если клики не помогают — подскажи альтернативу (hotkey, key, scroll, launch_app или pc_command)."
+            )
         lines.append(
-            "Посмотри на красный крестик курсора на свежем скриншоте. Он точно наведён на нужный элемент/поле/кнопку? "
-            'Ответь строго JSON без markdown: {"approved":true|false,"reason":"что сейчас под крестиком и почему да/нет",'
-            '"guidanceForOperator":"если false — куда именно перенавести курсор или что сделать; если true — подтверждение",'
+            "Посмотри на выделенную строку/рамку вокруг цели, открытый прицел и увеличенную лупу ×2.5 на скриншоте "
+            "(а также крупный кроп, если он приложен). Точно ли выбран нужный элемент и контекст окна? "
+            'Ответь строго JSON без markdown: {"approved":true|false,"reason":"что в выделенной строке и почему да/нет",'
+            '"guidanceForOperator":"если false — куда именно перенавести курсор или какую команду/горячую клавишу применить; если true — подтверждение",'
             '"adviceForUser":"короткий статус для пользователя"}'
         )
         sys_msg = (
-            "Ты — Агент-наставник Настольного Оператора. Перед тем как Оператор кликнет, сделает двойной клик "
-            "или начнёт ввод текста, он наводит курсор и показывает тебе скриншот с красным крестиком. "
-            "Проверь, точно ли крестик попал на целевой элемент. Если мимо, перекрыто или опасная кнопка — ставь approved=false. "
+            "Ты — Агент-наставник Настольного Оператора. Перед кликом/двойным кликом/вводом текста Оператор "
+            "наводит курсор и присылает скриншот с ВЫДЕЛЕННОЙ СТРОКОЙ, открытым прицелом, лупой ×2.5 и признаками "
+            "окружения (активное окно, элемент под курсором). Не полагайся только на пиксели — проверяй контекст, "
+            "строку и читаемый текст. Если мимо, перекрыто или опасная кнопка — ставь approved=false. "
+            "Помни, что у Оператора есть полный доступ с разрешения пользователя: команды `pc_command`, любые клавиши и горячие клавиши. "
             "Отвечай строго JSON без markdown."
         )
     else:
@@ -1260,10 +1387,17 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
             lines.append(f"Результат действия: {last_result[:400]}")
         if observation:
             lines.append(f"Наблюдение с экрана: {observation[:400]}")
+        if cursor_context:
+            lines.append(f"Контекст курсора и окна: {cursor_context[:400]}")
         if user_hint:
             lines.append(f"Пожелание пользователя: {user_hint[:400]}")
         if history:
             lines.append("Недавние шаги:\n" + "\n".join(str(x)[:200] for x in history[-6:]))
+        if repeat_streak >= 2 or failed_checks >= 1:
+            lines.append(
+                f"Обнаружено зацикливание/сбой (повторов={repeat_streak}, неудач={failed_checks}). "
+                "Предложи смену тактики: горячие клавиши, команды pc_command, переключение окна или другой элемент."
+            )
         lines.append(
             'Ответь строго JSON: {"guidanceForOperator":"чёткое следующее действие/тактика для Оператора","adviceForUser":"понятная подсказка пользователю, что сейчас делать"}'
         )
@@ -1271,37 +1405,43 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
             "Ты — Агент-наставник Настольного Оператора. После КАЖДОГО шага Оператора помогаешь "
             "ему понять, что делать дальше, а пользователю — что происходит. Для игр (game) используй "
             "тактику управления персонажем (WASD удержание, камера move_mouse_rel, прыжок/взаимодействие). "
+            "Для ПК используй контекст окна, выделенной строки и полные возможности (pc_command, hotkey, key, клик). "
             "Отвечай строго JSON без markdown."
         )
 
     prompt_text = "\n".join(lines)
     has_image = screenshot.startswith("data:image/")
+    images_parts: List[Dict[str, Any]] = []
+    if has_image:
+        images_parts.append({"type": "image_url", "image_url": {"url": screenshot}})
+    if cursor_crop.startswith("data:image/"):
+        images_parts.append({"type": "image_url", "image_url": {"url": cursor_crop}})
     user_content: Any = (
-        [{"type": "text", "text": prompt_text}, {"type": "image_url", "image_url": {"url": screenshot}}]
-        if has_image
+        [{"type": "text", "text": prompt_text}, *images_parts]
+        if images_parts
         else prompt_text
     )
     messages = [
         {"role": "system", "content": sys_msg},
         {"role": "user", "content": user_content},
     ]
-    vision_used = has_image
+    vision_used = bool(images_parts)
     try:
-        data = call_model(base_url, api_key, model, messages, None, {"temperature": 0.2, "maxTokens": 600})
+        data = call_model(base_url, api_key, model, messages, None, coach_params)
     except AgentError:
         if isinstance(user_content, list):
             vision_used = False
             messages[1]["content"] = prompt_text
-            data = call_model(base_url, api_key, model, messages, None, {"temperature": 0.2, "maxTokens": 600})
+            data = call_model(base_url, api_key, model, messages, None, coach_params)
         else:
             raise
     choices = data.get("choices") or []
     raw = str((choices[0].get("message") or {}).get("content") or "") if choices else ""
     if phase == "before_action":
         parsed_before = parse_before_action_coach_response(raw)
-        return {"ok": True, **parsed_before, "visionUsed": vision_used, "source": "agent"}
+        return {"ok": True, **parsed_before, "visionUsed": vision_used, "tuned": tuned_meta, "source": "agent"}
     parsed = parse_coach_response(raw)
-    return {"ok": True, **parsed, "visionUsed": vision_used, "source": "agent"}
+    return {"ok": True, **parsed, "visionUsed": vision_used, "tuned": tuned_meta, "source": "agent"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2097,6 +2237,124 @@ def self_test() -> int:
                 and str(e.get("_image") or "").startswith("data:image/")
                 for e in ok_scr_ev
             ),
+        )
+
+        # 10. Коуч-Агент: reasoning medium+, температура от зацикливания, приоритет настроек человека и fallback.
+        p_def, m_def = resolve_adaptive_coach_params({}, repeat_streak=0, failed_checks=0, phase="after_step")
+        p_before, m_before = resolve_adaptive_coach_params({}, repeat_streak=0, failed_checks=0, phase="before_action")
+        p_human, m_human = resolve_adaptive_coach_params(
+            {"temperature": 0.1, "reasoning": "low"}, repeat_streak=0, failed_checks=0, phase="after_step"
+        )
+        p_loop, m_loop = resolve_adaptive_coach_params(
+            {"temperature": 0.1, "reasoning": "medium"}, repeat_streak=3, failed_checks=2, phase="after_step"
+        )
+        check(
+            "resolve_adaptive_coach_params ставит reasoning>=medium, уважает выбор человека первым и поднимает температуру от цикла",
+            p_def["reasoning"] == "medium"
+            and p_def["maxTokens"] >= 900
+            and p_before["reasoning"] == "high"
+            and p_human["temperature"] == 0.1
+            and p_human["reasoning"] == "low"
+            and p_loop["reasoning"] == "high"
+            and p_loop["temperature"] > 0.4
+            and m_loop["stuckLevel"] == 2
+            and m_def["userReasoning"] == "default",
+        )
+
+        import io  # noqa: PLC0415
+        coach_payloads: List[Dict[str, Any]] = []
+        orig_urlopen = urllib.request.urlopen
+
+        class _FakeResp:
+            def __init__(self, body_str: str) -> None:
+                self._b = body_str.encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._b
+
+            def __enter__(self) -> "_FakeResp":
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                return None
+
+        def fake_urlopen(req: Any, timeout: int = 30) -> _FakeResp:
+            payload = json.loads((req.data or b"{}").decode("utf-8"))
+            coach_payloads.append(payload)
+            if "reasoning_effort" in payload:
+                raise urllib.error.HTTPError(
+                    req.full_url,
+                    400,
+                    "Bad Request",
+                    hdrs=None,  # type: ignore[arg-type]
+                    fp=io.BytesIO(b'{"error":"unsupported parameter: reasoning_effort"}'),
+                )
+            return _FakeResp(
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {
+                                            "approved": True,
+                                            "reason": "В выделенной строке кнопка Сохранить",
+                                            "guidanceForOperator": "Жми клик",
+                                            "adviceForUser": "Курсор точно на кнопке",
+                                        }
+                                    )
+                                }
+                            }
+                        ]
+                    }
+                )
+            )
+
+        urllib.request.urlopen = fake_urlopen  # type: ignore[assignment]
+        try:
+            res_coach = coach_operator_step(
+                {
+                    "taskPrompt": "Сохрани документ",
+                    "taskMode": "copilot",
+                    "phase": "before_action",
+                    "step": 2,
+                    "repeatStreak": 3,
+                    "failedChecks": 1,
+                    "cursorContext": "активное окно: Блокнот | элемент: Сохранить",
+                    "screenshot": "data:image/jpeg;base64,AAA",
+                    "cursorCrop": "data:image/jpeg;base64,BBB",
+                    "settings": {"baseUrl": "http://127.0.0.1:8888/v1", "model": "strict-model"},
+                    "params": {"temperature": 0.15, "reasoning": "medium"},
+                }
+            )
+        finally:
+            urllib.request.urlopen = orig_urlopen  # type: ignore[assignment]
+
+        check(
+            "coach_operator_step передаёт лупу/контекст, reasoning_effort=high при зацикливании и откатывается при HTTP 400",
+            len(coach_payloads) == 2
+            and coach_payloads[0].get("reasoning_effort") == "high"
+            and float(coach_payloads[0].get("temperature") or 0) >= 0.5
+            and "reasoning_effort" not in coach_payloads[1]
+            and res_coach.get("approved") is True
+            and res_coach.get("visionUsed") is True
+            and "Сохранить" in str(res_coach.get("reason") or ""),
+        )
+
+        # 14. pc_command всегда запрашивает разрешение даже при trust=full.
+        pc_asked: List[Dict[str, Any]] = []
+        pc_denied_txt, _ = run_tool(
+            "pc_command",
+            {"command": "echo PC_TEST", "description": "Проверка разрешения ПК"},
+            trust_level="full",
+            approval_fn=lambda req: (pc_asked.append(req) or {"approved": False, "note": "проверка"}),
+            sandbox_root=root,
+        )
+        check(
+            "pc_command даже при trust=full всегда спрашивает разрешение пользователя",
+            len(pc_asked) == 1
+            and pc_asked[0].get("kind") == "pc_command"
+            and "отклонил" in pc_denied_txt.lower(),
         )
 
     passed = sum(1 for item in checks if item)

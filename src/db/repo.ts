@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 import { nowIso, q, q1, toIso, toNum, toYmd } from "./dialect";
 import { tokenize } from "@/lib/rag";
 import {
+  findTaskMode,
   normalizeCoachMode,
   normalizeTaskMode,
   normalizeTaskSource,
@@ -2296,6 +2297,199 @@ export async function insertAgentConversationMessage(input: {
     error: input.error ?? "",
     createdAt,
   };
+}
+
+export async function findOperatorTaskConversation(
+  userId: number,
+  taskId: number,
+): Promise<AgentConversationRow | null> {
+  const marker = `operator_task:${taskId}`;
+  const row = await q1(sql`select c.*,
+      (select count(*) from agent_conversation_messages m where m.conversation_id = c.id) as messages_count
+    from agent_conversations c
+    where c.user_id = ${userId} and c.kind = 'agent' and c.system_prompt = ${marker}
+    order by c.id desc limit 1`);
+  return row ? mapAgentConversation(row) : null;
+}
+
+const OP_STATUS_LABELS: Record<string, string> = {
+  queued: "в очереди",
+  running: "выполняется",
+  waiting_approval: "ждёт подтверждения",
+  waiting_steps: "лимит шагов",
+  done: "готово",
+  failed: "ошибка",
+  cancelled: "отменено",
+  paused: "пауза",
+};
+
+/**
+ * Синхронизирует живой ход работы Оператора (его размышления, шаги,
+ * совещания с Агентом, подсказки и итог) в полноценный чат раздела «Агент».
+ */
+export async function syncOperatorTaskToConversation(
+  userId: number,
+  taskId: number,
+): Promise<number | null> {
+  const task = await getAgentTask(userId, taskId);
+  if (!task) return null;
+  const events = await listAgentEvents(task.id, 300);
+
+  const marker = `operator_task:${task.id}`;
+  const cleanPromptTitle = task.prompt.replace(/\s+/g, " ").trim().slice(0, 64);
+  const title = `Оператор #${task.id}: ${cleanPromptTitle || "задача на ПК"}`.slice(0, 120);
+
+  let conv = await findOperatorTaskConversation(userId, task.id);
+  if (!conv) {
+    conv = await createAgentConversation(userId, "agent", title, marker);
+  }
+
+  const modeLabel = findTaskMode(task.taskMode).shortLabel;
+  const statusLabel = OP_STATUS_LABELS[task.status] ?? task.status;
+  const userContent = `Задача для Оператора #${task.id} (${modeLabel}, доверие: ${task.trustLevel}):\n${task.prompt}`;
+
+  const reasoningLines: string[] = [];
+  const dialogueLines: string[] = [
+    `Диалог Агент ↔ Оператор #${task.id} · статус: ${statusLabel} · шагов ${task.steps}/${task.maxSteps}`,
+  ];
+  const filesMeta: Array<{ name: string; mime: string; size: number }> = [];
+  let lastErrorText = "";
+
+  for (const ev of events) {
+    const text = ev.text.trim();
+    if (ev.kind === "thought") {
+      if (text) {
+        reasoningLines.push(`💭 ${text}`);
+        dialogueLines.push(`💭 Размышление: ${text}`);
+      }
+      continue;
+    }
+    if (ev.kind === "guidance") {
+      if (text) {
+        reasoningLines.push(`🤝 ${text}`);
+        dialogueLines.push(text);
+      }
+      continue;
+    }
+    if (ev.kind === "action") {
+      const desc = text || ev.action;
+      if (desc) dialogueLines.push(`▸ Действие: ${desc}`);
+      continue;
+    }
+    if (ev.kind === "result") {
+      if (text) dialogueLines.push(`Проверка: ${text}`);
+      continue;
+    }
+    if (ev.kind === "approval") {
+      if (text) {
+        reasoningLines.push(`🔐 ${text}`);
+        dialogueLines.push(`🔐 Запрос разрешения: ${text}`);
+      }
+      continue;
+    }
+    if (ev.kind === "file") {
+      filesMeta.push({
+        name: ev.fileName || text || "файл",
+        mime: ev.fileMime || "application/octet-stream",
+        size: ev.fileSize || 0,
+      });
+      dialogueLines.push(`📎 Файл: ${ev.fileName || text}`);
+      continue;
+    }
+    if (ev.kind === "screen") {
+      if (text) dialogueLines.push(`📷 Снимок экрана: ${text}`);
+      continue;
+    }
+    if (ev.kind === "error") {
+      if (text) {
+        lastErrorText = text;
+        reasoningLines.push(`⚠️ ${text}`);
+        dialogueLines.push(`⚠️ Ошибка: ${text}`);
+      }
+      continue;
+    }
+    if (text) {
+      if (
+        text.includes("Навёл курсор") ||
+        text.includes("совещаюсь") ||
+        text.includes("зацикливан") ||
+        text.includes("Результата нет") ||
+        text.includes("не подтверждено")
+      ) {
+        reasoningLines.push(`🎯 ${text}`);
+      }
+      dialogueLines.push(`ℹ️ ${text}`);
+    }
+  }
+
+  if (task.summary) {
+    const line = `Итог: ${task.summary}`;
+    if (!dialogueLines.some((l) => l.includes(task.summary))) {
+      dialogueLines.push(line);
+    }
+  } else if (events.length === 0) {
+    dialogueLines.push("Ожидаю первого шага и размышлений Оператора…");
+  }
+
+  const assistantContent = dialogueLines.join("\n").slice(0, 50_000);
+  const assistantReasoning = reasoningLines.join("\n\n").slice(0, 50_000);
+  const assistantActions = JSON.stringify([
+    {
+      type: "operator_task",
+      taskId: task.id,
+      task: task.prompt.slice(0, 300),
+      mode: task.taskMode,
+    },
+  ]);
+  const assistantFiles = JSON.stringify(filesMeta.slice(0, 20));
+  const assistantError = task.status === "failed" ? (task.summary || lastErrorText).slice(0, 2000) : "";
+
+  const existing = await listAgentConversationMessages(conv.id);
+  const now = nowIso();
+  if (existing.length === 0) {
+    await insertAgentConversationMessage({
+      userId,
+      conversationId: conv.id,
+      role: "user",
+      content: userContent.slice(0, 50_000),
+    });
+    await insertAgentConversationMessage({
+      userId,
+      conversationId: conv.id,
+      role: "assistant",
+      content: assistantContent,
+      reasoning: assistantReasoning,
+      actions: assistantActions,
+      files: assistantFiles,
+      error: assistantError,
+    });
+  } else {
+    const assistantMsg = existing.find((m) => m.role === "assistant");
+    if (assistantMsg) {
+      await q(sql`update agent_conversation_messages
+        set content = ${assistantContent},
+            reasoning = ${assistantReasoning},
+            actions = ${assistantActions},
+            files = ${assistantFiles},
+            error = ${assistantError}
+        where id = ${assistantMsg.id} and conversation_id = ${conv.id}`);
+    } else {
+      await insertAgentConversationMessage({
+        userId,
+        conversationId: conv.id,
+        role: "assistant",
+        content: assistantContent,
+        reasoning: assistantReasoning,
+        actions: assistantActions,
+        files: assistantFiles,
+        error: assistantError,
+      });
+    }
+    await q(sql`update agent_conversations set title = ${title}, updated_at = ${now}
+      where id = ${conv.id} and user_id = ${userId}`);
+  }
+
+  return conv.id;
 }
 
 /* ------------------ сохранённые переписки (файлы истории) ---------------- */
