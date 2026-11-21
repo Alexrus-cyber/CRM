@@ -46,6 +46,7 @@ const operatorCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
 let operatorPollCount = 0;
 
 let operatorTaskGuidance: Record<string, unknown> | null = null;
+let enableLiveOperatorMock = false;
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -163,6 +164,30 @@ function mockFetch() {
           },
         });
       }
+      if (url === "/api/agent/bot/status" && method === "GET" && enableLiveOperatorMock) {
+        return json({ ok: true, state: "online", connected: true, secondsAgo: 2 });
+      }
+      if (url === "/api/agent/tasks" && method === "GET" && enableLiveOperatorMock) {
+        return json({
+          tasks: [
+            {
+              id: 77,
+              prompt: "Открой окно игры, зажми W на 1 с и нажми E у двери",
+              status: "running",
+              maxSteps: 45,
+              steps: 1,
+              summary: "",
+              trustLevel: "verified",
+              taskMode: "game",
+              coachMode: "agent",
+              source: "agent",
+              guidanceNote: operatorTaskGuidance,
+              createdAt: "2026-11-17T10:00:00.000Z",
+              updatedAt: "2026-11-17T10:00:00.000Z",
+            },
+          ],
+        });
+      }
       if (url === "/api/agent/tasks/77" && method === "GET") {
         operatorPollCount += 1;
         return json({
@@ -181,7 +206,33 @@ function mockFetch() {
             createdAt: "2026-11-17T10:00:00.000Z",
             updatedAt: "2026-11-17T10:00:00.000Z",
           },
-          events: [],
+          conversationId: enableLiveOperatorMock ? 42 : null,
+          events: enableLiveOperatorMock
+            ? [
+                {
+                  id: 501,
+                  kind: "thought",
+                  text: "Вижу дверь и навожу курсор на ручку",
+                  action: "",
+                  fileName: "",
+                  fileMime: "",
+                  fileSize: 0,
+                  hasFile: false,
+                  createdAt: "2026-11-17T10:00:01.000Z",
+                },
+                {
+                  id: 502,
+                  kind: "action",
+                  text: "Клавиша e",
+                  action: '{"type":"key","key":"e"}',
+                  fileName: "",
+                  fileMime: "",
+                  fileSize: 0,
+                  hasFile: false,
+                  createdAt: "2026-11-17T10:00:02.000Z",
+                },
+              ]
+            : [],
         });
       }
       if (url === "/api/ai/agent" && method === "POST") {
@@ -301,6 +352,7 @@ describe("вкладка «Агент»", () => {
     operatorCalls.length = 0;
     operatorPollCount = 0;
     operatorTaskGuidance = null;
+    enableLiveOperatorMock = false;
     conversations = [];
     messagesByConv = {};
     nextConvId = 1;
@@ -589,5 +641,50 @@ describe("вкладка «Агент»", () => {
     expect(String(approvalsSent[0].screenSummary)).toContain("VS Code");
     expect(await screen.findByText(/Снимок экрана ПК передан Агенту \(#88\)/)).toBeTruthy();
     expect(await screen.findByText("Вижу ошибку TypeScript в VS Code")).toBeTruthy();
+  });
+
+  it("показывает статус Оператора ПК, его живые мысли и позволяет открыть задачу как чат", async () => {
+    enableLiveOperatorMock = true;
+    conversations = [
+      {
+        id: 1,
+        kind: "agent",
+        title: "Обычный чат",
+        messagesCount: 0,
+        updatedAt: "2026-11-17T09:59:00.000Z",
+      },
+      {
+        id: 42,
+        kind: "agent",
+        title: "Оператор #77: Открой окно игры",
+        messagesCount: 2,
+        updatedAt: "2026-11-17T10:00:02.000Z",
+      },
+    ];
+    messagesByConv[1] = [];
+    messagesByConv[42] = [
+      {
+        id: 9001,
+        role: "user",
+        content: "Задача для Оператора #77 (Игра):\nОткрой окно игры, зажми W на 1 с и нажми E у двери",
+      },
+      {
+        id: 9002,
+        role: "assistant",
+        content: "Диалог Агент ↔ Оператор #77 · статус: выполняется · шагов 1/45\n💭 Размышление: Вижу дверь\n▸ Действие: Клавиша e",
+        reasoning: "💭 Вижу дверь и навожу курсор на ручку",
+      },
+    ];
+
+    render(<AgentChat userName="Тест" />);
+
+    expect(await screen.findByText("Оператор ПК: онлайн")).toBeTruthy();
+    expect(await screen.findByText(/Мысли и шаги Оператора/)).toBeTruthy();
+    expect(await screen.findByText(/Вижу дверь и навожу курсор на ручку/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Открыть как чат/i }));
+
+    expect(await screen.findByText(/Диалог Агент ↔ Оператор #77/)).toBeTruthy();
+    expect(await screen.findByText(/Размышления ·/)).toBeTruthy();
   });
 });

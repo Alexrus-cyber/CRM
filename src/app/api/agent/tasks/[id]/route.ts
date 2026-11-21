@@ -1,11 +1,13 @@
 import {
   extendAgentTaskSteps,
+  findOperatorTaskConversation,
   getAgentTask,
   getLatestAgentScreen,
   listAgentEvents,
   respondAgentTaskApproval,
   setAgentTaskGuidance,
   setAgentTaskStatus,
+  syncOperatorTaskToConversation,
 } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 
@@ -22,11 +24,20 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
   const task = await getAgentTask(me.id, Number(id) || 0);
   if (!task) return Response.json({ error: "Задание не найдено" }, { status: 404 });
 
-  const [events, latestScreen] = await Promise.all([
+  const [events, latestScreen, existingConv] = await Promise.all([
     listAgentEvents(task.id),
     getLatestAgentScreen(task.id),
+    findOperatorTaskConversation(me.id, task.id),
   ]);
-  return Response.json({ task, events, latestScreen }, { headers: { "Cache-Control": "no-store" } });
+  const conversationId =
+    existingConv?.id ??
+    (events.length > 0 || task.status !== "queued"
+      ? await syncOperatorTaskToConversation(me.id, task.id)
+      : null);
+  return Response.json(
+    { task, events, latestScreen, conversationId },
+    { headers: { "Cache-Control": "no-store" } },
+  );
 }
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
@@ -51,6 +62,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   if (body?.action === "cancel") {
     await setAgentTaskStatus(task.id, me.id, "cancelled", "Отменено пользователем");
+    await syncOperatorTaskToConversation(me.id, task.id);
     return Response.json({ ok: true });
   }
 
@@ -61,6 +73,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       note: typeof body.note === "string" ? body.note : undefined,
     });
     if (!updated) return Response.json({ error: "Задание уже завершено или отменено" }, { status: 409 });
+    await syncOperatorTaskToConversation(me.id, task.id);
     return Response.json({ ok: true, task: updated });
   }
 
@@ -71,6 +84,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       note: typeof body.note === "string" ? body.note : undefined,
     });
     if (!updated) return Response.json({ error: "Задание уже завершено или отменено" }, { status: 409 });
+    await syncOperatorTaskToConversation(me.id, task.id);
     return Response.json({ ok: true, task: updated });
   }
 
@@ -78,6 +92,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const addSteps = Math.max(1, Number(body.addSteps ?? 15) || 15);
     const updated = await extendAgentTaskSteps(task.id, me.id, addSteps);
     if (!updated) return Response.json({ error: "Нельзя расширить лимит завершённой задачи" }, { status: 409 });
+    await syncOperatorTaskToConversation(me.id, task.id);
     return Response.json({ ok: true, task: updated });
   }
 
@@ -89,7 +104,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     if (!result) {
       return Response.json({ error: "Задача уже завершена или отменена" }, { status: 409 });
     }
-    return Response.json({ ok: true, task: result.task, guidance: result.guidance });
+    const conversationId = await syncOperatorTaskToConversation(me.id, task.id);
+    return Response.json({ ok: true, task: result.task, guidance: result.guidance, conversationId });
   }
 
   return Response.json({ error: "Неизвестное действие" }, { status: 400 });

@@ -1,4 +1,4 @@
-import { addAgentEvent, bumpAgentTaskStep, getAgentTask, setAgentTaskStatus } from "@/db/repo";
+import { addAgentEvent, bumpAgentTaskStep, getAgentTask, setAgentTaskStatus, syncOperatorTaskToConversation } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
 
 /** Журнал шага, который выполнил бот: мысль модели, действие, результат, ошибка. */
@@ -28,17 +28,19 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     typeof action === "string" ? action : action && typeof action === "object" ? JSON.stringify(action) : "";
 
   const kind = String(body?.kind ?? "info");
+  const cleanKind = KINDS.has(kind) ? kind : "info";
   await addAgentEvent({
     taskId: task.id,
-    kind: KINDS.has(kind) ? kind : "info",
+    kind: cleanKind,
     text: String(body?.text ?? "").slice(0, 8000),
     action: actionText.slice(0, 4000),
   });
 
-  if (kind === "action") await bumpAgentTaskStep(task.id);
+  if (cleanKind === "action") await bumpAgentTaskStep(task.id);
   if (body?.status) {
     await setAgentTaskStatus(task.id, ownerId, String(body.status), String(body.summary ?? "").slice(0, 4000));
   }
+  await syncOperatorTaskToConversation(ownerId, task.id);
 
   return Response.json({ ok: true, step: task.steps + 1 });
 }

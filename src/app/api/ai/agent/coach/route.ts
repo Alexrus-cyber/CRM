@@ -1,6 +1,7 @@
-import { getAgentTask, listAgentEvents, setAgentTaskGuidance } from "@/db/repo";
+import { getAgentTask, listAgentEvents, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 import { requestAgentStepCoaching } from "@/lib/agentCoach";
+import type { GenParams } from "@/lib/genParams";
 import { AGENT_URL } from "../route";
 
 /**
@@ -24,6 +25,7 @@ export async function POST(req: Request) {
         taskId?: number;
         userHint?: string;
         settings?: { baseUrl?: string; apiKey?: string; model?: string };
+        params?: Partial<GenParams>;
       }
     | null;
 
@@ -45,6 +47,19 @@ export async function POST(req: Request) {
     .slice(-8)
     .map((e) => `[${e.kind}] ${e.text || e.action}`);
 
+  // Оцениваем зацикливание по последним событиям (повтор действия или неудачи проверки).
+  const tailActions = events.filter((e) => e.kind === "action").slice(-4).map((e) => e.action || e.text);
+  let repeatStreak = 0;
+  if (tailActions.length > 0) {
+    const lastAct = tailActions[tailActions.length - 1];
+    for (let i = tailActions.length - 1; i >= 0 && tailActions[i] === lastAct; i--) {
+      repeatStreak += 1;
+    }
+  }
+  const failedChecks = events
+    .slice(-6)
+    .filter((e) => e.kind === "result" && e.text.includes("⚠️")).length;
+
   const advice = await requestAgentStepCoaching({
     agentUrl: AGENT_URL,
     taskPrompt: task.prompt,
@@ -54,6 +69,9 @@ export async function POST(req: Request) {
     lastResult: lastResultEv?.text || lastActionEv?.text || "",
     observation: lastThoughtEv?.text || "",
     userHint: typeof body?.userHint === "string" ? body.userHint : "",
+    repeatStreak,
+    failedChecks,
+    params: body?.params ?? null,
     history,
     settings: body?.settings,
   });
@@ -64,12 +82,15 @@ export async function POST(req: Request) {
     userAdvice: advice.adviceForUser,
     addEvent: true,
   });
+  const conversationId = await syncOperatorTaskToConversation(me.id, task.id);
 
   return Response.json(
     {
       ok: true,
       task: saved?.task ?? task,
       guidance: saved?.guidance ?? null,
+      tuned: advice.tuned,
+      conversationId,
       source: advice.source,
     },
     { headers: { "Cache-Control": "no-store" } },

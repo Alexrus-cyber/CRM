@@ -408,6 +408,9 @@ export function AgentChat({ userName }: { userName: string }) {
   const [opEvents, setOpEvents] = useState<OperatorEvent[]>([]);
   const [opGuidanceInput, setOpGuidanceInput] = useState("");
   const [opCoachBusy, setOpCoachBusy] = useState(false);
+  const [opConversationId, setOpConversationId] = useState<number | null>(null);
+  const [opBotStatus, setOpBotStatus] = useState<{ state: string; connected: boolean } | null>(null);
+  const [recentOpTasks, setRecentOpTasks] = useState<OperatorTask[]>([]);
 
   // RAG папки и загрузка без ограничений размера папки.
   const [ragFolders, setRagFolders] = useState<RagFolder[]>([]);
@@ -432,6 +435,19 @@ export function AgentChat({ userName }: { userName: string }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const ragDirRef = useRef<HTMLInputElement>(null);
   const counter = useRef(0);
+  const conversationIdRef = useRef<number | null>(null);
+  const opTaskRef = useRef<OperatorTask | null>(null);
+  const runningRef = useRef(false);
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
+  useEffect(() => {
+    opTaskRef.current = opTask;
+  }, [opTask]);
+  useEffect(() => {
+    runningRef.current = running;
+  }, [running]);
 
   const nextId = () => {
     counter.current += 1;
@@ -872,17 +888,102 @@ export function AgentChat({ userName }: { userName: string }) {
     }
   };
 
-  const refreshOpTask = useCallback(async (taskId: number) => {
+  const refreshConversations = useCallback(async () => {
     try {
-      const res = await fetch(`/api/agent/tasks/${taskId}`, { cache: "no-store" });
+      const res = await fetch("/api/agent/conversations?kind=agent", { cache: "no-store" });
       if (!res.ok) return;
-      const data = (await res.json()) as { task?: OperatorTask; events?: OperatorEvent[] };
-      if (data.task) setOpTask(data.task);
-      if (Array.isArray(data.events)) setOpEvents(data.events);
+      const data = (await res.json()) as { conversations?: AgentConversation[] };
+      if (Array.isArray(data.conversations)) setConversations(data.conversations);
     } catch {
-      /* фоновый поллинг */
+      /* фоновая проверка */
     }
   }, []);
+
+  const refreshOpTask = useCallback(
+    async (taskId: number) => {
+      try {
+        const res = await fetch(`/api/agent/tasks/${taskId}`, { cache: "no-store" });
+        if (!res.ok) return null;
+        const data = (await res.json()) as {
+          task?: OperatorTask;
+          events?: OperatorEvent[];
+          conversationId?: number | null;
+        };
+        if (data.task) setOpTask(data.task);
+        if (Array.isArray(data.events)) setOpEvents(data.events);
+        const convId = typeof data.conversationId === "number" ? data.conversationId : null;
+        setOpConversationId(convId);
+
+        if (convId && conversationIdRef.current === convId && !runningRef.current) {
+          try {
+            const cRes = await fetch(`/api/agent/conversations/${convId}`, { cache: "no-store" });
+            if (cRes.ok) {
+              const cData = (await cRes.json()) as { messages?: StoredTurn[] };
+              if (Array.isArray(cData.messages)) {
+                setTurns(cData.messages.map(decodeStoredTurn));
+              }
+            }
+          } catch {
+            /* тихо */
+          }
+        }
+        if (convId) void refreshConversations();
+        return data;
+      } catch {
+        /* фоновый поллинг */
+        return null;
+      }
+    },
+    [refreshConversations],
+  );
+
+  const refreshOperatorOverview = useCallback(async () => {
+    try {
+      const [botRes, tasksRes] = await Promise.all([
+        fetch("/api/agent/bot/status", { cache: "no-store" }).catch(() => null),
+        fetch("/api/agent/tasks", { cache: "no-store" }).catch(() => null),
+      ]);
+      if (botRes && botRes.ok) {
+        const botData = (await botRes.json().catch(() => null)) as {
+          state?: string;
+          connected?: boolean;
+        } | null;
+        if (botData && typeof botData.connected === "boolean") {
+          setOpBotStatus({
+            state: String(botData.state ?? (botData.connected ? "online" : "stale")),
+            connected: botData.connected,
+          });
+        }
+      }
+      if (tasksRes && tasksRes.ok) {
+        const tasksData = (await tasksRes.json().catch(() => null)) as {
+          tasks?: OperatorTask[];
+        } | null;
+        const list = Array.isArray(tasksData?.tasks)
+          ? tasksData!.tasks.filter((t) => t.taskMode !== "inspect")
+          : [];
+        setRecentOpTasks(list.slice(0, 8));
+        if (!opTaskRef.current) {
+          const active = list.find((t) =>
+            ["running", "waiting_approval", "waiting_steps", "queued"].includes(t.status),
+          );
+          if (active) {
+            void refreshOpTask(active.id);
+          }
+        }
+      }
+    } catch {
+      /* фоновый поллинг — тихо игнорируем */
+    }
+  }, [refreshOpTask]);
+
+  useEffect(() => {
+    void refreshOperatorOverview();
+    const timer = window.setInterval(() => {
+      void refreshOperatorOverview();
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [refreshOperatorOverview]);
 
   useEffect(() => {
     if (!opTask || ["done", "failed", "cancelled"].includes(opTask.status)) return;
@@ -1171,6 +1272,9 @@ export function AgentChat({ userName }: { userName: string }) {
       setPendingApproval(null);
       setApprovalDest("");
       setApprovalTaskDraft("");
+      if (launchedTaskId !== undefined) {
+        void refreshOpTask(launchedTaskId);
+      }
     } catch {
       setError("Сеть недоступна при отправке подтверждения");
     } finally {
@@ -1295,6 +1399,7 @@ export function AgentChat({ userName }: { userName: string }) {
           taskId: opTask.id,
           userHint: opGuidanceInput.trim(),
           settings,
+          params,
         }),
       });
       const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
@@ -1306,6 +1411,28 @@ export function AgentChat({ userName }: { userName: string }) {
       await refreshOpTask(opTask.id);
     } finally {
       setOpCoachBusy(false);
+    }
+  };
+
+  const openOperatorTaskChat = async (targetTaskId?: number) => {
+    const taskId = targetTaskId ?? opTask?.id;
+    if (!taskId || running || historyLoading) return;
+    setError(null);
+    try {
+      let convId = targetTaskId === opTask?.id ? opConversationId : null;
+      if (!convId) {
+        const refreshed = await refreshOpTask(taskId);
+        convId = typeof refreshed?.conversationId === "number" ? refreshed.conversationId : null;
+      }
+      if (!convId) {
+        setError(`Чат для задачи Оператора #${taskId} ещё не сформирован`);
+        return;
+      }
+      await refreshConversations();
+      await openConversation(convId);
+      setNotice(`Открыт чат задачи Оператора #${taskId} (история сохраняется автоматически).`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось открыть чат задачи Оператора");
     }
   };
 
@@ -1718,6 +1845,20 @@ export function AgentChat({ userName }: { userName: string }) {
           />
           {health === null ? "проверяю…" : available ? "агент онлайн" : "агент не запущен"}
         </span>
+        {opBotStatus && (
+          <span
+            className={cn(
+              "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium",
+              opBotStatus.connected
+                ? "bg-cyan-500/15 text-cyan-400"
+                : "bg-card2 text-muted",
+            )}
+            title="Статус настольного Оператора ПК"
+          >
+            <MonitorCog size={11} />
+            {opBotStatus.connected ? "Оператор ПК: онлайн" : "Оператор ПК: не в сети"}
+          </span>
+        )}
         <span className={cn("rounded-md border px-1.5 py-0.5 text-[10px] font-medium", trustMeta.badgeClass)}>
           {trustMeta.shortLabel}
         </span>
@@ -1727,6 +1868,7 @@ export function AgentChat({ userName }: { userName: string }) {
           onClick={() => {
             void loadHealth().then(setHealth);
             void refreshSandbox();
+            void refreshOperatorOverview();
           }}
           className="ml-auto rounded-lg border border-border bg-card px-2 py-1 font-medium text-muted transition hover:text-text"
         >
@@ -2232,6 +2374,31 @@ export function AgentChat({ userName }: { userName: string }) {
               </button>
             </div>
           </div>
+
+          {recentOpTasks.length > 0 && (
+            <div className="space-y-1.5 border-t border-border pt-2">
+              <p className="text-[10px] font-medium text-muted">Недавние и активные задачи Оператора:</p>
+              <div className="flex flex-wrap gap-1.5">
+                {recentOpTasks.map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => void refreshOpTask(t.id)}
+                    className={cn(
+                      "flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[10px] transition",
+                      opTask?.id === t.id
+                        ? "border-cyan-500/50 bg-cyan-500/15 text-text"
+                        : "border-border bg-card2 text-muted hover:text-text",
+                    )}
+                  >
+                    <StatusChip status={t.status} />
+                    <span>#{t.id}</span>
+                    <span className="max-w-[180px] truncate">{t.prompt}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -2243,6 +2410,9 @@ export function AgentChat({ userName }: { userName: string }) {
         const latestActionEv = [...opEvents].reverse().find((e) => e.kind === "action");
         const guidanceText =
           opTask.guidanceNote?.userAdvice || opTask.guidanceNote?.text || latestGuidanceEv?.text || "";
+        const liveFeed = opEvents
+          .filter((e) => ["thought", "action", "result", "guidance", "approval", "error"].includes(e.kind))
+          .slice(-8);
         return (
           <div className="space-y-2 rounded-2xl border border-cyan-500/40 bg-card p-3 text-[11px]">
             <div className="flex flex-wrap items-center gap-2">
@@ -2258,7 +2428,15 @@ export function AgentChat({ userName }: { userName: string }) {
               <span className="text-[10px] text-muted">
                 шагов {opTask.steps}/{opTask.maxSteps}
               </span>
-              <div className="ml-auto flex items-center gap-1.5">
+              <div className="ml-auto flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void openOperatorTaskChat(opTask.id)}
+                  className="flex items-center gap-1 rounded-md border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-medium text-accent2 hover:bg-accent/20"
+                  title="Открыть полную историю мыслей и шагов Оператора как отдельный чат"
+                >
+                  <History size={10} /> Открыть как чат
+                </button>
                 {!opFinished && (
                   <>
                     <button
@@ -2289,7 +2467,41 @@ export function AgentChat({ userName }: { userName: string }) {
               </div>
             </div>
             <p className="truncate text-[10px] text-muted">{opTask.prompt}</p>
-            {latestActionEv && (
+            {liveFeed.length > 0 && (
+              <div className="space-y-1 rounded-lg border border-border bg-card2/50 p-2">
+                <p className="text-[10px] font-medium text-muted">
+                  Мысли и шаги Оператора ({opEvents.length}):
+                </p>
+                <div className="max-h-36 space-y-1 overflow-y-auto text-[10px]">
+                  {liveFeed.map((ev) => (
+                    <p
+                      key={ev.id}
+                      className={cn(
+                        "leading-snug",
+                        ev.kind === "thought" && "text-cyan-300",
+                        ev.kind === "guidance" && "text-accent2",
+                        ev.kind === "action" && "text-emerald-400",
+                        ev.kind === "error" && "text-red-400",
+                        (ev.kind === "result" || ev.kind === "approval") && "text-muted",
+                      )}
+                    >
+                      {ev.kind === "thought"
+                        ? `💭 ${ev.text}`
+                        : ev.kind === "guidance"
+                          ? `🤝 ${ev.text}`
+                          : ev.kind === "action"
+                            ? `▸ ${ev.text || ev.action}`
+                            : ev.kind === "error"
+                              ? `⚠️ ${ev.text}`
+                              : ev.kind === "approval"
+                                ? `🔐 ${ev.text}`
+                                : ev.text}
+                    </p>
+                  ))}
+                </div>
+              </div>
+            )}
+            {latestActionEv && liveFeed.length === 0 && (
               <p className="rounded-lg bg-card2 px-2 py-1 text-[10px] text-emerald-500">
                 Последнее действие: {latestActionEv.text || latestActionEv.action}
               </p>
@@ -2299,6 +2511,12 @@ export function AgentChat({ userName }: { userName: string }) {
                 <span className="font-medium text-cyan-400">Что делать дальше: </span>
                 {guidanceText}
               </div>
+            )}
+            {opFinished && opTask.summary && (
+              <p className="rounded-lg border border-border bg-card2 px-2.5 py-1.5 text-[10px] text-text">
+                <span className="font-medium text-emerald-400">Итог: </span>
+                {opTask.summary}
+              </p>
             )}
             {(opApproval || opTask.status === "waiting_approval" || opTask.status === "waiting_steps") && (
               <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-[10px] font-medium text-amber-400">
@@ -2591,13 +2809,22 @@ export function AgentChat({ userName }: { userName: string }) {
                             Оператор запущен #{action.taskId ?? "—"} · {action.task || action.label}
                           </span>
                           {action.taskId ? (
-                            <button
-                              type="button"
-                              onClick={() => void refreshOpTask(action.taskId!)}
-                              className="shrink-0 text-[10px] font-medium text-emerald-500 hover:underline"
-                            >
-                              Обновить статус
-                            </button>
+                            <div className="flex shrink-0 items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => void openOperatorTaskChat(action.taskId!)}
+                                className="text-[10px] font-medium text-accent2 hover:underline"
+                              >
+                                Открыть как чат
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void refreshOpTask(action.taskId!)}
+                                className="text-[10px] font-medium text-emerald-500 hover:underline"
+                              >
+                                Ход работы
+                              </button>
+                            </div>
                           ) : null}
                         </div>
                       );

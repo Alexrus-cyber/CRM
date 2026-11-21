@@ -1,4 +1,4 @@
-import { addAgentEvent, getAgentTask } from "@/db/repo";
+import { addAgentEvent, getAgentTask, syncOperatorTaskToConversation } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
 
 /**
@@ -38,6 +38,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     fileSize: size,
     fileData: data,
   });
+  await syncOperatorTaskToConversation(ownerId, task.id);
 
   return Response.json({ ok: true, eventId, url: `/api/agent/file/${eventId}` });
 }

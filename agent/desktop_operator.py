@@ -135,13 +135,14 @@ SYSTEM_PROMPT = """Ты — умный оператор рабочего сто�
 - {"type":"switch_language","target":"ru|en|toggle"} — переключить раскладку клавиатуры (если текст не печатается или набирается не на том языке);
 - {"type":"select_all_copy","x":..,"y":..} — выделить всё и скопировать в буфер обмена (возвращает текст);
 - {"type":"clipboard_get"} / {"type":"clipboard_set","text":"…"} — прочитать или записать буфер обмена;
-- {"type":"hotkey","keys":["ctrl","s"]} — сочетание клавиш;
-- {"type":"key","key":"enter"} — одна клавиша;
+- {"type":"hotkey","keys":["ctrl","s"]} — любые сочетания клавиш (включая win+r, alt+tab, ctrl+shift+esc, win+e и т.д.; системно опасные сочетания спросят подтверждение);
+- {"type":"key","key":"enter"} — любая клавиша клавиатуры (enter, esc, tab, win, printscreen, f1..f12, стрелки и др.);
 - {"type":"scroll","amount":-3,"x":..,"y":..} — прокрутка (минус — вниз);
 - {"type":"drag","fromX":..,"fromY":..,"toX":..,"toY":..};
 - {"type":"wait","seconds":1};
 - {"type":"open_url","url":"https://…"} — открыть сайт или видео в браузере;
-- {"type":"launch_app","app":"notepad"} — открыть программу на ПК (опасное действие: требует подтверждения на сайте);
+- {"type":"launch_app","app":"notepad"} — открыть программу на ПК (спрашивает подтверждение на сайте);
+- {"type":"pc_command","command":"…","cwd":"."} — выполнить любую команду на ПК (PowerShell/cmd/bash, запуск скриптов/процессов, системные операции; требует разрешения пользователя на сайте в режиме verified);
 - {"type":"run_command","command":"…","cwd":"."} — выполнить команду в изолированной песочнице Sandbox (требует подтверждения на сайте);
 - {"type":"sandbox_write_file","path":"site/index.html","content":"…"} / {"type":"sandbox_list","path":"."};
 - {"type":"export_from_sandbox","source":"…","destination":"…","mode":"copy|move"} — перенести файлы из Sandbox (требует согласия на сайте);
@@ -150,9 +151,14 @@ SYSTEM_PROMPT = """Ты — умный оператор рабочего сто�
 
 Правила:
 - Координаты — в пикселях скриншота, который ты видишь (его размер указан в задании).
-- Текущее положение курсора отмечено на скриншоте красным крестиком: если прошлый
-  клик промахнулся, по крестику видно, куда именно попал курсор и насколько нужно
-  поправить координаты. Перед кликом курсор наводится сам (лишний action move не нужен).
+- На скриншоте курсор отмечен открытым прицелом, ВЫДЕЛЕННОЙ СТРОКОЙ/рамкой вокруг элемента под курсором
+  и увеличенной ЛУПОЙ ×2.5 в свободном углу, а также текстовым описанием окружения (окно и элемент под курсором).
+  Ориентируйся не только по пикселям, а по выделенной области, активному окну, тексту на лупе и интерфейсу вокруг.
+  Перед кликом курсор наводится сам (лишний action move не нужен).
+- У тебя полный доступ к действиям на ПК с разрешения пользователя: смело используй команды `pc_command`,
+  любые клавиши (`key`, `hold_key`), быстрые клавиши (`hotkey`), `launch_app`, `open_url`, буфер обмена и
+  переключение раскладки — если задачу можно надёжнее решить командой или горячей клавишей вместо хрупких кликов,
+  выбирай команду или горячую клавишу (сайт сам спросит подтверждение у человека при уровне доверия verified).
 - Один шаг — одно осознанное действие. Если можно сделать надёжнее без хрупких кликов
   (например, open_url вместо клика по иконке браузера, ctrl+l для адресной строки,
   alt+tab для переключения окна, escape от всплывающего меню, enter для отправки) —
@@ -402,7 +408,8 @@ def build_step_prompt(prompt: str, step_index: int, shot: Optional[Dict[str, Any
                       attachments_context: str = "", last_outcome: str = "",
                       screen_unchanged: bool = False,
                       task_mode: str = "autonomous",
-                      pending_guidance: str = "") -> str:
+                      pending_guidance: str = "",
+                      cursor_context: str = "") -> str:
     """Собирает запрос шага: к скриншоту всегда приложен уточняющий вопрос."""
     parts = [
         'Задание: "{}"'.format(prompt),
@@ -414,6 +421,8 @@ def build_step_prompt(prompt: str, step_index: int, shot: Optional[Dict[str, Any
         )
     elif text_only:
         parts.append("Работаем без скриншота: координаты считай по текущему экрану.")
+    if cursor_context:
+        parts.append("Пространство и контекст вокруг курсора: " + cursor_context)
     if last_outcome:
         parts.append("Итог прошлого шага: " + last_outcome)
     if pending_guidance:
@@ -436,9 +445,9 @@ def build_step_prompt(prompt: str, step_index: int, shot: Optional[Dict[str, Any
         )
     else:
         parts.append(
-            "Уточняющий вопрос по текущему скриншоту: что именно сейчас открыто и происходит "
-            "на экране, что мне делать дальше для достижения цели и почему именно этот шаг "
-            "сработает надёжнее (не выдавай просто координаты наугад — оцени, нужен ли клик, "
+            "Уточняющий вопрос по текущему скриншоту: что именно сейчас открыто, что находится в выделенной "
+            "строке/лупе у курсора, что мне делать дальше для достижения цели и почему именно этот шаг "
+            "сработает надёжнее (не выбирай пиксели вслепую — оцени, нужен ли клик, pc_command, "
             "клавиша/сочетание, прокрутка, open_url, make_file или finish)?"
         )
     if attachments_context:
@@ -547,6 +556,10 @@ def action_label(action: Dict[str, Any]) -> str:
         text = str(action.get("text") or "")
         where = " в ({}, {})".format(x, y) if x is not None and y is not None else ""
         return "ввод «{}»{}".format(text[:40], where)
+    if kind == "pc_command":
+        return "команда на ПК: {}".format(str(action.get("command") or "")[:60])
+    if kind == "run_command":
+        return "команда Sandbox: {}".format(str(action.get("command") or "")[:60])
     if kind == "hold_key":
         return "удержание {} ({} с)".format(action.get("key") or "w", action.get("seconds") or 0.5)
     if kind == "move_mouse_rel":
@@ -577,7 +590,7 @@ def build_repeat_nudge(action: Dict[str, Any], streak: int) -> str:
         "- нужное окно не в фокусе → hotkey alt+tab;\n"
         "- поверх открыт диалог или меню → key escape;\n"
         "- элемент не виден → scroll -3 (или +3, если нужно вверх);\n"
-        "- программа закрыта → открой её (open_url или меню «Пуск»);\n"
+        "- программа закрыта → открой её (open_url, launch_app или pc_command);\n"
         "- текст не появляется → кликни в поле по координатам, затем type с x и y;\n"
         "- цель уже достигнута → finish с коротким итогом.\n"
         "Не повторяй прежние координаты и не рассуждай бесконечно: выбери один "
@@ -591,9 +604,9 @@ def build_failed_nudge(count: int, note: str) -> str:
     return (
         "Проверка {} раз подряд не подтвердила результат (последнее: «{}»).\n"
         "Задай себе вопрос: почему выбранное действие не работает и что я делаю не так? "
-        "Не повторяй его: посмотри на красный крестик курсора и смени тактику — "
-        "например, Esc от диалога, alt+tab к нужному окну, прокрутка к элементу "
-        "или другой способ выполнить задачу. Если не получается — finish и объясни, "
+        "Не повторяй его: посмотри на выделенную строку/лупу у курсора и смени тактику — "
+        "например, Esc от диалога, alt+tab к нужному окну, горячая клавиша, прокрутка "
+        "к элементу или команда pc_command. Если не получается — finish и объясни, "
         "что именно мешает."
     ).format(count, (note or "")[:120])
 
@@ -611,10 +624,308 @@ DANGEROUS = re.compile(
     re.IGNORECASE,
 )
 
-ALWAYS_CONFIRM_ACTIONS = {"launch_app", "run_command", "export_from_sandbox"}
+ALWAYS_CONFIRM_ACTIONS = {"launch_app", "run_command", "pc_command", "export_from_sandbox"}
 DANGEROUS_HOTKEYS = {("alt", "f4"), ("ctrl", "alt", "delete"), ("win", "r"), ("super", "r")}
 
 TRUST_ORDER = {"none": 0, "verified": 1, "full": 2}
+
+
+def _pixel_luma(rgb: Any) -> float:
+    if isinstance(rgb, (tuple, list)) and len(rgb) >= 3:
+        return 0.299 * float(rgb[0]) + 0.587 * float(rgb[1]) + 0.114 * float(rgb[2])
+    return float(rgb) if isinstance(rgb, (int, float)) else 0.0
+
+
+def detect_cursor_row_box(image: Any, cx: int, cy: int) -> Tuple[int, int, int, int]:
+    """Определяет границы визуальной строки/элемента вокруг (cx, cy) на скриншоте.
+
+    Помогает выделить именно ту строку, кнопку или поле, на которое наведён курсор,
+    вместо слепого точечного крестика.
+    """
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return (0, 0, 0, 0)
+    px = max(0, min(width - 1, int(cx)))
+    py = max(0, min(height - 1, int(cy)))
+
+    # Базовый фон в небольшой окрестности, чтобы поймать границы элемента/строки.
+    try:
+        base_luma = _pixel_luma(image.getpixel((px, py)))
+    except Exception:  # noqa: BLE001
+        return (
+            max(0, px - 110),
+            max(0, py - 16),
+            min(width - 1, px + 110),
+            min(height - 1, py + 16),
+        )
+
+    def scan_edge(dx: int, dy: int, limit: int, min_span: int, fallback: int) -> int:
+        step_x, step_y = dx, dy
+        last_pos = 0
+        for dist in range(1, limit + 1):
+            nx = px + step_x * dist
+            ny = py + step_y * dist
+            if not (0 <= nx < width and 0 <= ny < height):
+                return max(min_span, dist - 1)
+            try:
+                lum = _pixel_luma(image.getpixel((nx, ny)))
+            except Exception:  # noqa: BLE001
+                break
+            # Если нашли резкую границу после минимального отступа — считаем её краем элемента/строки.
+            if dist >= min_span and abs(lum - base_luma) >= 26.0:
+                return dist
+            last_pos = dist
+        return min(fallback, last_pos or fallback)
+
+    left_span = scan_edge(-1, 0, 220, 28, 120)
+    right_span = scan_edge(1, 0, 220, 28, 120)
+    top_span = scan_edge(0, -1, 34, 12, 16)
+    bottom_span = scan_edge(0, 1, 34, 12, 16)
+
+    x1 = max(1, px - max(28, min(220, left_span)))
+    x2 = min(width - 2, px + max(28, min(220, right_span)))
+    y1 = max(1, py - max(12, min(32, top_span)))
+    y2 = min(height - 2, py + max(12, min(32, bottom_span)))
+    return (x1, y1, x2, y2)
+
+
+def _draw_open_reticle(draw: Any, cx: int, cy: int, radius: int = 16, gap: int = 5) -> None:
+    """Рисует открытый прицел: центр (cx, cy) остаётся чистым и не перекрывает текст."""
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        x1 = cx + dx * gap
+        y1 = cy + dy * gap
+        x2 = cx + dx * radius
+        y2 = cy + dy * radius
+        draw.line([(x1, y1), (x2, y2)], fill=(255, 255, 255), width=4)
+        draw.line([(x1, y1), (x2, y2)], fill=(255, 36, 36), width=2)
+    draw.ellipse([(cx - gap, cy - gap), (cx + gap, cy + gap)], outline=(255, 36, 36), width=2)
+
+
+def draw_cursor_context_overlay(
+    image: Any,
+    mark_x: int,
+    mark_y: int,
+    raw_image: Any = None,
+    raw_cx: Optional[int] = None,
+    raw_cy: Optional[int] = None,
+) -> Tuple[int, int, int, int]:
+    """Подсвечивает выделенную строку вокруг курсора, ставит открытый прицел и врезку-лупу ×2.5."""
+    if Image is None or ImageDraw is None:
+        return (0, 0, 0, 0)
+    width, height = image.size
+    if not (0 <= mark_x < width and 0 <= mark_y < height):
+        return (0, 0, 0, 0)
+
+    row_box = detect_cursor_row_box(image, mark_x, mark_y)
+    rx1, ry1, rx2, ry2 = row_box
+    draw = ImageDraw.Draw(image)
+
+    # 1. Выделенная строка / рамка выбираемого элемента (голубая + янтарная кромка, центр не закрашен).
+    draw.rectangle([(max(0, rx1 - 1), max(0, ry1 - 1)), (min(width - 1, rx2 + 1), min(height - 1, ry2 + 1))],
+                   outline=(0, 210, 255), width=2)
+    draw.rectangle([(rx1, ry1), (rx2, ry2)], outline=(255, 204, 0), width=1)
+    # Боковые маркеры «выбранной строки» для мгновенного считывания уровня Y.
+    draw.rectangle([(max(0, rx1 - 6), ry1), (max(0, rx1 - 2), ry2)], fill=(0, 210, 255))
+    draw.rectangle([(min(width - 1, rx2 + 2), ry1), (min(width - 1, rx2 + 6), ry2)], fill=(0, 210, 255))
+
+    # 2. Открытый прицел в точке (mark_x, mark_y).
+    _draw_open_reticle(draw, mark_x, mark_y, radius=18, gap=5)
+
+    # 3. Увеличенная ЛУПА ×2.5 в самом свободном углу, чтобы не перекрывать цель.
+    if width >= 480 and height >= 320:
+        src = raw_image if raw_image is not None else image
+        src_w, src_h = src.size
+        scx = int(raw_cx) if raw_cx is not None else int(round(mark_x * (src_w / float(width))))
+        scy = int(raw_cy) if raw_cy is not None else int(round(mark_y * (src_h / float(height))))
+        half_w = min(72, max(44, src_w // 18))
+        half_h = min(44, max(28, src_h // 20))
+        crop_x1 = max(0, min(src_w - half_w * 2, scx - half_w))
+        crop_y1 = max(0, min(src_h - half_h * 2, scy - half_h))
+        crop_x2 = min(src_w, crop_x1 + half_w * 2)
+        crop_y2 = min(src_h, crop_y1 + half_h * 2)
+        if crop_x2 - crop_x1 >= 20 and crop_y2 - crop_y1 >= 20:
+            loupe_w = min(260, max(160, width // 5))
+            loupe_h = int(round(loupe_w * (crop_y2 - crop_y1) / float(crop_x2 - crop_x1)))
+            loupe_h = max(90, min(170, loupe_h))
+            crop = src.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+            if crop.mode != "RGB":
+                crop = crop.convert("RGB")
+            resample = getattr(getattr(Image, "Resampling", Image), "BILINEAR", 2)
+            loupe = crop.resize((loupe_w, loupe_h), resample=resample)
+            ldraw = ImageDraw.Draw(loupe)
+            lx = int(round((scx - crop_x1) * (loupe_w / float(crop_x2 - crop_x1))))
+            ly = int(round((scy - crop_y1) * (loupe_h / float(crop_y2 - crop_y1))))
+            ldraw.rectangle([(4, max(2, ly - 18)), (loupe_w - 5, min(loupe_h - 3, ly + 18))],
+                            outline=(0, 210, 255), width=2)
+            _draw_open_reticle(ldraw, lx, ly, radius=14, gap=4)
+
+            # Угол выбираем по противоположной стороне от курсора.
+            pad = 12
+            header_h = 18
+            paste_x = pad if mark_x > width // 2 else max(pad, width - loupe_w - pad)
+            paste_y = pad + header_h if mark_y > height // 2 else max(pad + header_h, height - loupe_h - pad)
+            draw.rectangle(
+                [(paste_x - 2, paste_y - header_h - 2), (paste_x + loupe_w + 2, paste_y + loupe_h + 2)],
+                fill=(15, 23, 42),
+                outline=(0, 210, 255),
+                width=2,
+            )
+            label = "LOUPE x2.5 ({},{})".format(scx, scy)
+            if ImageFont is not None:
+                try:
+                    draw.text((paste_x + 5, paste_y - header_h + 2), label, fill=(103, 232, 249),
+                              font=ImageFont.load_default())
+                except Exception:  # noqa: BLE001
+                    pass
+            image.paste(loupe, (paste_x, paste_y))
+
+    return row_box
+
+
+def build_cursor_crop_data_url(
+    raw_image: Any,
+    raw_cx: int,
+    raw_cy: int,
+    box_w: int = 280,
+    box_h: int = 160,
+) -> Optional[str]:
+    """Отдельный увеличенный фрагмент области курсора для совещания с Агентом."""
+    if Image is None or ImageDraw is None or raw_image is None:
+        return None
+    try:
+        src_w, src_h = raw_image.size
+        if src_w < 20 or src_h < 20:
+            return None
+        half_w = min(src_w // 2, max(60, box_w // 2))
+        half_h = min(src_h // 2, max(40, box_h // 2))
+        x1 = max(0, min(src_w - half_w * 2, int(raw_cx) - half_w))
+        y1 = max(0, min(src_h - half_h * 2, int(raw_cy) - half_h))
+        x2 = min(src_w, x1 + half_w * 2)
+        y2 = min(src_h, y1 + half_h * 2)
+        crop = raw_image.crop((x1, y1, x2, y2))
+        if crop.mode != "RGB":
+            crop = crop.convert("RGB")
+        target_w = min(560, max(240, (x2 - x1) * 2))
+        target_h = int(round(target_w * (y2 - y1) / float(max(1, x2 - x1))))
+        resample = getattr(getattr(Image, "Resampling", Image), "BILINEAR", 2)
+        zoomed = crop.resize((target_w, target_h), resample=resample)
+        cx = int(round((int(raw_cx) - x1) * (target_w / float(max(1, x2 - x1)))))
+        cy = int(round((int(raw_cy) - y1) * (target_h / float(max(1, y2 - y1)))))
+        row_box = detect_cursor_row_box(zoomed, cx, cy)
+        zdraw = ImageDraw.Draw(zoomed)
+        zdraw.rectangle([(row_box[0], row_box[1]), (row_box[2], row_box[3])], outline=(0, 210, 255), width=2)
+        _draw_open_reticle(zdraw, cx, cy, radius=16, gap=5)
+        buf = io.BytesIO()
+        zoomed.save(buf, format="JPEG", quality=82, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def inspect_cursor_context(
+    sx: int,
+    sy: int,
+    row_box: Optional[Tuple[int, int, int, int]] = None,
+    shot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Собирает признаки окружения вокруг (sx, sy): активное окно, элемент под курсором, выделенная строка."""
+    active_window = get_active_window_title()
+    ctx: Dict[str, Any] = {
+        "cursor": {"x": int(sx), "y": int(sy)},
+        "activeWindow": active_window,
+    }
+    if row_box and len(row_box) == 4 and (row_box[2] > row_box[0] or row_box[3] > row_box[1]):
+        ctx["highlightBox"] = {
+            "x1": int(row_box[0]),
+            "y1": int(row_box[1]),
+            "x2": int(row_box[2]),
+            "y2": int(row_box[3]),
+        }
+    if shot:
+        ctx["frame"] = {
+            "width": int(shot.get("width") or 0),
+            "height": int(shot.get("height") or 0),
+            "screenWidth": int(shot.get("screen_width") or 0),
+            "screenHeight": int(shot.get("screen_height") or 0),
+        }
+
+    if platform.system() == "Windows":
+        try:
+            import ctypes  # noqa: PLC0415
+
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+            pt = POINT(int(sx), int(sy))
+            hwnd = user32.WindowFromPoint(pt)
+            if hwnd:
+                root_hwnd = user32.GetAncestor(hwnd, 2) or hwnd  # GA_ROOT = 2
+                cls_buf = ctypes.create_unicode_buffer(128)
+                user32.GetClassNameW(hwnd, cls_buf, 128)
+                ctrl_cls = str(cls_buf.value or "").strip()
+
+                tlen = user32.GetWindowTextLengthW(hwnd)
+                ctrl_text = ""
+                if tlen > 0:
+                    tbuf = ctypes.create_unicode_buffer(min(256, tlen + 1))
+                    user32.GetWindowTextW(hwnd, tbuf, min(256, tlen + 1))
+                    ctrl_text = str(tbuf.value or "").strip()
+
+                wlen = user32.GetWindowTextLengthW(root_hwnd)
+                win_title = ""
+                if wlen > 0:
+                    wbuf = ctypes.create_unicode_buffer(min(256, wlen + 1))
+                    user32.GetWindowTextW(root_hwnd, wbuf, min(256, wlen + 1))
+                    win_title = str(wbuf.value or "").strip()
+
+                rect = RECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    ctx["controlRect"] = {
+                        "x1": int(rect.left), "y1": int(rect.top),
+                        "x2": int(rect.right), "y2": int(rect.bottom),
+                    }
+                if win_title:
+                    ctx["underCursorWindow"] = win_title[:240]
+                if ctrl_text:
+                    ctx["controlText"] = ctrl_text[:200]
+                if ctrl_cls:
+                    ctx["controlClass"] = ctrl_cls[:120]
+        except Exception:  # noqa: BLE001
+            pass
+
+    return ctx
+
+
+def format_cursor_context(ctx: Optional[Dict[str, Any]]) -> str:
+    """Компактная строка признаков окружения под курсором для Оператора и Агента."""
+    if not isinstance(ctx, dict) or not ctx:
+        return ""
+    parts: List[str] = []
+    cur = ctx.get("cursor")
+    if isinstance(cur, dict) and cur.get("x") is not None:
+        parts.append("курсор=({}, {})".format(cur.get("x"), cur.get("y")))
+    active = str(ctx.get("activeWindow") or "").strip()
+    under_win = str(ctx.get("underCursorWindow") or "").strip()
+    if active:
+        parts.append("активное окно: «{}»".format(active[:120]))
+    if under_win and under_win != active:
+        parts.append("окно под курсором: «{}»".format(under_win[:120]))
+    ctrl_text = str(ctx.get("controlText") or "").strip()
+    ctrl_cls = str(ctx.get("controlClass") or "").strip()
+    if ctrl_text or ctrl_cls:
+        desc = "«{}»".format(ctrl_text[:80]) if ctrl_text else ""
+        if ctrl_cls:
+            desc = (desc + " " if desc else "") + "[{}]".format(ctrl_cls)
+        parts.append("элемент: " + desc)
+    hbox = ctx.get("highlightBox")
+    if isinstance(hbox, dict) and hbox.get("x2", 0) > hbox.get("x1", 0):
+        parts.append("выделенная строка: [{x1},{y1}..{x2},{y2}]".format(**hbox))
+    return " | ".join(parts)
 
 
 def normalize_trust_level(raw: Any, default: str = "verified") -> str:
@@ -1619,6 +1930,87 @@ def self_test() -> int:
           ]
           and "Смести курсор правее в (340, 200)" in aim_prompts[1])
 
+    # Проверка 1: pc_command требует подтверждения в verified, выполняется на ПК и расширены скан-коды.
+    check("pc_command включён в ALWAYS_CONFIRM_ACTIONS и распознаётся как опасное действие + win/super скан-коды",
+          "pc_command" in ALWAYS_CONFIRM_ACTIONS
+          and is_dangerous_action({"type": "pc_command", "command": "echo ok"})
+          and _win32_scancode_lookup("win") == (0x5B, True)
+          and _win32_scancode_lookup("super") == (0x5B, True)
+          and _win32_scancode_lookup("printscreen") == (0x37, True))
+
+    pc_op = Operator(crm="", token="", base_url="http://127.0.0.1:8000/v1", model="sim-vl",
+                     api_key="", dry_run=False, assume_yes=True, max_steps=3, delay=0.0, poll=1.0,
+                     max_width=1600, text_only=True, vision_check=False, trust_level="full")
+    pc_out = pc_op.execute({"type": "pc_command", "command": "echo hello_pc_operator"})
+    check("pc_command выполняется на ПК и возвращает код выхода и вывод",
+          "команда на ПК (код 0)" in pc_out and "hello_pc_operator" in pc_out)
+
+    # Проверка 2: визуальная выделенная строка вокруг курсора, лупа и признаки окружения.
+    if Image is not None and ImageDraw is not None:
+        ui_img = Image.new("RGB", (640, 400), (245, 245, 245))
+        ui_draw = ImageDraw.Draw(ui_img)
+        ui_draw.rectangle([(180, 120), (360, 152)], fill=(30, 64, 175))
+        rbox = detect_cursor_row_box(ui_img, 240, 136)
+        drawn_box = draw_cursor_context_overlay(ui_img, 240, 136, raw_image=ui_img, raw_cx=240, raw_cy=136)
+        crop_url = build_cursor_crop_data_url(ui_img, 240, 136)
+        crop_ok = bool(crop_url and crop_url.startswith("data:image/jpeg;base64,")) and drawn_box == rbox
+    else:
+        class _FakeUiImg:
+            size = (640, 400)
+            def getpixel(self, pt: Tuple[int, int]) -> Tuple[int, int, int]:
+                x, y = pt
+                return (30, 64, 175) if (180 <= x <= 360 and 120 <= y <= 152) else (245, 245, 245)
+        rbox = detect_cursor_row_box(_FakeUiImg(), 240, 136)
+        crop_ok = True
+
+    ctx_str = format_cursor_context({
+        "cursor": {"x": 240, "y": 136},
+        "activeWindow": "CRM — Настройки",
+        "controlText": "Сохранить",
+        "controlClass": "Button",
+        "highlightBox": {"x1": rbox[0], "y1": rbox[1], "x2": rbox[2], "y2": rbox[3]},
+    })
+    check("выделенная строка вокруг элемента и строка контекста окружения формируются корректно",
+          rbox[0] <= 185 and rbox[2] >= 355 and rbox[1] <= 125 and rbox[3] >= 148
+          and crop_ok
+          and "CRM — Настройки" in ctx_str
+          and "Сохранить" in ctx_str
+          and "выделенная строка:" in ctx_str)
+
+    # Проверка 3: адаптивная генерация (человеческие настройки первыми + рост temperature/reasoning при зацикливании + fallback 400).
+    adapt_op = Operator(crm="", token="", base_url="http://127.0.0.1:8000/v1", model="sim-vl",
+                        api_key="", dry_run=False, assume_yes=False, max_steps=5, delay=0.0, poll=1.0,
+                        max_width=1600, text_only=True, vision_check=False,
+                        generation={"temperature": 0.15, "reasoning": "medium"})
+    p_clean: Dict[str, Any] = {"temperature": 0.2}
+    adapt_op.apply_generation(p_clean, stuck_level=0)
+    p_stuck2: Dict[str, Any] = {"temperature": 0.2}
+    adapt_op.apply_generation(p_stuck2, stuck_level=2)
+    p_stuck3: Dict[str, Any] = {"temperature": 0.2}
+    adapt_op.apply_generation(p_stuck3, stuck_level=3)
+
+    resilient_calls: List[Dict[str, Any]] = []
+
+    class ResilientModelHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 180, headers: Optional[dict] = None) -> Dict[str, Any]:
+            resilient_calls.append(dict(payload or {}))
+            if "reasoning_effort" in (payload or {}):
+                raise AgentError("модель POST ... → HTTP 400: unsupported parameter reasoning_effort")
+            return {"choices": [{"message": {"content": "{}"}}]}
+
+    adapt_op.model_http = ResilientModelHttp()  # type: ignore[assignment]
+    resilient_res = adapt_op._model_call_resilient(
+        {"model": "sim", "messages": [], "reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": True}},
+        {},
+    )
+    check("адаптивная генерация уважает настройки пользователя и усиливает temperature/reasoning при зацикливании + fallback 400",
+          p_clean.get("temperature") == 0.15 and p_clean.get("reasoning_effort") == "medium"
+          and float(p_stuck2.get("temperature") or 0) >= 0.5 and p_stuck2.get("reasoning_effort") == "high"
+          and float(p_stuck3.get("temperature") or 0) >= 0.65
+          and len(resilient_calls) == 2 and "reasoning_effort" not in resilient_calls[1]
+          and isinstance(resilient_res, dict))
+
     passed = sum(1 for item in checks if item)
     print("\n{}/{} проверок пройдено".format(passed, len(checks)))
     return 0 if passed == len(checks) else 1
@@ -1813,10 +2205,31 @@ _WIN_SCANCODES: Dict[str, Tuple[int, bool]] = {
     "home": (0x47, True), "up": (0x48, True), "pageup": (0x49, True), "pgup": (0x49, True),
     "left": (0x4B, True), "right": (0x4D, True),
     "end": (0x4F, True), "down": (0x50, True), "pagedown": (0x51, True), "pgdn": (0x51, True),
-    "insert": (0x52, True), "delete": (0x53, True),
+    "insert": (0x52, True), "delete": (0x53, True), "del": (0x53, True),
+    "win": (0x5B, True), "lwin": (0x5B, True), "super": (0x5B, True), "cmd": (0x5B, True), "meta": (0x5B, True),
+    "rwin": (0x5C, True),
+    "apps": (0x5D, True), "menu": (0x5D, True),
+    "printscreen": (0x37, True), "prtsc": (0x37, True),
+    "scrolllock": (0x46, False), "numlock": (0x45, False), "pause": (0x45, True),
+    "\\": (0x2B, False), "backslash": (0x2B, False), "plus": (0x0D, False), "minus": (0x0C, False),
 }
 
 _WIN32_SENDINPUT_WARNED = False
+
+
+def _normalize_pyautogui_key(key: str) -> str:
+    clean = str(key or "").strip().lower()
+    aliases = {
+        "win": "winleft",
+        "lwin": "winleft",
+        "super": "winleft",
+        "rwin": "winright",
+        "meta": "command" if platform.system() == "Darwin" else "winleft",
+        "cmd": "command" if platform.system() == "Darwin" else "winleft",
+        "del": "delete",
+        "prtsc": "printscreen",
+    }
+    return aliases.get(clean, clean)
 
 
 def _win32_scancode_lookup(key: str) -> Optional[Tuple[int, bool]]:
@@ -1951,10 +2364,11 @@ def send_key_state(key: str, down: bool) -> None:
     if _win32_send_scancode(clean, down=down):
         return
     require_pyautogui()
+    mapped = _normalize_pyautogui_key(clean)
     if down:
-        pyautogui.keyDown(clean)
+        pyautogui.keyDown(mapped)
     else:
-        pyautogui.keyUp(clean)
+        pyautogui.keyUp(mapped)
 
 
 def send_key_tap(key: str, hold_seconds: float = 0.05) -> None:
@@ -1967,7 +2381,7 @@ def send_key_tap(key: str, hold_seconds: float = 0.05) -> None:
         _win32_send_scancode(clean, down=False)
         return
     require_pyautogui()
-    pyautogui.press(clean)
+    pyautogui.press(_normalize_pyautogui_key(clean))
 
 
 def send_mouse_rel(dx: int, dy: int) -> None:
@@ -2158,10 +2572,34 @@ class Operator:
         self._last_frame_sig: Optional[bytes] = None
         self._last_verify_shot: Optional[str] = None
         self._last_screen_unchanged: bool = False
+        self._last_cursor_context: Optional[Dict[str, Any]] = None
+        self._last_cursor_crop: Optional[str] = None
         self.current_task: Optional[int] = None
         self.history: List[str] = []
 
     # ------------------------------------------------------------- модель
+    def _model_call_resilient(self, payload: Dict[str, Any], headers: Dict[str, str],
+                              timeout: int = 180) -> Dict[str, Any]:
+        """Вызывает модель; при отказе API на reasoning/thinking полях повторяет без них."""
+        try:
+            return self.model_http.call("POST", "/chat/completions", payload, timeout=timeout, headers=headers)
+        except AgentError as error:
+            detail = str(error).lower()
+            has_tuning = any(
+                k in payload for k in ("reasoning_effort", "thinking_budget", "chat_template_kwargs")
+            )
+            if has_tuning and ("400" in detail or "422" in detail) and any(
+                w in detail for w in ("reasoning", "thinking", "chat_template", "unknown", "unsupported", "extra", "invalid")
+            ):
+                stripped = {
+                    k: v
+                    for k, v in payload.items()
+                    if k not in ("reasoning_effort", "thinking_budget", "chat_template_kwargs")
+                }
+                log("[!] Модель не поддерживает параметры reasoning/thinking — повторяю без них")
+                return self.model_http.call("POST", "/chat/completions", stripped, timeout=timeout, headers=headers)
+            raise
+
     def ask_model(self, prompt: str, screenshot: Optional[str],
                   extra_images: Optional[List[str]] = None) -> Dict[str, Any]:
         if not self.model:
@@ -2181,14 +2619,11 @@ class Operator:
             {"role": "user", "content": content},
         ]
         payload = {"model": self.model, "messages": messages, "temperature": 0.2, "stream": False}
-        self.apply_generation(payload)
-        # Застряли — добавляем разнообразия: при низкой temperature модель
-        # послушно выбирает то же самое действие. Своё значение не трогаем.
-        if self.pending_nudge and (self.generation or {}).get("temperature") is None:
-            payload["temperature"] = 0.7
+        stuck_level = max(0, self.repeat_streak - 1, self.failed_checks)
+        self.apply_generation(payload, stuck_level=stuck_level)
         headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
         try:
-            data = self.model_http.call("POST", "/chat/completions", payload, timeout=180, headers=headers)
+            data = self._model_call_resilient(payload, headers, timeout=180)
         except AgentError as error:
             # Если зрение ещё не подтверждено, а API ругается на картинку —
             # один раз пробуем текстовый режим. Подтверждённую vision-модель
@@ -2205,15 +2640,18 @@ class Operator:
         text = str((choices[0].get("message") or {}).get("content") or "").strip()
         return self.parse_decision(text)
 
-    def apply_generation(self, payload: Dict[str, Any]) -> None:
-        """Подмешивает `--temperature`, `--reasoning` и остальные ручки в запрос.
+    def apply_generation(self, payload: Dict[str, Any], stuck_level: int = 0) -> None:
+        """Подмешивает `--temperature`, `--reasoning` и адаптацию от зацикливания.
 
-        Передаём только заданное: строгие сборки отвечают 400 на незнакомые поля.
+        Сначала всегда уважаем настройки пользователя; при зацикливании (stuck_level >= 1)
+        адаптивно поднимаем temperature и (если не выключено пользователем) усиливаем reasoning.
         """
         gen = self.generation if isinstance(self.generation, dict) else {}
+        user_temp: Optional[float] = None
         try:
             if gen.get("temperature") is not None:
-                payload["temperature"] = max(0.0, min(2.0, float(gen["temperature"])))
+                user_temp = max(0.0, min(2.0, float(gen["temperature"])))
+                payload["temperature"] = user_temp
             if gen.get("top_p") is not None:
                 payload["top_p"] = max(0.0, min(1.0, float(gen["top_p"])))
             if gen.get("max_tokens") is not None:
@@ -2223,11 +2661,28 @@ class Operator:
         except (TypeError, ValueError):
             pass
 
+        if stuck_level >= 1:
+            base_temp = user_temp if user_temp is not None else float(payload.get("temperature", 0.2) or 0.2)
+            if stuck_level == 1:
+                payload["temperature"] = round(min(1.2, max(base_temp, base_temp + 0.2)), 2)
+            elif stuck_level == 2:
+                payload["temperature"] = round(min(1.25, max(base_temp + 0.35, 0.55)), 2)
+            else:
+                payload["temperature"] = round(min(1.3, max(base_temp + 0.5, 0.75)), 2)
+
         reasoning = str(gen.get("reasoning") or "default")
         if reasoning not in ("default", "off", "low", "medium", "high", "budget"):
             reasoning = "default"
         if reasoning == "default":
-            return
+            if stuck_level >= 2:
+                reasoning = "high"
+            elif stuck_level == 1:
+                reasoning = "medium"
+            else:
+                return
+        elif reasoning in ("low", "medium") and stuck_level >= 2:
+            reasoning = "high"
+
         if reasoning == "off":
             payload["reasoning_effort"] = "none"
         elif reasoning == "budget":
@@ -2311,8 +2766,7 @@ class Operator:
         payload["max_tokens"] = max(1200, int(payload.get("max_tokens") or 0))
         headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
         try:
-            data = self.model_http.call("POST", "/chat/completions", payload, timeout=120,
-                                        headers=headers)
+            data = self._model_call_resilient(payload, headers, timeout=120)
         except TaskCancelled:
             raise
         except AgentError as error:
@@ -2411,14 +2865,11 @@ class Operator:
                 "max_tokens": 1200,
                 "stream": False,
             }
-            self.apply_generation(payload)
-            if (self.generation or {}).get("temperature") is None:
-                payload["temperature"] = 0.3
+            self.apply_generation(payload, stuck_level=max(1, self.repeat_streak - 1, self.failed_checks))
             payload["max_tokens"] = max(1200, int(payload.get("max_tokens") or 0))
             headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
             try:
-                data = self.model_http.call("POST", "/chat/completions", payload, timeout=120,
-                                            headers=headers)
+                data = self._model_call_resilient(payload, headers, timeout=120)
                 choices = data.get("choices") or []
                 raw_text = str((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
                 if raw_text:
@@ -2526,20 +2977,31 @@ class Operator:
         if Image is None:
             raise SystemExit("Нужен Pillow: pip install -r agent/requirements.txt")
         require_pyautogui()
-        image = pyautogui.screenshot()
+        raw_image = pyautogui.screenshot()
+        if raw_image.mode != "RGB":
+            raw_image = raw_image.convert("RGB")
+        image = raw_image
         screen = self.screen_size()
-        raw_width, raw_height = image.size
+        raw_width, raw_height = raw_image.size
         if raw_width > self.max_width:
             ratio = self.max_width / float(raw_width)
-            image = image.resize((self.max_width, max(1, int(round(raw_height * ratio)))))
-        if image.mode != "RGB":
-            image = image.convert("RGB")
+            image = raw_image.resize((self.max_width, max(1, int(round(raw_height * ratio)))))
+        else:
+            image = raw_image.copy()
 
-        # Считаем отпечаток чистого экрана до рисования крестика курсора.
+        # Считаем отпечаток чистого экрана до рисования выделенной строки, прицела и лупы.
         self._last_frame_sig = frame_signature(image)
+        self._last_cursor_crop = None
+        self._last_cursor_context = None
 
-        # Красный крестик в точке курсора: модель видит, где он сейчас, и не
-        # кликает «наугад» после промаха.
+        shot = {
+            "width": int(image.size[0]),
+            "height": int(image.size[1]),
+            "screen_width": int(screen["width"]),
+            "screen_height": int(screen["height"]),
+        }
+
+        # Выделенная строка, открытый прицел, увеличенная лупа ×2.5 и признаки окружения у курсора.
         if self.cursor_marker and pyautogui is not None and ImageDraw is not None:
             try:
                 cursor_x, cursor_y = pyautogui.position()
@@ -2547,12 +3009,23 @@ class Operator:
                 scale_y = image.size[1] / float(raw_height or image.size[1])
                 mark_x = int(cursor_x * scale_x)
                 mark_y = int(cursor_y * scale_y)
-                if 0 <= mark_x < image.size[0] and 0 <= mark_y < image.size[1]:
-                    draw = ImageDraw.Draw(image)
-                    draw.line([(mark_x - 16, mark_y), (mark_x + 16, mark_y)], fill=(255, 0, 0), width=2)
-                    draw.line([(mark_x, mark_y - 16), (mark_x, mark_y + 16)], fill=(255, 0, 0), width=2)
-                    draw.ellipse([(mark_x - 5, mark_y - 5), (mark_x + 5, mark_y + 5)],
-                                 outline=(255, 0, 0), width=2)
+                raw_cx = int(cursor_x * (raw_width / float(screen["width"] or raw_width)))
+                raw_cy = int(cursor_y * (raw_height / float(screen["height"] or raw_height)))
+                row_box = draw_cursor_context_overlay(
+                    image,
+                    mark_x,
+                    mark_y,
+                    raw_image=raw_image,
+                    raw_cx=raw_cx,
+                    raw_cy=raw_cy,
+                )
+                self._last_cursor_crop = build_cursor_crop_data_url(raw_image, raw_cx, raw_cy)
+                self._last_cursor_context = inspect_cursor_context(
+                    int(cursor_x),
+                    int(cursor_y),
+                    row_box=row_box,
+                    shot=shot,
+                )
             except Exception:  # noqa: BLE001 — метка не должна ломать шаг
                 pass
 
@@ -2571,12 +3044,6 @@ class Operator:
             image.save(buffer, format="JPEG", quality=40, optimize=True)
             encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
 
-        shot = {
-            "width": int(image.size[0]),
-            "height": int(image.size[1]),
-            "screen_width": int(screen["width"]),
-            "screen_height": int(screen["height"]),
-        }
         self.last_shot = shot
         return "data:image/jpeg;base64," + encoded, shot
 
@@ -2711,6 +3178,55 @@ class Operator:
             out = (res.get("stdout") or "") + (res.get("stderr") or "")
             return "команда (код {}): {}".format(res.get("exit_code"), out[:400] or "без вывода")
 
+        if kind == "pc_command":
+            cmd = str(action.get("command") or "").strip()
+            if not cmd:
+                return "пустая команда"
+            timeout = max(1, min(180, int(action.get("timeout") or 60)))
+            raw_cwd = str(action.get("cwd") or "").strip()
+            if raw_cwd and raw_cwd != "." and Path(raw_cwd).is_dir():
+                argv = (
+                    sandbox_mod._shell_argv(cmd)
+                    if sandbox_mod is not None and hasattr(sandbox_mod, "_shell_argv")
+                    else (["cmd", "/c", cmd] if platform.system() == "Windows" else ["/bin/sh", "-c", cmd])
+                )
+                try:
+                    proc = subprocess.run(
+                        argv,
+                        cwd=str(Path(raw_cwd)),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    raise AgentError("Команда на ПК превысила таймаут {} с".format(timeout)) from error
+                out = (proc.stdout or "").strip()[:500] or "(вывод пуст)"
+                return "команда на ПК (код {}): {}".format(proc.returncode, out)
+            if sandbox_mod is not None and hasattr(sandbox_mod, "run_pc_command"):
+                res = sandbox_mod.run_pc_command(cmd, timeout=timeout)
+                return "команда на ПК (код {}): {}".format(
+                    res.get("exitCode"), str(res.get("output") or "")[:500] or "без вывода"
+                )
+            argv = ["cmd", "/c", cmd] if platform.system() == "Windows" else ["/bin/sh", "-c", cmd]
+            try:
+                proc = subprocess.run(
+                    argv,
+                    cwd=str(Path.home()),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise AgentError("Команда на ПК превысила таймаут {} с".format(timeout)) from error
+            out = (proc.stdout or "").strip()[:500] or "(вывод пуст)"
+            return "команда на ПК (код {}): {}".format(proc.returncode, out)
+
         if kind == "export_from_sandbox":
             if sandbox_mod is None:
                 raise AgentError("Модуль sandbox.py не найден")
@@ -2800,7 +3316,7 @@ class Operator:
                         time.sleep(0.015)
             else:
                 require_pyautogui()
-                pyautogui.hotkey(*keys)
+                pyautogui.hotkey(*[_normalize_pyautogui_key(k) for k in keys])
             return "нажато: " + " + ".join(keys)
 
         if kind == "key":
@@ -3016,6 +3532,26 @@ class Operator:
                 raise TaskCancelled("Задание отменено в CRM")
         return task if isinstance(task, dict) else None
 
+    def _coach_generation_payload(self) -> Dict[str, Any]:
+        """Преобразует CLI/пользовательские параметры генерации в формат CRM `/coach`."""
+        gen = self.generation if isinstance(self.generation, dict) else {}
+        out: Dict[str, Any] = {}
+        if gen.get("temperature") is not None:
+            out["temperature"] = gen["temperature"]
+        if gen.get("top_p") is not None:
+            out["topP"] = gen["top_p"]
+        if gen.get("max_tokens") is not None:
+            out["maxTokens"] = gen["max_tokens"]
+        if gen.get("seed") is not None:
+            out["seed"] = gen["seed"]
+        if gen.get("reasoning"):
+            out["reasoning"] = gen["reasoning"]
+        if gen.get("thinking_budget") is not None:
+            out["thinkingBudget"] = gen["thinking_budget"]
+        if "send_thinking_flag" in gen:
+            out["sendThinkingFlag"] = bool(gen["send_thinking_flag"])
+        return out
+
     def post_step_assist(
         self,
         task_id: Optional[int],
@@ -3035,6 +3571,8 @@ class Operator:
 
         if coach == "agent" and self.has_crm and task_id:
             try:
+                cursor_ctx_str = format_cursor_context(self._last_cursor_context)
+                gen_payload = self._coach_generation_payload()
                 resp = self.crm.call(
                     "POST",
                     "/api/agent/bot/{}/coach".format(task_id),
@@ -3045,6 +3583,10 @@ class Operator:
                         "observation": observation[:400],
                         "lastGuidanceId": self._last_guidance_id,
                         "history": self.history[-8:],
+                        "repeatStreak": int(self.repeat_streak),
+                        "failedChecks": int(self.failed_checks),
+                        **({"cursorContext": cursor_ctx_str[:400]} if cursor_ctx_str else {}),
+                        **({"params": gen_payload} if gen_payload else {}),
                         **({"screenshot": screenshot} if screenshot else {}),
                     },
                     timeout=35,
@@ -3077,37 +3619,45 @@ class Operator:
         screenshot: Optional[str],
         decision: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Локальная проверка наведения (красного крестика) по свежему скриншоту, если Агент без vision/недоступен."""
+        """Локальная проверка наведения (выделенной строки, лупы и прицела) по свежему скриншоту."""
         if self.text_only or not self.model or not screenshot:
             return {"approved": True, "reason": ""}
         obs = str(decision.get("observation") or decision.get("thought") or "").strip()[:300]
+        ctx_str = format_cursor_context(self._last_cursor_context)
         prompt_text = (
-            "Перед выполнением действия «{}» курсор уже наведён в точку экрана ({}, {}) "
-            "и отмечен на свежем скриншоте красным крестиком.\n"
+            "Перед выполнением действия «{}» курсор наведён в точку экрана ({}, {}).\n"
+            "На скриншоте показана выделенная строка/рамка вокруг цели, открытый прицел и увеличенная лупа ×2.5.\n"
+            "{}"
             "Ожидаемая цель Оператора: {}\n"
-            "Посмотри на положение красного крестика: он действительно попал на нужную кнопку/поле/элемент "
-            "и можно сразу нажимать/вводить, или нужно сместить курсор?\n"
+            "Проверь по выделенной строке, лупе и контексту окна: курсор точно на нужном элементе/кнопке/поле "
+            "или его нужно сместить?\n"
             "Ответь ТОЛЬКО одним JSON-объектом без markdown:\n"
-            '{{"approved": true, "reason": "что под крестиком", "guidance": ""}}'
-        ).format(action_label(action), screen_point[0], screen_point[1], obs or "не указано")
+            '{{"approved": true, "reason": "что в выделенной строке под прицелом", "guidance": ""}}'
+        ).format(
+            action_label(action),
+            screen_point[0],
+            screen_point[1],
+            ("Признаки окружения: " + ctx_str + "\n") if ctx_str else "",
+            obs or "не указано",
+        )
+        user_parts: List[Dict[str, Any]] = [
+            {"type": "text", "text": prompt_text},
+            {"type": "image_url", "image_url": {"url": screenshot}},
+        ]
+        if self._last_cursor_crop and self._last_cursor_crop.startswith("data:image/"):
+            user_parts.append({"type": "image_url", "image_url": {"url": self._last_cursor_crop}})
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {
                     "role": "system",
                     "content": (
-                        "Ты проверяешь точность наведения курсора (красный крестик на скриншоте) "
-                        "перед кликом или вводом текста. Если крестик попал мимо цели, ставь approved=false "
-                        "и напиши в guidance куда сместить курсор."
+                        "Ты проверяешь точность наведения курсора (выделенная строка, открытый прицел и лупа на скриншоте) "
+                        "перед кликом или вводом текста. Ориентируйся по окружению окна и выделенной области. "
+                        "Если прицел попал мимо цели, ставь approved=false и напиши в guidance куда сместить курсор."
                     ),
                 },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt_text},
-                        {"type": "image_url", "image_url": {"url": screenshot}},
-                    ],
-                },
+                {"role": "user", "content": user_parts},
             ],
             "temperature": 0,
             "max_tokens": 600,
@@ -3118,7 +3668,7 @@ class Operator:
         payload["max_tokens"] = max(600, int(payload.get("max_tokens") or 0))
         headers = {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
         try:
-            data = self.model_http.call("POST", "/chat/completions", payload, timeout=90, headers=headers)
+            data = self._model_call_resilient(payload, headers, timeout=90)
         except TaskCancelled:
             raise
         except AgentError:
@@ -3147,6 +3697,8 @@ class Operator:
             return self.verify_aim(action, screen_point, screenshot, decision)
 
         observation = str(decision.get("observation") or decision.get("thought") or "").strip()
+        cursor_ctx_str = format_cursor_context(self._last_cursor_context)
+        gen_payload = self._coach_generation_payload()
         try:
             resp = self.crm.call(
                 "POST",
@@ -3160,6 +3712,11 @@ class Operator:
                     "observation": observation[:400],
                     "lastGuidanceId": self._last_guidance_id,
                     "history": self.history[-8:],
+                    "repeatStreak": int(self.repeat_streak),
+                    "failedChecks": int(self.failed_checks),
+                    **({"cursorContext": cursor_ctx_str[:400]} if cursor_ctx_str else {}),
+                    **({"cursorCrop": self._last_cursor_crop} if self._last_cursor_crop else {}),
+                    **({"params": gen_payload} if gen_payload else {}),
                     **({"screenshot": screenshot} if screenshot else {}),
                 },
                 timeout=35,
@@ -3465,6 +4022,7 @@ class Operator:
                 screen_unchanged=last_screen_unchanged,
                 task_mode=self.current_task_mode(),
                 pending_guidance=self.pending_guidance,
+                cursor_context=format_cursor_context(self._last_cursor_context),
             )
             try:
                 decision = self.ask_model(step_prompt, screenshot,
@@ -3621,10 +4179,11 @@ class Operator:
                                 prev_frame_sig = self._last_frame_sig
                             except Exception:  # noqa: BLE001
                                 aim_shot = screenshot
-                        log("  наведение в ({}, {}) — совещаюсь с Агентом перед {}".format(
-                            sx, sy, action_label(action)))
-                        self.report("info", "Навёл курсор в ({}, {}) перед «{}» — совещаюсь с Агентом".format(
-                            sx, sy, action_label(action)), action)
+                        cursor_ctx_line = format_cursor_context(self._last_cursor_context)
+                        log("  наведение в ({}, {}) — совещаюсь с Агентом перед {}{}".format(
+                            sx, sy, action_label(action), (" (" + cursor_ctx_line[:140] + ")") if cursor_ctx_line else ""))
+                        self.report("info", "Навёл курсор в ({}, {}) перед «{}»{} — совещаюсь с Агентом".format(
+                            sx, sy, action_label(action), (" [" + cursor_ctx_line[:180] + "]") if cursor_ctx_line else ""), action)
                         consult = self.consult_before_action(task_id, index, action, (sx, sy), decision, aim_shot)
                         if not consult.get("approved", True):
                             deny_reason = str(consult.get("reason") or "курсор не на цели").strip()

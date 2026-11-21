@@ -1,4 +1,4 @@
-import { claimAgentTask } from "@/db/repo";
+import { claimAgentTask, syncOperatorTaskToConversation } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
 
 /**
@@ -13,5 +13,8 @@ export async function GET(req: Request) {
   if (!ownerId) return Response.json({ error: "Неверный токен агента" }, { status: 401 });
 
   const task = await claimAgentTask(ownerId);
+  if (task) {
+    await syncOperatorTaskToConversation(ownerId, task.id);
+  }
   return Response.json({ task }, { headers: { "Cache-Control": "no-store" } });
 }

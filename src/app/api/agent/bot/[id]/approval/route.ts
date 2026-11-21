@@ -1,4 +1,4 @@
-import { getAgentTask, requestAgentTaskApproval } from "@/db/repo";
+import { getAgentTask, requestAgentTaskApproval, syncOperatorTaskToConversation } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
 
 /**
@@ -54,6 +54,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (!created) {
     return Response.json({ ok: false, cancelled: true, error: "Задание отменено" }, { status: 409 });
   }
+  await syncOperatorTaskToConversation(ownerId, task.id);
 
   return Response.json({ ok: true, approval: created }, { headers: { "Cache-Control": "no-store" } });
 }
