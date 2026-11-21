@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { sql } from "drizzle-orm";
 import { requestAgentStepCoaching } from "@/lib/agentCoach";
+import { normalizeTaskMode } from "@/lib/operatorModes";
 import { describeAction } from "@/components/operator/shared";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crm-op-collab-"));
@@ -121,5 +122,33 @@ describe("связка Агент ↔ Оператор, режимы и поша
     ).toContain("2 действий");
     expect(describeAction(JSON.stringify({ type: "mouse_down", button: "left" }))?.title).toContain("Зажата кнопка");
     expect(describeAction(JSON.stringify({ type: "key_down", key: "shift" }))?.title).toContain("Зажата клавиша shift");
+    expect(describeAction(JSON.stringify({ type: "inspect_screen" }))?.title).toContain("Снимок экрана ПК");
+  });
+
+  it("сохраняет снимок экрана Оператора (kind=screen) и возвращает его через getLatestAgentScreen", async () => {
+    expect(normalizeTaskMode("inspect")).toBe("inspect");
+    const task = await repo.createAgentTask(userId, "Покажи экран для Агента", 2, "verified", {
+      taskMode: "inspect",
+      coachMode: "off",
+      source: "agent",
+    });
+    expect(task.taskMode).toBe("inspect");
+
+    await repo.addAgentEvent({
+      taskId: task.id,
+      kind: "screen",
+      text: "Снимок экрана ПК (1280×720). Активное окно: Terminal",
+      action: JSON.stringify({ type: "inspect_screen", activeWindow: "Terminal", width: 1280, height: 720 }),
+      fileName: "screen.jpg",
+      fileMime: "image/jpeg",
+      fileSize: 9,
+      fileData: "/9j/4AAQ",
+    });
+
+    const latest = await repo.getLatestAgentScreen(task.id);
+    expect(latest).not.toBeNull();
+    expect(latest?.summary).toContain("Terminal");
+    expect(latest?.dataUrl).toBe("data:image/jpeg;base64,/9j/4AAQ");
+    expect(latest?.meta).toMatchObject({ activeWindow: "Terminal", width: 1280, height: 720 });
   });
 });

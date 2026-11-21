@@ -23,7 +23,9 @@ JSON, urllib). CRM находит его по переменной `AGENT_URL`
 Инструменты: `create_file` (docx/xlsx/csv/md/html/svg/json/zip/txt),
 `open_website`, `play_youtube`, `sandbox_*` (изолированная песочница),
 `run_command`, `export_from_sandbox`, а также совместная работа с Оператором:
-`formulate_operator_task` (помощь в формулировке задачи для экрана/игры) и
+`formulate_operator_task` (помощь в формулировке задачи для экрана/игры),
+`inspect_pc_screen` (запрос снимка экрана ПК у Оператора, если не хватает видимости —
+строго с разрешения пользователя во всплывающем уведомлении) и
 `call_operator` (запуск Оператора строго с разрешения пользователя на сайте)
 + `POST /coach` для подсказок после каждого действия.
 
@@ -39,8 +41,9 @@ python3 agent/desktop_operator.py --watch --token ТОКЕН --provider local
 python3 agent/desktop_operator.py --watch --token ТОКЕН --task-mode game --coach agent
 ```
 
-Поддерживает три стиля работы (`--task-mode autonomous|copilot|game`), пошаговые
-подсказки (`--coach after_step|agent|off`) и игровые действия (`hold_key`,
+Поддерживает стили работы (`--task-mode autonomous|copilot|game|inspect`,
+где `inspect` делает только снимок экрана ПК и отправляет его Агенту без кликов),
+пошаговые подсказки (`--coach after_step|agent|off`) и игровые действия (`hold_key`,
 `key_down`/`key_up`, `move_mouse_rel`, `mouse_down`/`mouse_up`, `sequence`).
 Подробная инструкция — [`OPERATOR.md`](OPERATOR.md).
 

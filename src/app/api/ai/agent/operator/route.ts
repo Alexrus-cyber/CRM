@@ -151,9 +151,12 @@ export async function POST(req: Request) {
   if (prompt.length > MAX_PROMPT) return Response.json({ error: "Слишком длинное задание" }, { status: 400 });
 
   const taskMode = normalizeTaskMode(body?.taskMode ?? body?.mode);
-  const coachMode = normalizeCoachMode(body?.coachMode ?? "agent");
+  const coachMode = taskMode === "inspect" ? "off" : normalizeCoachMode(body?.coachMode ?? "agent");
   const trustLevel = normalizeTrustLevel(body?.trustLevel ?? "verified");
-  const maxSteps = Math.min(AGENT_MAX_STEPS, Math.max(1, Number(body?.maxSteps ?? 30) || 30));
+  const maxSteps =
+    taskMode === "inspect"
+      ? 2
+      : Math.min(AGENT_MAX_STEPS, Math.max(1, Number(body?.maxSteps ?? 30) || 30));
 
   const task = await createAgentTask(me.id, prompt, maxSteps, trustLevel, {
     taskMode,

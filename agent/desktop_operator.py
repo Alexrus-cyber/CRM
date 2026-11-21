@@ -349,7 +349,7 @@ def build_reflection_nudge(reflection: Dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-TASK_MODES = ("autonomous", "copilot", "game")
+TASK_MODES = ("autonomous", "copilot", "game", "inspect")
 COACH_MODES = ("off", "after_step", "agent")
 
 
@@ -379,6 +379,11 @@ def build_mode_system_addon(task_mode: str, coach_mode: str) -> str:
             "АКТИВЕН РЕЖИМ ПОМОЩНИКА НА ПК (copilot):\n"
             "- Ты помогаешь пользователю выполнять действия на экране шаг за шагом.\n"
             "- После каждого шага в next_advice чётко объясняй, что изменилось и что делать дальше."
+        )
+    elif task_mode == "inspect":
+        lines.append(
+            "АКТИВЕН РЕЖИМ СНИМКА ЭКРАНА (inspect):\n"
+            "- Оператор делает только снимок экрана ПК без кликов и нажатий клавиш и возвращает изображение и краткое описание Агенту."
         )
     if coach_mode in ("after_step", "agent"):
         lines.append(
@@ -1286,9 +1291,100 @@ def self_test() -> int:
           and len(coach_state["prompts"]) >= 2
           and "Нажми E у сундука" in coach_state["prompts"][1])
 
+    inspect_state: Dict[str, Any] = {"screen_posts": 0, "finished": False, "summary": "", "executed": 0}
+
+    class InspectCrmHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            if path == "/api/agent/bot/80" and method == "GET":
+                return {
+                    "task": {
+                        "id": 80,
+                        "status": "running",
+                        "maxSteps": 2,
+                        "trustLevel": "verified",
+                        "taskMode": "inspect",
+                        "coachMode": "off",
+                    },
+                    "attachments": [],
+                }
+            if path == "/api/agent/bot/80/screen" and method == "POST":
+                inspect_state["screen_posts"] += 1
+                inspect_state["has_image"] = str((payload or {}).get("image") or "").startswith("data:image/")
+                return {"ok": True, "eventId": 901}
+            if path == "/api/agent/bot/80/finish" and method == "POST":
+                inspect_state["finished"] = (payload or {}).get("status") == "done"
+                inspect_state["summary"] = str((payload or {}).get("summary") or "")
+                return {"ok": True}
+            return {"ok": True}
+
+    inspect_op = Operator(crm="http://127.0.0.1:3000", token="crmop_" + "a" * 32,
+                          base_url="", model="", api_key="",
+                          dry_run=False, assume_yes=False, max_steps=2, delay=0.0, poll=1.0,
+                          max_width=1600, text_only=False, vision_check=False,
+                          verify_actions=False, self_reflect=False, trust_level="verified")
+    inspect_op.crm = InspectCrmHttp()  # type: ignore[assignment]
+    inspect_op.screenshot = lambda: (  # type: ignore[method-assign]
+        "data:image/jpeg;base64,/9j/4AAQ",
+        {"width": 1280, "height": 720, "screen_width": 1920, "screen_height": 1080},
+    )
+    inspect_op.execute = lambda act: (inspect_state.__setitem__("executed", inspect_state["executed"] + 1), "nope")[1]  # type: ignore[method-assign]
+    inspect_ok = inspect_op.run(80, "Покажи Агенту открытое окно", 2)
+    check("режим inspect делает только снимок экрана без кликов и отправляет его Агенту",
+          inspect_ok
+          and normalize_task_mode("inspect") == "inspect"
+          and inspect_state["screen_posts"] == 1
+          and inspect_state["has_image"]
+          and inspect_state["finished"]
+          and inspect_state["executed"] == 0
+          and "1280×720" in inspect_state["summary"])
+
     passed = sum(1 for item in checks if item)
     print("\n{}/{} проверок пройдено".format(passed, len(checks)))
     return 0 if passed == len(checks) else 1
+
+
+def get_active_window_title() -> str:
+    """Возвращает заголовок активного окна (без ошибок при отсутствии GUI)."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            import ctypes  # noqa: PLC0415
+
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return ""
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return ""
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            return str(buf.value or "").strip()[:300]
+        if system == "Darwin" and shutil.which("osascript"):
+            proc = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'tell application "System Events" to get name of first application process whose frontmost is true',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            return (proc.stdout or "").strip()[:300]
+        if shutil.which("xdotool"):
+            proc = subprocess.run(
+                ["xdotool", "getactivewindow", "getwindowname"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if proc.returncode == 0:
+                return (proc.stdout or "").strip()[:300]
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -2634,6 +2730,93 @@ class Operator:
         finally:
             self.release_all_inputs()
 
+    def inspect_screen_and_report(self, task_id: Optional[int], prompt: str) -> bool:
+        """Режим inspect: делает свежий снимок экрана без кликов и отправляет его Агенту."""
+        trust = self.current_trust_level()
+        if trust == "none" or self.dry_run:
+            reason = (
+                "режим dry-run: снимок не отправлен"
+                if self.dry_run
+                else "уровень доверия «Нет доступа к компьютеру»: снимок экрана запрещён"
+            )
+            self.report("error", reason, {"type": "inspect_screen"})
+            if self.has_crm and task_id:
+                self.crm.call(
+                    "POST",
+                    "/api/agent/bot/{}/finish".format(task_id),
+                    {"status": "failed", "summary": reason},
+                )
+            return False
+
+        try:
+            screenshot, shot = self.screenshot()
+        except SystemExit:
+            raise
+        except Exception as error:  # noqa: BLE001
+            err_msg = "Не удалось сделать снимок экрана: {}".format(error)
+            log("[!] " + err_msg)
+            self.report("error", err_msg, {"type": "inspect_screen"})
+            if self.has_crm and task_id:
+                self.crm.call(
+                    "POST",
+                    "/api/agent/bot/{}/finish".format(task_id),
+                    {"status": "failed", "summary": err_msg[:400]},
+                )
+            return False
+
+        active_window = get_active_window_title()
+        width = int((shot or {}).get("width") or 0)
+        height = int((shot or {}).get("height") or 0)
+        screen_width = int((shot or {}).get("screen_width") or width)
+        screen_height = int((shot or {}).get("screen_height") or height)
+
+        lines = [
+            "Снимок экрана ПК ({}×{}, экран {}×{}).".format(width, height, screen_width, screen_height),
+        ]
+        if active_window:
+            lines.append("Активное окно: {}.".format(active_window))
+
+        if self.model and screenshot and not self.text_only:
+            try:
+                obs_prompt = (
+                    "Агент запросил осмотр экрана ПК по задаче: «{}». "
+                    "Ничего не нажимай и не выполняй действий — верни action={{type:'finish', summary:'...'}} "
+                    "и в observation/summary опиши ключевое содержимое экрана, открытые окна, ошибки и важные элементы."
+                ).format(prompt)
+                decision = self.ask_model(obs_prompt, screenshot)
+                obs = str(decision.get("observation") or decision.get("thought") or "").strip()
+                act_sum = str((decision.get("action") or {}).get("summary") or "").strip()
+                desc = obs or act_sum
+                if desc:
+                    lines.append("Что видно на экране: " + desc[:1500])
+            except Exception as error:  # noqa: BLE001
+                log("[!] vision-описание снимка недоступно (отправляю сам снимок): {}".format(error))
+
+        summary = " ".join(lines).strip()
+        if self.has_crm and task_id:
+            self.crm.call(
+                "POST",
+                "/api/agent/bot/{}/screen".format(task_id),
+                {
+                    "image": screenshot,
+                    "summary": summary,
+                    "activeWindow": active_window,
+                    "width": width,
+                    "height": height,
+                    "screenWidth": screen_width,
+                    "screenHeight": screen_height,
+                },
+                timeout=30,
+            )
+            self.report("action", "Снимок экрана ПК отправлен Агенту ({}×{})".format(width, height), {"type": "inspect_screen"})
+            self.crm.call(
+                "POST",
+                "/api/agent/bot/{}/finish".format(task_id),
+                {"status": "done", "summary": summary[:800]},
+            )
+        log("Снимок экрана отправлен Агенту: " + summary[:220])
+        return True
+
     def _run_loop(
         self,
         task_id: Optional[int],
@@ -2655,6 +2838,9 @@ class Operator:
             prompt, self.current_trust_level(), current_max_steps))
         self.report("info", "Задание принято (доверие: {}): {}".format(
             self.current_trust_level(), prompt))
+
+        if self.current_task_mode() == "inspect":
+            return self.inspect_screen_and_report(task_id, prompt)
 
         self.attachments_context = self.load_attachments(task_id)
         if self.attachments_context:

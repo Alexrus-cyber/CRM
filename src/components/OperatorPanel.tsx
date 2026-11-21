@@ -21,7 +21,6 @@ import {
   Rocket,
   Send,
   Settings2,
-  ShieldAlert,
   ShieldCheck,
   Sparkles,
   Square,
@@ -79,6 +78,7 @@ import {
   type OperatorEvent,
   type OperatorTask,
 } from "./operator/shared";
+import { ApprovalToast } from "./ApprovalToast";
 import { PlannerChat } from "./operator/PlannerChat";
 import { ConnectionsCard, type ConnectionSelection } from "./operator/ConnectionsCard";
 import { formatFileSize, readOperatorFiles, type OperatorAttachment } from "./operator/files";
@@ -1137,75 +1137,10 @@ export function OperatorPanel() {
                   {activeTask.summary && <span className="truncate">{activeTask.summary}</span>}
                 </div>
 
-                {/* Карточка подтверждения действия или продления шагов прямо на сайте */}
                 {(pendingApproval || activeTask.status === "waiting_steps" || activeTask.status === "waiting_approval") && (
-                  <div className="mt-3 space-y-2 rounded-xl border border-amber-500/50 bg-amber-500/10 p-3 text-xs">
-                    <div className="flex items-start gap-2">
-                      <ShieldAlert size={16} className="mt-0.5 shrink-0 text-amber-500" />
-                      <div className="min-w-0 flex-1 space-y-1">
-                        <p className="font-semibold text-text">
-                          {pendingApproval?.title ??
-                            (activeTask.status === "waiting_steps"
-                              ? `Достигнут лимит ${activeTask.maxSteps} шагов`
-                              : "Оператор ждёт вашего подтверждения")}
-                        </p>
-                        {pendingApproval?.description && (
-                          <p className="text-[11px] text-muted">{pendingApproval.description}</p>
-                        )}
-                        {pendingApproval?.action && (
-                          <pre className="max-h-32 overflow-auto rounded-lg bg-card px-2 py-1.5 font-mono text-[10px] text-text">
-                            {JSON.stringify(pendingApproval.action, null, 2)}
-                          </pre>
-                        )}
-                      </div>
-                    </div>
-
-                    {pendingApproval?.kind === "step_limit" || activeTask.status === "waiting_steps" ? (
-                      <div className="flex flex-wrap gap-2">
-                        <Button
-                          size="sm"
-                          onClick={() => void extendSteps(activeTask.id, pendingApproval?.extraSteps ?? 20)}
-                          disabled={actionBusy}
-                        >
-                          <Plus size={12} /> +{pendingApproval?.extraSteps ?? 20} шагов и продолжить
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          onClick={() => void extendSteps(activeTask.id, 50)}
-                          disabled={actionBusy}
-                        >
-                          <Plus size={12} /> +50 шагов
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="danger"
-                          onClick={() => void cancelTask(activeTask.id)}
-                          disabled={actionBusy}
-                        >
-                          <Square size={12} /> Остановить
-                        </Button>
-                      </div>
-                    ) : (
-                      <div className="flex flex-wrap gap-2">
-                        <Button
-                          size="sm"
-                          onClick={() => void respondApproval(activeTask.id, "approve", pendingApproval?.id)}
-                          disabled={actionBusy}
-                        >
-                          <Check size={12} /> Разрешить выполнение
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="danger"
-                          onClick={() => void respondApproval(activeTask.id, "reject", pendingApproval?.id)}
-                          disabled={actionBusy}
-                        >
-                          <X size={12} /> Отклонить
-                        </Button>
-                      </div>
-                    )}
-                  </div>
+                  <p className="mt-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] font-medium text-amber-400">
+                    Запрос подтверждения показан во всплывающем окне справа внизу экрана.
+                  </p>
                 )}
 
                 {activeTask.status === "queued" && events.length === 0 && (
@@ -1706,6 +1641,85 @@ export function OperatorPanel() {
           </Card>
         </div>
       )}
+
+      {(() => {
+        const isWaiting = (t: OperatorTask) =>
+          Boolean(parsePendingApproval(t.pendingApproval)) ||
+          t.status === "waiting_steps" ||
+          t.status === "waiting_approval";
+        const waitingTask =
+          activeTask && isWaiting(activeTask) ? activeTask : tasks.find(isWaiting) ?? null;
+        if (!waitingTask) return null;
+        const waitingApproval = parsePendingApproval(waitingTask.pendingApproval);
+        const isStepLimit = waitingApproval?.kind === "step_limit" || waitingTask.status === "waiting_steps";
+        return (
+          <ApprovalToast
+            dedupeKey={`op-task-${waitingTask.id}-${waitingApproval?.id ?? waitingTask.status}`}
+            kind={waitingApproval?.kind ?? waitingTask.status}
+            badgeLabel={`Оператор #${waitingTask.id}`}
+            title={
+              waitingApproval?.title ??
+              (isStepLimit
+                ? `Достигнут лимит ${waitingTask.maxSteps} шагов`
+                : "Оператор ждёт вашего подтверждения")
+            }
+            description={waitingApproval?.description}
+            actions={
+              isStepLimit ? (
+                <>
+                  <Button
+                    size="sm"
+                    onClick={() => void extendSteps(waitingTask.id, waitingApproval?.extraSteps ?? 20)}
+                    disabled={actionBusy}
+                  >
+                    <Plus size={12} /> +{waitingApproval?.extraSteps ?? 20} шагов и продолжить
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void extendSteps(waitingTask.id, 50)}
+                    disabled={actionBusy}
+                  >
+                    <Plus size={12} /> +50 шагов
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    onClick={() => void cancelTask(waitingTask.id)}
+                    disabled={actionBusy}
+                  >
+                    <Square size={12} /> Остановить
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button
+                    size="sm"
+                    onClick={() => void respondApproval(waitingTask.id, "approve", waitingApproval?.id)}
+                    disabled={actionBusy}
+                  >
+                    <Check size={12} /> Разрешить выполнение
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    onClick={() => void respondApproval(waitingTask.id, "reject", waitingApproval?.id)}
+                    disabled={actionBusy}
+                  >
+                    <X size={12} /> Отклонить
+                  </Button>
+                </>
+              )
+            }
+          >
+            {waitingApproval?.action && (
+              <pre className="max-h-32 overflow-auto rounded-lg bg-card2 px-2 py-1.5 font-mono text-[10px] text-text">
+                {JSON.stringify(waitingApproval.action, null, 2)}
+              </pre>
+            )}
+          </ApprovalToast>
+        );
+      })()}
     </div>
   );
 }
@@ -1778,11 +1792,13 @@ function EventRow({ event }: { event: OperatorEvent }) {
           ? "Ошибка"
           : event.kind === "approval"
             ? "Подтверждение на сайте"
-            : event.kind === "result"
-              ? checkPassed ? "Проверка: получилось" : "Проверка: результат под вопросом"
-              : event.kind === "info"
-                ? "Служебное сообщение"
-                : "Действие");
+            : event.kind === "screen"
+              ? "Снимок экрана ПК для Агента"
+              : event.kind === "result"
+                ? checkPassed ? "Проверка: получилось" : "Проверка: результат под вопросом"
+                : event.kind === "info"
+                  ? "Служебное сообщение"
+                  : "Действие");
 
   return (
     <div

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } f
 import {
   Archive,
   Bot,
+  Camera,
   Check,
   Compass,
   Download,
@@ -23,7 +24,6 @@ import {
   PlugZap,
   RefreshCw,
   Send,
-  ShieldAlert,
   Sparkles,
   Square,
   Terminal,
@@ -68,6 +68,7 @@ import {
   type OperatorEvent,
   type OperatorTask,
 } from "./operator/shared";
+import { ApprovalToast } from "./ApprovalToast";
 
 /**
  * Вкладка «Агент» блока ИИ (только главный администратор).
@@ -89,7 +90,8 @@ type AgentAction = {
     | "project_created"
     | "sandbox_export"
     | "operator_plan"
-    | "operator_task";
+    | "operator_task"
+    | "operator_screen";
   url?: string;
   label?: string;
   autoplay?: boolean;
@@ -110,6 +112,8 @@ type AgentAction = {
   coachMode?: string;
   notes?: string;
   operatorTrustLevel?: string;
+  summary?: string;
+  hasImage?: boolean;
 };
 
 type Turn = {
@@ -183,13 +187,65 @@ type PendingApproval = {
   operatorTrustLevel?: string;
 };
 
+type SandboxProject = { name: string; files?: number };
+
 type SandboxState = {
   available: boolean;
   root?: string;
-  projects: string[];
+  projects: SandboxProject[];
   items: Array<{ path: string; isDir: boolean; size: number }>;
   processes: Array<{ pid: number; command: string; cwd: string; alive: boolean }>;
 };
+
+function normalizeSandboxState(raw: unknown): SandboxState {
+  const src = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const rawProjects = Array.isArray(src.projects) ? src.projects : [];
+  const projects: SandboxProject[] = rawProjects
+    .map((entry): SandboxProject | null => {
+      if (typeof entry === "string") {
+        const name = entry.trim();
+        return name ? { name } : null;
+      }
+      if (entry && typeof entry === "object") {
+        const obj = entry as Record<string, unknown>;
+        const name = String(obj.name ?? obj.project ?? obj.path ?? "").trim();
+        if (!name) return null;
+        const files = typeof obj.files === "number" && Number.isFinite(obj.files) ? obj.files : undefined;
+        return files !== undefined ? { name, files } : { name };
+      }
+      return null;
+    })
+    .filter((p): p is SandboxProject => p !== null);
+
+  const rawItems = Array.isArray(src.items) ? src.items : [];
+  const items = rawItems
+    .filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object"))
+    .map((obj) => ({
+      path: String(obj.path ?? ""),
+      isDir: typeof obj.isDir === "boolean" ? obj.isDir : String(obj.type ?? "") === "dir",
+      size: Number(obj.size ?? 0) || 0,
+    }))
+    .filter((it) => it.path.length > 0);
+
+  const rawProcs = Array.isArray(src.processes) ? src.processes : [];
+  const processes = rawProcs
+    .filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object"))
+    .map((obj) => ({
+      pid: Number(obj.pid ?? 0) || 0,
+      command: String(obj.command ?? ""),
+      cwd: String(obj.cwd ?? "."),
+      alive: Boolean(obj.alive),
+    }))
+    .filter((p) => p.pid > 0);
+
+  return {
+    available: Boolean(src.available),
+    root: src.root ? String(src.root) : undefined,
+    projects,
+    items,
+    processes,
+  };
+}
 
 type TranscriptMeta = {
   id: number;
@@ -331,6 +387,13 @@ export function AgentChat({ userName }: { userName: string }) {
   const [approvalCoachAfter, setApprovalCoachAfter] = useState(true);
   const [approvalOpTrust, setApprovalOpTrust] = useState<"verified" | "full">("verified");
   const [approvalBusy, setApprovalBusy] = useState(false);
+  const [screenCapture, setScreenCapture] = useState<{
+    approvalId: string;
+    taskId: number;
+    status: string;
+    error?: string;
+  } | null>(null);
+  const [browserCaptureBusy, setBrowserCaptureBusy] = useState(false);
 
   // Совместная работа Агента и Оператора (помощь на экране / игры / пошаговое сопровождение).
   const [opBridgeOpen, setOpBridgeOpen] = useState(false);
@@ -383,7 +446,15 @@ export function AgentChat({ userName }: { userName: string }) {
     try {
       const res = await fetch("/api/ai/agent", { cache: "no-store" });
       if (!res.ok) return { available: false, hint: "Агент доступен только главному администратору" };
-      return (await res.json()) as Health;
+      const data = (await res.json()) as Record<string, unknown>;
+      return {
+        available: Boolean(data.available),
+        endpoint: data.endpoint ? String(data.endpoint) : undefined,
+        hint: data.hint ? String(data.hint) : undefined,
+        model: data.model ? String(data.model) : null,
+        sandbox: data.sandbox ? String(data.sandbox) : undefined,
+        tools: Array.isArray(data.tools) ? data.tools.map((t) => String(t ?? "")).filter(Boolean) : [],
+      };
     } catch {
       return { available: false, hint: "Не удалось проверить агента" };
     }
@@ -393,8 +464,8 @@ export function AgentChat({ userName }: { userName: string }) {
     try {
       const res = await fetch("/api/ai/agent/sandbox", { cache: "no-store" });
       if (!res.ok) return;
-      const data = (await res.json()) as SandboxState;
-      setSandbox(data);
+      const data: unknown = await res.json();
+      setSandbox(normalizeSandboxState(data));
     } catch {
       /* фоновая проверка — тихо игнорируем */
     }
@@ -441,8 +512,8 @@ export function AgentChat({ userName }: { userName: string }) {
       try {
         const res = await fetch("/api/ai/agent/sandbox", { cache: "no-store" });
         if (res.ok && alive) {
-          const data = (await res.json()) as SandboxState;
-          setSandbox(data);
+          const data: unknown = await res.json();
+          setSandbox(normalizeSandboxState(data));
         }
       } catch {
         /* тихо игнорируем в фоне */
@@ -824,13 +895,221 @@ export function AgentChat({ userName }: { userName: string }) {
 
   /* --------------------------- Подтверждение & Sandbox --------------------------- */
 
+  const submitScreenApproval = useCallback(
+    async (
+      approvalId: string,
+      opts: {
+        taskId?: number;
+        taskPrompt?: string;
+        screenshot?: string;
+        screenSummary?: string;
+      },
+    ) => {
+      const res = await fetch("/api/ai/agent/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          approvalId,
+          approved: true,
+          ...(opts.taskId !== undefined ? { taskId: opts.taskId } : {}),
+          ...(opts.taskPrompt ? { taskPrompt: opts.taskPrompt } : {}),
+          mode: "inspect",
+          coachMode: "off",
+          operatorTrustLevel: approvalOpTrust,
+          ...(opts.screenshot ? { screenshot: opts.screenshot } : {}),
+          ...(opts.screenSummary ? { screenSummary: opts.screenSummary } : {}),
+        }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error ?? "Не удалось передать снимок экрана Агенту");
+      }
+      setScreenCapture(null);
+      setPendingApproval(null);
+      setApprovalDest("");
+      setApprovalTaskDraft("");
+      setNotice("Снимок экрана получен и передан Агенту.");
+    },
+    [approvalOpTrust],
+  );
+
+  useEffect(() => {
+    if (!screenCapture || screenCapture.error) return;
+    let active = true;
+
+    const pollOnce = async () => {
+      try {
+        const res = await fetch(`/api/agent/tasks/${screenCapture.taskId}`, { cache: "no-store" });
+        if (!res.ok || !active) return;
+        const data = (await res.json().catch(() => ({}))) as {
+          task?: OperatorTask;
+          latestScreen?: { dataUrl?: string; summary?: string } | null;
+        };
+        if (!active) return;
+        if (data.task) setOpTask(data.task);
+
+        const screenDataUrl = data.latestScreen?.dataUrl ?? "";
+        const screenSummary = (data.latestScreen?.summary ?? data.task?.summary ?? "").trim();
+        const taskDone = data.task?.status === "done";
+
+        if (screenDataUrl || (taskDone && screenSummary)) {
+          await submitScreenApproval(screenCapture.approvalId, {
+            taskId: screenCapture.taskId,
+            taskPrompt: data.task?.prompt,
+            screenshot: screenDataUrl,
+            screenSummary,
+          });
+          return;
+        }
+
+        if (data.task && (data.task.status === "failed" || data.task.status === "cancelled")) {
+          setScreenCapture((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  status: data.task!.status,
+                  error: data.task!.summary || "Оператор не смог сделать снимок экрана",
+                }
+              : null,
+          );
+          return;
+        }
+
+        if (data.task && data.task.status !== screenCapture.status) {
+          setScreenCapture((prev) => (prev ? { ...prev, status: data.task!.status } : null));
+        }
+      } catch (caught) {
+        if (!active) return;
+        setScreenCapture((prev) =>
+          prev
+            ? {
+                ...prev,
+                error: caught instanceof Error ? caught.message : "Ошибка ожидания снимка экрана",
+              }
+            : null,
+        );
+      }
+    };
+
+    void pollOnce();
+    const timer = window.setInterval(() => {
+      void pollOnce();
+    }, 1200);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [screenCapture, submitScreenApproval]);
+
+  const captureScreenInBrowser = async () => {
+    if (!pendingApproval || browserCaptureBusy) return;
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getDisplayMedia !== "function"
+    ) {
+      setError("Ваш браузер не поддерживает захват экрана (getDisplayMedia)");
+      return;
+    }
+    setBrowserCaptureBusy(true);
+    setError(null);
+    let stream: MediaStream | null = null;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      const video = document.createElement("video");
+      video.srcObject = stream;
+      video.muted = true;
+      await video.play();
+      await new Promise<void>((resolve) => {
+        if (video.readyState >= 2) resolve();
+        else video.onloadeddata = () => resolve();
+      });
+
+      const vw = video.videoWidth || 1280;
+      const vh = video.videoHeight || 720;
+      const scale = vw > 1440 ? 1440 / vw : 1;
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(vw * scale));
+      canvas.height = Math.max(1, Math.round(vh * scale));
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Не удалось обработать кадр экрана");
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+
+      if (screenCapture?.taskId) {
+        void fetch(`/api/agent/tasks/${screenCapture.taskId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "cancel" }),
+        });
+      }
+
+      await submitScreenApproval(pendingApproval.approvalId, {
+        taskId: screenCapture?.taskId,
+        screenshot: dataUrl,
+        screenSummary: `Снимок экрана (${canvas.width}×${canvas.height}), переданный через браузер`,
+      });
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "Захват экрана через браузер отменён",
+      );
+    } finally {
+      if (stream) {
+        for (const track of stream.getTracks()) track.stop();
+      }
+      setBrowserCaptureBusy(false);
+    }
+  };
+
   const sendApprovalDecision = async (approved: boolean) => {
     if (!pendingApproval || approvalBusy) return;
     setApprovalBusy(true);
+    setError(null);
     try {
       let launchedTaskId: number | undefined;
-      const finalPrompt = (approvalTaskDraft || pendingApproval.task || "").trim();
+      const finalPrompt = (approvalTaskDraft || pendingApproval.task || pendingApproval.description || "").trim();
       const finalCoachMode = approvalCoachAfter ? "agent" : "after_step";
+
+      if (approved && pendingApproval.kind === "capture_screen") {
+        const inspectPrompt = finalPrompt || "Сделай снимок экрана ПК и отправь его Агенту";
+        const launchRes = await fetch("/api/ai/agent/operator", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "launch",
+            prompt: inspectPrompt,
+            taskMode: "inspect",
+            coachMode: "off",
+            maxSteps: 2,
+            trustLevel: approvalOpTrust,
+          }),
+        });
+        const launchData = (await launchRes.json().catch(() => ({}))) as {
+          task?: OperatorTask;
+          error?: string;
+        };
+        if (!launchRes.ok || !launchData.task) {
+          setError(launchData.error ?? "Не удалось запросить снимок экрана у Оператора");
+          return;
+        }
+        setOpTask(launchData.task);
+        setOpEvents([]);
+        setScreenCapture({
+          approvalId: pendingApproval.approvalId,
+          taskId: launchData.task.id,
+          status: launchData.task.status,
+        });
+        setNotice(`Запрос снимка экрана отправлен Оператору (задача #${launchData.task.id}).`);
+        return;
+      }
+
+      if (!approved && screenCapture?.taskId) {
+        void fetch(`/api/agent/tasks/${screenCapture.taskId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "cancel" }),
+        });
+      }
 
       if (approved && pendingApproval.kind === "call_operator") {
         if (!finalPrompt) {
@@ -888,6 +1167,7 @@ export function AgentChat({ userName }: { userName: string }) {
         setError(data.error ?? "Не удалось отправить подтверждение");
         return;
       }
+      setScreenCapture(null);
       setPendingApproval(null);
       setApprovalDest("");
       setApprovalTaskDraft("");
@@ -1243,11 +1523,15 @@ export function AgentChat({ userName }: { userName: string }) {
               operatorTrustLevel: data.operatorTrustLevel ? String(data.operatorTrustLevel) : undefined,
             };
             setPendingApproval(req);
+            setScreenCapture(null);
             setApprovalDest(req.destination ?? "");
             if (req.kind === "call_operator") {
               setApprovalTaskDraft(req.task ?? "");
               setApprovalTaskMode(normalizeTaskMode(req.mode ?? "copilot"));
               setApprovalCoachAfter(req.coachAfterEachStep ?? true);
+              setApprovalOpTrust(req.operatorTrustLevel === "full" ? "full" : "verified");
+            } else if (req.kind === "capture_screen") {
+              setApprovalTaskDraft(req.task ?? req.description ?? "");
               setApprovalOpTrust(req.operatorTrustLevel === "full" ? "full" : "verified");
             }
             scrollDown();
@@ -1307,6 +1591,8 @@ export function AgentChat({ userName }: { userName: string }) {
                 coachMode: data.coachMode ? String(data.coachMode) : undefined,
                 notes: data.notes ? String(data.notes) : undefined,
                 operatorTrustLevel: data.operatorTrustLevel ? String(data.operatorTrustLevel) : undefined,
+                summary: data.summary ? String(data.summary) : undefined,
+                hasImage: typeof data.hasImage === "boolean" ? data.hasImage : undefined,
               };
               assistantDraft.actions.push(action);
               patch((t) => ({ ...t, actions: [...t.actions, action] }));
@@ -1325,6 +1611,7 @@ export function AgentChat({ userName }: { userName: string }) {
           } else if (event === "done") {
             setStatus(null);
             setPendingApproval(null);
+            setScreenCapture(null);
             void refreshSandbox();
           }
         }
@@ -1370,6 +1657,7 @@ export function AgentChat({ userName }: { userName: string }) {
       }
       setRunning(false);
       setPendingApproval(null);
+      setScreenCapture(null);
       setStatus(null);
       scrollDown();
 
@@ -1591,7 +1879,7 @@ export function AgentChat({ userName }: { userName: string }) {
             </div>
           </div>
           <p className="mt-1 truncate text-[10px] text-muted">
-            Проекты: {sandbox?.projects?.length ? sandbox.projects.join(", ") : "пока пусто"} · процессов:{" "}
+            Проекты: {sandbox?.projects?.length ? sandbox.projects.map((p) => p.name).join(", ") : "пока пусто"} · процессов:{" "}
             {sandbox?.processes?.filter((p) => p.alive).length ?? 0}
           </p>
         </div>
@@ -1702,19 +1990,22 @@ export function AgentChat({ userName }: { userName: string }) {
             <div className="flex flex-wrap gap-1.5">
               {sandbox.projects.map((proj) => (
                 <div
-                  key={proj}
+                  key={proj.name}
                   className="flex items-center gap-1.5 rounded-lg border border-border bg-card2 px-2 py-1 text-[10px]"
                 >
-                  <span className="font-medium text-text">{proj}</span>
+                  <span className="font-medium text-text">
+                    {proj.name}
+                    {typeof proj.files === "number" ? ` (${proj.files} ф.)` : ""}
+                  </span>
                   <a
-                    href={`/api/ai/agent/sandbox?download=${encodeURIComponent(proj)}`}
+                    href={`/api/ai/agent/sandbox?download=${encodeURIComponent(proj.name)}`}
                     className="text-emerald-500 hover:underline"
                   >
                     ZIP
                   </a>
                   <button
                     type="button"
-                    onClick={() => setExportSource(proj)}
+                    onClick={() => setExportSource(proj.name)}
                     className="text-accent2 hover:underline"
                   >
                     экспорт
@@ -2010,37 +2301,9 @@ export function AgentChat({ userName }: { userName: string }) {
               </div>
             )}
             {(opApproval || opTask.status === "waiting_approval" || opTask.status === "waiting_steps") && (
-              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5">
-                <span className="text-[11px] font-medium text-amber-400">
-                  {opApproval?.title ?? "Оператор ждёт подтверждения"}
-                </span>
-                {opApproval?.kind === "step_limit" || opTask.status === "waiting_steps" ? (
-                  <button
-                    type="button"
-                    onClick={() => void actOnOperatorTask("extend_steps", { addSteps: opApproval?.extraSteps ?? 20 })}
-                    className="ml-auto rounded-md bg-emerald-600 px-2.5 py-1 text-[10px] font-medium text-white"
-                  >
-                    Добавить шаги и продолжить
-                  </button>
-                ) : (
-                  <div className="ml-auto flex gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => void actOnOperatorTask("approve", { approvalId: opApproval?.id })}
-                      className="rounded-md bg-emerald-600 px-2.5 py-1 text-[10px] font-medium text-white"
-                    >
-                      Разрешить
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void actOnOperatorTask("reject", { approvalId: opApproval?.id })}
-                      className="rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] text-red-500"
-                    >
-                      Отклонить
-                    </button>
-                  </div>
-                )}
-              </div>
+              <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-[10px] font-medium text-amber-400">
+                Ожидает вашего решения во всплывающем окне справа внизу…
+              </p>
             )}
             {!opFinished && (
               <div className="flex gap-1.5">
@@ -2160,107 +2423,6 @@ export function AgentChat({ userName }: { userName: string }) {
             />
           </label>
         </div>
-
-        {/* Карточка подтверждения команды / переноса файлов при уровне доверия verified */}
-        {pendingApproval && (
-          <div className="m-3 space-y-2 rounded-xl border border-amber-500/50 bg-amber-500/10 p-3 text-xs">
-            <div className="flex items-start gap-2">
-              <ShieldAlert size={16} className="mt-0.5 shrink-0 text-amber-500" />
-              <div className="min-w-0 flex-1 space-y-1">
-                <p className="font-semibold text-text">{pendingApproval.title}</p>
-                {pendingApproval.description && (
-                  <p className="text-[11px] text-muted">{pendingApproval.description}</p>
-                )}
-                {pendingApproval.command && (
-                  <pre className="overflow-x-auto rounded-lg bg-card px-2 py-1.5 font-mono text-[11px] text-text">
-                    {pendingApproval.command}
-                    {pendingApproval.cwd ? `\n# cwd: ${pendingApproval.cwd}` : ""}
-                  </pre>
-                )}
-                {pendingApproval.kind === "sandbox_export" && (
-                  <div className="space-y-1.5 pt-1">
-                    <p className="text-[11px] text-muted">
-                      Источник в Sandbox: <b>{pendingApproval.source}</b> ({pendingApproval.filesCount ?? 0} файлов ·{" "}
-                      {pendingApproval.mode === "move" ? "перенос" : "копирование"})
-                    </p>
-                    <Input
-                      value={approvalDest}
-                      onChange={(e) => setApprovalDest(e.target.value)}
-                      placeholder="Папка назначения на ПК (можно изменить перед согласием)"
-                      className="h-8 text-[11px]"
-                    />
-                  </div>
-                )}
-                {pendingApproval.kind === "call_operator" && (
-                  <div className="space-y-2 pt-1">
-                    <Textarea
-                      value={approvalTaskDraft}
-                      onChange={(e) => setApprovalTaskDraft(e.target.value)}
-                      rows={3}
-                      placeholder="Задача для Настольного Оператора"
-                      className="text-[11px]"
-                    />
-                    <div className="flex flex-wrap items-center gap-2 text-[10px]">
-                      <span className="text-muted">Режим:</span>
-                      {OPERATOR_TASK_MODES.map((m) => (
-                        <button
-                          key={m.id}
-                          type="button"
-                          onClick={() => setApprovalTaskMode(m.id)}
-                          className={cn(
-                            "rounded-md border px-2 py-0.5 font-medium transition",
-                            approvalTaskMode === m.id ? m.badgeClass : "border-border bg-card text-muted",
-                          )}
-                        >
-                          {m.shortLabel}
-                        </button>
-                      ))}
-                      <label className="ml-auto flex items-center gap-1 text-muted">
-                        <input
-                          type="checkbox"
-                          checked={approvalCoachAfter}
-                          onChange={(e) => setApprovalCoachAfter(e.target.checked)}
-                          className="h-3 w-3 accent-[#7c5cff]"
-                        />
-                        Агент подсказывает после каждого шага
-                      </label>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted">
-                      <span>Доверие Оператора:</span>
-                      <select
-                        value={approvalOpTrust}
-                        onChange={(e) => setApprovalOpTrust(e.target.value === "full" ? "full" : "verified")}
-                        className="h-7 rounded-md border border-border bg-card px-1.5 text-[10px] text-text"
-                      >
-                        <option value="verified">С подтверждением (verified)</option>
-                        <option value="full">Полный доступ (full)</option>
-                      </select>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={() => void sendApprovalDecision(true)}
-                disabled={approvalBusy}
-                className="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
-              >
-                <Check size={12} />{" "}
-                {pendingApproval.kind === "call_operator" ? "Разрешить и запустить Оператора" : "Разрешить"}
-              </button>
-              <button
-                type="button"
-                onClick={() => void sendApprovalDecision(false)}
-                disabled={approvalBusy}
-                className="flex items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-500 hover:bg-red-500/20 disabled:opacity-50"
-              >
-                <X size={12} /> Отклонить
-              </button>
-            </div>
-          </div>
-        )}
 
         <div ref={listRef} className="h-[420px] space-y-3 overflow-y-auto p-3">
           {historyLoading ? (
@@ -2440,6 +2602,22 @@ export function AgentChat({ userName }: { userName: string }) {
                         </div>
                       );
                     }
+                    if (action.type === "operator_screen") {
+                      return (
+                        <div
+                          key={`op-screen-${index}`}
+                          className="flex items-start gap-2 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-2 text-[11px]"
+                        >
+                          <Camera size={13} className="mt-0.5 shrink-0 text-cyan-400" />
+                          <div className="min-w-0 flex-1 space-y-0.5">
+                            <p className="font-medium text-text">
+                              Снимок экрана ПК передан Агенту{action.taskId ? ` (#${action.taskId})` : ""}
+                            </p>
+                            {action.summary && <p className="text-[10px] text-muted">{action.summary}</p>}
+                          </div>
+                        </div>
+                      );
+                    }
                     return (
                       <div
                         key={`act-${index}`}
@@ -2592,6 +2770,259 @@ export function AgentChat({ userName }: { userName: string }) {
           </p>
         </div>
       </div>
+
+      {pendingApproval && (
+        <ApprovalToast
+          kind={pendingApproval.kind}
+          tone={pendingApproval.kind === "capture_screen" ? "cyan" : "amber"}
+          badgeLabel={
+            pendingApproval.kind === "capture_screen"
+              ? "Запрос снимка экрана"
+              : pendingApproval.kind === "call_operator"
+                ? "Запуск Оператора"
+                : "Запрос разрешения"
+          }
+          title={pendingApproval.title}
+          description={pendingApproval.description}
+          onDismiss={() => void sendApprovalDecision(false)}
+          dismissDisabled={approvalBusy || browserCaptureBusy}
+          actions={
+            pendingApproval.kind === "capture_screen" ? (
+              screenCapture ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void captureScreenInBrowser()}
+                    disabled={browserCaptureBusy || approvalBusy}
+                    className="flex items-center gap-1 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-1.5 text-[11px] font-medium text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-50"
+                  >
+                    {browserCaptureBusy ? <Loader2 size={12} className="animate-spin" /> : <Camera size={12} />}
+                    Снять в браузере
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void sendApprovalDecision(false)}
+                    disabled={approvalBusy || browserCaptureBusy}
+                    className="flex items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-[11px] font-medium text-red-500 hover:bg-red-500/20 disabled:opacity-50"
+                  >
+                    <X size={12} /> Отменить ожидание
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void sendApprovalDecision(true)}
+                    disabled={approvalBusy || browserCaptureBusy}
+                    className="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+                  >
+                    {approvalBusy ? <Loader2 size={12} className="animate-spin" /> : <Camera size={12} />}
+                    Разрешить Оператору снять экран
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void captureScreenInBrowser()}
+                    disabled={browserCaptureBusy || approvalBusy}
+                    className="flex items-center gap-1 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-1.5 text-[11px] font-medium text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-50"
+                  >
+                    {browserCaptureBusy ? <Loader2 size={12} className="animate-spin" /> : <Camera size={12} />}
+                    Снять в браузере
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void sendApprovalDecision(false)}
+                    disabled={approvalBusy || browserCaptureBusy}
+                    className="flex items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-500 hover:bg-red-500/20 disabled:opacity-50"
+                  >
+                    <X size={12} /> Отклонить
+                  </button>
+                </>
+              )
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void sendApprovalDecision(true)}
+                  disabled={approvalBusy}
+                  className="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+                >
+                  <Check size={12} />{" "}
+                  {pendingApproval.kind === "call_operator" ? "Разрешить и запустить Оператора" : "Разрешить"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void sendApprovalDecision(false)}
+                  disabled={approvalBusy}
+                  className="flex items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-500 hover:bg-red-500/20 disabled:opacity-50"
+                >
+                  <X size={12} /> Отклонить
+                </button>
+              </>
+            )
+          }
+        >
+          {pendingApproval.command && (
+            <pre className="max-h-28 overflow-auto rounded-lg bg-card2 px-2 py-1.5 font-mono text-[11px] text-text">
+              {pendingApproval.command}
+              {pendingApproval.cwd ? `\n# cwd: ${pendingApproval.cwd}` : ""}
+            </pre>
+          )}
+          {pendingApproval.kind === "sandbox_export" && (
+            <div className="space-y-1.5">
+              <p className="text-[11px] text-muted">
+                Источник в Sandbox: <b>{pendingApproval.source}</b> ({pendingApproval.filesCount ?? 0} файлов ·{" "}
+                {pendingApproval.mode === "move" ? "перенос" : "копирование"})
+              </p>
+              <Input
+                value={approvalDest}
+                onChange={(e) => setApprovalDest(e.target.value)}
+                placeholder="Папка назначения на ПК (можно изменить перед согласием)"
+                className="h-8 text-[11px]"
+              />
+            </div>
+          )}
+          {pendingApproval.kind === "call_operator" && (
+            <div className="space-y-2">
+              <Textarea
+                value={approvalTaskDraft}
+                onChange={(e) => setApprovalTaskDraft(e.target.value)}
+                rows={3}
+                placeholder="Задача для Настольного Оператора"
+                className="text-[11px]"
+              />
+              <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+                <span className="text-muted">Режим:</span>
+                {OPERATOR_TASK_MODES.map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => setApprovalTaskMode(m.id)}
+                    className={cn(
+                      "rounded-md border px-2 py-0.5 font-medium transition",
+                      approvalTaskMode === m.id ? m.badgeClass : "border-border bg-card2 text-muted",
+                    )}
+                  >
+                    {m.shortLabel}
+                  </button>
+                ))}
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-muted">
+                <label className="flex items-center gap-1">
+                  <input
+                    type="checkbox"
+                    checked={approvalCoachAfter}
+                    onChange={(e) => setApprovalCoachAfter(e.target.checked)}
+                    className="h-3 w-3 accent-[#7c5cff]"
+                  />
+                  Агент подсказывает после шага
+                </label>
+                <select
+                  value={approvalOpTrust}
+                  onChange={(e) => setApprovalOpTrust(e.target.value === "full" ? "full" : "verified")}
+                  className="h-7 rounded-md border border-border bg-card2 px-1.5 text-[10px] text-text"
+                >
+                  <option value="verified">С подтверждением (verified)</option>
+                  <option value="full">Полный доступ (full)</option>
+                </select>
+              </div>
+            </div>
+          )}
+          {pendingApproval.kind === "capture_screen" && (
+            <div className="space-y-2">
+              {pendingApproval.task && (
+                <p className="rounded-lg border border-border bg-card2 px-2 py-1.5 text-[11px] text-text">
+                  Что посмотреть на экране: {pendingApproval.task}
+                </p>
+              )}
+              {!screenCapture ? (
+                <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted">
+                  <span>Доверие Оператора:</span>
+                  <select
+                    value={approvalOpTrust}
+                    onChange={(e) => setApprovalOpTrust(e.target.value === "full" ? "full" : "verified")}
+                    className="h-7 rounded-md border border-border bg-card2 px-1.5 text-[10px] text-text"
+                  >
+                    <option value="verified">С подтверждением (verified)</option>
+                    <option value="full">Полный доступ (full)</option>
+                  </select>
+                </div>
+              ) : (
+                <div className="space-y-1 rounded-lg border border-cyan-500/40 bg-cyan-500/10 p-2 text-[11px]">
+                  <div className="flex items-center gap-1.5 font-medium text-cyan-300">
+                    {!screenCapture.error && <Loader2 size={12} className="animate-spin" />}
+                    <span>
+                      {screenCapture.error
+                        ? screenCapture.error
+                        : `Ждём снимок экрана от Оператора (#${screenCapture.taskId} · ${screenCapture.status})`}
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-muted">
+                    Оператор должен быть запущен с --watch. Можно также сразу нажать «Снять в браузере».
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+        </ApprovalToast>
+      )}
+
+      {opTask &&
+        (opTask.status === "waiting_approval" || opTask.status === "waiting_steps") &&
+        (() => {
+          const opApproval = parsePendingApproval(opTask.pendingApproval);
+          const isStepLimit = opApproval?.kind === "step_limit" || opTask.status === "waiting_steps";
+          return (
+            <ApprovalToast
+              dedupeKey={`op-task-${opTask.id}-${opApproval?.id ?? opTask.status}`}
+              kind={opApproval?.kind ?? opTask.status}
+              badgeLabel={`Оператор #${opTask.id}`}
+              title={
+                opApproval?.title ??
+                (isStepLimit ? `Достигнут лимит ${opTask.maxSteps} шагов` : "Оператор ждёт подтверждения")
+              }
+              description={opApproval?.description}
+              actions={
+                isStepLimit ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void actOnOperatorTask("extend_steps", { addSteps: opApproval?.extraSteps ?? 20 })
+                      }
+                      className="rounded-lg bg-emerald-600 px-3 py-1.5 text-[11px] font-medium text-white"
+                    >
+                      +{opApproval?.extraSteps ?? 20} шагов и продолжить
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void actOnOperatorTask("cancel")}
+                      className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] text-red-500"
+                    >
+                      Остановить
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void actOnOperatorTask("approve", { approvalId: opApproval?.id })}
+                      className="rounded-lg bg-emerald-600 px-3 py-1.5 text-[11px] font-medium text-white"
+                    >
+                      Разрешить
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void actOnOperatorTask("reject", { approvalId: opApproval?.id })}
+                      className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] text-red-500"
+                    >
+                      Отклонить
+                    </button>
+                  </>
+                )
+              }
+            />
+          );
+        })()}
     </div>
   );
 }

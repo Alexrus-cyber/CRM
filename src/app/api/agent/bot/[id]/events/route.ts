@@ -5,7 +5,7 @@ import { botOwner } from "@/lib/agentBot";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-const KINDS = new Set(["thought", "action", "result", "error", "info", "approval", "guidance"]);
+const KINDS = new Set(["thought", "action", "result", "error", "info", "approval", "guidance", "screen"]);
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const ownerId = await botOwner(req);
