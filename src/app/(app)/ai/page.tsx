@@ -1,7 +1,7 @@
 import { Bot, FlaskConical, Gauge, MessagesSquare, MonitorCog, Sparkles, ShieldCheck } from "lucide-react";
 import { requireUser } from "@/lib/auth";
 import { getAiQuotaOverride, getAiUsage, listAiChats } from "@/db/repo";
-import { aiPolicyFor, AI_ROLE_POLICY, formatTokenCount } from "@/lib/aiPolicy";
+import { aiPolicyFor, AI_ROLE_POLICY, formatStepLimit, formatTokenCount } from "@/lib/aiPolicy";
 import { ROLE_LABELS } from "@/lib/utils";
 import { Badge, Card, PageHeader } from "@/components/ui";
 import { LazyAiChat } from "@/components/LazyAiChat";
@@ -82,6 +82,7 @@ export default async function AiPage() {
                   <th className="py-1.5 pr-2 font-medium">Роль</th>
                   <th className="py-1.5 pr-2 font-medium">На чат</th>
                   <th className="py-1.5 pr-2 font-medium">В месяц</th>
+                  <th className="py-1.5 pr-2 font-medium">Шагов</th>
                   <th className="py-1.5 pr-2 font-medium">RAG</th>
                   <th className="py-1.5 font-medium">Раздумья</th>
                 </tr>
@@ -98,6 +99,7 @@ export default async function AiPage() {
                     </td>
                     <td className="py-1.5 pr-2">{formatTokenCount(row.perChatTokens)}</td>
                     <td className="py-1.5 pr-2">{formatTokenCount(row.monthlyTokens)}</td>
+                    <td className="py-1.5 pr-2">{formatStepLimit(row.maxSteps)}</td>
                     <td className="py-1.5 pr-2">{row.rag ? "да" : "нет"}</td>
                     <td className="py-1.5 text-muted">
                       {row.reasoning.length > 2 ? "любые" : row.reasoning.join(", ")}

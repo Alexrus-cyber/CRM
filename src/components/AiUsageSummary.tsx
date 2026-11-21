@@ -23,8 +23,8 @@ export function AiUsageSummary({
   limit: number | null;
   /** Всего токенов за всё время. */
   total: number;
-  /** Лимит на один чат. */
-  perChat: number;
+  /** Лимит на один чат; null — без ограничения. */
+  perChat: number | null;
   /** Сколько чатов у аккаунта. */
   chats: number;
   /** Расширение лимита администратором на этот месяц (если есть). */

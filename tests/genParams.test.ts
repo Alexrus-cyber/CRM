@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { normalizeParams } from "@/lib/ai";
-import { decodeGenParams, normalizeGenParams } from "@/lib/genParams";
+import {
+  AGENT_MAX_STEPS,
+  decodeGenParams,
+  isUnlimitedStepsRole,
+  maxStepsCapForRole,
+  normalizeGenParams,
+  resolveStepsForRole,
+} from "@/lib/genParams";
 
 describe("настройки раздумий и генерации", () => {
   it("читает сохранённые значения из localStorage", () => {
@@ -24,5 +31,26 @@ describe("настройки раздумий и генерации", () => {
     expect(normalizeGenParams({ thinkingBudget: 384000 }).thinkingBudget).toBe(384000);
     expect(normalizeParams({ maxTokens: 384000, thinkingBudget: 384000 }).maxTokens).toBe(384000);
     expect(normalizeParams({ maxTokens: 384000, thinkingBudget: 384000 }).thinkingBudget).toBe(384000);
+  });
+
+  it("различает безлимитный super_admin и потолок 500 шагов для остальных ролей (включая admin)", () => {
+    expect(isUnlimitedStepsRole("super_admin")).toBe(true);
+    expect(isUnlimitedStepsRole("admin")).toBe(false);
+    expect(isUnlimitedStepsRole("manager")).toBe(false);
+
+    expect(maxStepsCapForRole("super_admin")).toBeNull();
+    expect(maxStepsCapForRole("admin")).toBe(AGENT_MAX_STEPS);
+    expect(maxStepsCapForRole("employee")).toBe(AGENT_MAX_STEPS);
+
+    // super_admin: 0 = без лимита, произвольное положительное число не режется потолком 500/2000
+    expect(resolveStepsForRole("super_admin", 0, 0)).toBe(0);
+    expect(resolveStepsForRole("super_admin", undefined, 0)).toBe(0);
+    expect(resolveStepsForRole("super_admin", 5000, 0)).toBe(5000);
+
+    // admin и рядовые роли: жёсткий предел 500 шагов и запрет 0 (безлимита)
+    expect(resolveStepsForRole("admin", 0, 15)).toBe(15);
+    expect(resolveStepsForRole("admin", 5000, 15)).toBe(AGENT_MAX_STEPS);
+    expect(resolveStepsForRole("admin", 120, 15)).toBe(120);
+    expect(resolveStepsForRole("developer", 999, 15)).toBe(AGENT_MAX_STEPS);
   });
 });

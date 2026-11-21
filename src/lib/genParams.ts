@@ -36,10 +36,40 @@ export const GEN_DEFAULT_PARAMS: GenParams = {
   seed: null,
 };
 
-/** Предел шагов у обоих агентов. */
+/** Предел шагов агента и оператора для всех ролей, кроме главного администратора. */
 export const AGENT_MAX_STEPS = 500;
-/** Жёсткий потолок при расширении лимита шагов «на месте» в операторе. */
+/** Жёсткий потолок при расширении лимита шагов «на месте» (кроме главного администратора). */
 export const OPERATOR_MAX_EXTEND_STEPS = 2000;
+
+export function isUnlimitedStepsRole(role: string | null | undefined): boolean {
+  return role === "super_admin";
+}
+
+export function maxStepsCapForRole(role: string | null | undefined): number | null {
+  return isUnlimitedStepsRole(role) ? null : AGENT_MAX_STEPS;
+}
+
+/**
+ * Нормализует лимит шагов в зависимости от роли пользователя:
+ * - у главного администратора (`super_admin`) лимита нет: `0` означает «без лимита»,
+ *   а любое положительное число (`>= 1`) принимается без потолка 500/2000;
+ * - у всех остальных ролей (включая обычных `admin`) предел строго 500 шагов.
+ */
+export function resolveStepsForRole(
+  role: string | null | undefined,
+  raw: unknown,
+  fallback: number,
+): number {
+  const parsed = typeof raw === "number" ? raw : Number(raw);
+  if (isUnlimitedStepsRole(role)) {
+    if (raw === 0 || raw === "0" || raw === null) return 0;
+    if (!Number.isFinite(parsed)) return fallback <= 0 ? 0 : Math.floor(fallback);
+    return parsed <= 0 ? 0 : Math.floor(parsed);
+  }
+  const safeFallback = Math.min(AGENT_MAX_STEPS, Math.max(1, Math.floor(fallback) || 15));
+  if (!Number.isFinite(parsed) || parsed <= 0) return safeFallback;
+  return Math.min(AGENT_MAX_STEPS, Math.max(1, Math.floor(parsed)));
+}
 
 export function normalizeGenParams(raw: unknown): GenParams {
   const source = (raw ?? {}) as Partial<GenParams>;

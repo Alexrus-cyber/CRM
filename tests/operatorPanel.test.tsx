@@ -234,6 +234,8 @@ describe("ручная проверка подключения бота во в�
     expect(createdCall.body.trustLevel).toBe("none");
     expect(createdCall.body.taskMode).toBe("game");
     expect(createdCall.body.coachMode).toBe("agent");
+    // При включённой галочке «Без лимита шагов» (по умолчанию, и даже в режиме «Игра») передаётся maxSteps: 0.
+    expect(createdCall.body.maxSteps).toBe(0);
 
     // Ручная подсказка и кнопка «Совет Агента» работают в живой задаче (#43).
     const hintInput = screen.getByPlaceholderText(/Подсказка на следующий шаг/i);

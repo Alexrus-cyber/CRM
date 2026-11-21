@@ -2,32 +2,35 @@
  * Ограничения ИИ по ролям.
  *
  * Один источник правды и для интерфейса (какие режимы раздумий показывать,
- * есть ли RAG, сколько токенов осталось), и для сервера (`/api/ai/chat`
- * отказывает, если роль не имеет права на режим или лимит исчерпан).
+ * есть ли RAG, сколько токенов и шагов доступно), и для сервера (`/api/ai/chat`,
+ * `/api/ai/agent`, `/api/agent/tasks`).
  *
  * Правила:
  *
- * | Роль            | Чат, токенов | В месяц     | RAG | Раздумья            |
- * | --------------- | ------------ | ----------- | --- | ------------------- |
- * | Главный админ   | 1 000 000    | без лимита  | да  | любые               |
- * | Администратор   | 1 000 000    | без лимита  | да  | любые               |
- * | Разработчик     | 1 000 000    | 5 000 000   | да  | любые               |
- * | Менеджер        | 1 000 000    | 1 500 000   | нет | без / коротко       |
- * | Консультант     | 1 000 000    | 500 000     | нет | без / коротко       |
- * | Сотрудник       | 1 000 000    | 500 000     | нет | без / коротко       |
+ * | Роль            | Чат, токенов | В месяц     | Шагов агента | RAG | Раздумья            |
+ * | --------------- | ------------ | ----------- | ------------ | --- | ------------------- |
+ * | Главный админ   | без лимита   | без лимита  | без лимита   | да  | любые               |
+ * | Администратор   | 1 000 000    | без лимита  | до 500       | да  | любые               |
+ * | Разработчик     | 1 000 000    | 5 000 000   | до 500       | да  | любые               |
+ * | Менеджер        | 1 000 000    | 1 500 000   | до 500       | нет | без / коротко       |
+ * | Консультант     | 1 000 000    | 500 000     | до 500       | нет | без / коротко       |
+ * | Сотрудник       | 1 000 000    | 500 000     | до 500       | нет | без / коротко       |
  *
  * Месячный лимит администратор может расширить конкретному сотруднику на
  * текущий месяц (таблица `ai_quota_overrides`) — это не меняет роль.
  */
 import type { Role } from "@/db/schema";
 import type { ReasoningMode } from "./ai";
+import { AGENT_MAX_STEPS } from "./genParams";
 
 export type AiRolePolicy = {
   role: Role;
-  /** Потолок токенов на один чат. */
-  perChatTokens: number;
+  /** Потолок токенов на один чат; null — без ограничения. */
+  perChatTokens: number | null;
   /** Месячный лимит; null — без ограничения. */
   monthlyTokens: number | null;
+  /** Предел шагов агента/оператора; null — без ограничения. */
+  maxSteps: number | null;
   /** Доступна ли RAG-папка. */
   rag: boolean;
   /** Разрешённые режимы раздумий. */
@@ -44,56 +47,62 @@ const LIGHT_REASONING: ReasoningMode[] = ["off", "low"];
 export const AI_ROLE_POLICY: Record<Role, AiRolePolicy> = {
   super_admin: {
     role: "super_admin",
-    perChatTokens: 1_000_000,
+    perChatTokens: null,
     monthlyTokens: null,
+    maxSteps: null,
     rag: true,
     reasoning: FULL_REASONING,
-    summary: "Полный доступ: любые режимы раздумий и RAG, до 1 млн токенов на чат, без месячного лимита",
+    summary: "Без лимитов: любые режимы раздумий и RAG, без ограничений по токенам и шагам",
     chatsUnlimited: true,
   },
   admin: {
     role: "admin",
     perChatTokens: 1_000_000,
     monthlyTokens: null,
+    maxSteps: AGENT_MAX_STEPS,
     rag: true,
     reasoning: FULL_REASONING,
-    summary: "Полный доступ: любые режимы раздумий и RAG, до 1 млн токенов на чат, без месячного лимита",
+    summary: "Полный доступ: любые режимы раздумий и RAG, до 1 млн на чат и до 500 шагов, без месячного лимита",
     chatsUnlimited: true,
   },
   developer: {
     role: "developer",
     perChatTokens: 1_000_000,
     monthlyTokens: 5_000_000,
+    maxSteps: AGENT_MAX_STEPS,
     rag: true,
     reasoning: FULL_REASONING,
-    summary: "Полный доступ: любые режимы и RAG, до 1 млн на чат и 5 млн токенов в месяц",
+    summary: "Полный доступ: любые режимы и RAG, до 1 млн на чат, 5 млн в месяц и до 500 шагов",
     chatsUnlimited: true,
   },
   manager: {
     role: "manager",
     perChatTokens: 1_000_000,
     monthlyTokens: 1_500_000,
+    maxSteps: AGENT_MAX_STEPS,
     rag: false,
     reasoning: LIGHT_REASONING,
-    summary: "Раздумья только «без» или «коротко», RAG выключен, 1,5 млн токенов в месяц",
+    summary: "Раздумья только «без» или «коротко», RAG выключен, 1,5 млн токенов в месяц и до 500 шагов",
     chatsUnlimited: true,
   },
   consultant: {
     role: "consultant",
     perChatTokens: 1_000_000,
     monthlyTokens: 500_000,
+    maxSteps: AGENT_MAX_STEPS,
     rag: false,
     reasoning: LIGHT_REASONING,
-    summary: "Раздумья только «без» или «коротко», RAG выключен, 500 тыс. токенов в месяц",
+    summary: "Раздумья только «без» или «коротко», RAG выключен, 500 тыс. токенов в месяц и до 500 шагов",
     chatsUnlimited: true,
   },
   user: {
     role: "user",
     perChatTokens: 1_000_000,
     monthlyTokens: 500_000,
+    maxSteps: AGENT_MAX_STEPS,
     rag: false,
     reasoning: LIGHT_REASONING,
-    summary: "Раздумья только «без» или «коротко», RAG выключен, 500 тыс. токенов в месяц",
+    summary: "Раздумья только «без» или «коротко», RAG выключен, 500 тыс. токенов в месяц и до 500 шагов",
     chatsUnlimited: true,
   },
 };
@@ -109,10 +118,20 @@ export function aiPolicyFor(role: Role, monthlyOverride: number | null = null): 
   };
 }
 
-/** Лимит на чат для конкретной роли (0 — не ограничивать). */
+/** Лимит на чат для конкретной роли (null или <= 0 — не ограничивать). */
 export function chatTokensLeft(chat: { tokensTotal: number }, policy: AiRolePolicy): number {
-  if (policy.perChatTokens <= 0) return Number.POSITIVE_INFINITY;
+  if (policy.perChatTokens === null || policy.perChatTokens <= 0) return Number.POSITIVE_INFINITY;
   return Math.max(policy.perChatTokens - chat.tokensTotal, 0);
+}
+
+/** Предел шагов агента/оператора для роли (`null` у главного администратора, `500` у остальных). */
+export function roleStepLimit(role: Role): number | null {
+  return (AI_ROLE_POLICY[role] ?? AI_ROLE_POLICY.user).maxSteps;
+}
+
+export function formatStepLimit(value: number | null | undefined): string {
+  if (value === null || value === undefined || value <= 0) return "без лимита";
+  return `до ${new Intl.NumberFormat("ru-RU").format(value)}`;
 }
 
 /** 1250000 → «1,25 млн», 500000 → «500 тыс.», 8192 → «8 192». */

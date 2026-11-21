@@ -1,6 +1,6 @@
 import { addAgentEvent, createAgentTask, listAgentTasks, syncOperatorTaskToConversation } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
-import { AGENT_MAX_STEPS } from "@/lib/genParams";
+import { isUnlimitedStepsRole, resolveStepsForRole } from "@/lib/genParams";
 import { normalizeCoachMode, normalizeTaskMode, normalizeTaskSource } from "@/lib/operatorModes";
 import { normalizeTrustLevel } from "@/lib/trust";
 
@@ -57,7 +57,11 @@ export async function POST(req: Request) {
     files.push({ name, mime, data, size: bytes.length });
   }
 
-  const maxSteps = Math.min(Math.max(Number(body?.maxSteps ?? 15) || 15, 1), AGENT_MAX_STEPS);
+  const maxSteps = resolveStepsForRole(
+    me.role,
+    body?.maxSteps,
+    isUnlimitedStepsRole(me.role) ? 0 : 15,
+  );
   const trustLevel = normalizeTrustLevel(body?.trustLevel);
   const taskMode = normalizeTaskMode(body?.taskMode ?? body?.mode);
   const coachMode = normalizeCoachMode(body?.coachMode);

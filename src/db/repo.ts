@@ -13,7 +13,7 @@ import {
   type TaskGuidanceNote,
 } from "@/lib/operatorModes";
 import { normalizeTrustLevel, type TrustLevel } from "@/lib/trust";
-import { OPERATOR_MAX_EXTEND_STEPS } from "@/lib/genParams";
+import { AGENT_MAX_STEPS, isUnlimitedStepsRole, resolveStepsForRole } from "@/lib/genParams";
 import type { Role, TaskPriority, TaskStatus } from "./schema";
 
 export type UserLite = {
@@ -1332,6 +1332,11 @@ function dayAgoIso(): string {
   return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 }
 
+export async function getUserRoleById(userId: number): Promise<Role | null> {
+  const row = await q1<{ role: string }>(sql`select role from users where id = ${userId}`);
+  return (row?.role as Role) ?? null;
+}
+
 export async function createAgentTask(
   userId: number,
   prompt: string,
@@ -1348,16 +1353,18 @@ export async function createAgentTask(
   const taskMode = normalizeTaskMode(options?.taskMode);
   const source = normalizeTaskSource(options?.source);
   const coachMode = normalizeCoachMode(options?.coachMode);
+  const ownerRole = await getUserRoleById(userId);
+  const safeMaxSteps = resolveStepsForRole(ownerRole, maxSteps, isUnlimitedStepsRole(ownerRole) ? 0 : 15);
   const row = await q1<{ id: number }>(sql`
     insert into agent_tasks (user_id, prompt, status, max_steps, steps, summary, trust_level, task_mode, source, coach_mode, guidance_note, pending_approval, approval_response, created_at, updated_at)
-    values (${userId}, ${prompt}, 'queued', ${maxSteps}, 0, '', ${safeTrust}, ${taskMode}, ${source}, ${coachMode}, '', '', '', ${now}, ${now}) returning id`);
+    values (${userId}, ${prompt}, 'queued', ${safeMaxSteps}, 0, '', ${safeTrust}, ${taskMode}, ${source}, ${coachMode}, '', '', '', ${now}, ${now}) returning id`);
   const id = toNum(row?.id);
   return {
     id,
     userId,
     prompt,
     status: "queued",
-    maxSteps,
+    maxSteps: safeMaxSteps,
     steps: 0,
     summary: "",
     trustLevel: safeTrust,
@@ -1539,12 +1546,24 @@ export async function respondAgentTaskApproval(
   const task = await getAgentTask(userId, taskId);
   if (!task || task.status === "cancelled") return null;
   const now = nowIso();
+  const ownerRole = await getUserRoleById(userId);
+  const unlimited = isUnlimitedStepsRole(ownerRole);
   const id = input.approvalId || task.pendingApproval?.id || `appr_${Date.now()}`;
+  const requestedAdd = Math.max(1, Math.round(input.extraSteps || 15));
   const addSteps =
     input.decision === "extend_steps"
-      ? Math.max(1, Math.min(OPERATOR_MAX_EXTEND_STEPS - task.maxSteps, Math.round(input.extraSteps || 15)))
+      ? unlimited
+        ? requestedAdd
+        : Math.max(0, Math.min(AGENT_MAX_STEPS - task.maxSteps, requestedAdd))
       : 0;
-  const nextMaxSteps = Math.min(OPERATOR_MAX_EXTEND_STEPS, task.maxSteps + addSteps);
+  const nextMaxSteps =
+    input.decision === "extend_steps"
+      ? unlimited
+        ? task.maxSteps === 0
+          ? 0
+          : task.maxSteps + addSteps
+        : Math.min(AGENT_MAX_STEPS, task.maxSteps + addSteps)
+      : task.maxSteps;
   const decisionPayload: AgentTaskApprovalDecision = {
     id,
     decision: input.decision,
@@ -1564,7 +1583,9 @@ export async function respondAgentTaskApproval(
 
   const eventText =
     input.decision === "extend_steps"
-      ? `Лимит шагов расширен (+${addSteps}) до ${nextMaxSteps} — продолжаем с текущего шага`
+      ? nextMaxSteps === 0
+        ? "Лимит шагов снят (без лимита) — продолжаем с текущего шага"
+        : `Лимит шагов расширен (+${addSteps}) до ${nextMaxSteps} — продолжаем с текущего шага`
       : input.decision === "approved"
         ? `Пользователь на сайте разрешил действие${input.note ? `: ${input.note}` : ""}`
         : `Пользователь на сайте отклонил действие${input.note ? `: ${input.note}` : ""}`;
@@ -1580,8 +1601,14 @@ export async function extendAgentTaskSteps(
 ): Promise<AgentTaskRow | null> {
   const task = await getAgentTask(userId, taskId);
   if (!task || task.status === "cancelled" || task.status === "done") return null;
-  const addSteps = Math.max(1, Math.min(OPERATOR_MAX_EXTEND_STEPS, Math.round(addStepsRaw || 15)));
-  const nextMaxSteps = Math.min(OPERATOR_MAX_EXTEND_STEPS, Math.max(task.maxSteps + addSteps, task.steps + 1));
+  const ownerRole = await getUserRoleById(userId);
+  const unlimited = isUnlimitedStepsRole(ownerRole);
+  const addSteps = Math.max(1, Math.round(addStepsRaw || 15));
+  const nextMaxSteps = unlimited
+    ? task.maxSteps === 0
+      ? 0
+      : Math.max(task.maxSteps + addSteps, task.steps + 1)
+    : Math.min(AGENT_MAX_STEPS, Math.max(task.maxSteps + addSteps, task.steps + 1));
   const actualAdded = nextMaxSteps - task.maxSteps;
   if (task.pendingApproval?.kind === "step_limit") {
     return respondAgentTaskApproval(taskId, userId, {
@@ -1601,7 +1628,10 @@ export async function extendAgentTaskSteps(
   await addAgentEvent({
     taskId,
     kind: "info",
-    text: `Лимит шагов увеличен до ${nextMaxSteps} (+${actualAdded})`,
+    text:
+      nextMaxSteps === 0
+        ? "Задача выполняется без лимита шагов"
+        : `Лимит шагов увеличен до ${nextMaxSteps} (+${actualAdded})`,
   });
   return getAgentTask(userId, taskId);
 }
@@ -2350,7 +2380,7 @@ export async function syncOperatorTaskToConversation(
 
   const reasoningLines: string[] = [];
   const dialogueLines: string[] = [
-    `Диалог Агент ↔ Оператор #${task.id} · статус: ${statusLabel} · шагов ${task.steps}/${task.maxSteps}`,
+    `Диалог Агент ↔ Оператор #${task.id} · статус: ${statusLabel} · ${task.maxSteps <= 0 ? `шагов ${task.steps} (без лимита)` : `шагов ${task.steps}/${task.maxSteps}`}`,
   ];
   const filesMeta: Array<{ name: string; mime: string; size: number }> = [];
   let lastErrorText = "";

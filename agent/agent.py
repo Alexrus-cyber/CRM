@@ -1615,6 +1615,21 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, **parsed, "visionUsed": vision_used, "tuned": tuned_meta, "source": "agent"}
 
 
+def resolve_steps_limit(raw_steps: Any, unlimited: bool = False) -> int:
+    """Вычислить лимит шагов: для главного админа (unlimited=True) 0 = без лимита и нет потолка 500."""
+    try:
+        parsed = int(raw_steps) if raw_steps is not None and raw_steps != "" else None
+    except (TypeError, ValueError):
+        parsed = None
+    if unlimited:
+        if parsed is None or parsed <= 0:
+            return 0
+        return parsed
+    if parsed is None or parsed <= 0:
+        return MAX_STEPS
+    return max(1, min(MAX_STEPS_LIMIT, parsed))
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CrmAgent/2.0"
     protocol_version = "HTTP/1.1"
@@ -1883,11 +1898,8 @@ class Handler(BaseHTTPRequestHandler):
         context = body.get("context") or {}
         params = body.get("params") or {}
         trust_level = normalize_trust(body.get("trustLevel"))
-        try:
-            steps_limit = int(body.get("maxSteps") or MAX_STEPS)
-        except (TypeError, ValueError):
-            steps_limit = MAX_STEPS
-        steps_limit = max(1, min(MAX_STEPS_LIMIT, steps_limit))
+        unlimited_role = bool(body.get("unlimited"))
+        steps_limit = resolve_steps_limit(body.get("maxSteps"), unlimited_role)
 
         incoming = body.get("messages") or []
         if not isinstance(incoming, list) or not incoming:
@@ -2002,7 +2014,7 @@ class Handler(BaseHTTPRequestHandler):
         final_text = ""
         thinking = ""
 
-        while steps < steps_limit:
+        while steps_limit == 0 or steps < steps_limit:
             steps += 1
             self.write(sse({"text": "Думаю…" if steps == 1 else f"Шаг {steps}: уточняю план…"}, "status"))
 
@@ -2581,6 +2593,17 @@ def self_test() -> int:
             and streamed_texts[-1] == "Готово!"
             and stream_msg.get("reasoning_content") == "Шаг 1: проверяю"
             and stream_msg.get("content") == "Готово!",
+        )
+
+        # 16. Политика шагов: безлимит (0 / >500) только при unlimited=True, иначе предел 500
+        check(
+            "resolve_steps_limit: unlimited=True снимает потолок и поддерживает 0 (без лимита), unlimited=False ограничивает 500",
+            resolve_steps_limit(0, True) == 0
+            and resolve_steps_limit(None, True) == 0
+            and resolve_steps_limit(1200, True) == 1200
+            and resolve_steps_limit(0, False) == MAX_STEPS_LIMIT
+            and resolve_steps_limit(1200, False) == MAX_STEPS_LIMIT
+            and resolve_steps_limit(25, False) == 25,
         )
 
     passed = sum(1 for item in checks if item)
