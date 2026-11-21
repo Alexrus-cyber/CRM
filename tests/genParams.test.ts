@@ -23,14 +23,20 @@ describe("настройки раздумий и генерации", () => {
     expect(decodeGenParams("{не json").reasoning).toBe("default");
   });
 
-  it("нормализует значения из запроса и поддерживает вывод до 384k токенов", () => {
+  it("нормализует значения из запроса и поддерживает режим max + безлимитный режим super_admin", () => {
     expect(normalizeGenParams({ temperature: 5 }).temperature).toBe(2);
     expect(normalizeGenParams({ reasoning: "budget", thinkingBudget: 2048 }).thinkingBudget).toBe(2048);
+    expect(normalizeGenParams({ reasoning: "max" }).reasoning).toBe("max");
     expect(normalizeGenParams({ maxTokens: 384000 }).maxTokens).toBe(384000);
     expect(normalizeGenParams({ maxTokens: 500000 }).maxTokens).toBe(384000);
+    expect(normalizeGenParams({ maxTokens: 500000 }, { unlimited: true }).maxTokens).toBe(500000);
     expect(normalizeGenParams({ thinkingBudget: 384000 }).thinkingBudget).toBe(384000);
+    expect(normalizeGenParams({ thinkingBudget: 500000 }, { unlimited: true }).thinkingBudget).toBe(500000);
     expect(normalizeParams({ maxTokens: 384000, thinkingBudget: 384000 }).maxTokens).toBe(384000);
     expect(normalizeParams({ maxTokens: 384000, thinkingBudget: 384000 }).thinkingBudget).toBe(384000);
+    expect(normalizeParams({ maxTokens: 600000, reasoning: "max" }, { unlimited: true }).maxTokens).toBe(600000);
+    expect(normalizeParams({ maxTokens: 600000, reasoning: "max" }, { unlimited: true }).reasoning).toBe("max");
+    expect(normalizeParams({ maxTokens: null }, { unlimited: true }).maxTokens).toBeNull();
   });
 
   it("различает безлимитный super_admin и потолок 500 шагов для остальных ролей (включая admin)", () => {

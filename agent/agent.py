@@ -595,6 +595,7 @@ def run_tool(
     approval_fn: Optional[Any] = None,
     sandbox_root: Path = SANDBOX_ROOT,
     browser_manager: Optional[browser_inspector.BrowserSessionManager] = None,
+    unlimited: bool = False,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Выполнить инструмент с учётом Sandbox и уровня доверия."""
     args = args or {}
@@ -613,7 +614,7 @@ def run_tool(
         else:
             data = content.encode("utf-8")
             file_name = safe_file_name(raw_name)
-        if len(data) > MAX_FILE_BYTES:
+        if not unlimited and len(data) > MAX_FILE_BYTES:
             raise AgentError(f"Файл больше {MAX_FILE_BYTES // 1000} КБ — сократи содержимое")
         try:
             (WORKSPACE / file_name).write_bytes(data)
@@ -656,7 +657,9 @@ def run_tool(
         if mode not in ("autonomous", "copilot", "game"):
             mode = "copilot"
         try:
-            op_steps = max(5, min(500, int(args.get("max_steps") or (50 if mode == "game" else 30))))
+            raw_steps = args.get("max_steps")
+            parsed_steps = int(raw_steps) if raw_steps is not None and raw_steps != "" else (50 if mode == "game" else 30)
+            op_steps = max(0, parsed_steps) if unlimited else max(5, min(500, parsed_steps))
         except (TypeError, ValueError):
             op_steps = 30
         coach_mode = "agent" if args.get("coach_after_each_step", True) else "after_step"
@@ -761,7 +764,9 @@ def run_tool(
         if mode not in ("autonomous", "copilot", "game"):
             mode = "copilot"
         try:
-            op_steps = max(5, min(500, int(args.get("max_steps") or (50 if mode == "game" else 30))))
+            raw_steps = args.get("max_steps")
+            parsed_steps = int(raw_steps) if raw_steps is not None and raw_steps != "" else (50 if mode == "game" else 30)
+            op_steps = (max(0, parsed_steps) if unlimited else max(5, min(500, parsed_steps)))
         except (TypeError, ValueError):
             op_steps = 30
         coach_after = bool(args.get("coach_after_each_step", True))
@@ -829,7 +834,12 @@ def run_tool(
 
     if name == "sandbox_write_file":
         try:
-            res = sandbox_mod.write_file(sandbox_root, str(args.get("path") or ""), str(args.get("content") or ""))
+            res = sandbox_mod.write_file(
+                sandbox_root,
+                str(args.get("path") or ""),
+                str(args.get("content") or ""),
+                unlimited=unlimited,
+            )
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
         events.append({"type": "sandbox_update", "path": res["path"], "size": res["size"], "kind": "file"})
@@ -842,20 +852,27 @@ def run_tool(
         try:
             proj_dir = sandbox_mod.mkdir(sandbox_root, project)
             created_dirs: List[str] = [proj_dir["path"]]
-            for sub in (args.get("directories") or [])[:100]:
+            dir_items = args.get("directories") or []
+            for sub in (dir_items if unlimited else dir_items[:100]):
                 sub_clean = str(sub or "").strip().lstrip("/\\")
                 if not sub_clean:
                     continue
                 d = sandbox_mod.mkdir(sandbox_root, f"{project}/{sub_clean}")
                 created_dirs.append(d["path"])
             created_files: List[str] = []
-            for item in (args.get("files") or [])[:100]:
+            file_items = args.get("files") or []
+            for item in (file_items if unlimited else file_items[:100]):
                 if not isinstance(item, dict):
                     continue
                 rel = str(item.get("path") or "").strip().lstrip("/\\")
                 if not rel:
                     continue
-                f = sandbox_mod.write_file(sandbox_root, f"{project}/{rel}", str(item.get("content") or ""))
+                f = sandbox_mod.write_file(
+                    sandbox_root,
+                    f"{project}/{rel}",
+                    str(item.get("content") or ""),
+                    unlimited=unlimited,
+                )
                 created_files.append(f["path"])
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
@@ -876,10 +893,11 @@ def run_tool(
 
     if name == "sandbox_list":
         try:
-            tree = sandbox_mod.list_tree(sandbox_root, str(args.get("path") or "."))
+            tree = sandbox_mod.list_tree(sandbox_root, str(args.get("path") or "."), unlimited=unlimited)
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
-        lines = [f"- [{item['type']}] {item['path']} ({item['size']} Б)" for item in tree["items"][:120]]
+        list_slice = tree["items"] if unlimited else tree["items"][:120]
+        lines = [f"- [{item['type']}] {item['path']} ({item['size']} Б)" for item in list_slice]
         return (
             f"Содержимое Sandbox ({tree['root']}):\n" + ("\n".join(lines) if lines else "(пусто)"),
             events,
@@ -887,7 +905,7 @@ def run_tool(
 
     if name == "sandbox_read_file":
         try:
-            text = sandbox_mod.read_file(sandbox_root, str(args.get("path") or ""))
+            text = sandbox_mod.read_file(sandbox_root, str(args.get("path") or ""), unlimited=unlimited)
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
         return text, events
@@ -938,10 +956,12 @@ def run_tool(
                 timeout=timeout_sec,
                 background=background,
                 process_manager=PROCESS_MANAGER,
+                unlimited=unlimited,
             )
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
 
+        raw_out = str(res.get("output") or "")
         events.append(
             {
                 "type": "command_result",
@@ -950,7 +970,7 @@ def run_tool(
                 "background": bool(res.get("background")),
                 "pid": res.get("pid"),
                 "exitCode": res.get("exitCode"),
-                "output": str(res.get("output") or "")[:4000],
+                "output": raw_out if unlimited else raw_out[:4000],
                 "url": res.get("url") or "",
             }
         )
@@ -1002,9 +1022,10 @@ def run_tool(
             )
 
         try:
-            res = sandbox_mod.run_pc_command(command)
+            res = sandbox_mod.run_pc_command(command, unlimited=unlimited)
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
+        raw_out = str(res.get("output") or "")
         events.append(
             {
                 "type": "command_result",
@@ -1012,7 +1033,7 @@ def run_tool(
                 "cwd": "ПК",
                 "background": False,
                 "exitCode": res.get("exitCode"),
-                "output": str(res.get("output") or "")[:4000],
+                "output": raw_out if unlimited else raw_out[:4000],
                 "url": "",
             }
         )
@@ -1109,8 +1130,8 @@ def apply_generation(payload: Dict[str, Any], params: Dict[str, Any]) -> None:
     if isinstance(seed, (int, float)):
         payload["seed"] = int(seed)
 
-    reasoning = str(params.get("reasoning") or "default")
-    if reasoning not in ("default", "off", "low", "medium", "high", "budget"):
+    reasoning = str(params.get("reasoning") or "default").strip().lower()
+    if reasoning not in ("default", "off", "low", "medium", "high", "max", "budget"):
         reasoning = "default"
     if reasoning == "default":
         return
@@ -1165,7 +1186,7 @@ def resolve_adaptive_coach_params(
     resolved["temperature"] = eff_temp
 
     user_reasoning = str(src.get("reasoning") or "default").strip().lower()
-    if user_reasoning not in ("default", "off", "low", "medium", "high", "budget"):
+    if user_reasoning not in ("default", "off", "low", "medium", "high", "max", "budget"):
         user_reasoning = "default"
 
     if user_reasoning == "default":
@@ -1193,7 +1214,7 @@ def resolve_adaptive_coach_params(
         except (TypeError, ValueError):
             user_max_tokens = None
 
-    min_tokens = 900 if eff_reasoning in ("medium", "high", "budget") else 600
+    min_tokens = 900 if eff_reasoning in ("medium", "high", "max", "budget") else 600
     resolved["maxTokens"] = max(min_tokens, user_max_tokens) if user_max_tokens is not None else min_tokens
 
     if "sendThinkingFlag" not in resolved:
@@ -1436,6 +1457,22 @@ def call_model(
         if has_tuning and ("400" in detail or "422" in detail) and any(
             w in detail for w in ("reasoning", "thinking", "chat_template", "unknown", "unsupported", "extra", "invalid")
         ):
+            if payload.get("reasoning_effort") == "max":
+                fallback_high = dict(payload)
+                fallback_high["reasoning_effort"] = "high"
+                log("модель не принимает reasoning_effort=max — пробую high")
+                try:
+                    return _consume_stream(fallback_high)
+                except AgentError as inner_err:
+                    detail = str(inner_err).lower()
+                    if not (
+                        ("400" in detail or "422" in detail)
+                        and any(
+                            w in detail
+                            for w in ("reasoning", "thinking", "chat_template", "unknown", "unsupported", "extra", "invalid")
+                        )
+                    ):
+                        raise
             stripped = {
                 k: v
                 for k, v in payload.items()
@@ -1789,7 +1826,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "/sandbox":
-            tree = sandbox_mod.list_tree(SANDBOX_ROOT, ".")
+            tree = sandbox_mod.list_tree(SANDBOX_ROOT, ".", unlimited=True)
             self._json(
                 200,
                 {
@@ -1922,6 +1959,7 @@ class Handler(BaseHTTPRequestHandler):
                     SANDBOX_ROOT,
                     f"transcripts/{raw_name}",
                     str(body.get("content") or ""),
+                    unlimited=True,
                 )
             except sandbox_mod.SandboxError as error:
                 self._json(400, {"error": str(error)})
@@ -2025,7 +2063,8 @@ class Handler(BaseHTTPRequestHandler):
             ),
         }
         system += f"\n\n{trust_notes[trust_level]}\nКорень Sandbox: {SANDBOX_ROOT}"
-        custom_system = str(body.get("systemPrompt") or "").strip()[:12_000]
+        raw_custom_system = str(body.get("systemPrompt") or "").strip()
+        custom_system = raw_custom_system if unlimited_role else raw_custom_system[:12_000]
         if custom_system:
             system += f"\n\nПользовательский системный промпт (обязательно следуй этим правилам):\n{custom_system}"
 
@@ -2042,7 +2081,8 @@ class Handler(BaseHTTPRequestHandler):
             if facts:
                 system += "\n\nКонтекст CRM:\n" + "\n".join(f"- {line}" for line in facts)
 
-            rag_context = str(context.get("ragContext") or "").strip()[:MAX_RAG_CHARS]
+            raw_rag = str(context.get("ragContext") or "").strip()
+            rag_context = raw_rag if unlimited_role else raw_rag[:MAX_RAG_CHARS]
             rag_meta = context.get("ragMeta") or {}
             if rag_context:
                 if rag_meta:
@@ -2068,15 +2108,20 @@ class Handler(BaseHTTPRequestHandler):
         attachments = body.get("attachments") or []
         if isinstance(attachments, list) and attachments:
             blocks = []
-            for item in attachments[:MAX_ATTACHMENTS]:
+            for item in (attachments if unlimited_role else attachments[:MAX_ATTACHMENTS]):
                 if not isinstance(item, dict):
                     continue
                 name = str(item.get("name") or "файл")[:MAX_NAME]
                 note = str(item.get("note") or "").strip()
-                text = str(item.get("text") or "").strip()[:MAX_ATTACHMENT_CHARS]
+                raw_att_text = str(item.get("text") or "").strip()
+                text = raw_att_text if unlimited_role else raw_att_text[:MAX_ATTACHMENT_CHARS]
                 header = "--- {} ---".format(name + (" · " + note if note else ""))
                 image = item.get("image")
-                has_image = isinstance(image, str) and image.startswith("data:image/") and len(images) < 3
+                has_image = (
+                    isinstance(image, str)
+                    and image.startswith("data:image/")
+                    and (unlimited_role or len(images) < 3)
+                )
                 if has_image:
                     images.append({"type": "image_url", "image_url": {"url": image}})
                 placeholder = "[картинка приложена ниже]" if has_image else "[содержимое недоступно]"
@@ -2088,9 +2133,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
-        for item in incoming[-100:]:
+        for item in (incoming if unlimited_role else incoming[-100:]):
             role = item.get("role")
-            content = str(item.get("content") or "")[:256_000]
+            raw_content = str(item.get("content") or "")
+            content = raw_content if unlimited_role else raw_content[:256_000]
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
         if attachment_block or images:
@@ -2197,7 +2243,7 @@ class Handler(BaseHTTPRequestHandler):
                 assistant_calls = []
                 captured_screen_images: List[Dict[str, Any]] = []
                 has_browser_images = False
-                for index, call in enumerate(tool_calls[:6]):
+                for index, call in enumerate(tool_calls if unlimited_role else tool_calls[:6]):
                     function = call.get("function") or {}
                     name = str(function.get("name") or "")
                     raw_args = function.get("arguments") or "{}"
@@ -2215,6 +2261,7 @@ class Handler(BaseHTTPRequestHandler):
                             approval_fn=self.await_website_approval,
                             sandbox_root=SANDBOX_ROOT,
                             browser_manager=browser_mgr,
+                            unlimited=unlimited_role,
                         )
                     except AgentError as error:
                         result_text, events = f"Ошибка инструмента: {error}", []
@@ -2225,7 +2272,7 @@ class Handler(BaseHTTPRequestHandler):
                             captured_screen_images.append({"type": "image_url", "image_url": {"url": img}})
                         imgs = event.pop("_images", None)
                         if isinstance(imgs, list):
-                            for item_img in imgs[:3]:
+                            for item_img in (imgs if unlimited_role else imgs[:3]):
                                 if isinstance(item_img, str) and item_img.startswith("data:image/"):
                                     captured_screen_images.append({"type": "image_url", "image_url": {"url": item_img}})
                                     has_browser_images = True
@@ -2250,16 +2297,17 @@ class Handler(BaseHTTPRequestHandler):
                     if has_browser_images
                     else "Снимок экрана ПК, переданный Оператором после разрешения пользователя:"
                 )
+                screen_slice = captured_screen_images if unlimited_role else captured_screen_images[:3]
                 if use_tools:
                     messages.append({"role": "assistant", "content": content, "tool_calls": assistant_calls})
                     messages.extend(call_results)
-                    if captured_screen_images:
+                    if screen_slice:
                         messages.append(
                             {
                                 "role": "user",
                                 "content": [
                                     {"type": "text", "text": image_note},
-                                    *captured_screen_images[:3],
+                                    *screen_slice,
                                 ],
                             }
                         )
@@ -2274,8 +2322,8 @@ class Handler(BaseHTTPRequestHandler):
                         {
                             "role": "user",
                             "content": (
-                                [{"type": "text", "text": results_text}, *captured_screen_images[:3]]
-                                if captured_screen_images
+                                [{"type": "text", "text": results_text}, *screen_slice]
+                                if screen_slice
                                 else results_text
                             ),
                         }
@@ -2744,6 +2792,49 @@ def self_test() -> int:
             and "browse_project" not in none_names
             and browse_none_blocked
             and browser_inspector.self_test() == 0,
+        )
+
+        # 18. Режим reasoning="max" и каскадный fallback "max" -> "high" -> strip при HTTP 400
+        max_payload: Dict[str, Any] = {}
+        apply_generation(max_payload, {"reasoning": "max", "sendThinkingFlag": True})
+        cascade_payloads: List[Dict[str, Any]] = []
+        prev_urlopen_max = urllib.request.urlopen
+        try:
+            def fake_max_urlopen(req: Any, timeout: int = 30) -> Any:
+                pl = json.loads((req.data or b"{}").decode("utf-8"))
+                cascade_payloads.append(pl)
+                effort = pl.get("reasoning_effort")
+                if effort in ("max", "high"):
+                    raise urllib.error.HTTPError(
+                        req.full_url,
+                        400,
+                        "Bad Request",
+                        hdrs=None,  # type: ignore[arg-type]
+                        fp=io.BytesIO(f'{{"error":"unsupported effort {effort}"}}'.encode("utf-8")),
+                    )
+                return io.BytesIO(
+                    b'data: {"choices":[{"delta":{"content":"OK_CASCADE"}}]}\ndata: [DONE]\n'
+                )
+
+            urllib.request.urlopen = fake_max_urlopen  # type: ignore[assignment]
+            cascade_res = call_model(
+                "http://localhost:1234",
+                "",
+                "test-model",
+                [{"role": "user", "content": "тест max"}],
+                None,
+                params={"reasoning": "max", "sendThinkingFlag": True},
+                on_text=lambda _: None,
+            )
+        finally:
+            urllib.request.urlopen = prev_urlopen_max  # type: ignore[assignment]
+        cascade_content = ((cascade_res.get("choices") or [{}])[0].get("message") or {}).get("content")
+        check(
+            "reasoning=max ставит reasoning_effort=max и каскадно откатывается max -> high -> strip при HTTP 400",
+            max_payload.get("reasoning_effort") == "max"
+            and (max_payload.get("chat_template_kwargs") or {}).get("enable_thinking") is True
+            and [p.get("reasoning_effort") for p in cascade_payloads] == ["max", "high", None]
+            and cascade_content == "OK_CASCADE",
         )
 
     passed = sum(1 for item in checks if item)

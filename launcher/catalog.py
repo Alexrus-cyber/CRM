@@ -38,6 +38,7 @@ REASONING_MODES: Tuple[Tuple[str, str], ...] = (
     ("low", "Коротко"),
     ("medium", "Средне"),
     ("high", "Глубоко"),
+    ("max", "Максимум"),
 )
 
 TRUST_LEVELS: Tuple[Tuple[str, str], ...] = (

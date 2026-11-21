@@ -83,13 +83,16 @@ export async function POST(req: Request) {
     return Response.json({ error: "Некорректный запрос" }, { status: 400 });
   }
 
+  const unlimited = me.role === "super_admin";
   if (!content && !file) return Response.json({ error: "Пустое сообщение" }, { status: 400 });
-  if (content.length > MAX_TEXT) return Response.json({ error: "Слишком длинное сообщение" }, { status: 400 });
+  if (!unlimited && content.length > MAX_TEXT) {
+    return Response.json({ error: "Слишком длинное сообщение" }, { status: 400 });
+  }
   if (peer === me.id) return Response.json({ error: "Нельзя писать самому себе" }, { status: 400 });
   if (peer !== 0 && !(await userExists(peer))) {
     return Response.json({ error: "Пользователь не найден" }, { status: 404 });
   }
-  if (file && file.size > MAX_FILE_BYTES) {
+  if (!unlimited && file && file.size > MAX_FILE_BYTES) {
     return Response.json({ error: "Файл больше 5 МБ" }, { status: 413 });
   }
 

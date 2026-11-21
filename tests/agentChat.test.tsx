@@ -237,6 +237,50 @@ function mockFetch() {
             : [],
         });
       }
+      if (url.startsWith("/api/ai/models") && method === "GET") {
+        return json({
+          ok: true,
+          models: ["o3-mini", "gpt-4o-mini"],
+          capabilitiesByModel: {
+            "o3-mini": {
+              model: "o3-mini",
+              supportsReasoning: true,
+              reasoningModes: ["default", "off", "low", "medium", "high", "max", "budget"],
+              supportsThinkingBudget: true,
+              supportsVision: false,
+              supportsTools: true,
+              maxContextLength: 200000,
+              maxOutputTokens: 100000,
+              source: "metadata",
+              note: "Метаданные o3-mini: reasoning high/max и budget",
+            },
+            "gpt-4o-mini": {
+              model: "gpt-4o-mini",
+              supportsReasoning: false,
+              reasoningModes: ["default", "off"],
+              supportsThinkingBudget: false,
+              supportsVision: true,
+              supportsTools: true,
+              maxContextLength: 128000,
+              maxOutputTokens: 16384,
+              source: "metadata",
+              note: "Модель gpt-4o-mini без расширенного reasoning",
+            },
+          },
+          selectedCapabilities: {
+            model: "o3-mini",
+            supportsReasoning: true,
+            reasoningModes: ["default", "off", "low", "medium", "high", "max", "budget"],
+            supportsThinkingBudget: true,
+            supportsVision: false,
+            supportsTools: true,
+            maxContextLength: 200000,
+            maxOutputTokens: 100000,
+            source: "metadata",
+            note: "Метаданные o3-mini: reasoning high/max и budget",
+          },
+        });
+      }
       if (url === "/api/ai/agent" && method === "POST") {
         sent.push(JSON.parse(String(init?.body ?? "{}")) as Sent);
         if (sseResponder) {
@@ -458,7 +502,8 @@ describe("вкладка «Агент»", () => {
     const textarea = await screen.findByPlaceholderText(/Например: открой ютуб/i);
     await waitFor(() => expect((textarea as HTMLTextAreaElement).disabled).toBe(false));
 
-    // Выбор уровня доверия «Дать полный доступ».
+    // Переходим во вкладку «Доверие и RAG», выбираем уровень доверия и RAG-папку.
+    fireEvent.click(screen.getByRole("tab", { name: /Доверие и RAG/i }));
     fireEvent.click(screen.getByRole("radio", { name: /Дать полный доступ/i }));
 
     // Открытие RAG-панели, выбор папки и «Вся база».
@@ -466,6 +511,9 @@ describe("вкладка «Агент»", () => {
     const ragSelect = await screen.findByLabelText("Выбор RAG-папки");
     fireEvent.change(ragSelect, { target: { value: "5" } });
     fireEvent.click(screen.getByRole("checkbox", { name: /Вся база/i }));
+
+    // Возвращаемся на последнюю вкладку «Чат» и отправляем запрос.
+    fireEvent.click(screen.getByRole("tab", { name: /^Чат$/i }));
 
     // Стриминговый ответ с запросом подтверждения экспорта из Sandbox:
     // завершаем поток только после отправки подтверждения, как в реальном agent.py.
@@ -575,6 +623,7 @@ describe("вкладка «Агент»", () => {
 
   it("корректно рендерит sandbox.projects формата {name, files} без ошибки React child", async () => {
     render(<AgentChat userName="Тест" />);
+    fireEvent.click(screen.getByRole("tab", { name: /Sandbox и Оператор/i }));
     expect(await screen.findByText(/Проекты: landing-site, crm-widget/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /Sandbox \(2\)/i }));
@@ -809,5 +858,59 @@ describe("вкладка «Агент»", () => {
     const savedActions = savedAssistant.body.actions as Array<Record<string, unknown>>;
     expect(savedActions[0]?.type).toBe("browser_inspect");
     expect(savedActions[0]?.preview).toBeUndefined();
+  });
+
+  it("переключается между видом по вкладкам (с чатом на последней вкладке) и классическим видом", async () => {
+    render(<AgentChat userName="Тест" />);
+
+    const tabs = screen.getAllByRole("tab");
+    expect(tabs.map((t) => t.textContent?.replace(/\d+$/, "").trim())).toEqual([
+      "Модель и генерация",
+      "Доверие и RAG",
+      "Sandbox и Оператор",
+      "Чат",
+    ]);
+    expect(tabs[tabs.length - 1]?.textContent).toBe("Чат");
+    expect(tabs[tabs.length - 1]?.getAttribute("aria-selected")).toBe("true");
+
+    // Переключаемся в классический вид: все настройки и чат видны на одном экране без вкладок.
+    fireEvent.click(screen.getByRole("button", { name: "Классический вид" }));
+    expect(screen.queryByRole("tablist")).toBeNull();
+    expect(screen.getByRole("radio", { name: /Дать полный доступ/i })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /Sandbox \(2\)/i })).toBeTruthy();
+    expect(screen.getByPlaceholderText(/Например: открой ютуб/i)).toBeTruthy();
+    expect(JSON.parse(localStorage.getItem("crm.ai.agent.layout.v1") ?? '""')).toBe("classic");
+
+    // Возвращаемся к виду по вкладкам.
+    fireEvent.click(screen.getByRole("button", { name: "По вкладкам" }));
+    expect(screen.getByRole("tablist")).toBeTruthy();
+    expect(JSON.parse(localStorage.getItem("crm.ai.agent.layout.v1") ?? '""')).toBe("tabs");
+  });
+
+  it("подтягивает список моделей, возможности и разрешает безлимитный ввод для super_admin", async () => {
+    render(<AgentChat userName="Тест" />);
+    fireEvent.click(screen.getByRole("tab", { name: /Модель и генерация/i }));
+
+    fireEvent.click(screen.getByRole("button", { name: /Подтянуть модели/i }));
+
+    const modelSelect = (await screen.findByLabelText("Выбрать модель из списка сервера")) as HTMLSelectElement;
+    expect(modelSelect.value).toBe("o3-mini");
+    expect(await screen.findByText(/Метаданные o3-mini/)).toBeTruthy();
+
+    // Системный промпт > 12000 символов и max_tokens > 384000 не обрезаются для unlimited (super_admin).
+    const longPrompt = "A".repeat(13_500);
+    const promptInput = screen.getByLabelText("Системный промпт агента") as HTMLTextAreaElement;
+    fireEvent.change(promptInput, { target: { value: longPrompt } });
+    expect(promptInput.value.length).toBe(13_500);
+    expect(screen.getByText(/13500 симв\. · без лимита/)).toBeTruthy();
+
+    const maxTokensInput = screen.getByLabelText("max_tokens") as HTMLInputElement;
+    fireEvent.change(maxTokensInput, { target: { value: "500000" } });
+    expect(maxTokensInput.value).toBe("500000");
+
+    // Переключаемся на gpt-4o-mini без reasoning и проверяем, что список режимов обновился.
+    fireEvent.change(modelSelect, { target: { value: "gpt-4o-mini" } });
+    const notes = await screen.findAllByText(/Модель gpt-4o-mini без расширенного reasoning/);
+    expect(notes.length).toBeGreaterThanOrEqual(1);
   });
 });

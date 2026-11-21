@@ -19,10 +19,12 @@ export function LazyChat({
   users,
   meId,
   initialPeer,
+  unlimited = false,
 }: {
   users: UserLite[];
   meId: number;
   initialPeer?: number;
+  unlimited?: boolean;
 }) {
   return (
     <LazyMount
@@ -31,7 +33,7 @@ export function LazyChat({
       label="Загружаем чат..."
       fallback={<ChatSkeleton />}
     >
-      <ChatClient users={users} meId={meId} initialPeer={initialPeer} />
+      <ChatClient users={users} meId={meId} initialPeer={initialPeer} unlimited={unlimited} />
     </LazyMount>
   );
 }

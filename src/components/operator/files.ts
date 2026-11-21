@@ -48,8 +48,12 @@ export function formatFileSize(bytes: number): string {
  * читается». Так «прикрепить» работает для любого типа и размера в пределах
  * лимита, а не только для тех, что умеет `extractFile`.
  */
-export async function readOperatorFile(file: File): Promise<OperatorAttachment> {
-  if (file.size > OPERATOR_MAX_FILE_BYTES) {
+export async function readOperatorFile(
+  file: File,
+  options: { unlimited?: boolean } = {},
+): Promise<OperatorAttachment> {
+  const unlimited = options.unlimited === true;
+  if (!unlimited && file.size > OPERATOR_MAX_FILE_BYTES) {
     throw new Error(`«${file.name}» больше 10 МБ — такие файлы бот не принимает`);
   }
   const data = await readBase64(file);
@@ -62,7 +66,7 @@ export async function readOperatorFile(file: File): Promise<OperatorAttachment> 
       image = compressed.dataUrl;
       note = `изображение · ${compressed.note} · vision-модель увидит картинку`;
     } else {
-      const extracted = await extractFile(file);
+      const extracted = await extractFile(file, unlimited ? { maxChars: null } : {});
       text = extracted.text;
       note = extracted.note;
     }
@@ -80,20 +84,27 @@ export async function readOperatorFile(file: File): Promise<OperatorAttachment> 
   };
 }
 
-/** Пакетная загрузка с проверкой лимита на количество. */
-export async function readOperatorFiles(current: OperatorAttachment[], incoming: FileList | File[]) {
+/** Пакетная загрузка с проверкой лимита на количество (для super_admin — без лимита). */
+export async function readOperatorFiles(
+  current: OperatorAttachment[],
+  incoming: FileList | File[],
+  options: { unlimited?: boolean } = {},
+) {
+  const unlimited = options.unlimited === true;
   const list = Array.from(incoming);
-  const room = OPERATOR_MAX_FILES - current.length;
+  const room = unlimited ? list.length : OPERATOR_MAX_FILES - current.length;
   const accepted = list.slice(0, Math.max(0, room));
   const skipped = list.slice(accepted.length);
-  const read = await Promise.all(accepted.map((file) => readOperatorFile(file).catch((error: Error) => error)));
+  const read = await Promise.all(
+    accepted.map((file) => readOperatorFile(file, options).catch((error: Error) => error)),
+  );
   const files: OperatorAttachment[] = [];
   const errors: string[] = [];
   for (const item of read) {
     if (item instanceof Error) errors.push(item.message);
     else files.push(item);
   }
-  if (skipped.length > 0) {
+  if (!unlimited && skipped.length > 0) {
     errors.push(`Можно приложить не больше ${OPERATOR_MAX_FILES} файлов — остальные пропущены`);
   }
   return { files, errors };

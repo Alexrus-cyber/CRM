@@ -108,10 +108,18 @@ export const RAG_CHARS_PER_TOKEN = 2.4;
  * потолок. Иначе считаем свободное место: контекст минус уже занятое историей и
  * минус резерв под ответ.
  */
-export function ragBudgetChars(contextLimit: number, usedTokens: number, reserveTokens = 0): number {
-  if (!Number.isFinite(contextLimit) || contextLimit <= 0) return RAG_FULL_MAX_CHARS;
+export function ragBudgetChars(
+  contextLimit: number,
+  usedTokens: number,
+  reserveTokens = 0,
+  unlimited = false,
+): number {
+  if (!Number.isFinite(contextLimit) || contextLimit <= 0) {
+    return unlimited ? Number.MAX_SAFE_INTEGER : RAG_FULL_MAX_CHARS;
+  }
   const free = contextLimit - Math.max(0, usedTokens) - Math.max(0, reserveTokens);
-  return Math.min(RAG_FULL_MAX_CHARS, Math.max(0, Math.floor(free * RAG_CHARS_PER_TOKEN)));
+  const raw = Math.max(0, Math.floor(free * RAG_CHARS_PER_TOKEN));
+  return unlimited ? raw : Math.min(RAG_FULL_MAX_CHARS, raw);
 }
 
 export type FullRagContext = {

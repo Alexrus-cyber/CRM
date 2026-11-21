@@ -245,10 +245,12 @@ const ZIP_TARGETS: Array<{ match: RegExp; files: (name: string) => boolean }> = 
   { match: /\.epub$/i, files: (name) => /\.x?html?$/i.test(name) },
 ];
 
-function clip(text: string): { text: string; truncated: boolean } {
+function clip(text: string, maxChars: number | null = MAX_EXTRACT_CHARS): { text: string; truncated: boolean } {
   const clean = text.replace(/\u0000/g, "").replace(/\r\n/g, "\n").trim();
-  if (clean.length <= MAX_EXTRACT_CHARS) return { text: clean, truncated: false };
-  return { text: clean.slice(0, MAX_EXTRACT_CHARS), truncated: true };
+  if (maxChars === null || !Number.isFinite(maxChars) || maxChars <= 0 || clean.length <= maxChars) {
+    return { text: clean, truncated: false };
+  }
+  return { text: clean.slice(0, maxChars), truncated: true };
 }
 
 /** Похоже ли содержимое на текст (эвристика для файлов без расширения). */
@@ -261,9 +263,13 @@ function looksLikeText(bytes: Uint8Array): boolean {
   return printable / Math.max(sample.length, 1) > 0.9;
 }
 
-export async function extractFile(file: File): Promise<ExtractedFile> {
+export async function extractFile(
+  file: File,
+  options: { maxChars?: number | null } = {},
+): Promise<ExtractedFile> {
   const name = file.name || "файл";
   const type = file.type || "";
+  const maxChars = options.maxChars === undefined ? MAX_EXTRACT_CHARS : options.maxChars;
 
   if (isImageMime(type)) {
     return { kind: "image", text: "", note: "картинка → модели как изображение", truncated: false };
@@ -287,7 +293,7 @@ export async function extractFile(file: File): Promise<ExtractedFile> {
           return xmlToPlainText(xml);
         })
         .join("\n\n");
-      const clipped = clip(joined);
+      const clipped = clip(joined, maxChars);
       if (!clipped.text) {
         return { kind: "unreadable", text: "", note: "не удалось прочитать содержимое архива", truncated: false };
       }
@@ -304,29 +310,29 @@ export async function extractFile(file: File): Promise<ExtractedFile> {
           truncated: false,
         };
       }
-      const clipped = clip(text);
+      const clipped = clip(text, maxChars);
       return { kind: "text", text: clipped.text, note: "PDF → текст", truncated: clipped.truncated };
     }
 
     if (/\.rtf$/i.test(name)) {
-      const clipped = clip(stripRtf(await file.text()));
+      const clipped = clip(stripRtf(await file.text()), maxChars);
       return { kind: "text", text: clipped.text, note: "RTF → текст", truncated: clipped.truncated };
     }
 
     if (/\.html?$/i.test(name) || type === "text/html") {
-      const clipped = clip(xmlToPlainText(await file.text()));
+      const clipped = clip(xmlToPlainText(await file.text()), maxChars);
       return { kind: "text", text: clipped.text, note: "HTML → текст", truncated: clipped.truncated };
     }
 
     if (isTextFile(type, name)) {
-      const clipped = clip(await file.text());
+      const clipped = clip(await file.text(), maxChars);
       return { kind: "text", text: clipped.text, note: "текст", truncated: clipped.truncated };
     }
 
     // Неизвестный формат: если байты выглядят текстом — прочитаем, иначе только метаданные.
     const buffer = await file.arrayBuffer();
     if (looksLikeText(new Uint8Array(buffer))) {
-      const clipped = clip(new TextDecoder("utf-8", { fatal: false }).decode(buffer));
+      const clipped = clip(new TextDecoder("utf-8", { fatal: false }).decode(buffer), maxChars);
       return { kind: "text", text: clipped.text, note: "распознано как текст", truncated: clipped.truncated };
     }
     return {

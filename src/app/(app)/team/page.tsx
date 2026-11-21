@@ -27,7 +27,7 @@ export default async function TeamPage({ searchParams }: { searchParams: Promise
       <PageHeader title="Команда и чат" subtitle={`${users.length} участников · общий чат и личные сообщения`} />
       <div className="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-[400px_minmax(0,1fr)]">
         <div className="min-w-0"><TeamList users={users} me={{ id: user.id, role: user.role }} stats={stats} /></div>
-        <div className="min-w-0"><LazyChat users={users} meId={user.id} initialPeer={sp.chat ? Number(sp.chat) || 0 : 0} /></div>
+        <div className="min-w-0"><LazyChat users={users} meId={user.id} initialPeer={sp.chat ? Number(sp.chat) || 0 : 0} unlimited={user.role === "super_admin"} /></div>
       </div>
     </>
   );

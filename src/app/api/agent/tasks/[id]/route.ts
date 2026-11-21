@@ -25,7 +25,7 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
   if (!task) return Response.json({ error: "Задание не найдено" }, { status: 404 });
 
   const [events, latestScreen, existingConv] = await Promise.all([
-    listAgentEvents(task.id),
+    listAgentEvents(task.id, 10_000),
     getLatestAgentScreen(task.id),
     findOperatorTaskConversation(me.id, task.id),
   ]);

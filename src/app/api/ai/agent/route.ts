@@ -83,34 +83,41 @@ export async function POST(req: Request) {
       }
     | null;
 
-  const messages = (body?.messages ?? [])
-    .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-    .slice(-100)
-    .map((m) => ({ role: m.role, content: String(m.content).slice(0, 256_000) }));
+  const unlimitedSteps = isUnlimitedStepsRole(me.role);
+  const rawMessages = (body?.messages ?? []).filter(
+    (m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string",
+  );
+  const messages = (unlimitedSteps ? rawMessages : rawMessages.slice(-100)).map((m) => ({
+    role: m.role,
+    content: unlimitedSteps ? String(m.content) : String(m.content).slice(0, 256_000),
+  }));
   if (messages.length === 0) {
     return Response.json({ error: "Пустой запрос" }, { status: 400 });
   }
 
-  const attachments = (body?.attachments ?? [])
-    .filter((item) => item && typeof item === "object")
-    .slice(0, 8)
-    .map((item) => {
-      const image =
-        typeof item.image === "string" && item.image.startsWith("data:image/")
-          ? item.image.slice(0, 6_000_000)
-          : "";
-      return {
-        name: String(item.name ?? "файл").slice(0, 160),
-        note: String(item.note ?? "").slice(0, 160),
-        text: String(item.text ?? "").slice(0, 120_000),
-        ...(image ? { image } : {}),
-      };
-    });
+  const rawAttachments = (body?.attachments ?? []).filter((item) => item && typeof item === "object");
+  const attachments = (unlimitedSteps ? rawAttachments : rawAttachments.slice(0, 8)).map((item) => {
+    const image =
+      typeof item.image === "string" && item.image.startsWith("data:image/")
+        ? unlimitedSteps
+          ? item.image
+          : item.image.slice(0, 6_000_000)
+        : "";
+    return {
+      name: String(item.name ?? "файл").slice(0, 240),
+      note: String(item.note ?? "").slice(0, 240),
+      text: unlimitedSteps ? String(item.text ?? "") : String(item.text ?? "").slice(0, 120_000),
+      ...(image ? { image } : {}),
+    };
+  });
 
   // RAG-окружение без искусственных ограничений: вся база или топ-N фрагментов.
   const ragFolderId = Number(body?.ragFolderId ?? 0) || 0;
   const ragFull = Boolean(body?.ragFull);
-  const ragChunks = Math.max(0, Math.min(500, Number(body?.ragChunks ?? 8) || 8));
+  const rawRagChunks = Number(body?.ragChunks ?? 8);
+  const ragChunks = unlimitedSteps
+    ? Math.max(0, Number.isFinite(rawRagChunks) ? Math.floor(rawRagChunks) : 8)
+    : Math.max(0, Math.min(500, Number.isFinite(rawRagChunks) ? Math.floor(rawRagChunks) : 8));
   const contextLimit = Math.max(0, Number(body?.contextLimit ?? 0) || 0);
 
   let ragContext = "";
@@ -122,7 +129,7 @@ export async function POST(req: Request) {
     if (folder) {
       const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
       if (ragFull) {
-        const chunks = await listRagChunks(ragFolderId);
+        const chunks = await listRagChunks(ragFolderId, unlimitedSteps ? 500_000 : 50_000);
         if (chunks.length > 0) {
           const relevant = lastUser ? await searchRagChunks(ragFolderId, lastUser, chunks.length) : [];
           const seen = new Set<number>();
@@ -139,7 +146,11 @@ export async function POST(req: Request) {
           }
           const usedTokens = messages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
           const budgetChars =
-            contextLimit > 0 ? ragBudgetChars(contextLimit, usedTokens, 1024) : RAG_FULL_MAX_CHARS;
+            contextLimit > 0
+              ? ragBudgetChars(contextLimit, usedTokens, 1024, unlimitedSteps)
+              : unlimitedSteps
+                ? Number.MAX_SAFE_INTEGER
+                : RAG_FULL_MAX_CHARS;
           const packed = formatFullRagContext(ordered, budgetChars);
           if (packed.used > 0) {
             ragContext = packed.text;
@@ -155,7 +166,12 @@ export async function POST(req: Request) {
       } else if (lastUser.trim()) {
         const hits = await searchRagChunks(ragFolderId, lastUser, ragChunks);
         if (hits.length > 0) {
-          const maxChars = contextLimit > 0 ? ragBudgetChars(contextLimit, 0, 1024) : RAG_FULL_MAX_CHARS;
+          const maxChars =
+            contextLimit > 0
+              ? ragBudgetChars(contextLimit, 0, 1024, unlimitedSteps)
+              : unlimitedSteps
+                ? Number.MAX_SAFE_INTEGER
+                : RAG_FULL_MAX_CHARS;
           ragContext = formatRagContext(hits, maxChars);
           ragMeta = {
             folderName: folder.name,
@@ -169,13 +185,16 @@ export async function POST(req: Request) {
     }
   }
 
-  const params = normalizeGenParams(body?.params);
-  const unlimitedSteps = isUnlimitedStepsRole(me.role);
+  const params = normalizeGenParams(body?.params, { unlimited: unlimitedSteps });
   const maxSteps = resolveStepsForRole(me.role, body?.maxSteps, unlimitedSteps ? 0 : AGENT_MAX_STEPS);
   const trustLevel = normalizeTrustLevel(body?.trustLevel);
   const runId = typeof body?.runId === "string" && body.runId.trim() ? body.runId.trim().slice(0, 80) : undefined;
   const systemPrompt =
-    typeof body?.systemPrompt === "string" ? body.systemPrompt.trim().slice(0, 12_000) : "";
+    typeof body?.systemPrompt === "string"
+      ? unlimitedSteps
+        ? body.systemPrompt.trim()
+        : body.systemPrompt.trim().slice(0, 12_000)
+      : "";
 
   const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl ?? "") ?? undefined;
   const payload = {

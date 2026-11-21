@@ -38,6 +38,7 @@ import {
   decodeGenParams,
   type GenParams,
 } from "@/lib/genParams";
+import { pickCapabilitiesForModel, type ModelCapabilities } from "@/lib/modelCapabilities";
 import {
   DEFAULT_TRUST_LEVEL,
   decodeTrustLevel,
@@ -160,7 +161,7 @@ type BotCheckState = {
   checkedAt?: string;
 };
 
-export function OperatorPanel() {
+export function OperatorPanel({ unlimited = true }: { unlimited?: boolean } = {}) {
   const [tab, setTab] = useState<SubTab>("desk");
   // Подключение и токен из карточки «Подключения и токены» (хранятся в базе).
   const [connection, setConnection] = useState<ConnectionSelection | null>(null);
@@ -185,7 +186,7 @@ export function OperatorPanel() {
   const [genParams, setGenParams] = useStoredJson<GenParams>(
     "crm.ai.operator.params.v1",
     GEN_DEFAULT_PARAMS,
-    decodeGenParams,
+    (raw) => decodeGenParams(raw, { unlimited }),
   );
   const [trustLevel, setTrustLevel] = useStoredJson<TrustLevel>(
     "crm.ai.operator.trust.v1",
@@ -227,6 +228,8 @@ export function OperatorPanel() {
   const [dryRun, setDryRun] = useState(false);
   const [assumeYes, setAssumeYes] = useState(false);
   const [textOnly, setTextOnly] = useState(false);
+  const [capabilitiesByModel, setCapabilitiesByModel] = useState<Record<string, ModelCapabilities>>({});
+  const [refreshingCaps, setRefreshingCaps] = useState(false);
 
   /* ------------------------------ загрузка ------------------------------ */
 
@@ -506,7 +509,7 @@ export function OperatorPanel() {
   const attachToTask = async (list: FileList | File[]) => {
     if (list.length === 0) return;
     setError(null);
-    const { files: added, errors } = await readOperatorFiles(taskFiles, list);
+    const { files: added, errors } = await readOperatorFiles(taskFiles, list, { unlimited });
     setTaskFiles((prev) => [...prev, ...added]);
     if (errors.length > 0) setError(errors[0]);
   };
@@ -684,6 +687,44 @@ export function OperatorPanel() {
   const effectiveToken = (connection?.token.trim() || tokenInput.trim()).trim();
 
   const providerMeta = findProvider(provider);
+  const resolvedModelName = model.trim() || providerMeta.defaultModel;
+  const modelCapabilities = useMemo(
+    () => pickCapabilitiesForModel(capabilitiesByModel, resolvedModelName),
+    [capabilitiesByModel, resolvedModelName],
+  );
+
+  const refreshModelCapabilities = useCallback(async () => {
+    if (refreshingCaps) return;
+    setRefreshingCaps(true);
+    try {
+      const base = providerBaseUrl(provider);
+      const res = await fetch(
+        `/api/ai/models?base=${encodeURIComponent(base)}&model=${encodeURIComponent(resolvedModelName)}`,
+        {
+          headers: apiKey.trim() ? { "x-ai-key": apiKey.trim() } : undefined,
+          cache: "no-store",
+        },
+      );
+      if (!res.ok) return;
+      const data = (await res.json().catch(() => ({}))) as {
+        capabilitiesByModel?: Record<string, ModelCapabilities>;
+        selectedCapabilities?: ModelCapabilities;
+      };
+      if (data.capabilitiesByModel || data.selectedCapabilities) {
+        setCapabilitiesByModel((prev) => ({
+          ...prev,
+          ...(data.capabilitiesByModel ?? {}),
+          ...(data.selectedCapabilities && resolvedModelName
+            ? { [resolvedModelName]: data.selectedCapabilities }
+            : {}),
+        }));
+      }
+    } catch {
+      /* сервер модели может быть недоступен локально */
+    } finally {
+      setRefreshingCaps(false);
+    }
+  }, [apiKey, provider, refreshingCaps, resolvedModelName]);
   const commandOptions = useMemo(
     () => ({
       provider,
@@ -833,7 +874,12 @@ export function OperatorPanel() {
             value={genParams}
             onChange={setGenParams}
             defaultOpen
-            subtitle="Раздумья модели и параметры генерации. Действуют и на планировщик, и на команду запуска бота."
+            capabilities={modelCapabilities}
+            unlimited={unlimited}
+            modelName={resolvedModelName}
+            onRefreshCapabilities={() => void refreshModelCapabilities()}
+            refreshingCapabilities={refreshingCaps}
+            subtitle="Раздумья модели (подтягиваются по возможностям модели) и параметры генерации. Действуют и на планировщик, и на команду запуска бота."
           >
             <div className="grid gap-2 sm:grid-cols-2">
               <label className="flex items-start gap-2 text-[11px] text-muted">
@@ -867,6 +913,7 @@ export function OperatorPanel() {
             <PlannerChat
               providerLabel={providerMeta.label}
               params={genParams}
+              unlimited={unlimited}
               baseUrl={providerBaseUrl(provider)}
               model={model.trim() || providerMeta.defaultModel}
               apiKey={apiKey.trim()}
@@ -951,7 +998,7 @@ export function OperatorPanel() {
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
                 rows={3}
-                maxLength={4000}
+                maxLength={unlimited ? undefined : 4000}
                 placeholder={
                   taskMode === "game"
                     ? "Опишите цель в игре и управление (например: иди вперёд по тропе, нажми E у двери)"
@@ -1034,7 +1081,11 @@ export function OperatorPanel() {
                   size="sm"
                   variant="secondary"
                   onClick={() => taskFileRef.current?.click()}
-                  title="Файлы (до 5 по 10 МБ) — бот прочитает текст и учтёт в плане"
+                  title={
+                    unlimited
+                      ? "Любые файлы без лимита — бот прочитает текст и учтёт в плане"
+                      : "Файлы (до 5 по 10 МБ) — бот прочитает текст и учтёт в плане"
+                  }
                 >
                   <Paperclip size={11} /> файлы
                 </Button>

@@ -85,7 +85,7 @@ export function aiAuthHeaders(apiKey: string): Record<string, string> {
 
 /* ---------------------------- параметры генерации ------------------------- */
 
-export type ReasoningMode = "default" | "off" | "low" | "medium" | "high" | "budget";
+export type ReasoningMode = "default" | "off" | "low" | "medium" | "high" | "max" | "budget";
 
 export type AiParams = {
   /** Системный промпт — уходит первым сообщением. */
@@ -136,13 +136,22 @@ export const AI_REASONING_MODES: Array<{ value: ReasoningMode; label: string; hi
   { value: "low", label: "Коротко", hint: "reasoning_effort: low" },
   { value: "medium", label: "Средне", hint: "reasoning_effort: medium" },
   { value: "high", label: "Глубоко", hint: "reasoning_effort: high" },
+  { value: "max", label: "Максимально (Max)", hint: "reasoning_effort: max, enable_thinking: true" },
   { value: "budget", label: "Свой бюджет", hint: "thinking_budget — число токенов на размышления" },
 ];
 
+export type NormalizeParamsOptions = {
+  /** Снять все искусственные потолки для Главного администратора (`super_admin`). */
+  unlimited?: boolean;
+};
+
 /** Приводит «сырые» параметры из localStorage/тела запроса к безопасному виду. */
-export function normalizeParams(raw: unknown): AiParams {
+export function normalizeParams(raw: unknown, options: NormalizeParamsOptions = {}): AiParams {
   const source = (raw ?? {}) as Partial<AiParams>;
+  const unlimited = options.unlimited === true;
+  const maxGen = unlimited ? Number.MAX_SAFE_INTEGER : AI_MAX_GENERATION_TOKENS;
   const num = (value: unknown, min: number, max: number): number | null => {
+    if (value === null || value === undefined || value === "") return null;
     const parsed = typeof value === "number" ? value : Number(value);
     if (!Number.isFinite(parsed)) return null;
     return Math.min(Math.max(parsed, min), max);
@@ -151,17 +160,23 @@ export function normalizeParams(raw: unknown): AiParams {
     ? (source.reasoning as ReasoningMode)
     : AI_DEFAULT_PARAMS.reasoning;
   return {
-    system: typeof source.system === "string" ? source.system.slice(0, 8000) : AI_DEFAULT_PARAMS.system,
+    system:
+      typeof source.system === "string"
+        ? unlimited
+          ? source.system
+          : source.system.slice(0, 8000)
+        : AI_DEFAULT_PARAMS.system,
     temperature: num(source.temperature, 0, 2),
     topP: num(source.topP, 0, 1),
-    maxTokens: num(source.maxTokens, 1, AI_MAX_GENERATION_TOKENS),
+    maxTokens: num(source.maxTokens, 1, maxGen),
     seed: num(source.seed, 0, 2 ** 31),
     reasoning,
-    thinkingBudget: num(source.thinkingBudget, 64, AI_MAX_GENERATION_TOKENS),
+    thinkingBudget: num(source.thinkingBudget, unlimited ? 1 : 64, maxGen),
     sendThinkingFlag: source.sendThinkingFlag !== false,
-    ragChunks: num(source.ragChunks, 0, 50) ?? AI_DEFAULT_PARAMS.ragChunks,
+    ragChunks: num(source.ragChunks, 0, unlimited ? Number.MAX_SAFE_INTEGER : 50) ?? AI_DEFAULT_PARAMS.ragChunks,
     ragFull: source.ragFull === true,
-    contextLimit: num(source.contextLimit, 0, 1_000_000) ?? AI_DEFAULT_PARAMS.contextLimit,
+    contextLimit:
+      num(source.contextLimit, 0, unlimited ? Number.MAX_SAFE_INTEGER : 1_000_000) ?? AI_DEFAULT_PARAMS.contextLimit,
     streamUsage: source.streamUsage !== false,
   };
 }

@@ -140,10 +140,10 @@ def relative_to_root(root: Path, target: Path) -> str:
     return target.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix()
 
 
-def write_file(root: Path, rel_path: str, content: str) -> Dict[str, Any]:
+def write_file(root: Path, rel_path: str, content: str, *, unlimited: bool = False) -> Dict[str, Any]:
     target = safe_resolve(root, rel_path, allow_root=False)
     data = (content or "").encode("utf-8")
-    if len(data) > MAX_SANDBOX_FILE_BYTES:
+    if not unlimited and len(data) > MAX_SANDBOX_FILE_BYTES:
         raise SandboxError(f"Файл «{rel_path}» превышает лимит {MAX_SANDBOX_FILE_BYTES // 1000} КБ")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
@@ -159,11 +159,12 @@ def mkdir(root: Path, rel_path: str) -> Dict[str, Any]:
     return {"path": relative_to_root(root, target)}
 
 
-def read_file(root: Path, rel_path: str, limit: int = 30_000) -> str:
+def read_file(root: Path, rel_path: str, limit: int = 30_000, *, unlimited: bool = False) -> str:
     target = safe_resolve(root, rel_path, allow_root=False)
     if not target.is_file():
         raise SandboxError(f"Файл не найден в Sandbox: {rel_path}")
-    return target.read_text(encoding="utf-8", errors="replace")[:limit]
+    text = target.read_text(encoding="utf-8", errors="replace")
+    return text if (unlimited or limit <= 0) else text[:limit]
 
 
 def delete_path(root: Path, rel_path: str) -> bool:
@@ -177,7 +178,7 @@ def delete_path(root: Path, rel_path: str) -> bool:
     return True
 
 
-def list_tree(root: Path, rel_path: str = ".") -> Dict[str, Any]:
+def list_tree(root: Path, rel_path: str = ".", *, unlimited: bool = False) -> Dict[str, Any]:
     root_resolved = root.resolve(strict=False)
     base = safe_resolve(root_resolved, rel_path, allow_root=True)
     if not base.exists():
@@ -198,7 +199,7 @@ def list_tree(root: Path, rel_path: str = ".") -> Dict[str, Any]:
         rel = relative_to_root(root_resolved, entry)
         if rel.startswith(".tmp"):
             continue
-        if len(items) >= MAX_LIST_ITEMS:
+        if not unlimited and len(items) >= MAX_LIST_ITEMS:
             break
         items.append({
             "path": rel,
@@ -476,6 +477,8 @@ def run_command(
     timeout: int = 60,
     background: bool = False,
     process_manager: Optional[ProcessManager] = None,
+    *,
+    unlimited: bool = False,
 ) -> Dict[str, Any]:
     """Выполнить bash/shell-команду строго внутри песочницы `root`."""
     if background:
@@ -489,7 +492,8 @@ def run_command(
     cwd = safe_resolve(root, rel_cwd, allow_root=True)
     cwd.mkdir(parents=True, exist_ok=True)
     env = sanitized_env(root, cwd)
-    safe_timeout = max(1, min(300, int(timeout or 60)))
+    raw_timeout = int(timeout or 60)
+    safe_timeout = max(1, raw_timeout if unlimited else min(300, raw_timeout))
 
     try:
         completed = subprocess.run(
@@ -509,7 +513,8 @@ def run_command(
             f"Команда превысила таймаут {safe_timeout} с. Если это сервер — запустите с background=true.\n{partial[:2000]}"
         ) from error
 
-    output = (completed.stdout or "").strip()[:MAX_OUTPUT_CHARS]
+    raw_output = (completed.stdout or "").strip()
+    output = raw_output if unlimited else raw_output[:MAX_OUTPUT_CHARS]
     return {
         "background": False,
         "exitCode": completed.returncode,
@@ -519,12 +524,13 @@ def run_command(
     }
 
 
-def run_pc_command(command: str, timeout: int = 60) -> Dict[str, Any]:
+def run_pc_command(command: str, timeout: int = 60, *, unlimited: bool = False) -> Dict[str, Any]:
     """Команда на ПК пользователя (вызывается только при полном доверии или явном разрешении на сайте)."""
     text = (command or "").strip()
     if not text:
         raise SandboxError("Пустая команда")
-    safe_timeout = max(1, min(180, int(timeout or 60)))
+    raw_timeout = int(timeout or 60)
+    safe_timeout = max(1, raw_timeout if unlimited else min(180, raw_timeout))
     try:
         completed = subprocess.run(
             _shell_argv(text),
@@ -538,7 +544,8 @@ def run_pc_command(command: str, timeout: int = 60) -> Dict[str, Any]:
         )
     except subprocess.TimeoutExpired as error:
         raise SandboxError(f"Команда на ПК превысила таймаут {safe_timeout} с") from error
-    output = (completed.stdout or "").strip()[:MAX_OUTPUT_CHARS]
+    raw_output = (completed.stdout or "").strip()
+    output = raw_output if unlimited else raw_output[:MAX_OUTPUT_CHARS]
     return {
         "exitCode": completed.returncode,
         "output": output or f"(вывод пуст, код возврата {completed.returncode})",

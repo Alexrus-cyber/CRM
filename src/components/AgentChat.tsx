@@ -55,6 +55,7 @@ import {
   decodeGenParams,
   type GenParams,
 } from "@/lib/genParams";
+import { pickCapabilitiesForModel, type ModelCapabilities } from "@/lib/modelCapabilities";
 import { DEFAULT_TRUST_LEVEL, decodeTrustLevel, findTrustLevel, type TrustLevel } from "@/lib/trust";
 import {
   OPERATOR_TASK_MODES,
@@ -321,12 +322,33 @@ const EXAMPLES = [
 const DEFAULT_SETTINGS: AiSettings = { baseUrl: AI_DEFAULT_BASE_URL, apiKey: "", model: "" };
 const DEFAULT_RAG_PREFS: RagPrefs = { folderId: 0, ragFull: false, ragChunks: 12 };
 
-function decodeSystemPrompt(raw: string): string {
+type AgentLayoutMode = "tabs" | "classic";
+type AgentTabId = "model" | "knowledge" | "workspace" | "chat";
+
+const AGENT_TABS: Array<{ id: AgentTabId; label: string; hint: string }> = [
+  { id: "model", label: "Модель и генерация", hint: "Подключение, выбор модели, возможности, раздумья и системный промпт" },
+  { id: "knowledge", label: "Доверие и RAG", hint: "Уровень доверия ИИ, RAG-база знаний, контекст и архив переписок" },
+  { id: "workspace", label: "Sandbox и Оператор", hint: "Изолированная папка Sandbox, экспорт на ПК и совместная работа с Оператором" },
+  { id: "chat", label: "Чат", hint: "История переписок, диалог с Агентом, вложения и запуск" },
+];
+
+function decodeLayoutMode(raw: string): AgentLayoutMode {
   try {
     const parsed: unknown = JSON.parse(raw);
-    return typeof parsed === "string" ? parsed.slice(0, 12_000) : "";
+    return parsed === "classic" ? "classic" : "tabs";
   } catch {
-    return String(raw ?? "").slice(0, 12_000);
+    return raw === "classic" ? "classic" : "tabs";
+  }
+}
+
+function decodeSystemPrompt(raw: string, unlimited = false): string {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "string") return "";
+    return unlimited ? parsed : parsed.slice(0, 12_000);
+  } catch {
+    const str = String(raw ?? "");
+    return unlimited ? str : str.slice(0, 12_000);
   }
 }
 
@@ -345,13 +367,14 @@ function decodeSettings(raw: string): AiSettings {
   };
 }
 
-function decodeRagPrefs(raw: string): RagPrefs {
+function decodeRagPrefs(raw: string, unlimited = false): RagPrefs {
   try {
     const parsed = JSON.parse(raw) as Partial<RagPrefs>;
+    const chunks = Math.max(0, Math.floor(Number(parsed.ragChunks ?? 12)));
     return {
       folderId: Math.max(0, Math.floor(Number(parsed.folderId) || 0)),
       ragFull: Boolean(parsed.ragFull),
-      ragChunks: Math.min(500, Math.max(0, Math.floor(Number(parsed.ragChunks ?? 12)))),
+      ragChunks: unlimited ? chunks : Math.min(500, chunks),
     };
   } catch {
     return DEFAULT_RAG_PREFS;
@@ -374,7 +397,13 @@ function turnsToTranscript(turns: Turn[]): TranscriptTurn[] {
   }));
 }
 
-export function AgentChat({ userName }: { userName: string }) {
+export function AgentChat({ userName, unlimited = true }: { userName: string; unlimited?: boolean }) {
+  const [layoutMode, setLayoutMode] = useStoredJson<AgentLayoutMode>(
+    "crm.ai.agent.layout.v1",
+    "tabs",
+    decodeLayoutMode,
+  );
+  const [activeTab, setActiveTab] = useState<AgentTabId>("chat");
   const [settings, setSettings] = useStoredJson<AiSettings>(
     AI_STORAGE_SETTINGS,
     DEFAULT_SETTINGS,
@@ -383,7 +412,7 @@ export function AgentChat({ userName }: { userName: string }) {
   const [params, setParams] = useStoredJson<GenParams>(
     "crm.ai.agent.params.v1",
     GEN_DEFAULT_PARAMS,
-    decodeGenParams,
+    (raw) => decodeGenParams(raw, { unlimited }),
   );
   const [trustLevel, setTrustLevel] = useStoredJson<TrustLevel>(
     "crm.ai.agent.trust.v1",
@@ -393,7 +422,7 @@ export function AgentChat({ userName }: { userName: string }) {
   const [ragPrefs, setRagPrefs] = useStoredJson<RagPrefs>(
     "crm.ai.agent.rag.v1",
     DEFAULT_RAG_PREFS,
-    decodeRagPrefs,
+    (raw) => decodeRagPrefs(raw, unlimited),
   );
   const [maxSteps, setMaxSteps] = useStoredJson<number>(
     "crm.ai.agent.steps.v1",
@@ -407,8 +436,11 @@ export function AgentChat({ userName }: { userName: string }) {
   const [systemPrompt, setSystemPrompt] = useStoredJson<string>(
     "crm.ai.agent.system.v1",
     "",
-    decodeSystemPrompt,
+    (raw) => decodeSystemPrompt(raw, unlimited),
   );
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [capabilitiesByModel, setCapabilitiesByModel] = useState<Record<string, ModelCapabilities>>({});
+  const [checkingModels, setCheckingModels] = useState(false);
 
   const [health, setHealth] = useState<Health | null>(null);
   const [conversations, setConversations] = useState<AgentConversation[]>([]);
@@ -504,6 +536,45 @@ export function AgentChat({ userName }: { userName: string }) {
   const saveSettings = (next: AiSettings) => {
     setSettings(next);
   };
+
+  const refreshModelsAndCapabilities = useCallback(async () => {
+    if (checkingModels) return;
+    setCheckingModels(true);
+    try {
+      const targetModel = settings.model.trim();
+      const qs = new URLSearchParams({ base: settings.baseUrl });
+      if (targetModel) qs.set("model", targetModel);
+      const res = await fetch(`/api/ai/models?${qs.toString()}`, {
+        headers: settings.apiKey.trim() ? { "x-ai-key": settings.apiKey.trim() } : undefined,
+        cache: "no-store",
+      });
+      if (!res.ok) return;
+      const data = (await res.json().catch(() => ({}))) as {
+        models?: string[];
+        capabilitiesByModel?: Record<string, ModelCapabilities>;
+        selectedCapabilities?: ModelCapabilities;
+      };
+      if (Array.isArray(data.models)) {
+        setAvailableModels(data.models);
+        if (!settings.model.trim() && data.models.length > 0) {
+          setSettings({ ...settings, model: data.models[0] });
+        }
+      }
+      if (data.capabilitiesByModel || data.selectedCapabilities) {
+        setCapabilitiesByModel((prev) => ({
+          ...prev,
+          ...(data.capabilitiesByModel ?? {}),
+          ...(data.selectedCapabilities && (targetModel || data.models?.[0])
+            ? { [targetModel || data.models![0]]: data.selectedCapabilities }
+            : {}),
+        }));
+      }
+    } catch {
+      /* сервер модели может быть недоступен локально */
+    } finally {
+      setCheckingModels(false);
+    }
+  }, [checkingModels, setSettings, settings]);
 
   const loadHealth = useCallback(async (): Promise<Health> => {
     try {
@@ -837,17 +908,20 @@ export function AgentChat({ userName }: { userName: string }) {
       const data = (await res.json()) as { transcript?: { content?: string; fileName?: string } };
       const content = String(data.transcript?.content ?? "");
       if (!content) throw new Error("Файл переписки пуст");
-      setAttachments((prev) => [
-        ...prev.slice(0, 4),
-        {
-          name: item.fileName || `transcript-${item.id}.md`,
-          mime: "text/markdown",
-          size: content.length,
-          data: "",
-          text: content,
-          note: "архивная переписка агента",
-        },
-      ]);
+      setAttachments((prev) => {
+        const next = [
+          ...prev,
+          {
+            name: item.fileName || `transcript-${item.id}.md`,
+            mime: "text/markdown",
+            size: content.length,
+            data: "",
+            text: content,
+            note: "архивная переписка агента",
+          },
+        ];
+        return unlimited ? next : next.slice(-5);
+      });
       setNotice(`Файл переписки «${item.fileName}» приложен к запросу — можно задать вопрос или продолжить работу.`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Не удалось приложить переписку");
@@ -873,10 +947,10 @@ export function AgentChat({ userName }: { userName: string }) {
       for (let i = 0; i < files.length; i += 1) {
         const file = files[i];
         const path = (file.webkitRelativePath || file.name).slice(0, 300);
-        if (file.size > AI_MAX_FILE_BYTES) {
+        if (!unlimited && file.size > AI_MAX_FILE_BYTES) {
           skipped += 1;
         } else {
-          const extracted = await extractFile(file);
+          const extracted = await extractFile(file, unlimited ? { maxChars: null } : {});
           if (extracted.kind === "text" && extracted.text.trim()) {
             items.push({ path, chunks: splitIntoChunks(extracted.text) });
           } else {
@@ -1366,6 +1440,7 @@ export function AgentChat({ userName }: { userName: string }) {
       setOpDraftSteps(Math.max(0, Math.floor(Number(data.maxSteps ?? 0) || 0)));
       setOpDraftNotes(String(data.notes ?? ""));
       setOpBridgeOpen(true);
+      if (layoutMode === "tabs") setActiveTab("workspace");
     } catch {
       setError("Сеть недоступна при формулировке задачи Оператора");
     } finally {
@@ -1586,14 +1661,14 @@ export function AgentChat({ userName }: { userName: string }) {
       if (incoming.length === 0 || running || reading || historyLoading || conversationId === null) return;
       setError(null);
       setReading(true);
-      void readOperatorFiles(attachments, incoming)
+      void readOperatorFiles(attachments, incoming, { unlimited })
         .then(({ files, errors }) => {
           if (files.length > 0) setAttachments((prev) => [...prev, ...files]);
           if (errors.length > 0) setError(errors[0]);
         })
         .finally(() => setReading(false));
     },
-    [attachments, conversationId, historyLoading, reading, running],
+    [attachments, conversationId, historyLoading, reading, running, unlimited],
   );
 
   const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
@@ -1972,6 +2047,11 @@ export function AgentChat({ userName }: { userName: string }) {
     [ragFolders, ragPrefs.folderId],
   );
   const trustMeta = findTrustLevel(trustLevel);
+  const modelCapabilities = useMemo(
+    () => pickCapabilitiesForModel(capabilitiesByModel, settings.model),
+    [capabilitiesByModel, settings.model],
+  );
+  const isTabs = layoutMode === "tabs";
 
   return (
     <div className="space-y-3">
@@ -2015,6 +2095,36 @@ export function AgentChat({ userName }: { userName: string }) {
           {trustMeta.shortLabel}
         </span>
         {health?.endpoint && <span className="text-muted">· {health.endpoint}</span>}
+        <div
+          role="group"
+          aria-label="Режим отображения агента"
+          className="ml-auto flex items-center rounded-lg border border-border bg-card p-0.5 text-[10px]"
+        >
+          <button
+            type="button"
+            aria-pressed={isTabs}
+            onClick={() => setLayoutMode("tabs")}
+            className={cn(
+              "rounded-md px-2 py-0.5 font-medium transition",
+              isTabs ? "bg-accent/20 text-text" : "text-muted hover:text-text",
+            )}
+            title="Упорядоченный вид по вкладкам с чатом на последней вкладке"
+          >
+            По вкладкам
+          </button>
+          <button
+            type="button"
+            aria-pressed={!isTabs}
+            onClick={() => setLayoutMode("classic")}
+            className={cn(
+              "rounded-md px-2 py-0.5 font-medium transition",
+              !isTabs ? "bg-accent/20 text-text" : "text-muted hover:text-text",
+            )}
+            title="Классический вид: все настройки и чат на одном экране"
+          >
+            Классический вид
+          </button>
+        </div>
         <button
           type="button"
           onClick={() => {
@@ -2022,162 +2132,312 @@ export function AgentChat({ userName }: { userName: string }) {
             void refreshSandbox();
             void refreshOperatorOverview();
           }}
-          className="ml-auto rounded-lg border border-border bg-card px-2 py-1 font-medium text-muted transition hover:text-text"
+          className="rounded-lg border border-border bg-card px-2 py-1 font-medium text-muted transition hover:text-text"
         >
           Проверить
         </button>
       </div>
 
-      {/* Выбор уровня доверия ИИ */}
-      <TrustSelector value={trustLevel} onChange={setTrustLevel} disabled={running} />
-
-      <div className="flex flex-wrap items-center gap-1.5 rounded-xl border border-border bg-card p-2">
-        <History size={13} className="ml-1 text-muted" />
-        <select
-          aria-label="История чатов агента"
-          value={conversationId ?? ""}
-          onChange={(event) => {
-            const id = Number(event.target.value);
-            if (id > 0) void selectConversation(id);
-          }}
-          disabled={historyLoading || conversations.length === 0}
-          className="h-8 min-w-0 flex-1 rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent disabled:opacity-60"
+      {isTabs && (
+        <div
+          role="tablist"
+          aria-label="Разделы агента"
+          className="flex gap-1 overflow-x-auto rounded-2xl border border-border bg-card p-1"
         >
-          {conversations.length === 0 ? (
-            <option value="">{historyLoading ? "Загружаю историю…" : "Чатов пока нет"}</option>
-          ) : (
-            conversations.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.title || "Новый чат"} · {item.messagesCount} сообщ.
-              </option>
-            ))
-          )}
-        </select>
-        <button
-          type="button"
-          onClick={() => void rolloverToSummaryChat(turns, "manual")}
-          disabled={historyLoading || running || summarizing || turns.length === 0}
-          className="flex h-8 items-center gap-1 rounded-lg border border-border bg-card2 px-2 text-[10px] font-medium text-muted transition hover:text-text disabled:opacity-40"
-          title="Сжать переписку в Summary, сохранить полный текст в .md и открыть новый чат"
-        >
-          {summarizing ? <Loader2 size={12} className="animate-spin" /> : <Archive size={12} />}
-          Сжать в Summary и новый чат
-        </button>
-        <button
-          type="button"
-          onClick={() => void startNewConversation()}
-          disabled={historyLoading || running}
-          className="flex h-8 items-center gap-1 rounded-lg border border-border bg-card2 px-2 text-[10px] font-medium text-muted transition hover:text-text disabled:opacity-40"
-        >
-          <MessageSquarePlus size={12} /> Новый чат
-        </button>
-        <button
-          type="button"
-          onClick={() => void deleteCurrentConversation()}
-          disabled={conversationId === null || historyLoading || running}
-          className="flex h-8 w-8 items-center justify-center rounded-lg border border-border bg-card2 text-muted transition hover:text-red-500 disabled:opacity-40"
-          title="Удалить этот чат"
-          aria-label="Удалить чат агента"
-        >
-          <Trash2 size={13} />
-        </button>
-      </div>
-
-      {/* Индикатор контекста, панель RAG-папок, Sandbox и архива переписок */}
-      <div className="grid gap-2 lg:grid-cols-3">
-        <div className="rounded-xl border border-border bg-card p-2.5 text-[11px]">
-          <div className="flex items-center justify-between gap-2">
-            <span className="flex items-center gap-1.5 font-medium text-text">
-              <Gauge size={13} className="text-accent2" /> Контекст чата
-            </span>
-            <label className="flex items-center gap-1 text-[10px] text-muted">
-              лимит
-              <Input
-                type="number"
-                min={0}
-                step={512}
-                value={contextLimit}
-                onChange={(e) => setContextLimit(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
-                className="h-6 w-20 px-1.5 text-[10px]"
-              />
-            </label>
-          </div>
-          {contextLimit > 0 ? (
-            <div className="mt-2">
-              <div className="mb-1 flex items-center justify-between text-[10px] text-muted">
-                <span>≈{usedTokens} / {contextLimit} токенов</span>
-                <span>{contextPercent}% (авто-Summary на 80%)</span>
-              </div>
-              <div className="h-1.5 overflow-hidden rounded-full bg-card2">
-                <div
-                  className={cn(
-                    "h-full rounded-full transition-all",
-                    contextPercent >= 80 ? "bg-amber-500" : "bg-emerald-500",
-                  )}
-                  style={{ width: `${Math.max(contextPercent, 2)}%` }}
-                />
-              </div>
-            </div>
-          ) : (
-            <p className="mt-1.5 text-[10px] text-muted">Автопереход по лимиту отключён (лимит = 0).</p>
-          )}
+          {AGENT_TABS.map((tab) => {
+            const selected = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                onClick={() => setActiveTab(tab.id)}
+                title={tab.hint}
+                className={cn(
+                  "flex shrink-0 items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium transition",
+                  selected
+                    ? "bg-gradient-to-r from-accent/25 to-transparent text-text ring-1 ring-accent/30"
+                    : "text-muted hover:bg-card2 hover:text-text",
+                )}
+              >
+                <span>{tab.label}</span>
+                {tab.id === "workspace" && (opTask || (sandbox?.items?.length ?? 0) > 0) && (
+                  <span className="rounded bg-card2 px-1 py-0.5 text-[10px] text-muted">
+                    {opTask ? `#${opTask.id}` : sandbox?.items?.length ?? 0}
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </div>
+      )}
 
-        <div className="rounded-xl border border-border bg-card p-2.5 text-[11px]">
-          <div className="flex items-center justify-between gap-2">
-            <span className="flex items-center gap-1.5 font-medium text-text">
-              <FolderOpen size={13} className="text-accent2" /> RAG-база знаний
+      {/* Вкладка 1: Модель, подключение и параметры генерации */}
+      <div
+        role={isTabs ? "tabpanel" : undefined}
+        aria-label="Модель и генерация"
+        hidden={isTabs && activeTab !== "model"}
+        className="space-y-3"
+      >
+        {health !== null && !available && (
+          <div className="rounded-2xl border border-border bg-card p-3 text-[11px] text-muted">
+            <p className="flex items-center gap-1.5 font-semibold text-text">
+              <PlugZap size={13} className="text-amber-500" /> Как включить агента
+            </p>
+            <p className="mt-1">{health?.hint ?? "Агент — отдельный процесс на Python."}</p>
+            <pre className="mt-2 overflow-x-auto rounded-lg bg-card2 px-2 py-1.5 text-[11px] text-text">python3 agent/agent.py</pre>
+            <p className="mt-1">
+              Он использует тот же OpenAI-совместимый сервер, что и чат: адрес, ключ и модель берутся из настроек ниже.
+            </p>
+          </div>
+        )}
+
+        <div className="rounded-2xl border border-border bg-card">
+          <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2.5 text-[11px] text-muted">
+            <label className="flex items-center gap-1.5">
+              Провайдер
+              <select
+                value={activeProvider}
+                onChange={(e) => applyProvider(e.target.value)}
+                className="h-8 rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
+              >
+                {PROVIDERS.map((provider) => (
+                  <option key={provider.id} value={provider.id}>
+                    {provider.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <span className="text-[10px]">
+              {remoteApi
+                ? "облачный API: ключ нужен и уходит в запросе, в базу не пишется"
+                : "локальная модель: ключ обычно не нужен"}
             </span>
             <button
               type="button"
-              onClick={() => setRagOpen((v) => !v)}
-              className="text-[10px] font-medium text-accent2 hover:underline"
+              onClick={() => void refreshModelsAndCapabilities()}
+              disabled={checkingModels || running}
+              className="ml-auto flex h-7 items-center gap-1 rounded-lg border border-border bg-card2 px-2 text-[10px] font-medium text-text transition hover:border-accent/50 disabled:opacity-40"
+              title="Получить список моделей с сервера и определить их возможности (reasoning / vision / tools / контекст)"
             >
-              {ragOpen ? "Скрыть" : activeRagFolder ? `${activeRagFolder.chunksCount} фрагм.` : "Настроить"}
+              {checkingModels ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+              Подтянуть модели
             </button>
           </div>
-          <p className="mt-1 truncate text-[10px] text-muted">
-            {activeRagFolder
-              ? `${activeRagFolder.name} · ${activeRagFolder.filesCount} файлов${ragPrefs.ragFull ? " · вся база" : ` · до ${ragPrefs.ragChunks} фрагм.`}`
-              : "Папка не выбрана — можно загрузить папку любого размера"}
-          </p>
+
+          <div className="grid gap-2 p-3 sm:grid-cols-3">
+            <label className="text-[11px] text-muted">
+              Base URL
+              <input
+                value={settings.baseUrl}
+                onChange={(e) => saveSettings({ ...settings, baseUrl: e.target.value })}
+                placeholder={AI_DEFAULT_BASE_URL}
+                className="mt-1 h-8 w-full rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
+              />
+            </label>
+            <div className="text-[11px] text-muted">
+              <div className="flex items-center justify-between gap-2">
+                <span>Модель</span>
+                {availableModels.length > 0 && (
+                  <span className="text-[10px] text-emerald-500">{availableModels.length} доступно</span>
+                )}
+              </div>
+              <div className="mt-1 flex gap-1">
+                {availableModels.length > 0 && (
+                  <select
+                    aria-label="Выбрать модель из списка сервера"
+                    value={availableModels.includes(settings.model) ? settings.model : ""}
+                    onChange={(e) => {
+                      if (e.target.value) saveSettings({ ...settings, model: e.target.value });
+                    }}
+                    className="h-8 max-w-[50%] rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
+                  >
+                    <option value="">список…</option>
+                    {availableModels.map((modelId) => (
+                      <option key={modelId} value={modelId}>
+                        {modelId}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <input
+                  aria-label="Модель"
+                  value={settings.model}
+                  onChange={(e) => saveSettings({ ...settings, model: e.target.value })}
+                  placeholder="например, qwen3:8b"
+                  className="h-8 min-w-0 flex-1 rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
+                />
+              </div>
+            </div>
+            <label className="text-[11px] text-muted">
+              API-ключ (если нужен)
+              <input
+                value={settings.apiKey}
+                onChange={(e) => saveSettings({ ...settings, apiKey: e.target.value })}
+                type="password"
+                placeholder="необязательно"
+                className="mt-1 h-8 w-full rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
+              />
+            </label>
+          </div>
         </div>
 
-        <div className="rounded-xl border border-border bg-card p-2.5 text-[11px]">
-          <div className="flex items-center justify-between gap-2">
-            <span className="flex items-center gap-1.5 font-medium text-text">
-              <Terminal size={13} className="text-accent2" /> Sandbox и архивы
-            </span>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setOpBridgeOpen((v) => !v)}
-                className="flex items-center gap-1 text-[10px] font-medium text-cyan-400 hover:underline"
-              >
-                <MonitorCog size={11} /> Оператор{opTask ? ` #${opTask.id}` : ""}
-              </button>
-              <button
-                type="button"
-                onClick={() => setSandboxOpen((v) => !v)}
-                className="text-[10px] font-medium text-accent2 hover:underline"
-              >
-                Sandbox ({sandbox?.items?.length ?? 0})
-              </button>
-              <button
-                type="button"
-                onClick={() => setTranscriptsOpen((v) => !v)}
-                className="text-[10px] font-medium text-accent2 hover:underline"
-              >
-                Архив ({transcripts.length})
-              </button>
+        <GenSettings
+          value={params}
+          onChange={setParams}
+          defaultOpen
+          capabilities={modelCapabilities}
+          unlimited={unlimited}
+          modelName={settings.model}
+          onRefreshCapabilities={() => void refreshModelsAndCapabilities()}
+          refreshingCapabilities={checkingModels}
+          subtitle="Режимы раздумий подтягиваются под возможности выбранной модели. Пустое поле — параметр не передаём."
+        >
+          <div className="space-y-2.5">
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-2 text-[11px] text-muted">
+                <label htmlFor="agent-system-prompt" className="font-medium text-text">
+                  Системный промпт агента
+                </label>
+                <div className="flex items-center gap-2 text-[10px]">
+                  <span>{unlimited ? `${systemPrompt.length} симв. · без лимита` : `${systemPrompt.length}/12000`}</span>
+                  {systemPrompt.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setSystemPrompt("")}
+                      className="text-red-500 hover:underline"
+                    >
+                      Очистить
+                    </button>
+                  )}
+                </div>
+              </div>
+              <Textarea
+                id="agent-system-prompt"
+                value={systemPrompt}
+                onChange={(event) =>
+                  setSystemPrompt(unlimited ? event.target.value : event.target.value.slice(0, 12_000))
+                }
+                rows={3}
+                placeholder="Дополнительные правила для Агента: роль, стиль отчётов, формат кода, ограничения…"
+                className="text-[11px]"
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
+              <label className="flex items-center gap-1.5 text-text">
+                <input
+                  type="checkbox"
+                  checked={maxSteps <= 0}
+                  onChange={(event) => setMaxSteps(event.target.checked ? 0 : 20)}
+                  className="h-3.5 w-3.5 accent-[#7c5cff]"
+                />
+                Без лимита шагов
+              </label>
+              {maxSteps > 0 ? (
+                <>
+                  <Input
+                    type="number"
+                    min={1}
+                    aria-label="Лимит шагов агента"
+                    value={maxSteps}
+                    onChange={(event) => setMaxSteps(Math.max(1, Math.floor(Number(event.target.value) || 1)))}
+                    className="h-8 w-24 px-2 text-[11px]"
+                  />
+                  <span className="text-[10px]">
+                    ограничение вызовов инструментов (для главного админа потолка нет)
+                  </span>
+                </>
+              ) : (
+                <span className="text-[10px] text-emerald-500">
+                  Главный администратор: ограничений на шаги нет
+                </span>
+              )}
             </div>
           </div>
-          <p className="mt-1 truncate text-[10px] text-muted">
-            Проекты: {sandbox?.projects?.length ? sandbox.projects.map((p) => p.name).join(", ") : "пока пусто"} · процессов:{" "}
-            {sandbox?.processes?.filter((p) => p.alive).length ?? 0}
-          </p>
-        </div>
+        </GenSettings>
       </div>
+
+      {/* Вкладка 2: Доверие, контекст, RAG и архив переписок */}
+      <div
+        role={isTabs ? "tabpanel" : undefined}
+        aria-label="Доверие и RAG"
+        hidden={isTabs && activeTab !== "knowledge"}
+        className="space-y-3"
+      >
+        {/* Выбор уровня доверия ИИ */}
+        <TrustSelector value={trustLevel} onChange={setTrustLevel} disabled={running} />
+
+        {/* Индикатор контекста и панель RAG-папок */}
+        <div className="grid gap-2 lg:grid-cols-2">
+          <div className="rounded-xl border border-border bg-card p-2.5 text-[11px]">
+            <div className="flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 font-medium text-text">
+                <Gauge size={13} className="text-accent2" /> Контекст чата
+              </span>
+              <label className="flex items-center gap-1 text-[10px] text-muted">
+                лимит
+                <Input
+                  type="number"
+                  min={0}
+                  step={512}
+                  value={contextLimit}
+                  onChange={(e) => setContextLimit(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+                  className="h-6 w-20 px-1.5 text-[10px]"
+                />
+              </label>
+            </div>
+            {contextLimit > 0 ? (
+              <div className="mt-2">
+                <div className="mb-1 flex items-center justify-between text-[10px] text-muted">
+                  <span>≈{usedTokens} / {contextLimit} токенов</span>
+                  <span>{contextPercent}% (авто-Summary на 80%)</span>
+                </div>
+                <div className="h-1.5 overflow-hidden rounded-full bg-card2">
+                  <div
+                    className={cn(
+                      "h-full rounded-full transition-all",
+                      contextPercent >= 80 ? "bg-amber-500" : "bg-emerald-500",
+                    )}
+                    style={{ width: `${Math.max(contextPercent, 2)}%` }}
+                  />
+                </div>
+              </div>
+            ) : (
+              <p className="mt-1.5 text-[10px] text-muted">Автопереход по лимиту отключён (лимит = 0).</p>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-border bg-card p-2.5 text-[11px]">
+            <div className="flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 font-medium text-text">
+                <FolderOpen size={13} className="text-accent2" /> RAG-база знаний
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setRagOpen((v) => !v)}
+                  className="text-[10px] font-medium text-accent2 hover:underline"
+                >
+                  {ragOpen ? "Скрыть" : activeRagFolder ? `${activeRagFolder.chunksCount} фрагм.` : "Настроить"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTranscriptsOpen((v) => !v)}
+                  className="text-[10px] font-medium text-accent2 hover:underline"
+                >
+                  Архив ({transcripts.length})
+                </button>
+              </div>
+            </div>
+            <p className="mt-1 truncate text-[10px] text-muted">
+              {activeRagFolder
+                ? `${activeRagFolder.name} · ${activeRagFolder.filesCount} файлов${ragPrefs.ragFull ? " · вся база" : ` · до ${ragPrefs.ragChunks} фрагм.`}`
+                : "Папка не выбрана — можно загрузить папку любого размера"}
+            </p>
+          </div>
+        </div>
 
       {/* Панель настройки RAG-папки */}
       {ragOpen && (
@@ -2234,12 +2494,13 @@ export function AgentChat({ userName }: { userName: string }) {
               <Input
                 type="number"
                 min={0}
-                max={500}
+                max={unlimited ? undefined : 500}
                 disabled={ragPrefs.ragFull}
                 value={ragPrefs.ragChunks}
-                onChange={(e) =>
-                  setRagPrefs({ ...ragPrefs, ragChunks: Math.min(500, Math.max(0, Number(e.target.value) || 0)) })
-                }
+                onChange={(e) => {
+                  const next = Math.max(0, Number(e.target.value) || 0);
+                  setRagPrefs({ ...ragPrefs, ragChunks: unlimited ? next : Math.min(500, next) });
+                }}
                 className="h-7 w-16 px-1.5 text-[11px]"
               />
             </label>
@@ -2255,6 +2516,96 @@ export function AgentChat({ userName }: { userName: string }) {
           </div>
         </div>
       )}
+
+      {/* Архив переписок (.md) */}
+      {transcriptsOpen && (
+        <div className="space-y-2 rounded-2xl border border-border bg-card p-3 text-[11px]">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-semibold text-text">Сохранённые переписки агента (.md)</span>
+            <button
+              type="button"
+              onClick={() => void refreshTranscripts()}
+              className="text-[10px] text-accent2 hover:underline"
+            >
+              Обновить
+            </button>
+          </div>
+          {transcripts.length === 0 ? (
+            <p className="text-[10px] text-muted">
+              Сохранённых переписок пока нет. Они появляются автоматически при достижении 80% лимита
+              контекста или по кнопке «Сжать в Summary и новый чат».
+            </p>
+          ) : (
+            <div className="max-h-48 space-y-1.5 overflow-y-auto">
+              {transcripts.map((item) => (
+                <div
+                  key={item.id}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-card2 px-2.5 py-1.5"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate font-medium text-text">{item.fileName}</p>
+                    <p className="truncate text-[10px] text-muted">
+                      {item.title} · {formatBytes(item.chars)}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <a
+                      href={`/api/agent/transcripts/${item.id}?download=1`}
+                      download={item.fileName}
+                      className="flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 text-[10px] text-text hover:border-accent/50"
+                    >
+                      <Download size={11} /> Скачать
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() => void attachTranscript(item)}
+                      className="flex items-center gap-1 rounded-md border border-accent/40 bg-accent/10 px-2 py-1 text-[10px] font-medium text-accent2 hover:bg-accent/20"
+                    >
+                      <Paperclip size={11} /> Приложить в чат
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+      </div>
+
+      {/* Вкладка 3: Sandbox и Оператор */}
+      <div
+        role={isTabs ? "tabpanel" : undefined}
+        aria-label="Sandbox и Оператор"
+        hidden={isTabs && activeTab !== "workspace"}
+        className="space-y-3"
+      >
+        <div className="rounded-xl border border-border bg-card p-2.5 text-[11px]">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5 font-medium text-text">
+              <Terminal size={13} className="text-accent2" /> Sandbox и Оператор ПК
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setOpBridgeOpen((v) => !v)}
+                className="flex items-center gap-1 text-[10px] font-medium text-cyan-400 hover:underline"
+              >
+                <MonitorCog size={11} /> Оператор{opTask ? ` #${opTask.id}` : ""}
+              </button>
+              <button
+                type="button"
+                onClick={() => setSandboxOpen((v) => !v)}
+                className="text-[10px] font-medium text-accent2 hover:underline"
+              >
+                Sandbox ({sandbox?.items?.length ?? 0})
+              </button>
+            </div>
+          </div>
+          <p className="mt-1 truncate text-[10px] text-muted">
+            Проекты: {sandbox?.projects?.length ? sandbox.projects.map((p) => p.name).join(", ") : "пока пусто"} · процессов:{" "}
+            {sandbox?.processes?.filter((p) => p.alive).length ?? 0}
+          </p>
+        </div>
 
       {/* Панель Sandbox и переноса файлов наружу */}
       {sandboxOpen && (
@@ -2381,60 +2732,6 @@ export function AgentChat({ userName }: { userName: string }) {
         </div>
       )}
 
-      {/* Архив переписок (.md) */}
-      {transcriptsOpen && (
-        <div className="space-y-2 rounded-2xl border border-border bg-card p-3 text-[11px]">
-          <div className="flex items-center justify-between gap-2">
-            <span className="font-semibold text-text">Сохранённые переписки агента (.md)</span>
-            <button
-              type="button"
-              onClick={() => void refreshTranscripts()}
-              className="text-[10px] text-accent2 hover:underline"
-            >
-              Обновить
-            </button>
-          </div>
-          {transcripts.length === 0 ? (
-            <p className="text-[10px] text-muted">
-              Сохранённых переписок пока нет. Они появляются автоматически при достижении 80% лимита
-              контекста или по кнопке «Сжать в Summary и новый чат».
-            </p>
-          ) : (
-            <div className="max-h-48 space-y-1.5 overflow-y-auto">
-              {transcripts.map((item) => (
-                <div
-                  key={item.id}
-                  className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-card2 px-2.5 py-1.5"
-                >
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate font-medium text-text">{item.fileName}</p>
-                    <p className="truncate text-[10px] text-muted">
-                      {item.title} · {formatBytes(item.chars)}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <a
-                      href={`/api/agent/transcripts/${item.id}?download=1`}
-                      download={item.fileName}
-                      className="flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 text-[10px] text-text hover:border-accent/50"
-                    >
-                      <Download size={11} /> Скачать
-                    </a>
-                    <button
-                      type="button"
-                      onClick={() => void attachTranscript(item)}
-                      className="flex items-center gap-1 rounded-md border border-accent/40 bg-accent/10 px-2 py-1 text-[10px] font-medium text-accent2 hover:bg-accent/20"
-                    >
-                      <Paperclip size={11} /> Приложить в чат
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
       {/* Панель совместной формулировки и запуска Оператора прямо из Агента */}
       {opBridgeOpen && (
         <div className="space-y-2.5 rounded-2xl border border-cyan-500/40 bg-card p-3 text-[11px]">
@@ -2552,8 +2849,9 @@ export function AgentChat({ userName }: { userName: string }) {
           )}
         </div>
       )}
+      </div>
 
-      {/* Живое сопровождение Оператора, запущенного из Агента */}
+      {/* Живое сопровождение Оператора (видно на вкладках «Sandbox и Оператор» и «Чат», а также в классическом виде) */}
       {opTask && (() => {
         const opApproval = parsePendingApproval(opTask.pendingApproval);
         const opFinished = ["done", "failed", "cancelled"].includes(opTask.status);
@@ -2565,7 +2863,10 @@ export function AgentChat({ userName }: { userName: string }) {
           .filter((e) => ["thought", "action", "result", "guidance", "approval", "error"].includes(e.kind))
           .slice(-8);
         return (
-          <div className="space-y-2 rounded-2xl border border-cyan-500/40 bg-card p-3 text-[11px]">
+          <div
+            hidden={isTabs && activeTab !== "workspace" && activeTab !== "chat"}
+            className="space-y-2 rounded-2xl border border-cyan-500/40 bg-card p-3 text-[11px]"
+          >
             <div className="flex flex-wrap items-center gap-2">
               <span className="flex items-center gap-1.5 font-semibold text-text">
                 <Compass size={13} className="text-cyan-400" /> Оператор #{opTask.id}
@@ -2702,86 +3003,97 @@ export function AgentChat({ userName }: { userName: string }) {
         );
       })()}
 
-      {health !== null && !available && (
-        <div className="rounded-2xl border border-border bg-card p-3 text-[11px] text-muted">
-          <p className="flex items-center gap-1.5 font-semibold text-text">
-            <PlugZap size={13} className="text-amber-500" /> Как включить агента
-          </p>
-          <p className="mt-1">{health?.hint ?? "Агент — отдельный процесс на Python."}</p>
-          <pre className="mt-2 overflow-x-auto rounded-lg bg-card2 px-2 py-1.5 text-[11px] text-text">python3 agent/agent.py</pre>
-          <p className="mt-1">
-            Он использует тот же OpenAI-совместимый сервер, что и чат: адрес, ключ и модель берутся из настроек ниже.
-          </p>
-        </div>
-      )}
-
-      <GenSettings
-        value={params}
-        onChange={setParams}
-        defaultOpen
-        subtitle="Как модель думает и генерирует ответ. Пустое поле — параметр не передаём."
+      {/* Вкладка 4 (последняя): Чат с Агентом и история */}
+      <div
+        role={isTabs ? "tabpanel" : undefined}
+        aria-label="Чат"
+        hidden={isTabs && activeTab !== "chat"}
+        className="space-y-3"
       >
-        <div className="space-y-2.5">
-          <div className="space-y-1">
-            <div className="flex items-center justify-between gap-2 text-[11px] text-muted">
-              <label htmlFor="agent-system-prompt" className="font-medium text-text">
-                Системный промпт агента
-              </label>
-              <div className="flex items-center gap-2 text-[10px]">
-                <span>{systemPrompt.length}/12000</span>
-                {systemPrompt.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => setSystemPrompt("")}
-                    className="text-red-500 hover:underline"
-                  >
-                    Очистить
-                  </button>
-                )}
-              </div>
-            </div>
-            <Textarea
-              id="agent-system-prompt"
-              value={systemPrompt}
-              onChange={(event) => setSystemPrompt(event.target.value.slice(0, 12_000))}
-              rows={3}
-              placeholder="Дополнительные правила для Агента: роль, стиль отчётов, формат кода, ограничения…"
-              className="text-[11px]"
-            />
+        {isTabs && (
+          <div className="flex flex-wrap items-center gap-1.5 rounded-xl border border-border bg-card px-2.5 py-1.5 text-[10px] text-muted">
+            <button
+              type="button"
+              onClick={() => setActiveTab("model")}
+              className="rounded-md border border-border bg-card2 px-2 py-0.5 text-text hover:border-accent/50"
+            >
+              Модель: {settings.model.trim() || "по умолчанию"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("model")}
+              className="rounded-md border border-border bg-card2 px-2 py-0.5 hover:text-text"
+            >
+              Раздумья: {params.reasoning}
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("knowledge")}
+              className="rounded-md border border-border bg-card2 px-2 py-0.5 hover:text-text"
+            >
+              RAG: {activeRagFolder ? activeRagFolder.name : "выкл"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("workspace")}
+              className="rounded-md border border-border bg-card2 px-2 py-0.5 hover:text-text"
+            >
+              Sandbox: {sandbox?.items?.length ?? 0}
+            </button>
           </div>
+        )}
 
-          <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
-            <label className="flex items-center gap-1.5 text-text">
-              <input
-                type="checkbox"
-                checked={maxSteps <= 0}
-                onChange={(event) => setMaxSteps(event.target.checked ? 0 : 20)}
-                className="h-3.5 w-3.5 accent-[#7c5cff]"
-              />
-              Без лимита шагов
-            </label>
-            {maxSteps > 0 ? (
-              <>
-                <Input
-                  type="number"
-                  min={1}
-                  aria-label="Лимит шагов агента"
-                  value={maxSteps}
-                  onChange={(event) => setMaxSteps(Math.max(1, Math.floor(Number(event.target.value) || 1)))}
-                  className="h-8 w-24 px-2 text-[11px]"
-                />
-                <span className="text-[10px]">
-                  ограничение вызовов инструментов (для главного админа потолка нет)
-                </span>
-              </>
+        <div className="flex flex-wrap items-center gap-1.5 rounded-xl border border-border bg-card p-2">
+          <History size={13} className="ml-1 text-muted" />
+          <select
+            aria-label="История чатов агента"
+            value={conversationId ?? ""}
+            onChange={(event) => {
+              const id = Number(event.target.value);
+              if (id > 0) void selectConversation(id);
+            }}
+            disabled={historyLoading || conversations.length === 0}
+            className="h-8 min-w-0 flex-1 rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent disabled:opacity-60"
+          >
+            {conversations.length === 0 ? (
+              <option value="">{historyLoading ? "Загружаю историю…" : "Чатов пока нет"}</option>
             ) : (
-              <span className="text-[10px] text-emerald-500">
-                Главный администратор: ограничений на шаги нет
-              </span>
+              conversations.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.title || "Новый чат"} · {item.messagesCount} сообщ.
+                </option>
+              ))
             )}
-          </div>
+          </select>
+          <button
+            type="button"
+            onClick={() => void rolloverToSummaryChat(turns, "manual")}
+            disabled={historyLoading || running || summarizing || turns.length === 0}
+            className="flex h-8 items-center gap-1 rounded-lg border border-border bg-card2 px-2 text-[10px] font-medium text-muted transition hover:text-text disabled:opacity-40"
+            title="Сжать переписку в Summary, сохранить полный текст в .md и открыть новый чат"
+          >
+            {summarizing ? <Loader2 size={12} className="animate-spin" /> : <Archive size={12} />}
+            Сжать в Summary и новый чат
+          </button>
+          <button
+            type="button"
+            onClick={() => void startNewConversation()}
+            disabled={historyLoading || running}
+            className="flex h-8 items-center gap-1 rounded-lg border border-border bg-card2 px-2 text-[10px] font-medium text-muted transition hover:text-text disabled:opacity-40"
+          >
+            <MessageSquarePlus size={12} /> Новый чат
+          </button>
+          <button
+            type="button"
+            onClick={() => void deleteCurrentConversation()}
+            disabled={conversationId === null || historyLoading || running}
+            className="flex h-8 w-8 items-center justify-center rounded-lg border border-border bg-card2 text-muted transition hover:text-red-500 disabled:opacity-40"
+            title="Удалить этот чат"
+            aria-label="Удалить чат агента"
+          >
+            <Trash2 size={13} />
+          </button>
         </div>
-      </GenSettings>
 
       <div
         onDragEnter={handleDragEnter}
@@ -2800,58 +3112,6 @@ export function AgentChat({ userName }: { userName: string }) {
             </p>
           </div>
         )}
-        <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 pt-3 text-[11px] text-muted">
-          <label className="flex items-center gap-1.5">
-            Провайдер
-            <select
-              value={activeProvider}
-              onChange={(e) => applyProvider(e.target.value)}
-              className="h-8 rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
-            >
-              {PROVIDERS.map((provider) => (
-                <option key={provider.id} value={provider.id}>
-                  {provider.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <span className="text-[10px]">
-            {remoteApi
-              ? "облачный API: ключ нужен и уходит в запросе, в базу не пишется"
-              : "локальная модель: ключ обычно не нужен"}
-          </span>
-        </div>
-
-        <div className="grid gap-2 border-b border-border p-3 sm:grid-cols-3">
-          <label className="text-[11px] text-muted">
-            Base URL
-            <input
-              value={settings.baseUrl}
-              onChange={(e) => saveSettings({ ...settings, baseUrl: e.target.value })}
-              placeholder={AI_DEFAULT_BASE_URL}
-              className="mt-1 h-8 w-full rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
-            />
-          </label>
-          <label className="text-[11px] text-muted">
-            Модель
-            <input
-              value={settings.model}
-              onChange={(e) => saveSettings({ ...settings, model: e.target.value })}
-              placeholder="например, qwen3:8b"
-              className="mt-1 h-8 w-full rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
-            />
-          </label>
-          <label className="text-[11px] text-muted">
-            API-ключ (если нужен)
-            <input
-              value={settings.apiKey}
-              onChange={(e) => saveSettings({ ...settings, apiKey: e.target.value })}
-              type="password"
-              placeholder="необязательно"
-              className="mt-1 h-8 w-full rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
-            />
-          </label>
-        </div>
 
         <div ref={listRef} onScroll={handleChatScroll} className="h-[420px] space-y-3 overflow-y-auto p-3">
           {historyLoading ? (
@@ -2996,6 +3256,7 @@ export function AgentChat({ userName }: { userName: string }) {
                                 setOpDraftSteps(action.maxSteps ?? 30);
                                 setOpDraftNotes(action.notes ?? "");
                                 setOpBridgeOpen(true);
+                                if (isTabs) setActiveTab("workspace");
                               }}
                               className="rounded-lg border border-border bg-card px-2 py-1 text-[10px] text-muted hover:text-text"
                             >
@@ -3199,7 +3460,11 @@ export function AgentChat({ userName }: { userName: string }) {
               onClick={() => fileRef.current?.click()}
               disabled={running || reading || historyLoading || conversationId === null}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border bg-card2 text-muted transition hover:text-text disabled:opacity-40"
-              title="Приложить файлы для анализа (до 5 по 10 МБ)"
+              title={
+                unlimited
+                  ? "Приложить файлы для анализа (без лимита по размеру и количеству)"
+                  : "Приложить файлы для анализа (до 5 по 10 МБ)"
+              }
               aria-label="Приложить файлы"
             >
               {reading ? <Loader2 size={14} className="animate-spin" /> : <Paperclip size={14} />}
@@ -3240,10 +3505,11 @@ export function AgentChat({ userName }: { userName: string }) {
             </button>
           </div>
           <p className="mt-1.5 text-[10px] text-muted">
-            Скрепка — файлы для анализа (до 5 по 10 МБ) или сохранённые .md-переписки. В истории остаются имена файлов,
+            Скрепка — файлы для анализа ({unlimited ? "без лимита" : "до 5 по 10 МБ"}) или сохранённые .md-переписки. В истории остаются имена файлов,
             а при 80% лимита контекста чат автоматически архивируется и продолжается через Summary.
           </p>
         </div>
+      </div>
       </div>
 
       {pendingApproval && (

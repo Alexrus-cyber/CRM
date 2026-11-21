@@ -17,7 +17,7 @@ export async function GET() {
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
   if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
 
-  const tasks = await listAgentTasks(me.id, 12);
+  const tasks = await listAgentTasks(me.id, 200);
   return Response.json({ tasks }, { headers: { "Cache-Control": "no-store" } });
 }
 
@@ -39,21 +39,24 @@ export async function POST(req: Request) {
       }
     | null;
 
+  const unlimited = isUnlimitedStepsRole(me.role);
   const prompt = (body?.prompt ?? "").trim();
   if (!prompt) return Response.json({ error: "Опишите задание для агента" }, { status: 400 });
-  if (prompt.length > MAX_PROMPT) return Response.json({ error: "Слишком длинное задание" }, { status: 400 });
+  if (!unlimited && prompt.length > MAX_PROMPT) {
+    return Response.json({ error: "Слишком длинное задание" }, { status: 400 });
+  }
 
-  // Файлы задания: их прочитает бот (текст, docx/xlsx, csv…) — они приходят
-  // вместе с заданием и лежат в его журнале как вложения.
-  const incoming = Array.isArray(body?.files) ? body.files.slice(0, MAX_FILES) : [];
+  // Файлы задания: их прочитает бот (текст, docx/xlsx, csv…) — для главного админа без ограничений.
+  const incoming = Array.isArray(body?.files) ? (unlimited ? body.files : body.files.slice(0, MAX_FILES)) : [];
   const files: Array<{ name: string; mime: string; data: string; size: number }> = [];
   for (const item of incoming) {
     const data = String(item?.data ?? "");
-    const name = String(item?.name ?? "файл").slice(0, 160);
-    const mime = String(item?.mime ?? "application/octet-stream").slice(0, 120);
+    const name = String(item?.name ?? "файл").slice(0, 240);
+    const mime = String(item?.mime ?? "application/octet-stream").slice(0, 160);
     if (!data) continue;
     const bytes = Buffer.from(data, "base64");
-    if (!bytes.length || bytes.length > MAX_FILE_BYTES) continue;
+    if (!bytes.length) continue;
+    if (!unlimited && bytes.length > MAX_FILE_BYTES) continue;
     files.push({ name, mime, data, size: bytes.length });
   }
 

@@ -13,7 +13,7 @@ export async function GET() {
   const [usage, override, chats] = await Promise.all([
     getAiUsage(me.id),
     getAiQuotaOverride(me.id),
-    listAiChats(me.id, 200),
+    listAiChats(me.id, me.role === "super_admin" ? 1000 : 200),
   ]);
   const policy = aiPolicyFor(me.role, override?.monthlyLimit ?? null);
   const monthlyLimit = policy.monthlyTokens;

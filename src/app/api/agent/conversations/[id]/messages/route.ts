@@ -21,8 +21,8 @@ function boundedNumber(value: unknown): number {
 /** Файлы намеренно хранятся только как имена и размеры — без base64-содержимого. */
 function cleanFileMetadata(value: unknown): Array<{ name: string; mime: string; size: number }> {
   if (!Array.isArray(value)) return [];
-  return value.slice(0, 5).filter(isDict).map((item) => ({
-    name: String(item.name ?? "файл").slice(0, 160),
+  return value.filter(isDict).map((item) => ({
+    name: String(item.name ?? "файл").slice(0, 240),
     mime: String(item.mime ?? "application/octet-stream").slice(0, 160),
     size: boundedNumber(item.size),
   }));
@@ -30,8 +30,8 @@ function cleanFileMetadata(value: unknown): Array<{ name: string; mime: string; 
 
 function cleanAttachments(value: unknown): Array<{ name: string; size: number; mime?: string }> {
   if (!Array.isArray(value)) return [];
-  return value.slice(0, 5).filter(isDict).map((item) => ({
-    name: String(item.name ?? "файл").slice(0, 160),
+  return value.filter(isDict).map((item) => ({
+    name: String(item.name ?? "файл").slice(0, 240),
     size: boundedNumber(item.size),
     ...(typeof item.mime === "string" ? { mime: item.mime.slice(0, 160) } : {}),
   }));
@@ -40,7 +40,7 @@ function cleanAttachments(value: unknown): Array<{ name: string; size: number; m
 function cleanActions(value: unknown): Array<{ type: "open_url"; url: string; label: string; autoplay: boolean }> {
   if (!Array.isArray(value)) return [];
   const actions: Array<{ type: "open_url"; url: string; label: string; autoplay: boolean }> = [];
-  for (const item of value.slice(0, 30)) {
+  for (const item of value) {
     if (!isDict(item) || item.type !== "open_url") continue;
     const rawUrl = String(item.url ?? "").slice(0, 2_048);
     try {
@@ -102,12 +102,12 @@ export async function POST(
     userId: auth.user.id,
     conversationId: id,
     role: body.role,
-    content: body.content.slice(0, MAX_CONTENT),
-    reasoning: String(body.reasoning ?? "").slice(0, MAX_REASONING),
+    content: body.content,
+    reasoning: String(body.reasoning ?? ""),
     attachments: JSON.stringify(cleanAttachments(body.attachments)),
     actions: JSON.stringify(cleanActions(body.actions)),
     files: JSON.stringify(cleanFileMetadata(body.files)),
-    error: String(body.error ?? "").slice(0, 2_000),
+    error: String(body.error ?? "").slice(0, 10_000),
   });
   if (!message) return Response.json({ error: "Чат не найден" }, { status: 404 });
   return Response.json({ message }, { headers: { "Cache-Control": "no-store" } });

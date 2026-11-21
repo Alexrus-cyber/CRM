@@ -58,7 +58,17 @@ function highlightMatch(text: string, query: string) {
   return parts;
 }
 
-export function ChatClient({ users, meId, initialPeer = 0 }: { users: UserLite[]; meId: number; initialPeer?: number }) {
+export function ChatClient({
+  users,
+  meId,
+  initialPeer = 0,
+  unlimited = false,
+}: {
+  users: UserLite[];
+  meId: number;
+  initialPeer?: number;
+  unlimited?: boolean;
+}) {
   const [peer, setPeer] = useState<number>(initialPeer);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [peerReadId, setPeerReadId] = useState(0);
@@ -285,7 +295,7 @@ export function ChatClient({ users, meId, initialPeer = 0 }: { users: UserLite[]
   const pickFile = (picked: File | null | undefined) => {
     setError(null);
     if (!picked) return;
-    if (picked.size > MAX_FILE_BYTES) {
+    if (!unlimited && picked.size > MAX_FILE_BYTES) {
       setError("Файл больше 5 МБ");
       clearFile();
       return;
@@ -674,7 +684,7 @@ export function ChatClient({ users, meId, initialPeer = 0 }: { users: UserLite[]
           <div className="flex items-end gap-2">
             <label
               className="flex h-10 w-10 shrink-0 cursor-pointer items-center justify-center rounded-xl border border-border bg-card2 text-muted transition hover:text-text"
-              title="Прикрепить файл или картинку (до 5 МБ)"
+              title={unlimited ? "Прикрепить файл или картинку (без лимита)" : "Прикрепить файл или картинку (до 5 МБ)"}
             >
               <Paperclip size={16} />
               <input
