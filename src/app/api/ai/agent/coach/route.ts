@@ -1,4 +1,5 @@
-import { getAgentTask, listAgentEvents, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
+import { getAgentTask, listAgentEvents, recordAgentUsage, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
+import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { requestAgentStepCoaching } from "@/lib/agentCoach";
 import type { GenParams } from "@/lib/genParams";
@@ -16,8 +17,8 @@ export const runtime = "nodejs";
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") {
-    return Response.json({ error: "Доступно только главному администратору" }, { status: 403 });
+  if (!hasAgentAccess(me) && !hasOperatorAccess(me)) {
+    return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
   }
 
   const body = (await req.json().catch(() => null)) as
@@ -82,7 +83,18 @@ export async function POST(req: Request) {
     userAdvice: advice.adviceForUser,
     addEvent: true,
   });
-  const conversationId = await syncOperatorTaskToConversation(me.id, task.id);
+  if (advice.usage) {
+    await recordAgentUsage({
+      userId: me.id,
+      kind: "operator",
+      refId: task.id,
+      model: advice.usage.model ?? body?.settings?.model ?? "",
+      prompt: advice.usage.prompt,
+      completion: advice.usage.completion,
+      total: advice.usage.total,
+    }).catch(() => undefined);
+  }
+  const conversationId = await syncOperatorTaskToConversation(me.id, task.id, { onlyIfExisting: true });
 
   return Response.json(
     {

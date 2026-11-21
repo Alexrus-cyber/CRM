@@ -42,6 +42,7 @@ if wheels.is_dir():
 hiddenimports = [
     "launcher.catalog",
     "launcher.commands",
+    "launcher.crm_client",
     "launcher.gui",
     "launcher.runner",
     "launcher.settings",

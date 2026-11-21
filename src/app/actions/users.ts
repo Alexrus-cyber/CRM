@@ -11,6 +11,7 @@ import {
   getUser,
   insertUser,
   setAiQuotaOverride,
+  setUserAgentAccess,
   setUserPassword,
   setUserRole,
   updateProfile,
@@ -119,6 +120,30 @@ export async function setAiQuotaAction(userId: number, monthlyLimit: number | nu
     if (!Number.isFinite(monthlyLimit) || monthlyLimit < 0) return { ok: false, error: "Некорректный лимит" };
     await setAiQuotaOverride(userId, Math.round(monthlyLimit), me.id);
   }
+  revalidatePath("/", "layout");
+  publishLiveEvent("users", me.id);
+  return { ok: true };
+}
+
+/**
+ * Выдача или отзыв доступа к разделам «Агент» и «Оператор» (в CRM и лаунчере).
+ * Разрешено ИСКЛЮЧИТЕЛЬНО главному администратору (`super_admin`).
+ */
+export async function setUserAgentAccessAction(
+  userId: number,
+  input: { canUseAgent?: boolean; canUseOperator?: boolean },
+): Promise<ActionResult> {
+  const me = await getCurrentUser();
+  if (!me || me.role !== "super_admin") {
+    return { ok: false, error: "Только главный администратор может управлять доступом к Агенту и Оператору" };
+  }
+  const target = await getUser(userId);
+  if (!target || target.isBot) return { ok: false, error: "Пользователь не найден" };
+  if (target.role === "super_admin") {
+    return { ok: false, error: "У главного администратора доступ всегда включён" };
+  }
+
+  await setUserAgentAccess(userId, input);
   revalidatePath("/", "layout");
   publishLiveEvent("users", me.id);
   return { ok: true };

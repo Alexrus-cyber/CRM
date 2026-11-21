@@ -1,4 +1,4 @@
-import { getAgentTask, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
+import { getAgentTask, recordAgentUsage, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
 import { requestAgentStepCoaching } from "@/lib/agentCoach";
 import { AGENT_URL } from "@/app/api/ai/agent/route";
@@ -109,7 +109,18 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     userAdvice: advice.adviceForUser,
     addEvent: true,
   });
-  await syncOperatorTaskToConversation(ownerId, task.id);
+  if (advice.usage) {
+    await recordAgentUsage({
+      userId: ownerId,
+      kind: "operator",
+      refId: task.id,
+      model: advice.usage.model ?? "",
+      prompt: advice.usage.prompt,
+      completion: advice.usage.completion,
+      total: advice.usage.total,
+    }).catch(() => undefined);
+  }
+  await syncOperatorTaskToConversation(ownerId, task.id, { onlyIfExisting: true });
 
   return Response.json(
     {

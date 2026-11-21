@@ -71,7 +71,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     fileSize: byteSize,
     fileData: base64Data,
   });
-  await syncOperatorTaskToConversation(ownerId, task.id);
+  await syncOperatorTaskToConversation(ownerId, task.id, { onlyIfExisting: true });
 
   return Response.json({ ok: true, eventId }, { headers: { "Cache-Control": "no-store" } });
 }

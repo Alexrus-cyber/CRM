@@ -1,4 +1,5 @@
 import { getAgentBotConnectionStatus } from "@/db/repo";
+import { hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
 /**
@@ -14,8 +15,8 @@ export const runtime = "nodejs";
 export async function GET(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") {
-    return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasOperatorAccess(me)) {
+    return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
   }
 
   const rawConnectionId = new URL(req.url).searchParams.get("connectionId");

@@ -49,6 +49,9 @@ const PG_DDL = [
     role text not null default 'user',
     avatar_color text not null default '#7c5cff',
     avatar_url text,
+    is_bot integer not null default 0,
+    can_use_agent integer not null default 0,
+    can_use_operator integer not null default 0,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
   )`,
@@ -94,10 +97,60 @@ const PG_DDL = [
   `create index if not exists tasks_assignee_idx on tasks (assignee_id)`,
   `create index if not exists tasks_author_idx on tasks (author_id)`,
   `create index if not exists tasks_deadline_idx on tasks (deadline)`,
+  `create table if not exists chat_rooms (
+    id serial primary key,
+    name text not null,
+    description text not null default '',
+    kind text not null default 'group',
+    created_by integer references users(id) on delete set null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`,
+  `create index if not exists chat_rooms_created_by_idx on chat_rooms (created_by)`,
+  `create table if not exists chat_room_members (
+    id serial primary key,
+    room_id integer not null references chat_rooms(id) on delete cascade,
+    user_id integer not null references users(id) on delete cascade,
+    added_by integer references users(id) on delete set null,
+    role text not null default 'member',
+    created_at timestamptz not null default now()
+  )`,
+  `create unique index if not exists chat_room_members_room_user_uq on chat_room_members (room_id, user_id)`,
+  `create index if not exists chat_room_members_user_idx on chat_room_members (user_id)`,
+  `create table if not exists chat_room_reads (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    room_id integer not null references chat_rooms(id) on delete cascade,
+    last_read_id integer not null default 0,
+    updated_at timestamptz not null default now()
+  )`,
+  `create unique index if not exists chat_room_reads_user_room_uq on chat_room_reads (user_id, room_id)`,
+  `create table if not exists chat_general_bots (
+    id serial primary key,
+    bot_user_id integer not null unique references users(id) on delete cascade,
+    added_by integer references users(id) on delete set null,
+    created_at timestamptz not null default now()
+  )`,
+  `create table if not exists ai_bot_configs (
+    id serial primary key,
+    user_id integer not null unique references users(id) on delete cascade,
+    provider text not null default 'local',
+    base_url text not null default '',
+    api_key text not null default '',
+    model text not null default '',
+    system_prompt text not null default '',
+    params_json text not null default '{}',
+    reply_mode text not null default 'mention',
+    is_active integer not null default 1,
+    created_by integer references users(id) on delete set null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`,
   `create table if not exists messages (
     id serial primary key,
     sender_id integer not null references users(id) on delete cascade,
     recipient_id integer references users(id) on delete cascade,
+    room_id integer references chat_rooms(id) on delete cascade,
     content text not null,
     content_lower text not null default '',
     created_at timestamptz not null default now()
@@ -306,6 +359,19 @@ const PG_DDL = [
     tf integer not null default 1
   )`,
   `create index if not exists ai_rag_terms_lookup_idx on ai_rag_terms (folder_id, term)`,
+  `create table if not exists agent_usage_events (
+    id serial primary key,
+    user_id integer not null references users(id) on delete cascade,
+    kind text not null,
+    ref_id integer not null default 0,
+    model text not null default '',
+    prompt_tokens integer not null default 0,
+    completion_tokens integer not null default 0,
+    total_tokens integer not null default 0,
+    month text not null,
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists agent_usage_events_user_kind_month_idx on agent_usage_events (user_id, kind, month)`,
 ];
 
 /**
@@ -324,6 +390,9 @@ const SQLITE_DDL = [
     role text not null default 'user',
     avatar_color text not null default '#7c5cff',
     avatar_url text,
+    is_bot integer not null default 0,
+    can_use_agent integer not null default 0,
+    can_use_operator integer not null default 0,
     created_at text not null,
     updated_at text not null
   )`,
@@ -369,10 +438,60 @@ const SQLITE_DDL = [
   `create index if not exists tasks_assignee_idx on tasks (assignee_id)`,
   `create index if not exists tasks_author_idx on tasks (author_id)`,
   `create index if not exists tasks_deadline_idx on tasks (deadline)`,
+  `create table if not exists chat_rooms (
+    id integer primary key autoincrement,
+    name text not null,
+    description text not null default '',
+    kind text not null default 'group',
+    created_by integer references users(id) on delete set null,
+    created_at text not null,
+    updated_at text not null
+  )`,
+  `create index if not exists chat_rooms_created_by_idx on chat_rooms (created_by)`,
+  `create table if not exists chat_room_members (
+    id integer primary key autoincrement,
+    room_id integer not null references chat_rooms(id) on delete cascade,
+    user_id integer not null references users(id) on delete cascade,
+    added_by integer references users(id) on delete set null,
+    role text not null default 'member',
+    created_at text not null
+  )`,
+  `create unique index if not exists chat_room_members_room_user_uq on chat_room_members (room_id, user_id)`,
+  `create index if not exists chat_room_members_user_idx on chat_room_members (user_id)`,
+  `create table if not exists chat_room_reads (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    room_id integer not null references chat_rooms(id) on delete cascade,
+    last_read_id integer not null default 0,
+    updated_at text not null
+  )`,
+  `create unique index if not exists chat_room_reads_user_room_uq on chat_room_reads (user_id, room_id)`,
+  `create table if not exists chat_general_bots (
+    id integer primary key autoincrement,
+    bot_user_id integer not null unique references users(id) on delete cascade,
+    added_by integer references users(id) on delete set null,
+    created_at text not null
+  )`,
+  `create table if not exists ai_bot_configs (
+    id integer primary key autoincrement,
+    user_id integer not null unique references users(id) on delete cascade,
+    provider text not null default 'local',
+    base_url text not null default '',
+    api_key text not null default '',
+    model text not null default '',
+    system_prompt text not null default '',
+    params_json text not null default '{}',
+    reply_mode text not null default 'mention',
+    is_active integer not null default 1,
+    created_by integer references users(id) on delete set null,
+    created_at text not null,
+    updated_at text not null
+  )`,
   `create table if not exists messages (
     id integer primary key autoincrement,
     sender_id integer not null references users(id) on delete cascade,
     recipient_id integer references users(id) on delete cascade,
+    room_id integer references chat_rooms(id) on delete cascade,
     content text not null,
     content_lower text not null default '',
     created_at text not null
@@ -577,6 +696,19 @@ const SQLITE_DDL = [
     tf integer not null default 1
   )`,
   `create index if not exists ai_rag_terms_lookup_idx on ai_rag_terms (folder_id, term)`,
+  `create table if not exists agent_usage_events (
+    id integer primary key autoincrement,
+    user_id integer not null references users(id) on delete cascade,
+    kind text not null,
+    ref_id integer not null default 0,
+    model text not null default '',
+    prompt_tokens integer not null default 0,
+    completion_tokens integer not null default 0,
+    total_tokens integer not null default 0,
+    month text not null,
+    created_at text not null
+  )`,
+  `create index if not exists agent_usage_events_user_kind_month_idx on agent_usage_events (user_id, kind, month)`,
 ];
 
 /* ------------------------------------------------------------------ */
@@ -758,6 +890,10 @@ async function migrateColumns(executor: Executor): Promise<void> {
     `alter table agent_tasks add column guidance_note text not null default ''`,
     `alter table agent_tasks add column pending_approval text not null default ''`,
     `alter table agent_tasks add column approval_response text not null default ''`,
+    `alter table users add column is_bot integer not null default 0`,
+    `alter table users add column can_use_agent integer not null default 0`,
+    `alter table users add column can_use_operator integer not null default 0`,
+    `alter table messages add column room_id integer references chat_rooms(id) on delete cascade`,
   ];
   for (const statement of statements) {
     try {
@@ -767,6 +903,7 @@ async function migrateColumns(executor: Executor): Promise<void> {
       if (!/already exists|duplicate column/i.test(message)) throw error;
     }
   }
+  await executor.exec(`create index if not exists messages_room_idx on messages (room_id, id)`);
   await migrateLegacyAgentTokens(executor);
 }
 

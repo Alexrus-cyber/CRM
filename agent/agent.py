@@ -1270,6 +1270,39 @@ def _process_stream_think_chunk(
     return "".join(out_content), "".join(out_think), in_think, ""
 
 
+def extract_usage(data: Any, prompt_chars: int = 0, completion_chars: int = 0) -> Dict[str, int]:
+    """Извлекает prompt/completion/total токены из ответа OpenAI/Ollama либо оценивает по длине текста."""
+    raw = data.get("usage") if isinstance(data, dict) else None
+    if isinstance(raw, dict):
+        p = int(raw.get("prompt_tokens") or raw.get("input_tokens") or raw.get("prompt") or 0)
+        c = int(raw.get("completion_tokens") or raw.get("output_tokens") or raw.get("completion") or 0)
+        t = int(raw.get("total_tokens") or raw.get("total") or (p + c))
+        if t > 0 or p > 0 or c > 0:
+            return {"prompt": max(0, p), "completion": max(0, c), "total": max(0, t or (p + c))}
+    p_est = max(1, (prompt_chars + 3) // 4) if prompt_chars > 0 else 0
+    c_est = max(1, (completion_chars + 3) // 4) if completion_chars > 0 else 0
+    return {"prompt": p_est, "completion": c_est, "total": p_est + c_est}
+
+
+def _messages_char_len(messages: Any) -> int:
+    total = 0
+    if not isinstance(messages, list):
+        return 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        c = msg.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    total += len(part["text"])
+                elif isinstance(part, dict) and part.get("type") == "image_url":
+                    total += 400
+    return total
+
+
 def call_model(
     base_url: str,
     api_key: str,
@@ -1287,6 +1320,8 @@ def call_model(
         "temperature": 0.3,
         "stream": streaming,
     }
+    if streaming:
+        payload["stream_options"] = {"include_usage": True}
     apply_generation(payload, params or {})
     if tools:
         payload["tools"] = tools
@@ -1326,6 +1361,7 @@ def call_model(
                 last_reason_emit = 0.0
                 last_text_emit = 0.0
                 is_sse = False
+                stream_usage: Optional[Dict[str, Any]] = None
 
                 for raw_bytes in response:
                     line = raw_bytes.decode("utf-8", "replace").rstrip("\r\n")
@@ -1364,6 +1400,9 @@ def call_model(
                         chunk = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
+
+                    if isinstance(chunk.get("usage"), dict):
+                        stream_usage = chunk["usage"]
 
                     choices = chunk.get("choices") or []
                     if not choices:
@@ -1438,7 +1477,10 @@ def call_model(
                     **({"reasoning_content": final_reasoning} if final_reasoning else {}),
                     **({"tool_calls": assembled_tools} if assembled_tools else {}),
                 }
-                return {"choices": [{"message": msg_obj}]}
+                result_obj: Dict[str, Any] = {"choices": [{"message": msg_obj}]}
+                if stream_usage:
+                    result_obj["usage"] = stream_usage
+                return result_obj
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")[:400]
             raise AgentError(f"Модель вернула ошибку {error.code}: {detail}") from error
@@ -1451,6 +1493,13 @@ def call_model(
         return _consume_stream(payload)
     except AgentError as error:
         detail = str(error).lower()
+        if "stream_options" in payload and ("400" in detail or "422" in detail) and "stream_options" in detail:
+            no_stream_opts = {k: v for k, v in payload.items() if k != "stream_options"}
+            try:
+                return _consume_stream(no_stream_opts)
+            except AgentError as inner_so_err:
+                error = inner_so_err
+                detail = str(inner_so_err).lower()
         has_tuning = any(
             k in payload for k in ("reasoning_effort", "thinking_budget", "chat_template_kwargs")
         )
@@ -1751,11 +1800,13 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
             raise
     choices = data.get("choices") or []
     raw = str((choices[0].get("message") or {}).get("content") or "") if choices else ""
+    coach_usage = extract_usage(data, _messages_char_len(messages), len(raw))
+    coach_usage_out = {**coach_usage, "model": model or MODEL}
     if phase == "before_action":
         parsed_before = parse_before_action_coach_response(raw)
-        return {"ok": True, **parsed_before, "visionUsed": vision_used, "tuned": tuned_meta, "source": "agent"}
+        return {"ok": True, **parsed_before, "visionUsed": vision_used, "tuned": tuned_meta, "source": "agent", "usage": coach_usage_out}
     parsed = parse_coach_response(raw)
-    return {"ok": True, **parsed, "visionUsed": vision_used, "tuned": tuned_meta, "source": "agent"}
+    return {"ok": True, **parsed, "visionUsed": vision_used, "tuned": tuned_meta, "source": "agent", "usage": coach_usage_out}
 
 
 def resolve_steps_limit(raw_steps: Any, unlimited: bool = False) -> int:
@@ -2167,6 +2218,9 @@ class Handler(BaseHTTPRequestHandler):
         actions = 0
         final_text = ""
         thinking = ""
+        usage_prompt = 0
+        usage_completion = 0
+        usage_total = 0
 
         try:
             while steps_limit == 0 or steps < steps_limit:
@@ -2215,6 +2269,14 @@ class Handler(BaseHTTPRequestHandler):
                 message = choices[0].get("message") or {}
                 content = str(message.get("content") or "")
                 reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "").strip()
+                step_usage = extract_usage(
+                    data,
+                    _messages_char_len(messages),
+                    len(content) + len(reasoning),
+                )
+                usage_prompt += step_usage["prompt"]
+                usage_completion += step_usage["completion"]
+                usage_total += step_usage["total"]
                 if reasoning:
                     thinking += ("\n\n" if thinking else "") + reasoning
                     self.write(sse({"text": thinking}, "reasoning"))
@@ -2335,7 +2397,62 @@ class Handler(BaseHTTPRequestHandler):
             final_text = "Сделал максимум шагов. Уточните задачу, если нужно продолжение."
 
         self.write(sse({"text": final_text}, "text"))
-        self.write(sse({"steps": steps, "files": files, "actions": actions, "maxSteps": steps_limit}, "done"))
+        self.write(
+            sse(
+                {
+                    "steps": steps,
+                    "files": files,
+                    "actions": actions,
+                    "maxSteps": steps_limit,
+                    "usage": {
+                        "prompt": usage_prompt,
+                        "completion": usage_completion,
+                        "total": usage_total,
+                        "model": model or MODEL,
+                    },
+                },
+                "done",
+            )
+        )
+        _report_launcher_usage(model or MODEL, usage_prompt, usage_completion, usage_total)
+
+
+def _report_launcher_usage(
+    model_name: str, prompt_tokens: int, completion_tokens: int, total_tokens: int
+) -> None:
+    """Если агент запущен через лаунчер с сессией CRM, отправляет учёт токенов."""
+    server_url = os.environ.get("CRM_SERVER_URL", "").strip().rstrip("/")
+    session_token = os.environ.get("CRM_LAUNCHER_SESSION_TOKEN", "").strip()
+    if not server_url or not session_token:
+        return
+    if total_tokens <= 0 and prompt_tokens <= 0 and completion_tokens <= 0:
+        return
+
+    def _send() -> None:
+        try:
+            payload = json.dumps(
+                {
+                    "kind": "agent",
+                    "model": (model_name or "")[:160],
+                    "promptTokens": max(0, int(prompt_tokens)),
+                    "completionTokens": max(0, int(completion_tokens)),
+                    "totalTokens": max(0, int(total_tokens)),
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                f"{server_url}/api/launcher/usage",
+                data=payload,
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", f"Bearer {session_token}")
+            with urllib.request.urlopen(req, timeout=4.0):
+                pass
+        except Exception:  # noqa: BLE001 — телеметрия не должна мешать агенту
+            pass
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 class Server(ThreadingHTTPServer):
@@ -2835,6 +2952,33 @@ def self_test() -> int:
             and (max_payload.get("chat_template_kwargs") or {}).get("enable_thinking") is True
             and [p.get("reasoning_effort") for p in cascade_payloads] == ["max", "high", None]
             and cascade_content == "OK_CASCADE",
+        )
+
+        # 19. Потоковый SSE-ответ извлекает usage из финального чанка (даже при choices=[])
+        prev_urlopen_u = urllib.request.urlopen
+        try:
+            def fake_usage_urlopen(req: Any, timeout: int = 30) -> Any:
+                return io.BytesIO(
+                    b'data: {"choices":[{"delta":{"content":"ok"}}]}\n'
+                    b'data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":35,"total_tokens":155}}\n'
+                    b'data: [DONE]\n'
+                )
+
+            urllib.request.urlopen = fake_usage_urlopen  # type: ignore[assignment]
+            usage_res = call_model(
+                "http://localhost:1234",
+                "",
+                "test-model",
+                [{"role": "user", "content": "привет"}],
+                None,
+                on_text=lambda _: None,
+            )
+            extracted_u = extract_usage(usage_res, 10, 2)
+        finally:
+            urllib.request.urlopen = prev_urlopen_u  # type: ignore[assignment]
+        check(
+            "call_model и extract_usage извлекают prompt/completion/total из потокового usage-чанка",
+            extracted_u == {"prompt": 120, "completion": 35, "total": 155},
         )
 
     passed = sum(1 for item in checks if item)

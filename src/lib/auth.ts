@@ -74,6 +74,33 @@ export async function createSession(userId: number) {
   });
 }
 
+/** Создаёт долгоживущую сессию для настольного лаунчера (возвращает Bearer-токен). */
+export async function createLauncherSession(userId: number): Promise<{ token: string; expiresAt: string }> {
+  const token = randomBytes(32).toString("hex");
+  const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400000).toISOString();
+  await insertSession(token, userId, expiresAt);
+  return { token, expiresAt };
+}
+
+export async function destroyTokenSession(token: string): Promise<void> {
+  if (token) await deleteSession(token);
+}
+
+export async function findUserByBearer(req: Request): Promise<SafeUser | null> {
+  const auth = req.headers.get("authorization") ?? "";
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  const token = match ? match[1].trim() : "";
+  if (!token) return null;
+  const found = await findSessionUser(token);
+  return found?.user ?? null;
+}
+
+export async function getRequestUser(req: Request): Promise<SafeUser | null> {
+  const bearer = await findUserByBearer(req);
+  if (bearer) return bearer;
+  return getCurrentUser();
+}
+
 export async function destroySession() {
   const store = await cookies();
   const token = store.get(SESSION_COOKIE)?.value;

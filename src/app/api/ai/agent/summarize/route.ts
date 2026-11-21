@@ -1,5 +1,7 @@
+import { recordAgentUsage } from "@/db/repo";
+import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
-import { aiAuthHeaders, aiEndpoint, normalizeBaseUrl } from "@/lib/ai";
+import { aiAuthHeaders, aiEndpoint, estimateTokens, normalizeBaseUrl } from "@/lib/ai";
 import { buildFallbackSummary, type TranscriptTurn } from "@/lib/transcripts";
 
 /**
@@ -13,8 +15,8 @@ export const runtime = "nodejs";
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") {
-    return Response.json({ error: "Доступно только главному администратору" }, { status: 403 });
+  if (!hasAgentAccess(me)) {
+    return Response.json({ error: "Доступ к Агенту не выдан главным администратором" }, { status: 403 });
   }
 
   const body = (await req.json().catch(() => null)) as
@@ -79,11 +81,25 @@ export async function POST(req: Request) {
     if (!res.ok) {
       return Response.json({ summary: fallback, source: "fallback" }, { headers: { "Cache-Control": "no-store" } });
     }
-    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const data = (await res.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    };
     const text = String(data.choices?.[0]?.message?.content ?? "").trim();
     if (!text) {
       return Response.json({ summary: fallback, source: "fallback" }, { headers: { "Cache-Control": "no-store" } });
     }
+    const promptTok = Number(data.usage?.prompt_tokens ?? 0) || estimateTokens(dialog) + 80;
+    const compTok = Number(data.usage?.completion_tokens ?? 0) || estimateTokens(text);
+    const totalTok = Number(data.usage?.total_tokens ?? 0) || promptTok + compTok;
+    await recordAgentUsage({
+      userId: me.id,
+      kind: "agent",
+      model,
+      prompt: promptTok,
+      completion: compTok,
+      total: totalTok,
+    }).catch(() => undefined);
     return Response.json({ summary: text, source: "model" }, { headers: { "Cache-Control": "no-store" } });
   } catch {
     return Response.json({ summary: fallback, source: "fallback" }, { headers: { "Cache-Control": "no-store" } });

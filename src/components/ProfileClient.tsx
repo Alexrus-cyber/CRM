@@ -10,6 +10,7 @@ import {
   changePasswordAction,
   deleteUserAction,
   setAiQuotaAction,
+  setUserAgentAccessAction,
   updateProfileAction,
   updateUserRoleAction,
 } from "@/app/actions/users";
@@ -158,6 +159,8 @@ export function UserAdminControls({
   const router = useRouter();
   const [pending, start] = useTransition();
   const [role, setRole] = useState<Role>(target.role);
+  const [canUseAgent, setCanUseAgent] = useState<boolean>(Boolean(target.canUseAgent));
+  const [canUseOperator, setCanUseOperator] = useState<boolean>(Boolean(target.canUseOperator));
   const [pw, setPw] = useState("");
   const [quota, setQuota] = useState<string>(
     aiQuota?.override ? String(aiQuota.override) : aiQuota?.limit ? String(aiQuota.limit + 1_000_000) : "1000000",
@@ -204,6 +207,60 @@ export function UserAdminControls({
             <p className="mt-1.5 text-[11px] text-muted">
               Текущая роль: <span className="font-medium text-text">{ROLE_LABELS[target.role]}</span>
             </p>
+          </Field>
+        )}
+
+        {isSuper && (
+          <Field label="Доступ к Агенту и Оператору (сайт и лаунчер)">
+            <div className="space-y-2 rounded-xl border border-border bg-card2/40 p-3">
+              <label className="flex cursor-pointer items-center justify-between gap-2 text-xs">
+                <span>Раздел «Агент»</span>
+                <input
+                  type="checkbox"
+                  checked={canUseAgent}
+                  disabled={pending}
+                  onChange={(e) => {
+                    const next = e.target.checked;
+                    setCanUseAgent(next);
+                    start(async () => {
+                      const r = await setUserAgentAccessAction(target.id, { canUseAgent: next });
+                      setNotice(
+                        r.ok
+                          ? { msg: next ? "Доступ к Агенту выдан" : "Доступ к Агенту отключён", ok: true }
+                          : { msg: r.error, ok: false },
+                      );
+                      if (r.ok) router.refresh();
+                    });
+                  }}
+                  className="h-4 w-4 accent-[#7c5cff]"
+                />
+              </label>
+              <label className="flex cursor-pointer items-center justify-between gap-2 text-xs">
+                <span>Раздел «Оператор» (включая ПК-лаунчер)</span>
+                <input
+                  type="checkbox"
+                  checked={canUseOperator}
+                  disabled={pending}
+                  onChange={(e) => {
+                    const next = e.target.checked;
+                    setCanUseOperator(next);
+                    start(async () => {
+                      const r = await setUserAgentAccessAction(target.id, { canUseOperator: next });
+                      setNotice(
+                        r.ok
+                          ? { msg: next ? "Доступ к Оператору выдан" : "Доступ к Оператору отключён", ok: true }
+                          : { msg: r.error, ok: false },
+                      );
+                      if (r.ok) router.refresh();
+                    });
+                  }}
+                  className="h-4 w-4 accent-[#7c5cff]"
+                />
+              </label>
+              <p className="text-[10px] text-muted">
+                При выданном доступе токены Агента и Оператора не ограничены и учитываются отдельно (видны только вам).
+              </p>
+            </div>
           </Field>
         )}
 

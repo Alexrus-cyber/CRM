@@ -1,3 +1,4 @@
+import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { AGENT_URL } from "../route";
 
@@ -10,8 +11,8 @@ export const runtime = "nodejs";
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") {
-    return Response.json({ error: "Агент доступен только главному администратору" }, { status: 403 });
+  if (!hasAgentAccess(me) && !hasOperatorAccess(me)) {
+    return Response.json({ error: "Доступ к Агенту не выдан главным администратором" }, { status: 403 });
   }
 
   const body = (await req.json().catch(() => null)) as

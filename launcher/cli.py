@@ -27,7 +27,7 @@ if __package__ in (None, ""):  # запуск из исходников: python 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from launcher import APP_NAME, APP_VERSION  # noqa: E402
-from launcher import bundle, commands, deps, runner, settings as settings_mod  # noqa: E402
+from launcher import bundle, commands, crm_client, deps, runner, settings as settings_mod  # noqa: E402
 from launcher.catalog import DEFAULT_AGENTS, PROVIDER_PRESETS, REASONING_MODES, agent_by_id, load_catalog  # noqa: E402
 
 
@@ -317,6 +317,7 @@ def self_test() -> int:
                   proc.returncode == 0 and "Ошибка: тест → ✅" in (proc.stdout or ""))
 
     _spec_checks(check)
+    _crm_auth_checks(check)
     _gui_smoke(check)
 
     passed = sum(1 for _, ok in checks if ok)
@@ -361,12 +362,68 @@ def _spec_checks(check) -> None:
     check("сборка: скрипты агентов попадают в datas",
           any(destination == "agents" for _source, destination in captured.get("datas", [])))
     check("сборка: tkinter и зависимости в hiddenimports",
-          {"tkinter", "pyautogui", "PIL", "pyperclip"} <= set(captured.get("hiddenimports", [])))
+          {"tkinter", "pyautogui", "PIL", "pyperclip", "launcher.crm_client"}
+          <= set(captured.get("hiddenimports", [])))
     check("сборка: exe оконный (без консоли)", captured.get("exe", {}).get("console") is False)
 
 
+def _crm_auth_checks(check) -> None:
+    """Проверки ограничений CRM, автотокена и прав доступа в лаунчере."""
+    check("crm_client: нормализует URL без схемы",
+          crm_client.normalize_server_url("localhost:3000/") == "http://localhost:3000")
+    check("crm_client: ограничивает max_steps для обычных ролей",
+          crm_client.clamp_max_steps(999, 500, False) == 500
+          and crm_client.clamp_max_steps(0, 500, False) == 500
+          and crm_client.clamp_max_steps(999, 500, True) == 999)
+    check("crm_client: ограничивает reasoning по политике роли",
+          crm_client.clamp_reasoning("max", ["default", "low"]) == "default"
+          and crm_client.clamp_reasoning("low", ["default", "low"]) == "low")
+
+    agents = DEFAULT_AGENTS
+    operator = agent_by_id(agents, "operator")
+    chat_agent = agent_by_id(agents, "chat_agent")
+    assert operator and chat_agent
+
+    limited = settings_mod.LaunchSettings()
+    limited.reasoning = "max"
+    limited.set_value("operator", "max_steps", 900)
+    limited.set_value("chat_agent", "max_steps", 900)
+    limited.crm_profile = {
+        "user": {
+            "id": 2,
+            "name": "Сотрудник",
+            "role": "developer",
+            "canUseAgent": True,
+            "canUseOperator": False,
+        },
+        "limits": {
+            "unlimited": False,
+            "maxSteps": 500,
+            "reasoning": ["default", "low"],
+        },
+        "operator": {
+            "enabled": True,
+            "serverUrl": "https://crm.example.com",
+            "token": "crmop_auto_token",
+        },
+    }
+    check("crm_client: без права на Оператора запуск запрещён, а на Агента разрешён",
+          not crm_client.can_launch_agent("operator", limited.crm_profile)[0]
+          and crm_client.can_launch_agent("chat_agent", limited.crm_profile)[0])
+    op_args = commands.agent_args(operator, limited)
+    check("crm_client: оператор получает автотокен и потолок шагов из профиля",
+          "--token" in op_args and "crmop_auto_token" in op_args
+          and "--max-steps" in op_args and op_args[op_args.index("--max-steps") + 1] == "500")
+    check("crm_client: reasoning сбрасывается до разрешённого уровня",
+          "--reasoning" not in op_args
+          and crm_client.clamp_reasoning("max", ["low", "medium"]) == "low")
+    agent_env = commands.agent_env(chat_agent, limited)
+    check("crm_client: AGENT_MAX_STEPS режется лимитом роли",
+          agent_env.get("AGENT_MAX_STEPS") == "500")
+
+
 def _gui_smoke(check) -> None:
-    """Проверка интерфейса на заглушке tkinter: сборка формы и запуск агента."""
+    """Проверка интерфейса на заглушке tkinter: сборка формы, вход в CRM и запуск агента."""
     import time
 
     from launcher import _tkstub
@@ -376,6 +433,50 @@ def _gui_smoke(check) -> None:
         del sys.modules[name]
     from launcher import gui  # noqa: PLC0415 — импорт после подмены tkinter
 
+    orig_health = crm_client.check_health
+    orig_login = crm_client.login
+    orig_profile = crm_client.fetch_profile
+    orig_logout = crm_client.logout
+    active_profile: dict = {
+        "ok": True,
+        "user": {
+            "id": 10,
+            "name": "Тестовый разработчик",
+            "email": "dev@example.com",
+            "role": "developer",
+            "roleLabel": "Разработчик",
+            "canUseAgent": True,
+            "canUseOperator": False,
+        },
+        "limits": {
+            "unlimited": False,
+            "maxSteps": 500,
+            "reasoning": ["default", "low"],
+        },
+        "operator": {
+            "enabled": False,
+            "serverUrl": "http://localhost:3000",
+            "token": "",
+        },
+    }
+
+    def fake_health(url: str, timeout: float = 8.0):
+        clean = crm_client.normalize_server_url(url)
+        if "bad" in clean:
+            return False, "CRM не отвечает"
+        return True, f"CRM доступна ({clean})"
+
+    def fake_login(url: str, email: str, password: str, timeout: float = 15.0):
+        return {**active_profile, "sessionToken": "crm_sess_smoke_123"}
+
+    def fake_fetch_profile(url: str, token: str, timeout: float = 12.0):
+        return active_profile
+
+    crm_client.check_health = fake_health  # type: ignore[assignment]
+    crm_client.login = fake_login  # type: ignore[assignment]
+    crm_client.fetch_profile = fake_fetch_profile  # type: ignore[assignment]
+    crm_client.logout = lambda *_a, **_k: None  # type: ignore[assignment]
+
     with tempfile.TemporaryDirectory() as tmp:
         previous = os.environ.get("CRM_LAUNCHER_CONFIG")
         os.environ["CRM_LAUNCHER_CONFIG"] = str(Path(tmp) / "settings.json")
@@ -384,6 +485,28 @@ def _gui_smoke(check) -> None:
             app = gui.LauncherApp(root)
             check("интерфейс: агенты попали в список", len(app.agents) >= 3)
             check("интерфейс: выбрана форма оператора", app.spec.id == "operator")
+            check("интерфейс: без входа в CRM запуск заблокирован и шаг 2 закрыт",
+                  app.run_button.cget("state") == "disabled"
+                  and app.crm_login_btn.cget("state") == "disabled")
+
+            app.start_agent()
+            check("интерфейс: попытка запуска без входа в CRM отклоняется", app.run is None)
+
+            app.crm_url_var.set("http://bad-crm.local")
+            check("интерфейс: шаг 1 отклоняет нерабочий URL CRM", app.verify_crm_url() is False)
+            app.crm_url_var.set("http://localhost:3000")
+            check("интерфейс: шаг 1 проверяет URL и открывает шаг 2",
+                  app.verify_crm_url() is True and app.crm_login_btn.cget("state") == "normal")
+
+            app.crm_email_var.set("dev@example.com")
+            app.crm_password_var.set("secret123")
+            check("интерфейс: шаг 2 выполняет вход и подтягивает профиль",
+                  app.login_crm() is True and app.crm_password_var.get() == "")
+            check("интерфейс: без прав Оператора кнопка запуска Оператора отключена",
+                  app.run_button.cget("state") == "disabled")
+            app.start_agent()
+            check("интерфейс: запуск Оператора без прав в CRM не стартует процесс", app.run is None)
+
             hotkeys = {"<Control-a>", "<Control-c>", "<Control-v>", "<Control-KeyPress>"}
             check("интерфейс: Ctrl+A/C/V привязаны к полям и журналу",
                   hotkeys <= set(app._model_widgets["model"].bindings)
@@ -417,6 +540,18 @@ def _gui_smoke(check) -> None:
                   "лог для копирования" in app.log.clipboard_get() and app.log.content == before_log)
             app._sync_model_tab()
 
+            # Выдаём право на Оператора и проверяем автоподстановку токена и разблокировку.
+            active_profile["user"]["canUseOperator"] = True
+            active_profile["operator"] = {
+                "enabled": True,
+                "serverUrl": "http://localhost:3000",
+                "token": "crmop_live_auto",
+            }
+            app.refresh_crm_profile()
+            check("интерфейс: после выдачи прав Оператор разблокирован и токен подставлен",
+                  app.run_button.cget("state") == "normal"
+                  and app.field_vars["crm_token"].get() == "crmop_live_auto")
+
             app._show_agent("chat_agent")
             app.field_vars["port"].set("8901")
             app.collect()
@@ -431,7 +566,7 @@ def _gui_smoke(check) -> None:
 
             script = Path(tmp) / "my_agent.py"
             script.write_text(
-                "import os, sys\nprint('gui-smoke-ok', ' '.join(sys.argv[1:]))\nprint(os.environ.get('AGENT_MODEL'))\n",
+                "import os, sys\nprint('gui-smoke-ok', ' '.join(sys.argv[1:]))\nprint(os.environ.get('AGENT_MODEL'))\nprint(os.environ.get('CRM_LAUNCHER_SESSION_TOKEN'))\n",
                 encoding="utf-8",
             )
             app._show_agent("custom")
@@ -446,12 +581,16 @@ def _gui_smoke(check) -> None:
             app._drain_log()
             check("интерфейс: агент запускается и пишет в журнал",
                   "gui-smoke-ok --check" in app.log.content)
-            check("интерфейс: модель уходит в переменные окружения",
-                  "gpt-4o-mini" in app.log.content)
+            check("интерфейс: модель и сессия CRM уходят в переменные окружения",
+                  "gpt-4o-mini" in app.log.content and "crm_sess_smoke_123" in app.log.content)
             app._on_close()
             check("интерфейс: настройки сохраняются при выходе",
                   Path(os.environ["CRM_LAUNCHER_CONFIG"]).is_file())
         finally:
+            crm_client.check_health = orig_health  # type: ignore[assignment]
+            crm_client.login = orig_login  # type: ignore[assignment]
+            crm_client.fetch_profile = orig_profile  # type: ignore[assignment]
+            crm_client.logout = orig_logout  # type: ignore[assignment]
             if previous is None:
                 os.environ.pop("CRM_LAUNCHER_CONFIG", None)
             else:

@@ -1,4 +1,5 @@
 import { createAgentConnectionToken, deleteAgentConnectionToken, getAgentConnection, listAgentTokens } from "@/db/repo";
+import { hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
 /**
@@ -13,7 +14,7 @@ const MAX_NAME = 60;
 export async function GET(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasOperatorAccess(me)) return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
 
   const connectionId = Number(new URL(req.url).searchParams.get("connectionId") ?? 0) || 0;
   if (!connectionId) return Response.json({ error: "Не указано подключение" }, { status: 400 });
@@ -28,7 +29,7 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasOperatorAccess(me)) return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
 
   const body = (await req.json().catch(() => null)) as { connectionId?: number; name?: string } | null;
   const connectionId = Number(body?.connectionId ?? 0) || 0;
@@ -43,7 +44,7 @@ export async function POST(req: Request) {
 export async function DELETE(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasOperatorAccess(me)) return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
 
   const id = Number(new URL(req.url).searchParams.get("id") ?? 0) || 0;
   if (!id) return Response.json({ error: "Не указан токен" }, { status: 400 });

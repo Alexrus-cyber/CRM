@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List
 
 from launcher import APP_NAME, APP_VERSION, deps
-from launcher import bundle, commands
+from launcher import bundle, commands, crm_client
 from launcher import runner as runner_module
 from launcher import settings as settings_mod
 from launcher.catalog import PROVIDER_PRESETS, REASONING_MODES, AgentSpec, Field, load_catalog
@@ -176,14 +176,27 @@ class LauncherApp:
         self.field_vars: Dict[str, Any] = {}
         self.choice_maps: Dict[str, Dict[str, str]] = {}
         self._drain_after_id: str | None = None
+        self._crm_url_verified = False
+        self._crm_verified_url = ""
+        self._crm_allowed_reasoning: List[str] = []
 
         self._build_header()
+        self._build_auth_bar()
         self._build_body()
         self._build_log()
         self._build_footer()
 
         self._sync_model_tab()
         self._show_agent(self.spec.id, remember=False)
+        if self.settings.crm_session_token and crm_client.profile_user(self.settings.crm_profile):
+            self._apply_crm_profile(
+                self.settings.crm_profile,
+                session_token=self.settings.crm_session_token,
+                log_profile=False,
+            )
+            self.root.after(250, lambda: self.refresh_crm_profile(silent=True))
+        else:
+            self._update_auth_ui()
         self._log(f"{APP_NAME} {APP_VERSION}")
         self._log(f"настройки: {settings_mod.config_path()}")
         self._log(f"агенты: {bundle.agents_dir()}")
@@ -207,12 +220,96 @@ class LauncherApp:
             row=0, column=2, sticky="e"
         )
 
+    def _build_auth_bar(self) -> None:
+        self.auth_frame = tk.Frame(self.root, padx=14, pady=6)
+        self.auth_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.auth_frame.columnconfigure(0, weight=1)
+
+        self.crm_url_var = tk.StringVar(value=self.settings.crm_url or "http://localhost:3000")
+        self.crm_email_var = tk.StringVar(value=self.settings.crm_email or "")
+        self.crm_password_var = tk.StringVar(value="")
+        self.crm_auth_status_var = tk.StringVar(
+            value="Шаг 1: проверьте адрес CRM, затем введите логин и пароль."
+        )
+        self.crm_account_summary_var = tk.StringVar(value="")
+
+        # Неавторизованное состояние: двухэтапный вход (сначала URL, затем email/пароль).
+        self.auth_login_box = tk.Frame(self.auth_frame)
+        self.auth_login_box.grid(row=0, column=0, sticky="ew")
+        self.auth_login_box.columnconfigure(1, weight=1)
+        self.auth_login_box.columnconfigure(3, weight=1)
+
+        tk.Label(self.auth_login_box, text="Шаг 1. URL CRM:", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w", padx=(0, 6), pady=2
+        )
+        self.crm_url_entry = ttk.Entry(self.auth_login_box, textvariable=self.crm_url_var, width=36)
+        _bind_edit_shortcuts(self.crm_url_entry)
+        self.crm_url_entry.grid(row=0, column=1, columnspan=3, sticky="ew", padx=(0, 6), pady=2)
+        self.crm_url_entry.bind("<KeyRelease>", self._on_crm_url_edited)
+        self.crm_url_entry.bind("<Return>", lambda _event: self.verify_crm_url())
+
+        self.crm_check_btn = tk.Button(
+            self.auth_login_box, text="Проверить URL", command=self.verify_crm_url
+        )
+        self.crm_check_btn.grid(row=0, column=4, sticky="e", pady=2)
+
+        tk.Label(self.auth_login_box, text="Шаг 2. Email:", font=("Segoe UI", 9, "bold")).grid(
+            row=1, column=0, sticky="w", padx=(0, 6), pady=2
+        )
+        self.crm_email_entry = ttk.Entry(
+            self.auth_login_box, textvariable=self.crm_email_var, width=26, state="disabled"
+        )
+        _bind_edit_shortcuts(self.crm_email_entry)
+        self.crm_email_entry.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=2)
+
+        tk.Label(self.auth_login_box, text="Пароль:", font=("Segoe UI", 9)).grid(
+            row=1, column=2, sticky="w", padx=(0, 6), pady=2
+        )
+        self.crm_password_entry = ttk.Entry(
+            self.auth_login_box, textvariable=self.crm_password_var, show="•", width=22, state="disabled"
+        )
+        _bind_edit_shortcuts(self.crm_password_entry)
+        self.crm_password_entry.grid(row=1, column=3, sticky="ew", padx=(0, 6), pady=2)
+        self.crm_password_entry.bind("<Return>", lambda _event: self.login_crm())
+
+        self.crm_login_btn = tk.Button(
+            self.auth_login_box, text="Войти в CRM", command=self.login_crm, state="disabled"
+        )
+        self.crm_login_btn.grid(row=1, column=4, sticky="e", pady=2)
+
+        self.crm_auth_status_label = tk.Label(
+            self.auth_login_box,
+            textvariable=self.crm_auth_status_var,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+            justify="left",
+        )
+        self.crm_auth_status_label.grid(row=2, column=0, columnspan=5, sticky="w", pady=(2, 0))
+
+        # Авторизованное состояние: сводка роли/прав и кнопки управления сессией.
+        self.auth_account_box = tk.Frame(self.auth_frame)
+        self.auth_account_box.columnconfigure(0, weight=1)
+        tk.Label(
+            self.auth_account_box,
+            textvariable=self.crm_account_summary_var,
+            font=("Segoe UI", 9, "bold"),
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        self.crm_refresh_btn = tk.Button(
+            self.auth_account_box, text="Обновить права", command=self.refresh_crm_profile
+        )
+        self.crm_refresh_btn.grid(row=0, column=1, sticky="e", padx=(8, 6))
+        self.crm_logout_btn = tk.Button(
+            self.auth_account_box, text="Выйти", command=self.logout_crm
+        )
+        self.crm_logout_btn.grid(row=0, column=2, sticky="e")
+
     def _build_body(self) -> None:
         body = tk.Frame(self.root, padx=14)
-        body.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        body.grid(row=2, column=0, columnspan=2, sticky="nsew")
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, weight=1)
 
         left = tk.Frame(body)
         left.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
@@ -320,10 +417,10 @@ class LauncherApp:
 
     def _build_log(self) -> None:
         frame = tk.Frame(self.root, padx=14, pady=8)
-        frame.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
-        self.root.rowconfigure(2, weight=1)
+        self.root.rowconfigure(3, weight=1)
 
         head = tk.Frame(frame)
         head.grid(row=0, column=0, sticky="ew", pady=(0, 4))
@@ -348,7 +445,7 @@ class LauncherApp:
 
     def _build_footer(self) -> None:
         footer = tk.Frame(self.root, padx=14, pady=8)
-        footer.grid(row=3, column=0, columnspan=2, sticky="ew")
+        footer.grid(row=4, column=0, columnspan=2, sticky="ew")
         footer.columnconfigure(1, weight=1)
         self.status_var = tk.StringVar(value="агент не запущен")
         tk.Label(footer, textvariable=self.status_var, font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w")
@@ -410,6 +507,12 @@ class LauncherApp:
     def collect(self) -> None:
         self._collect_model_tab()
         self._collect_agent_tab()
+        if hasattr(self, "crm_url_var"):
+            clean_url = crm_client.normalize_server_url(self.crm_url_var.get())
+            if clean_url:
+                self.settings.crm_url = clean_url
+        if hasattr(self, "crm_email_var"):
+            self.settings.crm_email = self.crm_email_var.get().strip()
         self.summary_var.set(self.settings.describe())
         self.settings.last_agent = self.spec.id
 
@@ -453,6 +556,234 @@ class LauncherApp:
         self.requirements.configure(text=self._requirements_text(spec))
         if remember:
             self.settings.last_agent = spec.id
+        if hasattr(self, "run_button"):
+            self._sync_run_button_state()
+
+    # ------------------------------------------------------------------
+    # авторизация CRM (два этапа: проверка URL -> логин/пароль)
+    # ------------------------------------------------------------------
+    def _on_crm_url_edited(self, _event: object | None = None) -> None:
+        normalized = crm_client.normalize_server_url(self.crm_url_var.get())
+        if normalized != self._crm_verified_url and self._crm_url_verified:
+            self._crm_url_verified = False
+            self.crm_auth_status_var.set("URL изменён — нажмите «Проверить URL» перед входом.")
+            self._update_auth_ui()
+
+    def verify_crm_url(self) -> bool:
+        clean = crm_client.normalize_server_url(self.crm_url_var.get())
+        ok, message = crm_client.check_health(clean)
+        if ok:
+            self.crm_url_var.set(clean)
+            self.settings.crm_url = clean
+            self._crm_url_verified = True
+            self._crm_verified_url = clean
+            self.crm_auth_status_var.set(f"Шаг 1 пройден: {message}. Введите email и пароль.")
+            self._log(f"CRM URL подтверждён: {clean}")
+            self._update_auth_ui()
+            self.crm_email_entry.focus_set()
+            return True
+        self._crm_url_verified = False
+        self._crm_verified_url = ""
+        self.crm_auth_status_var.set(f"Шаг 1 — ошибка: {message}")
+        self._log(f"проверка CRM URL не пройдена: {message}")
+        self._update_auth_ui()
+        return False
+
+    def login_crm(self) -> bool:
+        if not self._crm_url_verified:
+            self.crm_auth_status_var.set("Сначала проверьте URL CRM (шаг 1).")
+            messagebox.showwarning(APP_NAME, "Сначала укажите URL CRM и нажмите «Проверить URL».")
+            return False
+        url = crm_client.normalize_server_url(self.crm_url_var.get())
+        email = self.crm_email_var.get().strip()
+        password = self.crm_password_var.get()
+        try:
+            data = crm_client.login(url, email, password)
+        except crm_client.CrmClientError as exc:
+            self.crm_auth_status_var.set(f"Ошибка входа: {exc}")
+            self._log(f"вход в CRM отклонён: {exc}")
+            messagebox.showerror(APP_NAME, str(exc))
+            return False
+
+        self.crm_password_var.set("")
+        self.settings.crm_url = url
+        self.settings.crm_email = email
+        token = str(data.get("sessionToken") or "")
+        self._apply_crm_profile(data, session_token=token, log_profile=True)
+        self._save_settings()
+        return True
+
+    def refresh_crm_profile(self, silent: bool = False) -> bool:
+        if not self.settings.crm_session_token or not self.settings.crm_url:
+            return False
+        try:
+            data = crm_client.fetch_profile(self.settings.crm_url, self.settings.crm_session_token)
+        except crm_client.CrmClientError as exc:
+            msg = str(exc)
+            lowered = msg.lower()
+            if any(marker in lowered for marker in ("сессия", "авториз", "запрещ", "401", "403")):
+                self.settings.clear_crm_auth()
+                self._crm_url_verified = False
+                self._crm_verified_url = ""
+                self._crm_allowed_reasoning = []
+                self._refresh_reasoning_choices()
+                self._update_auth_ui()
+                self._save_settings()
+            if not silent:
+                self._log(f"обновление прав CRM: {msg}")
+                messagebox.showwarning(APP_NAME, msg)
+            return False
+        self._apply_crm_profile(data, session_token=self.settings.crm_session_token, log_profile=not silent)
+        self._save_settings()
+        return True
+
+    def logout_crm(self) -> None:
+        if self.run is not None and self.run.is_running():
+            if not messagebox.askyesno(APP_NAME, "Агент ещё работает. Остановить его и выйти из CRM?"):
+                return
+            self.stop_agent()
+        crm_client.logout(self.settings.crm_url, self.settings.crm_session_token)
+        self.settings.clear_crm_auth()
+        self._crm_url_verified = False
+        self._crm_verified_url = ""
+        self._crm_allowed_reasoning = []
+        self._refresh_reasoning_choices()
+        self._update_auth_ui()
+        self._save_settings()
+        self._log("выполнен выход из аккаунта CRM")
+
+    def _apply_crm_profile(self, profile: Dict[str, Any], session_token: str, log_profile: bool = True) -> None:
+        self.settings.crm_session_token = session_token
+        self.settings.crm_profile = dict(profile)
+        user = crm_client.profile_user(profile)
+        limits = crm_client.profile_limits(profile)
+        op = profile.get("operator") if isinstance(profile.get("operator"), dict) else {}
+
+        # Автозаполнение сервера и персонального токена Оператора из CRM.
+        if op.get("serverUrl"):
+            self.settings.set_value("operator", "crm_server", str(op["serverUrl"]))
+        if op.get("token"):
+            self.settings.set_value("operator", "crm_token", str(op["token"]))
+        if self.spec.id == "operator":
+            if op.get("serverUrl") and "crm_server" in self.field_vars:
+                self.field_vars["crm_server"].set(str(op["serverUrl"]))
+            if op.get("token") and "crm_token" in self.field_vars:
+                self.field_vars["crm_token"].set(str(op["token"]))
+
+        # Ограничения раздумий и лимита шагов по роли.
+        allowed_r = limits.get("reasoning")
+        self._crm_allowed_reasoning = (
+            [str(item).strip().lower() for item in allowed_r if str(item).strip()]
+            if isinstance(allowed_r, list)
+            else []
+        )
+        self.settings.reasoning = crm_client.clamp_reasoning(
+            self.settings.reasoning, self._crm_allowed_reasoning or None
+        )
+        self._refresh_reasoning_choices()
+
+        unlimited = bool(limits.get("unlimited"))
+        cap_steps = _int_or_none(str(limits.get("maxSteps") or ""))
+        if not unlimited and cap_steps:
+            for agent_id in ("operator", "chat_agent"):
+                cur_val = _int_or_none(str(self.settings.agent_values.get(agent_id, {}).get("max_steps") or ""))
+                clamped = crm_client.clamp_max_steps(cur_val, cap_steps, False)
+                if clamped is not None:
+                    self.settings.set_value(agent_id, "max_steps", clamped)
+            if self.spec.id in ("operator", "chat_agent") and "max_steps" in self.field_vars:
+                cur_ui = _int_or_none(str(self.field_vars["max_steps"].get()))
+                clamped_ui = crm_client.clamp_max_steps(cur_ui, cap_steps, False)
+                if clamped_ui is not None:
+                    self.field_vars["max_steps"].set(str(clamped_ui))
+
+        self._update_auth_ui()
+        if log_profile and user:
+            steps_label = "без лимита" if unlimited else str(cap_steps or 500)
+            self._log(
+                f"вход в CRM: {user.get('name')} ({user.get('roleLabel') or user.get('role')}) · "
+                f"Агент={'да' if user.get('canUseAgent') else 'нет'}, "
+                f"Оператор={'да' if user.get('canUseOperator') else 'нет'}, "
+                f"шаги={steps_label}"
+            )
+
+    def _refresh_reasoning_choices(self) -> None:
+        widget = self._model_widgets.get("reasoning")
+        if widget is None:
+            return
+        allowed = set(self._crm_allowed_reasoning)
+        pairs = [
+            (val, label) for val, label in REASONING_MODES
+            if not allowed or val in allowed
+        ]
+        if not pairs:
+            pairs = list(REASONING_MODES)
+        self._reasoning_by_label = {label: val for val, label in pairs}
+        widget.configure(values=[label for _val, label in pairs])
+        clamped = crm_client.clamp_reasoning(self.settings.reasoning, [val for val, _ in pairs])
+        self.settings.reasoning = clamped
+        val_to_label = {val: label for val, label in pairs}
+        self.reasoning_var.set(val_to_label.get(clamped, pairs[0][1]))
+
+    def _refresh_agent_list(self) -> None:
+        if not hasattr(self, "agent_list"):
+            return
+        user = crm_client.profile_user(self.settings.crm_profile)
+        self.agent_list.delete(0, "end")
+        for spec in self.agents:
+            suffix = ""
+            if user:
+                allowed, _ = crm_client.can_launch_agent(spec.id, self.settings.crm_profile)
+                if not allowed:
+                    suffix = " [нет доступа]"
+            self.agent_list.insert("end", f"{spec.title}{suffix}\n{spec.subtitle}")
+        try:
+            idx = self.agents.index(self.spec)
+            self.agent_list.selection_clear(0, "end")
+            self.agent_list.selection_set(idx)
+        except ValueError:
+            pass
+
+    def _update_auth_ui(self) -> None:
+        user = crm_client.profile_user(self.settings.crm_profile)
+        signed_in = bool(self.settings.crm_session_token and user)
+        if signed_in:
+            limits = crm_client.profile_limits(self.settings.crm_profile)
+            unlimited = bool(limits.get("unlimited"))
+            steps_label = "без лимита" if unlimited else f"до {limits.get('maxSteps') or 500}"
+            self.crm_account_summary_var.set(
+                f"CRM: {user.get('name') or user.get('email')} ({user.get('roleLabel') or user.get('role')}) · "
+                f"Агент: {'да' if user.get('canUseAgent') else 'нет'} · "
+                f"Оператор: {'да' if user.get('canUseOperator') else 'нет'} · "
+                f"шаги: {steps_label}"
+            )
+            self.auth_login_box.grid_remove()
+            self.auth_account_box.grid(row=0, column=0, sticky="ew")
+        else:
+            self.auth_account_box.grid_remove()
+            self.auth_login_box.grid(row=0, column=0, sticky="ew")
+            step2_state = "normal" if self._crm_url_verified else "disabled"
+            self.crm_email_entry.configure(state=step2_state)
+            self.crm_password_entry.configure(state=step2_state)
+            self.crm_login_btn.configure(state=step2_state)
+        self._refresh_agent_list()
+        if hasattr(self, "run_button"):
+            self._sync_run_button_state()
+
+    def _sync_run_button_state(self) -> None:
+        if self.run is not None and self.run.is_running():
+            return
+        user = crm_client.profile_user(self.settings.crm_profile)
+        if not (self.settings.crm_session_token and user):
+            self.run_button.configure(state="disabled")
+            self.status_var.set("войдите в аккаунт CRM для запуска агента")
+            return
+        allowed, _reason = crm_client.can_launch_agent(self.spec.id, self.settings.crm_profile)
+        if not allowed:
+            self.run_button.configure(state="disabled")
+            self.status_var.set(f"«{self.spec.title}» недоступен — нет прав в CRM")
+            return
+        self.run_button.configure(state="normal")
+        self.status_var.set("агент не запущен")
 
     def _requirements_text(self, spec: AgentSpec) -> str:
         needs = {
@@ -535,6 +866,36 @@ class LauncherApp:
         if self.run is not None and self.run.is_running():
             messagebox.showinfo(APP_NAME, "Агент уже запущен. Сначала остановите его.")
             return
+        if not (self.settings.crm_session_token and crm_client.profile_user(self.settings.crm_profile)):
+            msg = "Запуск невозможен без входа в аккаунт CRM. Сначала проверьте URL и авторизуйтесь."
+            self._log(msg)
+            messagebox.showwarning(APP_NAME, msg)
+            return
+
+        # Свежая проверка прав в CRM перед стартом (если сервер доступен).
+        try:
+            fresh = crm_client.fetch_profile(self.settings.crm_url, self.settings.crm_session_token, timeout=5.0)
+            self._apply_crm_profile(fresh, session_token=self.settings.crm_session_token, log_profile=False)
+        except crm_client.CrmClientError as exc:
+            err_msg = str(exc)
+            lowered = err_msg.lower()
+            if any(marker in lowered for marker in ("сессия", "авториз", "запрещ", "401", "403")):
+                self.settings.clear_crm_auth()
+                self._crm_url_verified = False
+                self._crm_verified_url = ""
+                self._update_auth_ui()
+                self._save_settings()
+                self._log(f"доступ отклонён CRM: {err_msg}")
+                messagebox.showerror(APP_NAME, err_msg)
+                return
+
+        allowed, reason = crm_client.can_launch_agent(self.spec.id, self.settings.crm_profile)
+        if not allowed:
+            self._log(f"запуск запрещён: {reason}")
+            self._sync_run_button_state()
+            messagebox.showerror(APP_NAME, reason)
+            return
+
         self.collect()
 
         missing = deps.missing(self.spec.id)
@@ -654,10 +1015,9 @@ class LauncherApp:
         self._finish_run()
 
     def _finish_run(self) -> None:
-        self.run_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
-        self.status_var.set("агент не запущен")
         self.run = None
+        self._sync_run_button_state()
 
     def _schedule_drain(self) -> None:
         self._drain_after_id = self.root.after(120, self._drain_log)

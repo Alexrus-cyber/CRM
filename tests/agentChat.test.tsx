@@ -49,6 +49,7 @@ let operatorPollCount = 0;
 
 let operatorTaskGuidance: Record<string, unknown> | null = null;
 let enableLiveOperatorMock = false;
+let ensureChatRequested = 0;
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -190,7 +191,9 @@ function mockFetch() {
           ],
         });
       }
-      if (url === "/api/agent/tasks/77" && method === "GET") {
+      if ((url === "/api/agent/tasks/77" || url === "/api/agent/tasks/77?ensureChat=1") && method === "GET") {
+        const ensure = url.includes("ensureChat=1");
+        if (ensure) ensureChatRequested += 1;
         operatorPollCount += 1;
         return json({
           task: {
@@ -208,7 +211,7 @@ function mockFetch() {
             createdAt: "2026-11-17T10:00:00.000Z",
             updatedAt: "2026-11-17T10:00:00.000Z",
           },
-          conversationId: enableLiveOperatorMock ? 42 : null,
+          conversationId: ensure ? 42 : null,
           events: enableLiveOperatorMock
             ? [
                 {
@@ -912,5 +915,38 @@ describe("вкладка «Агент»", () => {
     fireEvent.change(modelSelect, { target: { value: "gpt-4o-mini" } });
     const notes = await screen.findAllByText(/Модель gpt-4o-mini без расширенного reasoning/);
     expect(notes.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("закрывает карточку задачи Оператора без повторного открытия при опросе и запрашивает ?ensureChat=1 только по кнопке «Открыть как чат»", async () => {
+    enableLiveOperatorMock = true;
+    ensureChatRequested = 0;
+    conversations = [
+      { id: 1, kind: "agent", title: "Основной чат", messagesCount: 0, updatedAt: "2026-11-17T10:00:00.000Z" },
+      { id: 42, kind: "agent", title: "Оператор #77", messagesCount: 1, updatedAt: "2026-11-17T10:00:05.000Z" },
+    ];
+    messagesByConv[42] = [
+      { id: 100, role: "assistant", content: "Шаг #1: навожу на дверь" },
+    ];
+
+    render(<AgentChat userName="Тест" />);
+    await screen.findByRole("button", { name: "Скрыть карточку задачи Оператора" });
+    expect(ensureChatRequested).toBe(0);
+
+    // Скрываем карточку задачи: при повторном опросе карточка остаётся закрытой.
+    fireEvent.click(screen.getByRole("button", { name: "Скрыть карточку задачи Оператора" }));
+    expect(screen.queryByRole("button", { name: "Скрыть карточку задачи Оператора" })).toBeNull();
+
+    // Открываем задачу снова из списка «Недавние и активные задачи Оператора» на вкладке «Sandbox и Оператор».
+    fireEvent.click(screen.getByRole("tab", { name: /Sandbox и Оператор/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Оператор$/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /#77/i }));
+    const openChatBtn = await screen.findByRole("button", { name: /Открыть как чат/i });
+    expect(ensureChatRequested).toBe(0);
+
+    // Нажатие «Открыть как чат» при conversationId === null дозапрашивает ?ensureChat=1 и переходит в чат.
+    fireEvent.click(openChatBtn);
+    await waitFor(() => expect(ensureChatRequested).toBe(1));
+    expect(await screen.findByText("Шаг #1: навожу на дверь")).toBeTruthy();
+    enableLiveOperatorMock = false;
   });
 });

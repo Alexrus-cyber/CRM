@@ -54,7 +54,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (!created) {
     return Response.json({ ok: false, cancelled: true, error: "Задание отменено" }, { status: 409 });
   }
-  await syncOperatorTaskToConversation(ownerId, task.id);
+  await syncOperatorTaskToConversation(ownerId, task.id, { onlyIfExisting: true });
 
   return Response.json({ ok: true, approval: created }, { headers: { "Cache-Control": "no-store" } });
 }

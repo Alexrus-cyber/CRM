@@ -138,4 +138,21 @@ describe("ручная проверка подключения бота", () => 
     expect(running.connected).toBe(true);
     expect(running.runningTask?.id).toBe(task.id);
   });
+
+  it("при onlyIfExisting=true синхронизирует только существующий чат задачи и не воскрешает удалённый", async () => {
+    const task = await repo.createAgentTask(userId, "Открой заметки", 10);
+
+    // Пока чата нет, onlyIfExisting=true не создаёт его при поллинге.
+    const noCreate = await repo.syncOperatorTaskToConversation(userId, task.id, { onlyIfExisting: true });
+    expect(noCreate).toBeNull();
+
+    // По явному запросу (?ensureChat=1) чат создаётся.
+    const ensuredId = await repo.syncOperatorTaskToConversation(userId, task.id);
+    expect(ensuredId).not.toBeNull();
+
+    // После удаления чата повторный поллинг с onlyIfExisting=true не воскрешает его.
+    await repo.deleteAgentConversation(userId, ensuredId!);
+    const afterDelete = await repo.syncOperatorTaskToConversation(userId, task.id, { onlyIfExisting: true });
+    expect(afterDelete).toBeNull();
+  });
 });

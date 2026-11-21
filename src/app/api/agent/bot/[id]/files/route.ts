@@ -38,7 +38,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     fileSize: size,
     fileData: data,
   });
-  await syncOperatorTaskToConversation(ownerId, task.id);
+  await syncOperatorTaskToConversation(ownerId, task.id, { onlyIfExisting: true });
 
   return Response.json({ ok: true, eventId, url: `/api/agent/file/${eventId}` });
 }

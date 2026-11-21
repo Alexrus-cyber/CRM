@@ -1,4 +1,5 @@
 import { createAgentTranscript, listAgentTranscripts } from "@/db/repo";
+import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { buildTranscriptFileName } from "@/lib/transcripts";
 
@@ -8,8 +9,8 @@ export const runtime = "nodejs";
 async function adminUser() {
   const me = await getCurrentUser();
   if (!me) return { response: Response.json({ error: "Unauthorized" }, { status: 401 }) };
-  if (me.role !== "super_admin") {
-    return { response: Response.json({ error: "Доступно только главному администратору" }, { status: 403 }) };
+  if (!hasAgentAccess(me)) {
+    return { response: Response.json({ error: "Доступ к Агенту не выдан главным администратором" }, { status: 403 }) };
   }
   return { user: me };
 }

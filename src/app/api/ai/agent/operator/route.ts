@@ -1,6 +1,7 @@
-import { addAgentEvent, createAgentTask } from "@/db/repo";
+import { addAgentEvent, createAgentTask, recordAgentUsage } from "@/db/repo";
+import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
-import { aiAuthHeaders, aiEndpoint, normalizeBaseUrl } from "@/lib/ai";
+import { aiAuthHeaders, aiEndpoint, estimateTokens, normalizeBaseUrl } from "@/lib/ai";
 import { isUnlimitedStepsRole, resolveStepsForRole } from "@/lib/genParams";
 import {
   normalizeCoachMode,
@@ -50,8 +51,8 @@ function heuristicFormulate(goal: string): {
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") {
-    return Response.json({ error: "Доступно только главному администратору" }, { status: 403 });
+  if (!hasAgentAccess(me) && !hasOperatorAccess(me)) {
+    return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
   }
 
   const body = (await req.json().catch(() => null)) as
@@ -111,8 +112,24 @@ export async function POST(req: Request) {
         signal: AbortSignal.timeout(30_000),
       });
       if (res.ok) {
-        const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+        const data = (await res.json()) as {
+          choices?: Array<{ message?: { content?: string } }>;
+          usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+        };
         const raw = String(data.choices?.[0]?.message?.content ?? "").trim();
+        const promptTok =
+          Number(data.usage?.prompt_tokens ?? 0) ||
+          estimateTokens(goal) + estimateTokens(String(body?.contextSummary ?? "")) + 80;
+        const compTok = Number(data.usage?.completion_tokens ?? 0) || estimateTokens(raw);
+        const totalTok = Number(data.usage?.total_tokens ?? 0) || promptTok + compTok;
+        await recordAgentUsage({
+          userId: me.id,
+          kind: "operator",
+          model,
+          prompt: promptTok,
+          completion: compTok,
+          total: totalTok,
+        }).catch(() => undefined);
         const match = raw.match(/\{[\s\S]*\}/);
         if (match) {
           const parsed = JSON.parse(match[0]) as {

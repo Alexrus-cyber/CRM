@@ -4,6 +4,7 @@ import {
   listAgentConversationMessages,
   updateAgentConversation,
 } from "@/db/repo";
+import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
@@ -12,8 +13,8 @@ export const runtime = "nodejs";
 async function operatorUser() {
   const user = await getCurrentUser();
   if (!user) return { response: Response.json({ error: "Unauthorized" }, { status: 401 }) };
-  if (user.role !== "super_admin") {
-    return { response: Response.json({ error: "Только главный администратор" }, { status: 403 }) };
+  if (!hasAgentAccess(user) && !hasOperatorAccess(user)) {
+    return { response: Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 }) };
   }
   return { user };
 }
@@ -32,6 +33,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   if (!id) return Response.json({ error: "Некорректный чат" }, { status: 400 });
   const conversation = await getAgentConversation(auth.user.id, id);
   if (!conversation) return Response.json({ error: "Чат не найден" }, { status: 404 });
+  if (conversation.kind === "agent" ? !hasAgentAccess(auth.user) : !hasOperatorAccess(auth.user)) {
+    return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
+  }
 
   return Response.json(
     { conversation, messages: await listAgentConversationMessages(id) },
@@ -47,6 +51,9 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
   if (!id) return Response.json({ error: "Некорректный чат" }, { status: 400 });
   const current = await getAgentConversation(auth.user.id, id);
   if (!current) return Response.json({ error: "Чат не найден" }, { status: 404 });
+  if (current.kind === "agent" ? !hasAgentAccess(auth.user) : !hasOperatorAccess(auth.user)) {
+    return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
+  }
 
   const body = (await req.json().catch(() => null)) as { title?: string; systemPrompt?: string } | null;
   if (!body || (body.title === undefined && body.systemPrompt === undefined)) {

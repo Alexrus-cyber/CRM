@@ -153,3 +153,24 @@ export function formatTokenCount(value: number | null | undefined): string {
 export function reasoningAllowed(policy: AiRolePolicy, mode: ReasoningMode): boolean {
   return policy.reasoning.includes(mode);
 }
+
+/** Доступ к «Агенту» есть у Главного админа всегда, а у остальных — только по выдаче Главным админом. */
+export function hasAgentAccess(
+  user: { role?: string | null; canUseAgent?: boolean | null } | null | undefined,
+): boolean {
+  if (!user) return false;
+  return user.role === "super_admin" || Boolean(user.canUseAgent);
+}
+
+/** Доступ к «Оператору» есть у Главного админа всегда, а у остальных — только по выдаче Главным админом. */
+export function hasOperatorAccess(
+  user: { role?: string | null; canUseOperator?: boolean | null } | null | undefined,
+): boolean {
+  if (!user) return false;
+  return user.role === "super_admin" || Boolean(user.canUseOperator);
+}
+
+/** Статистику токенов Агента и Оператора видит только Главный админ. */
+export function canViewAgentUsage(user: { role?: string | null } | null | undefined): boolean {
+  return user?.role === "super_admin";
+}

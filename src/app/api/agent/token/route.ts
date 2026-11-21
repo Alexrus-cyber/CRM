@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { getAgentToken, saveAgentToken } from "@/db/repo";
+import { hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
 /**
@@ -13,14 +14,10 @@ import { getCurrentUser } from "@/lib/auth";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-function guard(role: string): boolean {
-  return role === "super_admin";
-}
-
 export async function GET() {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (!guard(me.role)) return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasOperatorAccess(me)) return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
 
   const token = await getAgentToken(me.id);
   return Response.json(
@@ -32,7 +29,7 @@ export async function GET() {
 export async function POST() {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (!guard(me.role)) return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasOperatorAccess(me)) return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
 
   const token = `crmop_${randomBytes(24).toString("hex")}`;
   await saveAgentToken(me.id, token);

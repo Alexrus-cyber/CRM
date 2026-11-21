@@ -5,6 +5,7 @@ import {
   setDefaultAgentConnection,
   updateAgentConnection,
 } from "@/db/repo";
+import { hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
 /**
@@ -40,7 +41,7 @@ function cleanName(raw: unknown): string {
 export async function GET() {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasOperatorAccess(me)) return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
 
   const connections = await listAgentConnections(me.id);
   return Response.json({ connections }, { headers: { "Cache-Control": "no-store" } });
@@ -49,7 +50,7 @@ export async function GET() {
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasOperatorAccess(me)) return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
 
   const body = (await req.json().catch(() => null)) as { name?: string; serverUrl?: string } | null;
   const name = cleanName(body?.name);
@@ -76,7 +77,7 @@ export async function POST(req: Request) {
 export async function PATCH(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasOperatorAccess(me)) return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
 
   const body = (await req.json().catch(() => null)) as
     | { id?: number; name?: string; serverUrl?: string; isDefault?: boolean }
@@ -118,7 +119,7 @@ export async function PATCH(req: Request) {
 export async function DELETE(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasOperatorAccess(me)) return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
 
   const id = Number(new URL(req.url).searchParams.get("id") ?? 0) || 0;
   if (!id) return Response.json({ error: "Не указано подключение" }, { status: 400 });

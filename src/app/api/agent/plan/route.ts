@@ -1,6 +1,8 @@
+import { recordAgentUsage } from "@/db/repo";
+import { hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
-import { normalizeBaseUrl } from "@/lib/ai";
-import { applyGenParams, normalizeGenParams } from "@/lib/genParams";
+import { estimateTokens, normalizeBaseUrl } from "@/lib/ai";
+import { applyGenParams, isUnlimitedStepsRole, normalizeGenParams } from "@/lib/genParams";
 import { DEFAULT_PLAN_PROMPT } from "@/lib/operatorPlan";
 
 /**
@@ -27,8 +29,8 @@ type IncomingFile = { name?: string; text?: string; note?: string; image?: strin
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") {
-    return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasOperatorAccess(me)) {
+    return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
   }
 
   const body = (await req.json().catch(() => null)) as
@@ -101,15 +103,15 @@ export async function POST(req: Request) {
     }
   }
 
+  const unlimited = isUnlimitedStepsRole(me.role);
   const payload: Record<string, unknown> = {
     model,
     messages: [{ role: "system", content: systemPrompt }, ...messages],
     temperature: 0.3,
     stream: false,
   };
-  // Настройки «Раздумья и генерация» с вкладки «Оператор»: значения из
-  // интерфейса важнее дефолтов, иначе планировщик думает иначе, чем бот.
-  applyGenParams(payload, normalizeGenParams(body?.settings?.params, { unlimited: true }), { unlimited: true });
+  // Настройки «Раздумья и генерация» с вкладки «Оператор»: учитываем роль.
+  applyGenParams(payload, normalizeGenParams(body?.settings?.params, { unlimited }), { unlimited });
 
   try {
     const res = await fetch(`${baseUrl}/chat/completions`, {
@@ -133,11 +135,28 @@ export async function POST(req: Request) {
     }
     const data = JSON.parse(raw) as {
       choices?: Array<{ message?: { content?: unknown; reasoning_content?: unknown; reasoning?: unknown } }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
     };
     const message = data.choices?.[0]?.message ?? {};
     const reply = String(message.content ?? "").trim();
     const reasoning = String(message.reasoning_content ?? message.reasoning ?? "").trim();
     if (!reply) return Response.json({ error: "Модель вернула пустой ответ" }, { status: 502 });
+    const promptEst = messages.reduce(
+      (sum, m) => sum + estimateTokens(typeof m.content === "string" ? m.content : JSON.stringify(m.content)),
+      estimateTokens(systemPrompt),
+    );
+    const completionEst = estimateTokens(reply) + estimateTokens(reasoning);
+    const promptTokens = Number(data.usage?.prompt_tokens ?? 0) || promptEst;
+    const completionTokens = Number(data.usage?.completion_tokens ?? 0) || completionEst;
+    const totalTokens = Number(data.usage?.total_tokens ?? 0) || promptTokens + completionTokens;
+    await recordAgentUsage({
+      userId: me.id,
+      kind: "operator",
+      model,
+      prompt: promptTokens,
+      completion: completionTokens,
+      total: totalTokens,
+    }).catch(() => undefined);
     return Response.json({ reply, ...(reasoning ? { reasoning } : {}) });
   } catch (error) {
     const message = error instanceof Error ? error.message : "нет связи";

@@ -14,7 +14,7 @@ import {
 } from "@/lib/operatorModes";
 import { normalizeTrustLevel, type TrustLevel } from "@/lib/trust";
 import { AGENT_MAX_STEPS, isUnlimitedStepsRole, resolveStepsForRole } from "@/lib/genParams";
-import type { Role, TaskPriority, TaskStatus } from "./schema";
+import type { ChatRoomKind, Role, TaskPriority, TaskStatus } from "./schema";
 
 export type UserLite = {
   id: number;
@@ -26,6 +26,9 @@ export type UserLite = {
   avatarColor: string;
   avatarUrl: string | null;
   bio: string | null;
+  isBot: boolean;
+  canUseAgent: boolean;
+  canUseOperator: boolean;
   createdAt: string;
 };
 
@@ -109,11 +112,13 @@ export type ChatMessage = {
   id: number;
   senderId: number;
   recipientId: number | null;
+  roomId: number | null;
   content: string;
   createdAt: string;
   senderName: string;
   senderColor: string;
   senderAvatar: string | null;
+  senderIsBot: boolean;
   attachment: ChatAttachmentMeta | null;
 };
 
@@ -121,6 +126,7 @@ export type ChatAttachmentRow = ChatAttachmentMeta & {
   messageId: number;
   senderId: number;
   recipientId: number | null;
+  roomId: number | null;
   data: string;
 };
 
@@ -139,11 +145,14 @@ function mapUser(r: Raw): UserLite {
     avatarColor: String(r.avatar_color ?? "#7c5cff"),
     avatarUrl: (r.avatar_url as string | null) ?? null,
     bio: (r.bio as string | null) ?? null,
+    isBot: toNum(r.is_bot) === 1,
+    canUseAgent: toNum(r.can_use_agent) === 1,
+    canUseOperator: toNum(r.can_use_operator) === 1,
     createdAt: toIso(r.created_at) ?? nowIso(),
   };
 }
 
-const USER_FIELDS = sql`id, name, email, phone, position, role, avatar_color, avatar_url, bio, created_at`;
+const USER_FIELDS = sql`id, name, email, phone, position, role, avatar_color, avatar_url, bio, is_bot, can_use_agent, can_use_operator, created_at`;
 
 const TASK_SELECT = sql`t.id, t.title, t.description, t.assignee_id, t.author_id, t.counterparty_id,
   t.deadline, t.deadline_time, t.accepted_at, t.hours, t.status, t.priority, t.completed_at, t.closed_at, t.created_at, t.updated_at,
@@ -191,7 +200,7 @@ function mapTask(r: Raw): TaskRow {
 /* ------------------------------ users ------------------------------ */
 
 export async function listUsers(): Promise<UserLite[]> {
-  const rows = await q(sql`select ${USER_FIELDS} from users order by name asc`);
+  const rows = await q(sql`select ${USER_FIELDS} from users where is_bot = 0 order by name asc`);
   return rows.map(mapUser);
 }
 
@@ -206,7 +215,7 @@ export async function countSuperAdmins(): Promise<number> {
 }
 
 export async function findUserAuthByEmail(email: string): Promise<AuthUserRow | null> {
-  const row = await q1(sql`select id, email, password_hash, role, name from users where email = ${email} limit 1`);
+  const row = await q1(sql`select id, email, password_hash, role, name from users where email = ${email} and is_bot = 0 limit 1`);
   if (!row) return null;
   return {
     id: toNum(row.id),
@@ -281,8 +290,26 @@ export async function setUserRole(id: number, role: Role): Promise<void> {
   await q(sql`update users set role = ${role}, updated_at = ${nowIso()} where id = ${id} and role <> 'super_admin'`);
 }
 
+export async function setUserAgentAccess(
+  id: number,
+  input: { canUseAgent?: boolean; canUseOperator?: boolean },
+): Promise<UserLite | null> {
+  const current = await getUser(id);
+  if (!current || current.isBot) return null;
+  const nextAgent = input.canUseAgent !== undefined ? (input.canUseAgent ? 1 : 0) : current.canUseAgent ? 1 : 0;
+  const nextOperator =
+    input.canUseOperator !== undefined ? (input.canUseOperator ? 1 : 0) : current.canUseOperator ? 1 : 0;
+  await q(sql`
+    update users
+    set can_use_agent = ${nextAgent},
+        can_use_operator = ${nextOperator},
+        updated_at = ${nowIso()}
+    where id = ${id}`);
+  return getUser(id);
+}
+
 export async function promoteSuperAdmin(id: number): Promise<void> {
-  await q(sql`update users set role = 'super_admin', updated_at = ${nowIso()} where id = ${id}`);
+  await q(sql`update users set role = 'super_admin', can_use_agent = 1, can_use_operator = 1, updated_at = ${nowIso()} where id = ${id}`);
 }
 
 export async function deleteUser(id: number): Promise<void> {
@@ -297,9 +324,10 @@ export async function insertSession(token: string, userId: number, expiresAt: st
 
 export async function findSessionUser(token: string): Promise<{ user: UserLite } | null> {
   const row = await q1(sql`
-    select u.id, u.name, u.email, u.phone, u.position, u.role, u.avatar_color, u.avatar_url, u.bio, u.created_at
+    select u.id, u.name, u.email, u.phone, u.position, u.role, u.avatar_color, u.avatar_url, u.bio,
+           u.is_bot, u.can_use_agent, u.can_use_operator, u.created_at
     from sessions s join users u on u.id = s.user_id
-    where s.token = ${token} and s.expires_at > ${nowIso()}
+    where s.token = ${token} and s.expires_at > ${nowIso()} and u.is_bot = 0
     limit 1`);
   return row ? { user: mapUser(row) } : null;
 }
@@ -555,15 +583,16 @@ export async function messageCountsBySender(): Promise<Map<number, number>> {
   return new Map(rows.map((r) => [toNum(r.sender_id), toNum(r.c)]));
 }
 
-/** Условие «это сообщение из переписки me ↔ peer» (peer = 0 — общий чат). */
-function conversationFilter(meId: number, peer: number) {
+/** Условие «это сообщение из переписки» (room > 0 — комната, peer = 0 — общий чат, peer > 0 — личка). */
+function conversationFilter(meId: number, peer: number, room = 0) {
+  if (room > 0) return sql`m.room_id = ${room}`;
   return peer === 0
-    ? sql`m.recipient_id is null`
-    : sql`((m.sender_id = ${meId} and m.recipient_id = ${peer}) or (m.sender_id = ${peer} and m.recipient_id = ${meId}))`;
+    ? sql`m.room_id is null and m.recipient_id is null`
+    : sql`m.room_id is null and ((m.sender_id = ${meId} and m.recipient_id = ${peer}) or (m.sender_id = ${peer} and m.recipient_id = ${meId}))`;
 }
 
-const MESSAGE_SELECT = sql`m.id, m.sender_id, m.recipient_id, m.content, m.created_at,
-  u.name as sender_name, u.avatar_color as sender_color, u.avatar_url as sender_avatar,
+const MESSAGE_SELECT = sql`m.id, m.sender_id, m.recipient_id, m.room_id, m.content, m.created_at,
+  u.name as sender_name, u.avatar_color as sender_color, u.avatar_url as sender_avatar, u.is_bot as sender_is_bot,
   a.id as attachment_id, a.name as attachment_name, a.mime as attachment_mime, a.size as attachment_size`;
 
 const MESSAGE_FROM = sql`from messages m
@@ -575,11 +604,13 @@ function mapMessage(r: Raw): ChatMessage {
     id: toNum(r.id),
     senderId: toNum(r.sender_id),
     recipientId: r.recipient_id === null || r.recipient_id === undefined ? null : toNum(r.recipient_id),
+    roomId: r.room_id === null || r.room_id === undefined ? null : toNum(r.room_id),
     content: String(r.content),
     createdAt: toIso(r.created_at) ?? nowIso(),
     senderName: String(r.sender_name ?? ""),
     senderColor: String(r.sender_color ?? "#7c5cff"),
     senderAvatar: (r.sender_avatar as string | null) ?? null,
+    senderIsBot: toNum(r.sender_is_bot) === 1,
     attachment: r.attachment_id === null || r.attachment_id === undefined
       ? null
       : {
@@ -601,8 +632,9 @@ export async function listMessages(
   peer: number,
   afterId: number,
   limit = 30,
+  room = 0,
 ): Promise<{ messages: ChatMessage[]; hasOlder: boolean }> {
-  const conversation = conversationFilter(meId, peer);
+  const conversation = conversationFilter(meId, peer, room);
   const filter = afterId > 0 ? sql`${conversation} and m.id > ${afterId}` : conversation;
   const rows = await q(sql`select ${MESSAGE_SELECT} ${MESSAGE_FROM} where ${filter} order by m.id desc limit ${limit}`);
   const messages = rows.map(mapMessage).reverse();
@@ -619,8 +651,9 @@ export async function listMessagesBefore(
   peer: number,
   beforeId: number,
   limit = 30,
+  room = 0,
 ): Promise<{ messages: ChatMessage[]; hasOlder: boolean }> {
-  const conversation = conversationFilter(meId, peer);
+  const conversation = conversationFilter(meId, peer, room);
   const rows = await q(sql`
     select ${MESSAGE_SELECT} ${MESSAGE_FROM}
     where ${conversation} and m.id < ${beforeId}
@@ -641,8 +674,9 @@ export async function listMessagesAround(
   meId: number,
   peer: number,
   messageId: number,
+  room = 0,
 ): Promise<{ messages: ChatMessage[]; hasOlder: boolean; hasNewer: boolean }> {
-  const conversation = conversationFilter(meId, peer);
+  const conversation = conversationFilter(meId, peer, room);
   const before = await q(sql`
     select ${MESSAGE_SELECT} ${MESSAGE_FROM}
     where ${conversation} and m.id <= ${messageId}
@@ -663,10 +697,15 @@ export async function listMessagesAround(
   return { messages, hasOlder, hasNewer };
 }
 
-export async function insertMessage(senderId: number, recipientId: number | null, content: string): Promise<number> {
+export async function insertMessage(
+  senderId: number,
+  recipientId: number | null,
+  content: string,
+  roomId: number | null = null,
+): Promise<number> {
   const row = await q1<{ id: number }>(sql`
-    insert into messages (sender_id, recipient_id, content, content_lower, created_at)
-    values (${senderId}, ${recipientId}, ${content}, ${content.toLowerCase()}, ${nowIso()}) returning id`);
+    insert into messages (sender_id, recipient_id, room_id, content, content_lower, created_at)
+    values (${senderId}, ${roomId ? null : recipientId}, ${roomId}, ${content}, ${content.toLowerCase()}, ${nowIso()}) returning id`);
   return toNum(row?.id);
 }
 
@@ -683,7 +722,7 @@ export async function insertMessageAttachment(
 
 export async function getMessageAttachment(id: number): Promise<ChatAttachmentRow | null> {
   const row = await q1(sql`
-    select a.id, a.message_id, a.name, a.mime, a.size, a.data, m.sender_id, m.recipient_id
+    select a.id, a.message_id, a.name, a.mime, a.size, a.data, m.sender_id, m.recipient_id, m.room_id
     from message_attachments a join messages m on m.id = a.message_id
     where a.id = ${id} limit 1`);
   if (!row) return null;
@@ -696,6 +735,7 @@ export async function getMessageAttachment(id: number): Promise<ChatAttachmentRo
     data: String(row.data),
     senderId: toNum(row.sender_id),
     recipientId: row.recipient_id === null || row.recipient_id === undefined ? null : toNum(row.recipient_id),
+    roomId: row.room_id === null || row.room_id === undefined ? null : toNum(row.room_id),
   };
 }
 
@@ -716,6 +756,21 @@ export async function markChatRead(userId: number, peerId: number, lastReadId: n
   await q(sql`update chat_reads set last_read_id = ${lastReadId}, updated_at = ${nowIso()} where id = ${toNum(existing.id)}`);
 }
 
+/** Отметить групповой/общий чат прочитанным до сообщения `lastReadId`. */
+export async function markRoomRead(userId: number, roomId: number, lastReadId: number): Promise<void> {
+  if (lastReadId <= 0 || roomId <= 0) return;
+  const existing = await q1<{ id: number; last_read_id: number }>(sql`
+    select id, last_read_id from chat_room_reads where user_id = ${userId} and room_id = ${roomId} limit 1`);
+  if (!existing) {
+    await q(sql`
+      insert into chat_room_reads (user_id, room_id, last_read_id, updated_at)
+      values (${userId}, ${roomId}, ${lastReadId}, ${nowIso()})`);
+    return;
+  }
+  if (toNum(existing.last_read_id) >= lastReadId) return;
+  await q(sql`update chat_room_reads set last_read_id = ${lastReadId}, updated_at = ${nowIso()} where id = ${toNum(existing.id)}`);
+}
+
 /** До какого сообщения собеседник дочитал переписку с нами. */
 export async function getPeerReadId(meId: number, peerId: number): Promise<number> {
   const row = await q1<{ last_read_id: number }>(sql`
@@ -730,10 +785,17 @@ export async function listGeneralReaders(meId: number): Promise<Array<{ userId: 
   return rows.map((r) => ({ userId: toNum(r.user_id), lastReadId: toNum(r.last_read_id) }));
 }
 
+/** Кто и до какого сообщения дочитал групповой/общий чат. */
+export async function listRoomReaders(meId: number, roomId: number): Promise<Array<{ userId: number; lastReadId: number }>> {
+  const rows = await q(sql`
+    select user_id, last_read_id from chat_room_reads where room_id = ${roomId} and user_id <> ${meId}`);
+  return rows.map((r) => ({ userId: toNum(r.user_id), lastReadId: toNum(r.last_read_id) }));
+}
+
 /** Последний id в переписке — ограничитель для отметки «прочитано». */
-export async function maxConversationMessageId(meId: number, peer: number): Promise<number> {
+export async function maxConversationMessageId(meId: number, peer: number, room = 0): Promise<number> {
   const row = await q1<{ id: number | null }>(sql`
-    select max(m.id) as id ${MESSAGE_FROM} where ${conversationFilter(meId, peer)}`);
+    select max(m.id) as id ${MESSAGE_FROM} where ${conversationFilter(meId, peer, room)}`);
   return row ? toNum(row.id) : 0;
 }
 
@@ -749,7 +811,8 @@ export async function unreadCounts(meId: number): Promise<Record<string, number>
              end as peer,
              m.id as id
       from messages m
-      where m.sender_id <> ${meId}
+      where m.room_id is null
+        and m.sender_id <> ${meId}
         and (m.recipient_id is null or m.recipient_id = ${meId})
     ) t
     left join chat_reads r on r.user_id = ${meId} and r.peer_id = t.peer
@@ -760,12 +823,36 @@ export async function unreadCounts(meId: number): Promise<Record<string, number>
   return result;
 }
 
+/** Непрочитанные сообщения в групповых и общих комнатах, доступных пользователю. */
+export async function unreadRoomCounts(meId: number): Promise<Record<string, number>> {
+  const rows = await q(sql`
+    select m.room_id as room_id, count(*) as c
+    from messages m
+    join chat_rooms cr on cr.id = m.room_id
+    left join chat_room_reads r on r.user_id = ${meId} and r.room_id = m.room_id
+    where m.room_id is not null
+      and m.sender_id <> ${meId}
+      and (
+        cr.kind = 'shared'
+        or exists (
+          select 1 from chat_room_members cm
+          where cm.room_id = m.room_id and cm.user_id = ${meId}
+        )
+      )
+      and m.id > coalesce(r.last_read_id, 0)
+    group by m.room_id`);
+  const result: Record<string, number> = {};
+  for (const row of rows) result[String(toNum(row.room_id))] = toNum(row.c);
+  return result;
+}
+
 /** Поиск по переписке: текст сообщений и имена вложений (нижний регистр — заранее). */
 export async function searchMessages(
   meId: number,
   peer: number,
   query: string,
   limit = 50,
+  room = 0,
 ): Promise<ChatMessage[]> {
   // Спецсимволы LIKE вырезаем: без них пустой запрос не должен совпадать со всем.
   const clean = query.toLowerCase().replace(/[%_\\]/g, "").trim();
@@ -773,7 +860,7 @@ export async function searchMessages(
   const needle = `%${clean}%`;
   const rows = await q(sql`
     select ${MESSAGE_SELECT} ${MESSAGE_FROM}
-    where ${conversationFilter(meId, peer)}
+    where ${conversationFilter(meId, peer, room)}
       and (m.content_lower like ${needle} or a.name_lower like ${needle})
     order by m.id desc limit ${limit}`);
   return rows.map(mapMessage).reverse();
@@ -791,26 +878,39 @@ export type ChatNotificationRow = {
   senderName: string;
   senderColor: string;
   recipientId: number | null;
+  roomId: number | null;
+  roomName: string | null;
   preview: string;
   createdAt: string;
 };
 
 /**
- * Новые сообщения, адресованные мне (личные и общий чат), начиная с `afterId`.
- * Используется всплывающими уведомлениями: сами сообщения читает чат, а здесь
- * нужен только короткий текст-превью.
+ * Новые сообщения, адресованные мне (личные, общий чат и доступные группы/комнаты), начиная с `afterId`.
  */
 export async function listNewMessagesFor(meId: number, afterId: number, limit = 5): Promise<ChatNotificationRow[]> {
   const rows = await q(sql`
-    select m.id, m.sender_id, m.recipient_id, m.content, m.created_at,
+    select m.id, m.sender_id, m.recipient_id, m.room_id, cr.name as room_name,
+      m.content, m.created_at,
       u.name as sender_name, u.avatar_color as sender_color,
       a.name as attachment_name
     from messages m
     join users u on u.id = m.sender_id
+    left join chat_rooms cr on cr.id = m.room_id
     left join message_attachments a on a.message_id = m.id
     where m.id > ${afterId}
       and m.sender_id <> ${meId}
-      and (m.recipient_id is null or m.recipient_id = ${meId})
+      and (
+        (m.room_id is null and (m.recipient_id is null or m.recipient_id = ${meId}))
+        or (
+          m.room_id is not null and (
+            cr.kind = 'shared'
+            or exists (
+              select 1 from chat_room_members cm
+              where cm.room_id = m.room_id and cm.user_id = ${meId}
+            )
+          )
+        )
+      )
     order by m.id asc
     limit ${limit}`);
   return rows.map((r) => {
@@ -823,6 +923,8 @@ export async function listNewMessagesFor(meId: number, afterId: number, limit = 
       senderName: String(r.sender_name ?? ""),
       senderColor: String(r.sender_color ?? "#7c5cff"),
       recipientId: r.recipient_id === null || r.recipient_id === undefined ? null : toNum(r.recipient_id),
+      roomId: r.room_id === null || r.room_id === undefined ? null : toNum(r.room_id),
+      roomName: (r.room_name as string | null) ?? null,
       preview: preview.length > 160 ? `${preview.slice(0, 160)}…` : preview,
       createdAt: toIso(r.created_at) ?? nowIso(),
     };
@@ -2373,16 +2475,22 @@ const OP_STATUS_LABELS: Record<string, string> = {
 export async function syncOperatorTaskToConversation(
   userId: number,
   taskId: number,
+  options?: { onlyIfExisting?: boolean },
 ): Promise<number | null> {
   const task = await getAgentTask(userId, taskId);
   if (!task) return null;
+
+  let conv = await findOperatorTaskConversation(userId, task.id);
+  if (!conv && options?.onlyIfExisting) {
+    return null;
+  }
+
   const events = await listAgentEvents(task.id, 0);
 
   const marker = `operator_task:${task.id}`;
   const cleanPromptTitle = task.prompt.replace(/\s+/g, " ").trim().slice(0, 64);
   const title = `Оператор #${task.id}: ${cleanPromptTitle || "задача на ПК"}`.slice(0, 120);
 
-  let conv = await findOperatorTaskConversation(userId, task.id);
   if (!conv) {
     conv = await createAgentConversation(userId, "agent", title, marker);
   }
@@ -2630,4 +2738,595 @@ export async function deleteAgentTranscript(userId: number, id: number): Promise
   await q(sql`delete from agent_transcripts where id = ${id} and user_id = ${userId}`);
   return true;
 }
+
+/* --------------- расход токенов Агента и Оператора ----------------- */
+
+export type AgentUsageKind = "agent" | "operator";
+
+export type AgentUsageTotals = {
+  prompt: number;
+  completion: number;
+  total: number;
+  events: number;
+};
+
+export type AgentUsageSummaryData = {
+  currentMonth: string;
+  month: {
+    agent: AgentUsageTotals;
+    operator: AgentUsageTotals;
+    total: AgentUsageTotals;
+  };
+  all: {
+    agent: AgentUsageTotals;
+    operator: AgentUsageTotals;
+    total: AgentUsageTotals;
+  };
+};
+
+const EMPTY_AGENT_USAGE_TOTALS: AgentUsageTotals = { prompt: 0, completion: 0, total: 0, events: 0 };
+
+function sumAgentUsageTotals(a: AgentUsageTotals, b: AgentUsageTotals): AgentUsageTotals {
+  return {
+    prompt: a.prompt + b.prompt,
+    completion: a.completion + b.completion,
+    total: a.total + b.total,
+    events: a.events + b.events,
+  };
+}
+
+export async function recordAgentUsage(input: {
+  userId: number;
+  kind: AgentUsageKind;
+  refId?: number;
+  model?: string;
+  prompt: number;
+  completion: number;
+  total?: number;
+}): Promise<void> {
+  const prompt = Math.max(0, Math.round(input.prompt));
+  const completion = Math.max(0, Math.round(input.completion));
+  const total = Math.max(prompt + completion, Math.round(input.total ?? prompt + completion));
+  if (total <= 0 && prompt <= 0 && completion <= 0) return;
+  const month = aiMonthKey();
+  await q(sql`
+    insert into agent_usage_events (user_id, kind, ref_id, model, prompt_tokens, completion_tokens, total_tokens, month, created_at)
+    values (${input.userId}, ${input.kind}, ${Math.max(0, Math.round(input.refId ?? 0))}, ${String(input.model ?? "").slice(0, 160)},
+            ${prompt}, ${completion}, ${total}, ${month}, ${nowIso()})`);
+}
+
+export async function getAgentUsage(userId: number, month = aiMonthKey()): Promise<AgentUsageSummaryData> {
+  const allRows = await q(sql`
+    select kind,
+      coalesce(sum(prompt_tokens), 0) as prompt,
+      coalesce(sum(completion_tokens), 0) as completion,
+      coalesce(sum(total_tokens), 0) as total,
+      count(*) as events
+    from agent_usage_events
+    where user_id = ${userId}
+    group by kind`);
+  const monthRows = await q(sql`
+    select kind,
+      coalesce(sum(prompt_tokens), 0) as prompt,
+      coalesce(sum(completion_tokens), 0) as completion,
+      coalesce(sum(total_tokens), 0) as total,
+      count(*) as events
+    from agent_usage_events
+    where user_id = ${userId} and month = ${month}
+    group by kind`);
+
+  const extract = (rows: Raw[], kind: AgentUsageKind): AgentUsageTotals => {
+    const row = rows.find((r) => r.kind === kind);
+    if (!row) return { ...EMPTY_AGENT_USAGE_TOTALS };
+    return {
+      prompt: toNum(row.prompt),
+      completion: toNum(row.completion),
+      total: toNum(row.total),
+      events: toNum(row.events),
+    };
+  };
+
+  const monthAgent = extract(monthRows, "agent");
+  const monthOperator = extract(monthRows, "operator");
+  const allAgent = extract(allRows, "agent");
+  const allOperator = extract(allRows, "operator");
+
+  return {
+    currentMonth: month,
+    month: {
+      agent: monthAgent,
+      operator: monthOperator,
+      total: sumAgentUsageTotals(monthAgent, monthOperator),
+    },
+    all: {
+      agent: allAgent,
+      operator: allOperator,
+      total: sumAgentUsageTotals(allAgent, allOperator),
+    },
+  };
+}
+
+export type UserAgentUsageRow = {
+  userId: number;
+  name: string;
+  email: string;
+  role: Role;
+  canUseAgent: boolean;
+  canUseOperator: boolean;
+  monthAgent: number;
+  monthOperator: number;
+  monthTotal: number;
+  allAgent: number;
+  allOperator: number;
+  allTotal: number;
+};
+
+export async function listUsersAgentUsage(month = aiMonthKey()): Promise<UserAgentUsageRow[]> {
+  const rows = await q(sql`
+    select u.id, u.name, u.email, u.role, u.can_use_agent, u.can_use_operator,
+      coalesce((select sum(e.total_tokens) from agent_usage_events e where e.user_id = u.id and e.kind = 'agent' and e.month = ${month}), 0) as month_agent,
+      coalesce((select sum(e.total_tokens) from agent_usage_events e where e.user_id = u.id and e.kind = 'operator' and e.month = ${month}), 0) as month_operator,
+      coalesce((select sum(e.total_tokens) from agent_usage_events e where e.user_id = u.id and e.kind = 'agent'), 0) as all_agent,
+      coalesce((select sum(e.total_tokens) from agent_usage_events e where e.user_id = u.id and e.kind = 'operator'), 0) as all_operator
+    from users u
+    where u.is_bot = 0
+    order by u.name asc`);
+  return rows.map((r) => {
+    const monthAgent = toNum(r.month_agent);
+    const monthOperator = toNum(r.month_operator);
+    const allAgent = toNum(r.all_agent);
+    const allOperator = toNum(r.all_operator);
+    return {
+      userId: toNum(r.id),
+      name: String(r.name ?? ""),
+      email: String(r.email ?? ""),
+      role: (r.role as Role) ?? "user",
+      canUseAgent: toNum(r.can_use_agent) === 1 || r.role === "super_admin",
+      canUseOperator: toNum(r.can_use_operator) === 1 || r.role === "super_admin",
+      monthAgent,
+      monthOperator,
+      monthTotal: monthAgent + monthOperator,
+      allAgent,
+      allOperator,
+      allTotal: allAgent + allOperator,
+    };
+  });
+}
+
+/* ------------- групповые/общие чаты и модели-боты ------------------ */
+
+export type ChatBotRow = {
+  userId: number;
+  name: string;
+  position: string | null;
+  bio: string | null;
+  avatarColor: string;
+  avatarUrl: string | null;
+  provider: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  systemPrompt: string;
+  paramsJson: string;
+  replyMode: "mention" | "always";
+  isActive: boolean;
+  createdBy: number | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+function mapChatBot(r: Raw): ChatBotRow {
+  return {
+    userId: toNum(r.user_id ?? r.id),
+    name: String(r.name ?? "Модель ИИ"),
+    position: (r.position as string | null) ?? null,
+    bio: (r.bio as string | null) ?? null,
+    avatarColor: String(r.avatar_color ?? "#06b6d4"),
+    avatarUrl: (r.avatar_url as string | null) ?? null,
+    provider: String(r.provider ?? "local"),
+    baseUrl: String(r.base_url ?? ""),
+    apiKey: String(r.api_key ?? ""),
+    model: String(r.model ?? ""),
+    systemPrompt: String(r.system_prompt ?? ""),
+    paramsJson: String(r.params_json ?? "{}"),
+    replyMode: r.reply_mode === "always" ? "always" : "mention",
+    isActive: toNum(r.is_active) !== 0,
+    createdBy: r.created_by === null || r.created_by === undefined ? null : toNum(r.created_by),
+    createdAt: toIso(r.created_at) ?? nowIso(),
+    updatedAt: toIso(r.updated_at) ?? nowIso(),
+  };
+}
+
+export async function listChatBots(): Promise<ChatBotRow[]> {
+  const rows = await q(sql`
+    select u.id as user_id, u.name, u.position, u.bio, u.avatar_color, u.avatar_url,
+      c.provider, c.base_url, c.api_key, c.model, c.system_prompt, c.params_json,
+      c.reply_mode, c.is_active, c.created_by, c.created_at, c.updated_at
+    from users u
+    join ai_bot_configs c on c.user_id = u.id
+    where u.is_bot = 1
+    order by u.name asc`);
+  return rows.map(mapChatBot);
+}
+
+export async function getChatBot(botUserId: number): Promise<ChatBotRow | null> {
+  const row = await q1(sql`
+    select u.id as user_id, u.name, u.position, u.bio, u.avatar_color, u.avatar_url,
+      c.provider, c.base_url, c.api_key, c.model, c.system_prompt, c.params_json,
+      c.reply_mode, c.is_active, c.created_by, c.created_at, c.updated_at
+    from users u
+    join ai_bot_configs c on c.user_id = u.id
+    where u.is_bot = 1 and u.id = ${botUserId}
+    limit 1`);
+  return row ? mapChatBot(row) : null;
+}
+
+export async function createChatBot(input: {
+  createdBy: number;
+  name: string;
+  position?: string | null;
+  bio?: string | null;
+  avatarColor?: string;
+  avatarUrl?: string | null;
+  provider?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  model?: string;
+  systemPrompt?: string;
+  paramsJson?: string;
+  replyMode?: "mention" | "always";
+  isActive?: boolean;
+}): Promise<ChatBotRow> {
+  const now = nowIso();
+  const suffix = randomBytes(8).toString("hex");
+  const email = `bot-${suffix}@bot.crm.local`;
+  const fakeHash = `bot:${randomBytes(24).toString("hex")}`;
+  const name = input.name.trim().slice(0, 80) || "Модель ИИ";
+  const position = input.position?.trim().slice(0, 80) || "ИИ-модель (бот)";
+  const bio = input.bio?.trim().slice(0, 500) || null;
+  const avatarColor = input.avatarColor?.trim() || "#06b6d4";
+  const avatarUrl = input.avatarUrl?.trim() || null;
+
+  const userRow = await q1<{ id: number }>(sql`
+    insert into users (email, password_hash, name, position, bio, role, avatar_color, avatar_url, is_bot, can_use_agent, can_use_operator, created_at, updated_at)
+    values (${email}, ${fakeHash}, ${name}, ${position}, ${bio}, 'user', ${avatarColor}, ${avatarUrl}, 1, 0, 0, ${now}, ${now})
+    returning id`);
+  const userId = toNum(userRow?.id);
+
+  await q(sql`
+    insert into ai_bot_configs (user_id, provider, base_url, api_key, model, system_prompt, params_json, reply_mode, is_active, created_by, created_at, updated_at)
+    values (${userId}, ${String(input.provider ?? "local").slice(0, 40)}, ${String(input.baseUrl ?? "").trim().slice(0, 400)},
+            ${String(input.apiKey ?? "").trim().slice(0, 400)}, ${String(input.model ?? "").trim().slice(0, 160)},
+            ${String(input.systemPrompt ?? "").slice(0, 4000)}, ${String(input.paramsJson ?? "{}").slice(0, 2000)},
+            ${input.replyMode === "always" ? "always" : "mention"}, ${input.isActive === false ? 0 : 1},
+            ${input.createdBy}, ${now}, ${now})`);
+
+  const created = await getChatBot(userId);
+  if (!created) throw new Error("Не удалось создать бота");
+  return created;
+}
+
+export async function updateChatBot(
+  botUserId: number,
+  input: {
+    name?: string;
+    position?: string | null;
+    bio?: string | null;
+    avatarColor?: string;
+    avatarUrl?: string | null;
+    provider?: string;
+    baseUrl?: string;
+    apiKey?: string;
+    clearApiKey?: boolean;
+    model?: string;
+    systemPrompt?: string;
+    paramsJson?: string;
+    replyMode?: "mention" | "always";
+    isActive?: boolean;
+  },
+): Promise<ChatBotRow | null> {
+  const existing = await getChatBot(botUserId);
+  if (!existing) return null;
+  const now = nowIso();
+  const nextName = input.name !== undefined ? input.name.trim().slice(0, 80) || existing.name : existing.name;
+  const nextPosition = input.position !== undefined ? input.position?.trim().slice(0, 80) || null : existing.position;
+  const nextBio = input.bio !== undefined ? input.bio?.trim().slice(0, 500) || null : existing.bio;
+  const nextColor = input.avatarColor !== undefined ? input.avatarColor.trim() || existing.avatarColor : existing.avatarColor;
+  const nextAvatar = input.avatarUrl !== undefined ? input.avatarUrl?.trim() || null : existing.avatarUrl;
+
+  await q(sql`
+    update users
+    set name = ${nextName}, position = ${nextPosition}, bio = ${nextBio},
+        avatar_color = ${nextColor}, avatar_url = ${nextAvatar}, updated_at = ${now}
+    where id = ${botUserId} and is_bot = 1`);
+
+  const nextProvider = input.provider !== undefined ? String(input.provider).slice(0, 40) : existing.provider;
+  const nextBaseUrl = input.baseUrl !== undefined ? String(input.baseUrl).trim().slice(0, 400) : existing.baseUrl;
+  const nextApiKey = input.clearApiKey
+    ? ""
+    : input.apiKey !== undefined && input.apiKey.trim() !== ""
+      ? input.apiKey.trim().slice(0, 400)
+      : existing.apiKey;
+  const nextModel = input.model !== undefined ? String(input.model).trim().slice(0, 160) : existing.model;
+  const nextPrompt = input.systemPrompt !== undefined ? String(input.systemPrompt).slice(0, 4000) : existing.systemPrompt;
+  const nextParams = input.paramsJson !== undefined ? String(input.paramsJson).slice(0, 2000) : existing.paramsJson;
+  const nextReplyMode = input.replyMode !== undefined ? (input.replyMode === "always" ? "always" : "mention") : existing.replyMode;
+  const nextActive = input.isActive !== undefined ? (input.isActive ? 1 : 0) : existing.isActive ? 1 : 0;
+
+  await q(sql`
+    update ai_bot_configs
+    set provider = ${nextProvider}, base_url = ${nextBaseUrl}, api_key = ${nextApiKey},
+        model = ${nextModel}, system_prompt = ${nextPrompt}, params_json = ${nextParams},
+        reply_mode = ${nextReplyMode}, is_active = ${nextActive}, updated_at = ${now}
+    where user_id = ${botUserId}`);
+
+  return getChatBot(botUserId);
+}
+
+export async function deleteChatBot(botUserId: number): Promise<boolean> {
+  const existing = await getChatBot(botUserId);
+  if (!existing) return false;
+  await q(sql`delete from users where id = ${botUserId} and is_bot = 1`);
+  return true;
+}
+
+export async function listGeneralBotIds(): Promise<number[]> {
+  const rows = await q(sql`
+    select g.bot_user_id
+    from chat_general_bots g
+    join users u on u.id = g.bot_user_id
+    where u.is_bot = 1
+    order by g.id asc`);
+  return rows.map((r) => toNum(r.bot_user_id));
+}
+
+export async function listGeneralActiveBots(): Promise<ChatBotRow[]> {
+  const rows = await q(sql`
+    select u.id as user_id, u.name, u.position, u.bio, u.avatar_color, u.avatar_url,
+      c.provider, c.base_url, c.api_key, c.model, c.system_prompt, c.params_json,
+      c.reply_mode, c.is_active, c.created_by, c.created_at, c.updated_at
+    from chat_general_bots g
+    join users u on u.id = g.bot_user_id
+    join ai_bot_configs c on c.user_id = u.id
+    where u.is_bot = 1 and c.is_active = 1
+    order by u.name asc`);
+  return rows.map(mapChatBot);
+}
+
+export async function addGeneralBot(botUserId: number, addedBy: number): Promise<boolean> {
+  const bot = await getChatBot(botUserId);
+  if (!bot) return false;
+  const existing = await q1<{ id: number }>(sql`select id from chat_general_bots where bot_user_id = ${botUserId} limit 1`);
+  if (!existing) {
+    await q(sql`
+      insert into chat_general_bots (bot_user_id, added_by, created_at)
+      values (${botUserId}, ${addedBy}, ${nowIso()})`);
+  }
+  return true;
+}
+
+export async function removeGeneralBot(botUserId: number): Promise<boolean> {
+  await q(sql`delete from chat_general_bots where bot_user_id = ${botUserId}`);
+  return true;
+}
+
+export type ChatRoomMemberRow = {
+  userId: number;
+  name: string;
+  position: string | null;
+  avatarColor: string;
+  avatarUrl: string | null;
+  isBot: boolean;
+  role: "owner" | "member";
+};
+
+export type ChatRoomRow = {
+  id: number;
+  name: string;
+  description: string;
+  kind: ChatRoomKind;
+  createdBy: number | null;
+  isMember: boolean;
+  myRole: "owner" | "member" | null;
+  members: ChatRoomMemberRow[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+async function loadRoomMembersMap(roomIds: number[]): Promise<Map<number, ChatRoomMemberRow[]>> {
+  const map = new Map<number, ChatRoomMemberRow[]>();
+  if (roomIds.length === 0) return map;
+  const idList = sql.join(roomIds.map((id) => sql`${id}`), sql`, `);
+  const rows = await q(sql`
+    select m.room_id, m.user_id, m.role,
+      u.name, u.position, u.avatar_color, u.avatar_url, u.is_bot
+    from chat_room_members m
+    join users u on u.id = m.user_id
+    where m.room_id in (${idList})
+    order by u.is_bot asc, m.id asc`);
+  for (const r of rows) {
+    const rid = toNum(r.room_id);
+    const arr = map.get(rid) ?? [];
+    arr.push({
+      userId: toNum(r.user_id),
+      name: String(r.name ?? ""),
+      position: (r.position as string | null) ?? null,
+      avatarColor: String(r.avatar_color ?? "#7c5cff"),
+      avatarUrl: (r.avatar_url as string | null) ?? null,
+      isBot: toNum(r.is_bot) === 1,
+      role: r.role === "owner" ? "owner" : "member",
+    });
+    map.set(rid, arr);
+  }
+  return map;
+}
+
+export async function listChatRoomsForUser(userId: number): Promise<ChatRoomRow[]> {
+  const rows = await q(sql`
+    select cr.id, cr.name, cr.description, cr.kind, cr.created_by, cr.created_at, cr.updated_at
+    from chat_rooms cr
+    where cr.kind = 'shared'
+       or exists (select 1 from chat_room_members cm where cm.room_id = cr.id and cm.user_id = ${userId})
+    order by cr.updated_at desc, cr.id desc`);
+  const ids = rows.map((r) => toNum(r.id));
+  const membersMap = await loadRoomMembersMap(ids);
+  return rows.map((r) => {
+    const id = toNum(r.id);
+    const members = membersMap.get(id) ?? [];
+    const me = members.find((m) => m.userId === userId) ?? null;
+    return {
+      id,
+      name: String(r.name ?? "Чат"),
+      description: String(r.description ?? ""),
+      kind: r.kind === "shared" ? "shared" : "group",
+      createdBy: r.created_by === null || r.created_by === undefined ? null : toNum(r.created_by),
+      isMember: Boolean(me),
+      myRole: me ? me.role : null,
+      members,
+      createdAt: toIso(r.created_at) ?? nowIso(),
+      updatedAt: toIso(r.updated_at) ?? nowIso(),
+    };
+  });
+}
+
+export async function getChatRoomForUser(userId: number, roomId: number): Promise<ChatRoomRow | null> {
+  const row = await q1(sql`
+    select cr.id, cr.name, cr.description, cr.kind, cr.created_by, cr.created_at, cr.updated_at
+    from chat_rooms cr
+    where cr.id = ${roomId}
+      and (
+        cr.kind = 'shared'
+        or exists (select 1 from chat_room_members cm where cm.room_id = cr.id and cm.user_id = ${userId})
+      )
+    limit 1`);
+  if (!row) return null;
+  const membersMap = await loadRoomMembersMap([roomId]);
+  const members = membersMap.get(roomId) ?? [];
+  const me = members.find((m) => m.userId === userId) ?? null;
+  return {
+    id: toNum(row.id),
+    name: String(row.name ?? "Чат"),
+    description: String(row.description ?? ""),
+    kind: row.kind === "shared" ? "shared" : "group",
+    createdBy: row.created_by === null || row.created_by === undefined ? null : toNum(row.created_by),
+    isMember: Boolean(me),
+    myRole: me ? me.role : null,
+    members,
+    createdAt: toIso(row.created_at) ?? nowIso(),
+    updatedAt: toIso(row.updated_at) ?? nowIso(),
+  };
+}
+
+export async function canAccessChatRoom(userId: number, roomId: number): Promise<boolean> {
+  const room = await getChatRoomForUser(userId, roomId);
+  return room !== null;
+}
+
+export async function createChatRoom(input: {
+  creatorId: number;
+  name: string;
+  description?: string;
+  kind: ChatRoomKind;
+  memberIds?: number[];
+  botIds?: number[];
+}): Promise<ChatRoomRow> {
+  const now = nowIso();
+  const cleanName = input.name.trim().slice(0, 100) || "Новый чат";
+  const cleanDesc = String(input.description ?? "").trim().slice(0, 300);
+  const kind: ChatRoomKind = input.kind === "shared" ? "shared" : "group";
+  const row = await q1<{ id: number }>(sql`
+    insert into chat_rooms (name, description, kind, created_by, created_at, updated_at)
+    values (${cleanName}, ${cleanDesc}, ${kind}, ${input.creatorId}, ${now}, ${now})
+    returning id`);
+  const roomId = toNum(row?.id);
+
+  await q(sql`
+    insert into chat_room_members (room_id, user_id, added_by, role, created_at)
+    values (${roomId}, ${input.creatorId}, ${input.creatorId}, 'owner', ${now})`);
+
+  const candidateIds = Array.from(
+    new Set([...(input.memberIds ?? []), ...(input.botIds ?? [])].map((n) => Math.floor(Number(n))).filter((n) => n > 0 && n !== input.creatorId)),
+  );
+  if (candidateIds.length > 0) {
+    const idList = sql.join(candidateIds.map((id) => sql`${id}`), sql`, `);
+    const validUsers = await q<{ id: number }>(sql`select id from users where id in (${idList})`);
+    for (const u of validUsers) {
+      const uid = toNum(u.id);
+      await q(sql`
+        insert into chat_room_members (room_id, user_id, added_by, role, created_at)
+        values (${roomId}, ${uid}, ${input.creatorId}, 'member', ${now})`);
+    }
+  }
+
+  const created = await getChatRoomForUser(input.creatorId, roomId);
+  if (!created) throw new Error("Не удалось создать чат");
+  return created;
+}
+
+export async function ensureRoomMember(roomId: number, userId: number, addedBy = userId): Promise<boolean> {
+  const room = await getChatRoomForUser(userId, roomId);
+  if (!room) return false;
+  if (room.isMember) return true;
+  if (room.kind !== "shared") return false;
+  await q(sql`
+    insert into chat_room_members (room_id, user_id, added_by, role, created_at)
+    values (${roomId}, ${userId}, ${addedBy}, 'member', ${nowIso()})`);
+  return true;
+}
+
+export async function addChatRoomMember(roomId: number, targetUserId: number, addedBy: number): Promise<boolean> {
+  const existing = await q1<{ id: number }>(sql`
+    select id from chat_room_members where room_id = ${roomId} and user_id = ${targetUserId} limit 1`);
+  if (existing) return true;
+  const userRow = await q1<{ id: number }>(sql`select id from users where id = ${targetUserId} limit 1`);
+  if (!userRow) return false;
+  await q(sql`
+    insert into chat_room_members (room_id, user_id, added_by, role, created_at)
+    values (${roomId}, ${targetUserId}, ${addedBy}, 'member', ${nowIso()})`);
+  await q(sql`update chat_rooms set updated_at = ${nowIso()} where id = ${roomId}`);
+  return true;
+}
+
+export async function removeChatRoomMember(roomId: number, targetUserId: number): Promise<boolean> {
+  await q(sql`delete from chat_room_members where room_id = ${roomId} and user_id = ${targetUserId}`);
+  await q(sql`update chat_rooms set updated_at = ${nowIso()} where id = ${roomId}`);
+  return true;
+}
+
+export async function updateChatRoomInfo(
+  roomId: number,
+  input: { name?: string; description?: string },
+): Promise<void> {
+  const current = await q1<{ name: string; description: string }>(sql`
+    select name, description from chat_rooms where id = ${roomId} limit 1`);
+  if (!current) return;
+  const nextName = input.name !== undefined ? input.name.trim().slice(0, 100) || String(current.name) : String(current.name);
+  const nextDesc = input.description !== undefined ? input.description.trim().slice(0, 300) : String(current.description ?? "");
+  await q(sql`update chat_rooms set name = ${nextName}, description = ${nextDesc}, updated_at = ${nowIso()} where id = ${roomId}`);
+}
+
+export async function touchChatRoom(roomId: number): Promise<void> {
+  await q(sql`update chat_rooms set updated_at = ${nowIso()} where id = ${roomId}`);
+}
+
+export async function deleteChatRoom(roomId: number): Promise<boolean> {
+  const row = await q1<{ id: number }>(sql`select id from chat_rooms where id = ${roomId} limit 1`);
+  if (!row) return false;
+  await q(sql`delete from chat_rooms where id = ${roomId}`);
+  return true;
+}
+
+export async function getRoomActiveBots(roomId: number): Promise<ChatBotRow[]> {
+  const rows = await q(sql`
+    select u.id as user_id, u.name, u.position, u.bio, u.avatar_color, u.avatar_url,
+      c.provider, c.base_url, c.api_key, c.model, c.system_prompt, c.params_json,
+      c.reply_mode, c.is_active, c.created_by, c.created_at, c.updated_at
+    from chat_room_members m
+    join users u on u.id = m.user_id
+    join ai_bot_configs c on c.user_id = u.id
+    where m.room_id = ${roomId} and u.is_bot = 1 and c.is_active = 1
+    order by u.name asc`);
+  return rows.map(mapChatBot);
+}
+
 

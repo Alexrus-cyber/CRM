@@ -2101,6 +2101,45 @@ def self_test() -> int:
           and unlim_ok and unlim_state["finished"] and unlim_state["step"] == 4
           and not unlim_state["step_limit_asked"])
 
+    # Проверка учёта токенов Оператора -> /api/agent/bot/{id}/usage
+    usage_posts: List[Dict[str, Any]] = []
+
+    class UsageCrmHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            if path == "/api/agent/bot/89/usage" and method == "POST":
+                usage_posts.append(dict(payload or {}))
+                return {"ok": True}
+            if path == "/api/agent/bot/89/finish" and method == "POST":
+                return {"ok": True}
+            return {"ok": True}
+
+    class UsageModelHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            return {
+                "choices": [{"message": {"content": json.dumps({
+                    "thought": "финиш",
+                    "action": {"type": "finish", "summary": "usage ok"},
+                })}}],
+                "usage": {"prompt_tokens": 210, "completion_tokens": 45, "total_tokens": 255},
+            }
+
+    u_op = Operator(crm="http://127.0.0.1:3000", token="crmop_" + "a" * 32,
+                    base_url="http://127.0.0.1:8000/v1", model="sim-vl", api_key="",
+                    dry_run=False, assume_yes=True, max_steps=3, delay=0.0, poll=1.0,
+                    max_width=1600, text_only=True, vision_check=False,
+                    verify_actions=False, self_reflect=False, trust_level="full")
+    u_op.crm = UsageCrmHttp()  # type: ignore[assignment]
+    u_op.model_http = UsageModelHttp()  # type: ignore[assignment]
+    u_ok = u_op.run(89, "Проверка usage", 3)
+    check("Оператор отправляет статистику токенов в /api/agent/bot/{id}/usage",
+          u_ok and len(usage_posts) == 1
+          and usage_posts[0].get("promptTokens") == 210
+          and usage_posts[0].get("completionTokens") == 45
+          and usage_posts[0].get("totalTokens") == 255
+          and usage_posts[0].get("model") == "sim-vl")
+
     passed = sum(1 for item in checks if item)
     print("\n{}/{} проверок пройдено".format(passed, len(checks)))
     return 0 if passed == len(checks) else 1
@@ -2560,6 +2599,11 @@ class Http:
                     pass
                 if cancelled:
                     raise TaskCancelled("Задание отменено в CRM") from error
+            if error.code == 403 and self.kind == "CRM":
+                raise AgentError(
+                    "Доступ к «Оператору» отключён для этого аккаунта (HTTP 403). "
+                    "Обратитесь к главному администратору."
+                ) from error
             if error.code == 401 and self.kind == "модель":
                 hint = " или переменную {}".format(self.key_hint) if self.key_hint else ""
                 raise AgentError(
@@ -2667,6 +2711,59 @@ class Operator:
         self.current_task: Optional[int] = None
         self.history: List[str] = []
 
+    @staticmethod
+    def _extract_usage(data: Any, messages: Any, reply_text: str) -> Dict[str, int]:
+        raw = data.get("usage") if isinstance(data, dict) else None
+        if isinstance(raw, dict):
+            p = int(raw.get("prompt_tokens") or raw.get("input_tokens") or raw.get("prompt") or 0)
+            c = int(raw.get("completion_tokens") or raw.get("output_tokens") or raw.get("completion") or 0)
+            t = int(raw.get("total_tokens") or raw.get("total") or (p + c))
+            if t > 0 or p > 0 or c > 0:
+                return {"promptTokens": max(0, p), "completionTokens": max(0, c), "totalTokens": max(0, t or (p + c))}
+        prompt_chars = 0
+        if isinstance(messages, list):
+            for m in messages:
+                if not isinstance(m, dict):
+                    continue
+                content = m.get("content")
+                if isinstance(content, str):
+                    prompt_chars += len(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            prompt_chars += len(part["text"])
+                        elif isinstance(part, dict) and part.get("type") == "image_url":
+                            prompt_chars += 400
+        p_est = max(1, (prompt_chars + 3) // 4) if prompt_chars > 0 else 0
+        c_est = max(1, (len(reply_text) + 3) // 4) if reply_text else 0
+        return {"promptTokens": p_est, "completionTokens": c_est, "totalTokens": p_est + c_est}
+
+    def report_usage(self, data: Any, messages: Any, reply_text: str, phase: str = "operator_step") -> None:
+        """Отправляет расход токенов за шаг Оператора в CRM (для учёта у super_admin)."""
+        if not self.has_crm:
+            return
+        usage = self._extract_usage(data, messages, reply_text)
+        if usage["totalTokens"] <= 0:
+            return
+        task_path_id = self.current_task if self.current_task else 0
+        try:
+            self.crm.call(
+                "POST",
+                "/api/agent/bot/{}/usage".format(task_path_id),
+                {
+                    "promptTokens": usage["promptTokens"],
+                    "completionTokens": usage["completionTokens"],
+                    "totalTokens": usage["totalTokens"],
+                    "model": self.model,
+                    "source": phase,
+                },
+                timeout=10,
+            )
+        except TaskCancelled:
+            raise
+        except AgentError:
+            pass
+
     # ------------------------------------------------------------- модель
     def _model_call_resilient(self, payload: Dict[str, Any], headers: Dict[str, str],
                               timeout: int = 180) -> Dict[str, Any]:
@@ -2745,6 +2842,7 @@ class Operator:
         if not choices:
             raise AgentError("Модель вернула пустой ответ")
         text = str((choices[0].get("message") or {}).get("content") or "").strip()
+        self.report_usage(data, messages, text, "operator_step")
         return self.parse_decision(text)
 
     def apply_generation(self, payload: Dict[str, Any], stuck_level: int = 0) -> None:
@@ -2884,6 +2982,7 @@ class Operator:
         if not choices:
             return None
         text = str((choices[0].get("message") or {}).get("content") or "")
+        self.report_usage(data, messages, text, "operator_verify")
         verdict = self.parse_verdict(text)
         if verdict is None:
             log("[!] проверка: модель ответила без JSON — пропускаю")
@@ -2980,6 +3079,7 @@ class Operator:
                 choices = data.get("choices") or []
                 raw_text = str((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
                 if raw_text:
+                    self.report_usage(data, payload.get("messages"), raw_text, "operator_reflect")
                     reflection = self.parse_reflection(raw_text, question)
             except TaskCancelled:
                 raise
@@ -3783,6 +3883,7 @@ class Operator:
             return {"approved": True, "reason": ""}
         choices = data.get("choices") or []
         raw = str((choices[0].get("message") or {}).get("content") or "") if choices else ""
+        self.report_usage(data, payload.get("messages"), raw, "operator_verify_aim")
         for obj in reversed(_extract_json_objects(raw)):
             if "approved" in obj:
                 approved = bool(obj.get("approved"))

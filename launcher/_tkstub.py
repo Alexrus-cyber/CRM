@@ -250,6 +250,7 @@ def install() -> Dict[str, Any]:
     messagebox = _FakeModule("tkinter.messagebox")
     messagebox.askyesno = lambda *a, **k: calls["messagebox"].append(("askyesno", a)) or True
     messagebox.showinfo = lambda *a, **k: calls["messagebox"].append(("showinfo", a)) or None
+    messagebox.showwarning = lambda *a, **k: calls["messagebox"].append(("showwarning", a)) or None
     messagebox.showerror = lambda *a, **k: calls["messagebox"].append(("showerror", a)) or None
 
     filedialog = _FakeModule("tkinter.filedialog")

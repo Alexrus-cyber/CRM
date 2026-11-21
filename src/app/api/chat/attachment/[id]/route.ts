@@ -1,4 +1,4 @@
-import { getMessageAttachment } from "@/db/repo";
+import { canAccessChatRoom, getMessageAttachment } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 
 /**
@@ -26,8 +26,10 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
   const file = await getMessageAttachment(Number(id) || 0);
   if (!file) return Response.json({ error: "Файл не найден" }, { status: 404 });
 
-  const isGeneral = file.recipientId === null;
-  const allowed = isGeneral || file.senderId === me.id || file.recipientId === me.id;
+  const isGeneral = file.roomId === null && file.recipientId === null;
+  const allowed = file.roomId
+    ? await canAccessChatRoom(me.id, file.roomId)
+    : isGeneral || file.senderId === me.id || file.recipientId === me.id;
   if (!allowed) return Response.json({ error: "Нет доступа" }, { status: 403 });
 
   const bytes = Buffer.from(file.data, "base64");

@@ -1,4 +1,5 @@
-import { getRagFolder, listRagChunks, searchRagChunks } from "@/db/repo";
+import { getRagFolder, listRagChunks, recordAgentUsage, searchRagChunks } from "@/db/repo";
+import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { estimateTokens, normalizeBaseUrl } from "@/lib/ai";
 import { AGENT_MAX_STEPS, isUnlimitedStepsRole, normalizeGenParams, resolveStepsForRole } from "@/lib/genParams";
@@ -27,15 +28,11 @@ export const AGENT_URL = (process.env.AGENT_URL || "http://127.0.0.1:8899").repl
 const START_HINT =
   "Запустите агента в папке проекта: python3 agent/agent.py (или задайте AGENT_URL, если он на другом хосте)";
 
-function allowed(role: string): boolean {
-  return role === "super_admin";
-}
-
 export async function GET() {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (!allowed(me.role)) {
-    return Response.json({ error: "Агент доступен только главному администратору" }, { status: 403 });
+  if (!hasAgentAccess(me)) {
+    return Response.json({ error: "Доступ к Агенту не выдан главным администратором" }, { status: 403 });
   }
 
   try {
@@ -62,8 +59,8 @@ type IncomingAttachment = { name?: string; text?: string; note?: string; image?:
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (!allowed(me.role)) {
-    return Response.json({ error: "Агент доступен только главному администратору" }, { status: 403 });
+  if (!hasAgentAccess(me)) {
+    return Response.json({ error: "Доступ к Агенту не выдан главным администратором" }, { status: 403 });
   }
 
   const body = (await req.json().catch(() => null)) as
@@ -240,7 +237,97 @@ export async function POST(req: Request) {
     );
   }
 
-  return new Response(upstream.body, {
+  const promptEst =
+    messages.reduce((sum, m) => sum + estimateTokens(m.content), 0) +
+    estimateTokens(systemPrompt) +
+    estimateTokens(ragContext) +
+    attachments.reduce((sum, a) => sum + estimateTokens(a.text), 0);
+  const modelName = payload.settings.model || "";
+  const upstreamReader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let sseBuffer = "";
+  let textLatest = "";
+  let reasoningLatest = "";
+  let reportedPrompt = 0;
+  let reportedCompletion = 0;
+  let reportedTotal = 0;
+  let recorded = false;
+
+  const flushUsage = async () => {
+    if (recorded) return;
+    recorded = true;
+    const estComp = estimateTokens(textLatest) + estimateTokens(reasoningLatest);
+    const promptTokens = reportedPrompt || (reportedTotal > 0 ? 0 : promptEst);
+    const completionTokens = reportedCompletion || (reportedTotal > 0 ? 0 : estComp);
+    const totalTokens = reportedTotal || promptTokens + completionTokens;
+    if (totalTokens > 0 || promptTokens > 0 || completionTokens > 0) {
+      await recordAgentUsage({
+        userId: me.id,
+        kind: "agent",
+        model: modelName,
+        prompt: promptTokens,
+        completion: completionTokens,
+        total: totalTokens,
+      }).catch(() => undefined);
+    }
+  };
+
+  const inspectChunk = (chunkText: string) => {
+    sseBuffer += chunkText;
+    let sep = sseBuffer.indexOf("\n\n");
+    while (sep !== -1) {
+      const frame = sseBuffer.slice(0, sep);
+      sseBuffer = sseBuffer.slice(sep + 2);
+      sep = sseBuffer.indexOf("\n\n");
+      const evLine = frame.split("\n").find((l) => l.startsWith("event:"));
+      const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+      if (!dataLine) continue;
+      const ev = evLine ? evLine.slice(6).trim() : "message";
+      try {
+        const parsed = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
+        if (ev === "text" && typeof parsed.text === "string") {
+          textLatest = parsed.text;
+        } else if (ev === "reasoning" && typeof parsed.text === "string") {
+          reasoningLatest = parsed.text;
+        } else if (ev === "done" && parsed.usage && typeof parsed.usage === "object") {
+          const u = parsed.usage as Record<string, unknown>;
+          reportedPrompt = Math.max(reportedPrompt, Math.round(Number(u.prompt_tokens ?? u.promptTokens ?? 0) || 0));
+          reportedCompletion = Math.max(
+            reportedCompletion,
+            Math.round(Number(u.completion_tokens ?? u.completionTokens ?? 0) || 0),
+          );
+          reportedTotal = Math.max(reportedTotal, Math.round(Number(u.total_tokens ?? u.totalTokens ?? 0) || 0));
+        }
+      } catch {
+        /* ignore malformed SSE frame */
+      }
+    }
+  };
+
+  const trackedStream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done } = await upstreamReader.read();
+        if (done) {
+          inspectChunk(decoder.decode());
+          await flushUsage();
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+        inspectChunk(decoder.decode(value, { stream: true }));
+      } catch (err) {
+        await flushUsage();
+        controller.error(err);
+      }
+    },
+    async cancel() {
+      await upstreamReader.cancel().catch(() => undefined);
+      await flushUsage();
+    },
+  });
+
+  return new Response(trackedStream, {
     headers: {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-store, no-transform",

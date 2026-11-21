@@ -28,6 +28,10 @@ export type ChatEventPayload = {
   senderName: string;
   senderColor: string;
   recipientId: number | null;
+  roomId?: number | null;
+  roomName?: string | null;
+  isSharedRoom?: boolean;
+  memberIds?: number[];
   preview: string;
 };
 
