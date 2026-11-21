@@ -1,6 +1,7 @@
 import { addAgentEvent, createAgentTask, listAgentTasks } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 import { AGENT_MAX_STEPS } from "@/lib/genParams";
+import { normalizeCoachMode, normalizeTaskMode, normalizeTaskSource } from "@/lib/operatorModes";
 import { normalizeTrustLevel } from "@/lib/trust";
 
 /** Очередь заданий для бота-оператора рабочего стола. */
@@ -30,6 +31,10 @@ export async function POST(req: Request) {
         prompt?: string;
         maxSteps?: number;
         trustLevel?: string;
+        taskMode?: string;
+        mode?: string;
+        coachMode?: string;
+        source?: string;
         files?: Array<{ name?: string; mime?: string; size?: number; data?: string }>;
       }
     | null;
@@ -54,7 +59,14 @@ export async function POST(req: Request) {
 
   const maxSteps = Math.min(Math.max(Number(body?.maxSteps ?? 15) || 15, 1), AGENT_MAX_STEPS);
   const trustLevel = normalizeTrustLevel(body?.trustLevel);
-  const task = await createAgentTask(me.id, prompt, maxSteps, trustLevel);
+  const taskMode = normalizeTaskMode(body?.taskMode ?? body?.mode);
+  const coachMode = normalizeCoachMode(body?.coachMode);
+  const source = normalizeTaskSource(body?.source);
+  const task = await createAgentTask(me.id, prompt, maxSteps, trustLevel, {
+    taskMode,
+    coachMode,
+    source,
+  });
 
   for (const file of files) {
     await addAgentEvent({

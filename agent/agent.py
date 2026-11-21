@@ -90,10 +90,19 @@ SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CR
    ускоряющее работу).
 5. export_from_sandbox — скопировать или перенести готовые файлы/проект из Sandbox в папку,
    которую указал пользователь (только после согласия пользователя).
+6. Совместная работа с Настольным Оператором экрана:
+   - formulate_operator_task — превратить просьбу пользователя (работа в программах, на экране,
+     или управление персонажем в игре) в чёткое пошаговое задание для Оператора с подходящим
+     режимом (autonomous | copilot | game) и правилом помощи после каждого шага;
+   - call_operator — вызвать Оператора для выполнения действий на экране/ПК или помощи
+     пользователю (ВСЕГДА спрашивает разрешение пользователя на сайте перед запуском!).
 
 Правила безопасности и поведения:
 - Создавая проект или сайт, ВСЕГДА сначала собирай структуру папок и файлов в Sandbox через
   `sandbox_create_project` или `sandbox_write_file`, а затем при необходимости запускай через `run_command`.
+- Если пользователь просит выполнить действия на экране, в программе или помочь в игре / управлять
+  персонажем, сначала помоги сформулировать чёткую задачу (formulate_operator_task) и при готовности
+  вызови Оператора через call_operator — запуск произойдёт только после согласия пользователя.
 - Никогда не пытайся выйти за границы Sandbox (`..`, `/etc`, системные пути).
 - Если пользователь отклонил выполнение команды или перенос файлов, НЕ повторяй то же самое —
   учти отказ и предложи безопасную альтернативу (например, скачать архив или поправить файлы).
@@ -150,6 +159,38 @@ BASE_TOOLS = [
                     "query": {"type": "string", "description": "Что искать и включить"},
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "formulate_operator_task",
+            "description": (
+                "Помочь пользователю сформулировать чёткую пошаговую задачу для Настольного Оператора экрана "
+                "(клики, ввод, приложения, или управление персонажем в игре) и предложить её к запуску."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_goal": {"type": "string", "description": "Чего хочет пользователь своими словами"},
+                    "suggested_prompt": {
+                        "type": "string",
+                        "description": "Чётко сформулированное пошаговое задание для Оператора с критерием готовности",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["autonomous", "copilot", "game"],
+                        "description": "autonomous (автопилот), copilot (помощник ПК), game (игра/персонаж)",
+                    },
+                    "max_steps": {"type": "integer", "description": "Рекомендуемый лимит шагов (15–100)"},
+                    "coach_after_each_step": {
+                        "type": "boolean",
+                        "description": "true — Агент и Оператор подсказывают что делать после каждого действия",
+                    },
+                    "notes": {"type": "string", "description": "Краткое пояснение, почему выбран такой план"},
+                },
+                "required": ["suggested_prompt"],
             },
         },
     },
@@ -308,7 +349,50 @@ SANDBOX_TOOLS = [
     },
 ]
 
-TOOLS = BASE_TOOLS + SANDBOX_TOOLS
+OPERATOR_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "call_operator",
+            "description": (
+                "Вызвать Настольного Оператора экрана для выполнения действий на компьютере пользователя "
+                "(управление окнами, клики, ввод текста, игры и управление персонажем, пошаговая помощь). "
+                "ВСЕГДА сначала запрашивает явное разрешение пользователя на сайте."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Точная сформулированная задача и шаги для Оператора",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Коротко и понятно для пользователя: зачем вызываем Оператора",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["autonomous", "copilot", "game"],
+                        "description": "autonomous (автопилот), copilot (помощник на ПК), game (игра / персонаж)",
+                    },
+                    "max_steps": {"type": "integer", "description": "Лимит шагов Оператора (по умолчанию 30)"},
+                    "coach_after_each_step": {
+                        "type": "boolean",
+                        "description": "true — помогать Оператору и пользователю после каждого действия",
+                    },
+                    "operator_trust_level": {
+                        "type": "string",
+                        "enum": ["verified", "full"],
+                        "description": "Уровень доверия для запуска Оператора (по умолчанию verified)",
+                    },
+                },
+                "required": ["task", "reason"],
+            },
+        },
+    },
+]
+
+TOOLS = BASE_TOOLS + SANDBOX_TOOLS + OPERATOR_TOOLS
 
 
 class AgentError(Exception):
@@ -347,7 +431,7 @@ def normalize_trust(raw: Any) -> str:
 def tools_for_trust(trust_level: str) -> List[Dict[str, Any]]:
     if trust_level == "none":
         return list(BASE_TOOLS)
-    return list(BASE_TOOLS) + list(SANDBOX_TOOLS)
+    return list(BASE_TOOLS) + list(SANDBOX_TOOLS) + list(OPERATOR_TOOLS)
 
 
 def safe_file_name(raw: str) -> str:
@@ -430,11 +514,110 @@ def run_tool(
         events.append({"type": "open_url", "url": url, "label": f"YouTube: {query}", "autoplay": True})
         return f"Включил на YouTube видео по запросу «{query}».", events
 
+    if name == "formulate_operator_task":
+        goal = str(args.get("user_goal") or "").strip()
+        suggested_prompt = str(args.get("suggested_prompt") or goal).strip()
+        if not suggested_prompt:
+            raise AgentError("Укажите текст задачи для Оператора")
+        mode = str(args.get("mode") or "copilot").strip().lower()
+        if mode not in ("autonomous", "copilot", "game"):
+            mode = "copilot"
+        try:
+            op_steps = max(5, min(500, int(args.get("max_steps") or (50 if mode == "game" else 30))))
+        except (TypeError, ValueError):
+            op_steps = 30
+        coach_mode = "agent" if args.get("coach_after_each_step", True) else "after_step"
+        notes = str(args.get("notes") or "").strip()
+        events.append(
+            {
+                "type": "operator_plan",
+                "task": suggested_prompt,
+                "goal": goal,
+                "mode": mode,
+                "maxSteps": op_steps,
+                "coachMode": coach_mode,
+                "notes": notes,
+            }
+        )
+        return (
+            f"Сформулирована задача для Оператора (режим: {mode}, шагов: {op_steps}, "
+            f"помощь после каждого действия: {'да' if coach_mode == 'agent' else 'базовая'}):\n{suggested_prompt}",
+            events,
+        )
+
     # --- Инструменты компьютера и Sandbox (требуют доверие != "none") ---
     if trust == "none":
         raise AgentError(
             "Выбран уровень доверия «Нет доступа, к компьютеру для исполнения задач». "
-            "Запуск bash, работа с песочницей и перенос файлов отключены. Выдайте готовый файл через create_file или текст."
+            "Запуск bash, работа с песочницей, перенос файлов и автозапуск Оператора отключены. "
+            "Можно использовать formulate_operator_task или create_file."
+        )
+
+    if name == "call_operator":
+        task_text = str(args.get("task") or "").strip()
+        if not task_text:
+            raise AgentError("Не указана задача для Оператора")
+        reason = str(args.get("reason") or "Требуются действия на экране компьютера пользователя").strip()
+        mode = str(args.get("mode") or "copilot").strip().lower()
+        if mode not in ("autonomous", "copilot", "game"):
+            mode = "copilot"
+        try:
+            op_steps = max(5, min(500, int(args.get("max_steps") or (50 if mode == "game" else 30))))
+        except (TypeError, ValueError):
+            op_steps = 30
+        coach_after = bool(args.get("coach_after_each_step", True))
+        op_trust = normalize_trust(args.get("operator_trust_level") or ("full" if trust == "full" else "verified"))
+        if op_trust == "none":
+            op_trust = "verified"
+
+        # Вызов Оператора ВСЕГДА требует явного разрешения пользователя на сайте (независимо от full/verified).
+        if approval_fn is None:
+            raise AgentError("Для вызова Оператора требуется разрешение пользователя на сайте")
+        decision = approval_fn(
+            {
+                "kind": "call_operator",
+                "title": "Разрешить Агенту вызвать Оператора на ПК?",
+                "description": reason,
+                "task": task_text,
+                "mode": mode,
+                "maxSteps": op_steps,
+                "coachAfterEachStep": coach_after,
+                "operatorTrustLevel": op_trust,
+            }
+        )
+        if not decision.get("approved"):
+            note = str(decision.get("note") or "").strip()
+            return (
+                "Пользователь отклонил вызов Оператора"
+                + (f" ({note})" if note else "")
+                + ". Предложите текстовую подсказку или другой безопасный вариант.",
+                events,
+            )
+
+        final_task = str(decision.get("taskPrompt") or task_text).strip()
+        final_mode = str(decision.get("mode") or mode).strip().lower()
+        if final_mode not in ("autonomous", "copilot", "game"):
+            final_mode = mode
+        final_coach = str(decision.get("coachMode") or ("agent" if coach_after else "after_step")).strip().lower()
+        final_trust = normalize_trust(decision.get("operatorTrustLevel") or op_trust)
+        task_id = decision.get("taskId")
+        events.append(
+            {
+                "type": "operator_task",
+                "taskId": int(task_id) if str(task_id or "").isdigit() else 0,
+                "task": final_task,
+                "mode": final_mode,
+                "coachMode": final_coach,
+                "maxSteps": op_steps,
+                "operatorTrustLevel": final_trust,
+                "label": f"Оператор #{task_id}" if task_id else final_task[:80],
+            }
+        )
+        return (
+            f"Оператор вызван по разрешению пользователя (задача #{task_id or '—'}, режим: {final_mode}, "
+            f"сопровождение: {final_coach}, доверие: {final_trust}). "
+            f"Задача передана: {final_task}",
+            events,
         )
 
     if name == "sandbox_mkdir":
@@ -831,7 +1014,13 @@ def sse(data: Dict[str, Any], event: str = "message") -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
-def resolve_approval(approval_id: str, approved: bool, note: str = "", destination: str = "") -> bool:
+def resolve_approval(
+    approval_id: str,
+    approved: bool,
+    note: str = "",
+    destination: str = "",
+    extra: Optional[Dict[str, Any]] = None,
+) -> bool:
     with APPROVAL_LOCK:
         entry = PENDING_APPROVALS.get(approval_id)
         if not entry:
@@ -839,8 +1028,109 @@ def resolve_approval(approval_id: str, approved: bool, note: str = "", destinati
         entry["approved"] = bool(approved)
         entry["note"] = note
         entry["destination"] = destination
+        if isinstance(extra, dict):
+            entry["extra"] = extra
         entry["event"].set()
         return True
+
+
+def parse_coach_response(raw_text: str) -> Dict[str, str]:
+    """Разбирает ответ тренера-помощника Оператора (JSON или обычный текст)."""
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", str(raw_text or ""), flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE).strip()
+    candidates = re.findall(r"\{[\s\S]*\}", cleaned)
+    for raw in reversed(candidates):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            for_op = str(obj.get("guidanceForOperator") or obj.get("next_step") or obj.get("guidance") or "").strip()
+            for_user = str(obj.get("adviceForUser") or obj.get("user_advice") or "").strip()
+            if for_op or for_user:
+                return {
+                    "guidanceForOperator": (for_op or for_user)[:600],
+                    "adviceForUser": (for_user or for_op)[:600],
+                }
+    fallback = cleaned[:600] if cleaned else "Оцени свежий экран и выполни следующий шаг плана."
+    return {"guidanceForOperator": fallback, "adviceForUser": fallback}
+
+
+def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Формулирует помощь Оператору и пользователю после выполненного шага."""
+    task_prompt = str(body.get("taskPrompt") or "").strip()
+    task_mode = str(body.get("taskMode") or "copilot").strip().lower()
+    step_num = int(body.get("step") or 0)
+    last_action = body.get("lastAction")
+    last_result = str(body.get("lastResult") or "").strip()
+    observation = str(body.get("observation") or "").strip()
+    user_hint = str(body.get("userHint") or "").strip()
+    history = body.get("history") if isinstance(body.get("history"), list) else []
+    screenshot = str(body.get("screenshot") or "")
+    settings = body.get("settings") if isinstance(body.get("settings"), dict) else {}
+
+    base_url = str(settings.get("baseUrl") or BASE_URL)
+    api_key = str(settings.get("apiKey") or API_KEY)
+    model = str(settings.get("model") or MODEL)
+
+    if not model:
+        hint = (
+            "На основе результата шага оцени обновлённую сцену (hold_key / move_mouse_rel / sequence) и продолжай."
+            if task_mode == "game"
+            else "Проверь изменение на экране и переходи к следующему шагу или подскажи пользователю."
+        )
+        msg = f"Шаг {step_num}: {last_result or observation or 'выполнен'}. {hint}"
+        return {"ok": True, "guidanceForOperator": msg, "adviceForUser": msg, "source": "heuristic"}
+
+    lines = [
+        f"Главная задача: {task_prompt}",
+        f"Режим Оператора: {task_mode}",
+        f"Только что выполнен шаг #{step_num}",
+    ]
+    if last_action:
+        lines.append(f"Действие Оператора: {json.dumps(last_action, ensure_ascii=False)[:400]}")
+    if last_result:
+        lines.append(f"Результат действия: {last_result[:400]}")
+    if observation:
+        lines.append(f"Наблюдение с экрана: {observation[:400]}")
+    if user_hint:
+        lines.append(f"Пожелание пользователя: {user_hint[:400]}")
+    if history:
+        lines.append("Недавние шаги:\n" + "\n".join(str(x)[:200] for x in history[-6:]))
+    lines.append(
+        'Ответь строго JSON: {"guidanceForOperator":"чёткое следующее действие/тактика для Оператора","adviceForUser":"понятная подсказка пользователю, что сейчас делать"}'
+    )
+    prompt_text = "\n".join(lines)
+    user_content: Any = (
+        [{"type": "text", "text": prompt_text}, {"type": "image_url", "image_url": {"url": screenshot}}]
+        if screenshot.startswith("data:image/")
+        else prompt_text
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты — Агент-наставник Настольного Оператора. После КАЖДОГО шага Оператора помогаешь "
+                "ему понять, что делать дальше, а пользователю — что происходит. Для игр (game) используй "
+                "тактику управления персонажем (WASD удержание, камера move_mouse_rel, прыжок/взаимодействие). "
+                "Отвечай строго JSON без markdown."
+            ),
+        },
+        {"role": "user", "content": user_content},
+    ]
+    try:
+        data = call_model(base_url, api_key, model, messages, None, {"temperature": 0.2, "maxTokens": 320})
+    except AgentError:
+        if isinstance(user_content, list):
+            messages[1]["content"] = prompt_text
+            data = call_model(base_url, api_key, model, messages, None, {"temperature": 0.2, "maxTokens": 320})
+        else:
+            raise
+    choices = data.get("choices") or []
+    raw = str((choices[0].get("message") or {}).get("content") or "") if choices else ""
+    parsed = parse_coach_response(raw)
+    return {"ok": True, **parsed, "source": "agent"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -944,16 +1234,34 @@ class Handler(BaseHTTPRequestHandler):
             if not approval_id:
                 self._json(400, {"error": "Не указан approvalId"})
                 return
+            extra: Dict[str, Any] = {}
+            for key in ("taskId", "taskPrompt", "mode", "coachMode", "operatorTrustLevel"):
+                if key in body and body[key] is not None:
+                    extra[key] = body[key]
             ok = resolve_approval(
                 approval_id,
                 bool(body.get("approved")),
                 str(body.get("note") or ""),
                 str(body.get("destination") or ""),
+                extra=extra,
             )
             if not ok:
                 self._json(404, {"error": "Запрос подтверждения не найден или уже закрыт"})
                 return
             self._json(200, {"ok": True})
+            return
+
+        if route == "/coach":
+            body = self._read_json()
+            if not body:
+                self._json(400, {"error": "Некорректный JSON"})
+                return
+            try:
+                res = coach_operator_step(body)
+            except AgentError as error:
+                self._json(502, {"ok": False, "error": str(error)})
+                return
+            self._json(200, res)
             return
 
         if route == "/sandbox/export":
@@ -1062,10 +1370,12 @@ class Handler(BaseHTTPRequestHandler):
             elapsed = 0
             while elapsed < APPROVAL_TIMEOUT:
                 if event.wait(timeout=10):
+                    extra = entry.get("extra") if isinstance(entry.get("extra"), dict) else {}
                     return {
                         "approved": bool(entry["approved"]),
                         "note": str(entry.get("note") or ""),
                         "destination": str(entry.get("destination") or ""),
+                        **extra,
                     }
                 elapsed += 10
                 # Поддерживаем SSE-соединение живым во время ожидания человека.
@@ -1459,6 +1769,74 @@ def self_test() -> int:
         check(
             "ZIP-архив проекта и create_file работают",
             len(z_bytes) > 0 and z_name == "demo-site.zip" and cf_ev[0]["type"] == "file" and "создан" in cf_txt,
+        )
+
+        # 8. Формулировка задачи для Оператора (работает даже при none) и вызов Оператора с разрешением.
+        form_txt, form_ev = run_tool(
+            "formulate_operator_task",
+            {
+                "user_goal": "Помоги пройти обучение в игре",
+                "suggested_prompt": "Зажми W на 1с и нажми E у двери",
+                "mode": "game",
+                "max_steps": 45,
+                "coach_after_each_step": True,
+            },
+            trust_level="none",
+            sandbox_root=root,
+        )
+        check(
+            "formulate_operator_task работает при trust=none и оформляет план",
+            any(e.get("type") == "operator_plan" and e.get("mode") == "game" for e in form_ev)
+            and "game" in form_txt,
+        )
+
+        op_asked: List[Dict[str, Any]] = []
+
+        def deny_op(req: Dict[str, Any]) -> Dict[str, Any]:
+            op_asked.append(req)
+            return {"approved": False, "note": "позже"}
+
+        deny_op_txt, deny_op_ev = run_tool(
+            "call_operator",
+            {"task": "Нажми кнопку Старт", "reason": "Нужно нажать кнопку в игре", "mode": "game"},
+            trust_level="full",
+            approval_fn=deny_op,
+            sandbox_root=root,
+        )
+        check(
+            "call_operator даже при trust=full всегда спрашивает разрешение пользователя",
+            len(op_asked) == 1
+            and op_asked[0].get("kind") == "call_operator"
+            and "отклонил" in deny_op_txt.lower()
+            and not deny_op_ev,
+        )
+
+        ok_op_txt, ok_op_ev = run_tool(
+            "call_operator",
+            {"task": "Побеги к сундуку", "reason": "Помочь персонажу", "mode": "game", "max_steps": 40},
+            trust_level="verified",
+            approval_fn=lambda req: {
+                "approved": True,
+                "taskId": 77,
+                "taskPrompt": "Побеги к сундуку (hold_key w) и открой E",
+                "mode": "game",
+                "coachMode": "agent",
+            },
+            sandbox_root=root,
+        )
+        check(
+            "call_operator по разрешению эмитит operator_task с taskId",
+            "77" in ok_op_txt
+            and any(e.get("type") == "operator_task" and e.get("taskId") == 77 and e.get("mode") == "game" for e in ok_op_ev),
+        )
+
+        parsed_coach = parse_coach_response(
+            '<think>думаю</think>```json\n{"guidanceForOperator":"hold_key w 0.8s","adviceForUser":"Бежим вперёд к двери"}\n```'
+        )
+        check(
+            "parse_coach_response извлекает guidanceForOperator и adviceForUser",
+            parsed_coach["guidanceForOperator"] == "hold_key w 0.8s"
+            and parsed_coach["adviceForUser"] == "Бежим вперёд к двери",
         )
 
     passed = sum(1 for item in checks if item)

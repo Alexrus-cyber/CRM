@@ -117,12 +117,18 @@ SYSTEM_PROMPT = """Ты — умный оператор рабочего сто�
   "next_question": "уточняющий вопрос себе: что мне сейчас делать дальше и почему именно это?",
   "self_check": "если прошлый шаг не удался или экран не изменился — что пошло не так (иначе пусто)",
   "thought": "краткий вывод и план этого шага по-русски",
+  "next_advice": "что рекомендуется сделать дальше после этого действия (понятно для пользователя и следующего шага)",
   "action": {"type": "...", ...}
 }
 
 Действия:
 - {"type":"click","x":ЧИСЛО,"y":ЧИСЛО,"clicks":1,"button":"left"} — клик по координатам кадра;
 - {"type":"double_click","x":..,"y":..} / {"type":"right_click","x":..,"y":..} / {"type":"middle_click","x":..,"y":..} / {"type":"triple_click","x":..,"y":..};
+- {"type":"mouse_down","button":"left|right","x":..,"y":..} / {"type":"mouse_up","button":"left|right"} — зажать/отпустить кнопку мыши (удобно в играх и при перетаскивании);
+- {"type":"move_mouse_rel","dx":120,"dy":-20} — сместить мышь относительно текущего положения (поворот камеры/прицела в 3D-играх);
+- {"type":"hold_key","key":"w","seconds":0.8} — зажать и удерживать клавишу (бег, движение персонажа, прыжок в игре; до 5 с);
+- {"type":"key_down","key":"shift"} / {"type":"key_up","key":"shift"} — зажать или отпустить клавишу между шагами;
+- {"type":"sequence","steps":[{"type":"hold_key","key":"w","seconds":0.6},{"type":"key","key":"e"}]} — быстрая серия до 10 действий за один шаг (для игр и быстрых комбо);
 - {"type":"type","text":"текст","x":..,"y":..,"clear":false} — кликнуть в поле (x,y) и набрать текст;
   clear=true — сначала очистить поле; без x,y текст уйдёт в то окно, что сейчас активно;
 - {"type":"paste","text":"текст","x":..,"y":..} — то же самое длинным текстом через буфер обмена;
@@ -343,14 +349,56 @@ def build_reflection_nudge(reflection: Dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+TASK_MODES = ("autonomous", "copilot", "game")
+COACH_MODES = ("off", "after_step", "agent")
+
+
+def normalize_task_mode(raw: Any, default: str = "autonomous") -> str:
+    value = str(raw or "").strip().lower()
+    return value if value in TASK_MODES else default
+
+
+def normalize_coach_mode(raw: Any, default: str = "after_step") -> str:
+    value = str(raw or "").strip().lower()
+    return value if value in COACH_MODES else default
+
+
+def build_mode_system_addon(task_mode: str, coach_mode: str) -> str:
+    lines: List[str] = []
+    if task_mode == "game":
+        lines.append(
+            "АКТИВЕН ИГРОВОЙ РЕЖИМ (game — управление персонажем и помощь в игре):\n"
+            "- Для перемещения персонажа используй hold_key (w/a/s/d/space/shift, seconds 0.2..2.0), "
+            "key_down/key_up, sequence (комбинации вроде бег+прыжок или подойти+нажать E), "
+            "а для поворота камеры/прицела — move_mouse_rel(dx, dy) и mouse_down/mouse_up.\n"
+            "- Держи фокус в окне игры, читай HUD/мини-карту/здоровье/подсказки на экране.\n"
+            "- В поле next_advice всегда пиши конкретный следующий игровой ход."
+        )
+    elif task_mode == "copilot":
+        lines.append(
+            "АКТИВЕН РЕЖИМ ПОМОЩНИКА НА ПК (copilot):\n"
+            "- Ты помогаешь пользователю выполнять действия на экране шаг за шагом.\n"
+            "- После каждого шага в next_advice чётко объясняй, что изменилось и что делать дальше."
+        )
+    if coach_mode in ("after_step", "agent"):
+        lines.append(
+            "СОПРОВОЖДЕНИЕ ПОСЛЕ КАЖДОГО ДЕЙСТВИЯ:\n"
+            "- Если передано НАСТАВЛЕНИЕ ОТ АГЕНТА ИЛИ ПОЛЬЗОВАТЕЛЯ, обязательно учти его при выборе этого шага.\n"
+            "- Заполняй next_advice понятным советом для следующего шага."
+        )
+    return ("\n\n" + "\n\n".join(lines)) if lines else ""
+
+
 def build_step_prompt(prompt: str, step_index: int, shot: Optional[Dict[str, Any]],
                       text_only: bool, pending_nudge: str = "",
                       attachments_context: str = "", last_outcome: str = "",
-                      screen_unchanged: bool = False) -> str:
+                      screen_unchanged: bool = False,
+                      task_mode: str = "autonomous",
+                      pending_guidance: str = "") -> str:
     """Собирает запрос шага: к скриншоту всегда приложен уточняющий вопрос."""
     parts = [
         'Задание: "{}"'.format(prompt),
-        "Это шаг {}.".format(step_index + 1),
+        "Это шаг {} (режим: {}).".format(step_index + 1, task_mode),
     ]
     if not text_only and shot:
         parts.append(
@@ -360,6 +408,11 @@ def build_step_prompt(prompt: str, step_index: int, shot: Optional[Dict[str, Any
         parts.append("Работаем без скриншота: координаты считай по текущему экрану.")
     if last_outcome:
         parts.append("Итог прошлого шага: " + last_outcome)
+    if pending_guidance:
+        parts.append(
+            "НАСТАВЛЕНИЕ ПОСЛЕ ПРОШЛОГО ДЕЙСТВИЯ (учти при выборе этого шага):\n"
+            + pending_guidance
+        )
     if screen_unchanged:
         parts.append(
             "Важное наблюдение: экран после предыдущего шага визуально почти не изменился — "
@@ -367,12 +420,19 @@ def build_step_prompt(prompt: str, step_index: int, shot: Optional[Dict[str, Any
         )
     if pending_nudge:
         parts.append(pending_nudge)
-    parts.append(
-        "Уточняющий вопрос по текущему скриншоту: что именно сейчас открыто и происходит "
-        "на экране, что мне делать дальше для достижения цели и почему именно этот шаг "
-        "сработает надёжнее (не выдавай просто координаты наугад — оцени, нужен ли клик, "
-        "клавиша/сочетание, прокрутка, open_url, make_file или finish)?"
-    )
+    if task_mode == "game":
+        parts.append(
+            "Уточняющий вопрос по игровому экрану: где находится персонаж/цель/интерфейс, "
+            "какое движение (hold_key), поворот камеры (move_mouse_rel), серия (sequence) или "
+            "клик приблизят к цели, и что порекомендовать на следующий шаг в next_advice?"
+        )
+    else:
+        parts.append(
+            "Уточняющий вопрос по текущему скриншоту: что именно сейчас открыто и происходит "
+            "на экране, что мне делать дальше для достижения цели и почему именно этот шаг "
+            "сработает надёжнее (не выдавай просто координаты наугад — оцени, нужен ли клик, "
+            "клавиша/сочетание, прокрутка, open_url, make_file или finish)?"
+        )
     if attachments_context:
         if step_index == 0:
             parts.append("Файлы от пользователя (используй их содержимое):")
@@ -382,7 +442,7 @@ def build_step_prompt(prompt: str, step_index: int, shot: Optional[Dict[str, Any
     return "\n".join(parts)
 
 # Защита от зацикливания: сколько раз подряд допустимо одно и то же действие.
-# Клик/ввод — 2 раза, клавиши и прокрутка — 3 (прокрутка иногда нужна повторно).
+# Клик/ввод — 2 раза, клавиши и прокрутка — 3, игровые движения — выше.
 REPEAT_LIMITS = {
     "click": 2,
     "double_click": 2,
@@ -396,6 +456,9 @@ REPEAT_LIMITS = {
     "hotkey": 3,
     "scroll": 3,
     "switch_language": 3,
+    "hold_key": 6,
+    "move_mouse_rel": 6,
+    "sequence": 4,
 }
 # Сколько «лишних» повторов терпим, прежде чем остановить задание.
 MAX_REPEAT_EXTRA = 3
@@ -436,10 +499,16 @@ def action_signature(action: Dict[str, Any]) -> str:
         parts.append("cmd:{}".format(str(action.get("command") or "")[:80]))
     if kind == "launch_app":
         parts.append("app:{}".format(str(action.get("app") or action.get("path") or "")))
+    if kind == "move_mouse_rel":
+        parts.append("rel:{}:{}".format(number("dx"), number("dy")))
+    if kind == "hold_key":
+        parts.append("hold:{}:{}".format(str(action.get("key") or "").lower(), action.get("seconds") or 0.5))
+    if kind == "sequence" and isinstance(action.get("steps"), list):
+        parts.append("seq:" + ",".join(str(s.get("type") or "") for s in action["steps"][:6] if isinstance(s, dict)))
     keys = action.get("keys")
     if isinstance(keys, list):
         parts.append("+".join(str(key).lower() for key in keys))
-    if action.get("key"):
+    if action.get("key") and kind != "hold_key":
         parts.append(str(action.get("key")).lower())
     if action.get("amount") is not None:
         parts.append("amount:{}".format(action.get("amount")))
@@ -454,9 +523,16 @@ def action_label(action: Dict[str, Any]) -> str:
         text = str(action.get("text") or "")
         where = " в ({}, {})".format(x, y) if x is not None and y is not None else ""
         return "ввод «{}»{}".format(text[:40], where)
+    if kind == "hold_key":
+        return "удержание {} ({} с)".format(action.get("key") or "w", action.get("seconds") or 0.5)
+    if kind == "move_mouse_rel":
+        return "поворот мыши ({}, {})".format(action.get("dx") or 0, action.get("dy") or 0)
+    if kind == "sequence":
+        steps = action.get("steps") or []
+        return "серия из {} действий".format(len(steps) if isinstance(steps, list) else 0)
     if x is not None and y is not None:
         return "{} в ({}, {})".format(kind, x, y)
-    if kind in ("key", "hotkey"):
+    if kind in ("key", "hotkey", "key_down", "key_up"):
         keys = action.get("keys") or action.get("key") or ""
         return "{} {}".format(kind, keys)
     return kind
@@ -540,6 +616,10 @@ def is_dangerous_action(action: Dict[str, Any]) -> bool:
     if not isinstance(action, dict):
         return False
     kind = str(action.get("type") or "").lower()
+    if kind == "sequence" and isinstance(action.get("steps"), list):
+        for sub in action["steps"][:12]:
+            if isinstance(sub, dict) and is_dangerous_action(sub):
+                return True
     if kind in ALWAYS_CONFIRM_ACTIONS:
         return True
     if bool(action.get("dangerous") or action.get("requires_confirmation")):
@@ -1117,6 +1197,95 @@ def self_test() -> int:
     check("увеличение maxSteps на сайте во время работы подхватывается на лету",
           live_ok and live_state["finished"] and live_state["model_step"] == 2)
 
+    # Игровые действия, режим game/copilot, next_advice и пошаговый коучинг Агента.
+    check("normalize_task_mode / normalize_coach_mode работают корректно",
+          normalize_task_mode("game") == "game"
+          and normalize_task_mode("unknown") == "autonomous"
+          and normalize_coach_mode("agent") == "agent"
+          and normalize_coach_mode("invalid") == "after_step"
+          and "hold_key" in build_mode_system_addon("game", "agent"))
+
+    check("action_signature / action_label для hold_key, move_mouse_rel и sequence",
+          "hold:w:0.8" in action_signature({"type": "hold_key", "key": "W", "seconds": 0.8})
+          and "rel:120:-15" in action_signature({"type": "move_mouse_rel", "dx": 120, "dy": -15})
+          and "серия из 2" in action_label({"type": "sequence", "steps": [{"type": "key", "key": "w"}, {"type": "key", "key": "e"}]})
+          and is_dangerous_action({"type": "sequence", "steps": [{"type": "hold_key", "key": "w", "seconds": 0.4}, {"type": "run_command", "command": "rm -rf /"}]}))
+
+    parsed_adv = Operator.parse_decision(json.dumps({
+        "observation": "Персонаж перед дверью",
+        "thought": "Подойду ближе",
+        "next_advice": "Потом нажми E",
+        "action": {"type": "hold_key", "key": "w", "seconds": 0.5},
+    }))
+    check("parse_decision извлекает next_advice", parsed_adv["next_advice"] == "Потом нажми E")
+
+    coach_state: Dict[str, Any] = {"step": 0, "prompts": [], "coach_calls": 0, "executed": [], "finished": False}
+
+    class CoachCrmHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            if path == "/api/agent/bot/79" and method == "GET":
+                return {
+                    "task": {
+                        "id": 79,
+                        "status": "running",
+                        "maxSteps": 5,
+                        "trustLevel": "full",
+                        "taskMode": "game",
+                        "coachMode": "agent",
+                    },
+                    "attachments": [],
+                }
+            if path == "/api/agent/bot/79/coach" and method == "POST":
+                coach_state["coach_calls"] += 1
+                return {
+                    "ok": True,
+                    "guidance": {
+                        "id": "g-step-1",
+                        "author": "agent",
+                        "text": "Нажми E у сундука и проверь инвентарь",
+                        "userAdvice": "Персонаж подошёл — открываем сундук",
+                    },
+                }
+            if path == "/api/agent/bot/79/finish" and method == "POST":
+                coach_state["finished"] = (payload or {}).get("status") == "done"
+                return {"ok": True}
+            return {"ok": True}
+
+    class CoachModelHttp:
+        def call(self, method: str, path: str, payload: Optional[dict] = None,
+                 timeout: int = 30, headers: Optional[dict] = None) -> Dict[str, Any]:
+            coach_state["step"] += 1
+            msgs = (payload or {}).get("messages") or []
+            coach_state["prompts"].append(str(msgs[-1].get("content") or ""))
+            if coach_state["step"] == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "thought": "Иду вперёд в игре",
+                    "next_advice": "Подойдём ближе и осмотрим дверь",
+                    "action": {"type": "hold_key", "key": "w", "seconds": 0.4}
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "thought": "Готово",
+                "action": {"type": "finish", "summary": "дошёл и открыл"}
+            })}}]}
+
+    coach_op = Operator(crm="http://127.0.0.1:3000", token="crmop_" + "a" * 32,
+                        base_url="http://127.0.0.1:8000/v1", model="sim-vl", api_key="",
+                        dry_run=False, assume_yes=False, max_steps=5, delay=0.0, poll=1.0,
+                        max_width=1600, text_only=True, vision_check=False,
+                        verify_actions=False, self_reflect=False, trust_level="full")
+    coach_op.crm = CoachCrmHttp()  # type: ignore[assignment]
+    coach_op.model_http = CoachModelHttp()  # type: ignore[assignment]
+    coach_op.execute = lambda act: (coach_state["executed"].append(act.get("type")), "done:" + str(act.get("type")))[1]  # type: ignore[method-assign]
+    coach_ok = coach_op.run(79, "Помоги пройти квест в игре", 5)
+    check("игровой режим и пошаговый коучинг Агента передают наставление в следующий шаг",
+          coach_ok
+          and coach_state["finished"]
+          and coach_state["coach_calls"] == 1
+          and coach_state["executed"] == ["hold_key"]
+          and len(coach_state["prompts"]) >= 2
+          and "Нажми E у сундука" in coach_state["prompts"][1])
+
     passed = sum(1 for item in checks if item)
     print("\n{}/{} проверок пройдено".format(passed, len(checks)))
     return 0 if passed == len(checks) else 1
@@ -1243,6 +1412,108 @@ def switch_keyboard_layout(target: str = "toggle") -> str:
     return "переключил раскладку (Alt+Shift)"
 
 
+_WIN_SCANCODES: Dict[str, int] = {
+    "escape": 0x01, "esc": 0x01, "1": 0x02, "2": 0x03, "3": 0x04, "4": 0x05, "5": 0x06,
+    "6": 0x07, "7": 0x08, "8": 0x09, "9": 0x0A, "0": 0x0B, "backspace": 0x0E, "tab": 0x0F,
+    "q": 0x10, "w": 0x11, "e": 0x12, "r": 0x13, "t": 0x14, "y": 0x15, "u": 0x16, "i": 0x17,
+    "o": 0x18, "p": 0x19, "enter": 0x1C, "return": 0x1C, "ctrl": 0x1D, "a": 0x1E, "s": 0x1F,
+    "d": 0x20, "f": 0x21, "g": 0x22, "h": 0x23, "j": 0x24, "k": 0x25, "l": 0x26,
+    "shift": 0x2A, "z": 0x2C, "x": 0x2D, "c": 0x2E, "v": 0x2F, "b": 0x30, "n": 0x31, "m": 0x32,
+    "alt": 0x38, "space": 0x39, "up": 0xC8, "left": 0xCB, "right": 0xCD, "down": 0xD0,
+}
+
+
+def _win32_send_scancode(key: str, down: bool) -> bool:
+    """Низкоуровневый DirectInput-сканкод на Windows (нужен для 3D-игр)."""
+    if platform.system() != "Windows":
+        return False
+    code = _WIN_SCANCODES.get(key.lower())
+    if code is None:
+        return False
+    try:
+        import ctypes
+
+        PUL = ctypes.POINTER(ctypes.c_ulong)
+
+        class KeyBdInput(ctypes.Structure):
+            _fields_ = [
+                ("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", PUL),
+            ]
+
+        class InputUnion(ctypes.Union):
+            _fields_ = [("ki", KeyBdInput)]
+
+        class Input(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_ulong), ("ii", InputUnion)]
+
+        flags = 0x0008  # KEYEVENTF_SCANCODE
+        if code >= 0xC8:
+            flags |= 0x0001  # KEYEVENTF_EXTENDEDKEY
+        if not down:
+            flags |= 0x0002  # KEYEVENTF_KEYUP
+        extra = ctypes.c_ulong(0)
+        ii = InputUnion(ki=KeyBdInput(0, code & 0xFF, flags, 0, ctypes.pointer(extra)))
+        inp = Input(1, ii)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _win32_move_mouse_rel(dx: int, dy: int) -> bool:
+    """Относительное смещение мыши через Windows SendInput (поворот камеры в играх)."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+
+        PUL = ctypes.POINTER(ctypes.c_ulong)
+
+        class MouseInput(ctypes.Structure):
+            _fields_ = [
+                ("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong), ("dwExtraInfo", PUL),
+            ]
+
+        class InputUnion(ctypes.Union):
+            _fields_ = [("mi", MouseInput)]
+
+        class Input(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_ulong), ("ii", InputUnion)]
+
+        extra = ctypes.c_ulong(0)
+        ii = InputUnion(mi=MouseInput(int(dx), int(dy), 0, 0x0001, 0, ctypes.pointer(extra)))
+        inp = Input(0, ii)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def send_key_state(key: str, down: bool) -> None:
+    """Зажимает или отпускает клавишу (с DirectInput-приоритетом на Windows)."""
+    clean = str(key or "").strip().lower()
+    if not clean:
+        return
+    if _win32_send_scancode(clean, down=down):
+        return
+    require_pyautogui()
+    if down:
+        pyautogui.keyDown(clean)
+    else:
+        pyautogui.keyUp(clean)
+
+
+def send_mouse_rel(dx: int, dy: int) -> None:
+    """Сдвигает мышь относительно текущей позиции (камера/прицел)."""
+    if _win32_move_mouse_rel(dx, dy):
+        return
+    require_pyautogui()
+    pyautogui.moveRel(int(dx), int(dy), duration=0.08)
+
+
 def type_text(text: str) -> None:
     """Ввод текста: проверяет раскладку и использует буфер обмена для не-ASCII."""
     if not text:
@@ -1356,7 +1627,8 @@ class Operator:
                  vision_forced: bool = False, cursor_marker: bool = True,
                  generation: Optional[Dict[str, Any]] = None,
                  verify_actions: bool = True, repeat_nudge: bool = True,
-                 self_reflect: bool = True, trust_level: str = "") -> None:
+                 self_reflect: bool = True, trust_level: str = "",
+                 task_mode: str = "", coach_mode: str = "") -> None:
         self.crm = Http(crm, token, kind="CRM")
         self.has_crm = bool(crm and token)
         self.model_http = Http(base_url, kind="модель", key_hint=key_hint)
@@ -1367,6 +1639,14 @@ class Operator:
         self.assume_yes = assume_yes
         self.cli_trust_level = normalize_trust_level(trust_level, "") if trust_level else ""
         self.task_trust_level = ""
+        self.cli_task_mode = normalize_task_mode(task_mode, "") if task_mode else ""
+        self.task_mode = ""
+        self.cli_coach_mode = normalize_coach_mode(coach_mode, "") if coach_mode else ""
+        self.task_coach_mode = ""
+        self._held_keys: set[str] = set()
+        self._held_buttons: set[str] = set()
+        self._last_guidance_id: str = ""
+        self.pending_guidance: str = ""
         self.max_steps_cap = max_steps
         self.delay = delay
         self.poll = max(1.0, poll)
@@ -1412,9 +1692,10 @@ class Operator:
         for image in (extra_images or [])[:3]:
             if image.startswith("data:image/"):
                 parts.append({"type": "image_url", "image_url": {"url": image}})
+        sys_prompt = SYSTEM_PROMPT + build_mode_system_addon(self.current_task_mode(), self.current_coach_mode())
         content: Any = prompt if not parts else [{"type": "text", "text": prompt}, *parts]
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": sys_prompt},
             *([] if not self.history else [{"role": "user", "content": "Что уже сделано:\n" + "\n".join(self.history[-8:])}]),
             {"role": "user", "content": content},
         ]
@@ -1736,6 +2017,7 @@ class Operator:
             "next_question": str(data.get("next_question") or data.get("question") or "").strip(),
             "self_check": str(data.get("self_check") or "").strip(),
             "thought": str(data.get("thought") or "").strip(),
+            "next_advice": str(data.get("next_advice") or data.get("advice") or "").strip(),
             "action": action,
         }
 
@@ -2035,7 +2317,87 @@ class Operator:
             time.sleep(seconds)
             return "пауза {:.1f} с".format(seconds)
 
+        if kind == "move_mouse_rel":
+            dx = max(-2500, min(2500, int(round(float(action.get("dx") or 0)))))
+            dy = max(-2500, min(2500, int(round(float(action.get("dy") or 0)))))
+            send_mouse_rel(dx, dy)
+            return "смещение мыши ({:+d}, {:+d})".format(dx, dy)
+
+        if kind == "mouse_down":
+            button = str(action.get("button") or "left").lower()
+            if action.get("x") is not None and action.get("y") is not None:
+                x, y = self.to_screen(action.get("x"), action.get("y"))
+                self.ensure_cursor(x, y)
+            pyautogui.mouseDown(button=button)
+            self._held_buttons.add(button)
+            return "зажата кнопка мыши " + button
+
+        if kind == "mouse_up":
+            button = str(action.get("button") or "left").lower()
+            pyautogui.mouseUp(button=button)
+            self._held_buttons.discard(button)
+            return "отпущена кнопка мыши " + button
+
+        if kind == "key_down":
+            key = str(action.get("key") or "").strip().lower()
+            if not key:
+                return "не указана клавиша"
+            send_key_state(key, down=True)
+            self._held_keys.add(key)
+            return "зажата клавиша " + key
+
+        if kind == "key_up":
+            key = str(action.get("key") or "").strip().lower()
+            if not key:
+                return "не указана клавиша"
+            send_key_state(key, down=False)
+            self._held_keys.discard(key)
+            return "отпущена клавиша " + key
+
+        if kind == "hold_key":
+            key = str(action.get("key") or "w").strip().lower()
+            seconds = max(0.05, min(5.0, float(action.get("seconds") or 0.5)))
+            send_key_state(key, down=True)
+            self._held_keys.add(key)
+            try:
+                time.sleep(seconds)
+            finally:
+                send_key_state(key, down=False)
+                self._held_keys.discard(key)
+            return "удержание {} ({:.2f} с)".format(key, seconds)
+
+        if kind == "sequence":
+            substeps = action.get("steps") or []
+            if not isinstance(substeps, list) or not substeps:
+                return "пустая серия действий"
+            outcomes: List[str] = []
+            for sub in substeps[:10]:
+                if not isinstance(sub, dict):
+                    continue
+                sub_type = str(sub.get("type") or "").lower()
+                if sub_type in ("", "sequence", "finish"):
+                    continue
+                outcomes.append(self.execute(sub))
+                time.sleep(0.04)
+            return "серия: " + "; ".join(outcomes[:6])
+
         return "неизвестное действие: {}".format(kind)
+
+    def release_all_inputs(self) -> None:
+        """Безопасно отпускает все удержанные клавиши/кнопки мыши при остановке или ошибке."""
+        for key in list(self._held_keys):
+            try:
+                send_key_state(key, down=False)
+            except Exception:  # noqa: BLE001
+                pass
+            self._held_keys.discard(key)
+        for btn in list(self._held_buttons):
+            try:
+                if pyautogui is not None:
+                    pyautogui.mouseUp(button=btn)
+            except Exception:  # noqa: BLE001
+                pass
+            self._held_buttons.discard(btn)
 
     # ------------------------------------------------------------- цикл
     def report(self, kind: str, text: str, action: Optional[dict] = None) -> None:
@@ -2093,8 +2455,22 @@ class Operator:
     def current_trust_level(self) -> str:
         return effective_trust_level(self.cli_trust_level, self.assume_yes, self.task_trust_level)
 
+    def current_task_mode(self) -> str:
+        if self.cli_task_mode:
+            return self.cli_task_mode
+        if self.task_mode:
+            return self.task_mode
+        return "autonomous"
+
+    def current_coach_mode(self) -> str:
+        if self.cli_coach_mode:
+            return self.cli_coach_mode
+        if self.task_coach_mode:
+            return self.task_coach_mode
+        return "after_step"
+
     def sync_task_state(self, task_id: Optional[int]) -> Optional[Dict[str, Any]]:
-        """Запрашиваем свежее состояние задачи (статус, лимит шагов, уровень доверия)."""
+        """Запрашиваем свежее состояние задачи (статус, лимит шагов, режим, подсказки и доверие)."""
         if not (self.has_crm and task_id):
             return None
         try:
@@ -2107,9 +2483,77 @@ class Operator:
         if isinstance(task, dict):
             if task.get("trustLevel"):
                 self.task_trust_level = normalize_trust_level(task.get("trustLevel"), "verified")
+            if task.get("taskMode"):
+                self.task_mode = normalize_task_mode(task.get("taskMode"), "autonomous")
+            if task.get("coachMode"):
+                self.task_coach_mode = normalize_coach_mode(task.get("coachMode"), "after_step")
+            note = task.get("guidanceNote")
+            if isinstance(note, dict) and note.get("id") and note.get("text"):
+                note_id = str(note.get("id"))
+                if note_id != self._last_guidance_id:
+                    self._last_guidance_id = note_id
+                    guidance_text = str(note.get("text") or "").strip()
+                    if note.get("userAdvice"):
+                        guidance_text += "\n(Совет пользователю: {})".format(str(note.get("userAdvice")).strip())
+                    self.pending_guidance = guidance_text
+                    log("  получено указание ({}): {}".format(note.get("author") or "crm", guidance_text[:180]))
             if str(task.get("status") or "") == "cancelled":
                 raise TaskCancelled("Задание отменено в CRM")
         return task if isinstance(task, dict) else None
+
+    def post_step_assist(
+        self,
+        task_id: Optional[int],
+        step_index: int,
+        action: Dict[str, Any],
+        result: str,
+        decision: Dict[str, Any],
+        screenshot: Optional[str] = None,
+    ) -> None:
+        """После каждого действия помогает Оператору и пользователю определить, что делать дальше."""
+        coach = self.current_coach_mode()
+        if coach == "off":
+            return
+
+        model_advice = str(decision.get("next_advice") or "").strip()
+        observation = str(decision.get("observation") or decision.get("thought") or "").strip()
+
+        if coach == "agent" and self.has_crm and task_id:
+            try:
+                resp = self.crm.call(
+                    "POST",
+                    "/api/agent/bot/{}/coach".format(task_id),
+                    {
+                        "step": step_index + 1,
+                        "lastAction": action,
+                        "lastResult": result[:400],
+                        "observation": observation[:400],
+                        "lastGuidanceId": self._last_guidance_id,
+                        "history": self.history[-8:],
+                        **({"screenshot": screenshot} if screenshot else {}),
+                    },
+                    timeout=35,
+                )
+                g = resp.get("guidance") if isinstance(resp, dict) else None
+                if isinstance(g, dict) and g.get("text"):
+                    if g.get("id"):
+                        self._last_guidance_id = str(g["id"])
+                    text = str(g["text"]).strip()
+                    advice_line = str(g.get("userAdvice") or "").strip()
+                    self.pending_guidance = text
+                    log("  [совет Агента] {}".format((advice_line or text)[:220]))
+                    return
+            except TaskCancelled:
+                raise
+            except AgentError as error:
+                log("[!] не удалось получить совет Агента: {}".format(error))
+
+        # Локальный пошаговый помощник (использует next_advice от модели или итог шага).
+        hint = model_advice or "Оцени результат «{}» и переходи к следующему действию.".format(result[:120])
+        self.pending_guidance = hint
+        text = "После шага {} ({}): {}".format(step_index + 1, action_label(action), hint)
+        log("  [после шага] {}".format(hint[:220]))
+        self.report("guidance", text, action)
 
     def task_cancelled(self, task_id: Optional[int]) -> bool:
         """Спрашиваем CRM, не отменили ли задание, — до следующего шага."""
@@ -2178,11 +2622,26 @@ class Operator:
         self.last_signature = ""
         self.repeat_streak = 0
         self.pending_nudge = ""
+        self.pending_guidance = ""
+        self._last_guidance_id = ""
         self.failed_checks = 0
         self._last_frame_sig = None
         last_outcome = ""
         last_screen_unchanged = False
         current_max_steps = min(HARD_MAX_STEPS_LIMIT, max(1, int(max_steps or 15)))
+        try:
+            return self._run_loop(task_id, prompt, current_max_steps, last_outcome, last_screen_unchanged)
+        finally:
+            self.release_all_inputs()
+
+    def _run_loop(
+        self,
+        task_id: Optional[int],
+        prompt: str,
+        current_max_steps: int,
+        last_outcome: str,
+        last_screen_unchanged: bool,
+    ) -> bool:
         if self.has_crm and task_id:
             try:
                 task_info = self.sync_task_state(task_id)
@@ -2260,10 +2719,13 @@ class Operator:
                 attachments_context=self.attachments_context,
                 last_outcome=last_outcome,
                 screen_unchanged=last_screen_unchanged,
+                task_mode=self.current_task_mode(),
+                pending_guidance=self.pending_guidance,
             )
             decision = self.ask_model(step_prompt, screenshot,
                                       self.attachment_images if index == 0 else None)
             self.pending_nudge = ""
+            self.pending_guidance = ""
             action = decision["action"]
             thought_text = format_decision_thought(decision)
             log("Шаг {} | {} {}".format(index + 1, action.get("type"),
@@ -2275,6 +2737,7 @@ class Operator:
                 self.history.append("шаг {} мысль: {}".format(index + 1, thought_text[:200]))
 
             if action.get("type") == "finish":
+                self.release_all_inputs()
                 summary = str(action.get("summary") or "Готово")
                 self.report("info", "Итог: " + summary)
                 if self.has_crm and task_id:
@@ -2292,6 +2755,10 @@ class Operator:
                 self.repeat_streak = 1
             self.last_signature = signature
             limit = REPEAT_LIMITS.get(kind, 0)
+            if self.current_task_mode() == "game" and kind in (
+                "hold_key", "key", "move_mouse_rel", "mouse_down", "mouse_up", "sequence", "click"
+            ):
+                limit = max(limit, 8)
 
             if self.repeat_nudge_enabled and limit and self.repeat_streak >= limit:
                 repeat_nudge = build_repeat_nudge(action, self.repeat_streak)
@@ -2444,6 +2911,17 @@ class Operator:
                             )
                         else:
                             self.failed_checks = 0
+
+                    # После каждого выполненного действия помогаем определить, что делать дальше.
+                    if kind not in ("finish",):
+                        self.post_step_assist(
+                            task_id=task_id,
+                            step_index=index,
+                            action=action,
+                            result=result,
+                            decision=decision,
+                            screenshot=self._last_verify_shot or screenshot,
+                        )
                 except TaskCancelled:
                     raise
                 except Exception as error:  # noqa: BLE001
@@ -2461,8 +2939,9 @@ class Operator:
                     )
 
             index += 1
-            time.sleep(max(0.2, self.delay))
+            time.sleep(0.15 if self.current_task_mode() == "game" else max(0.2, self.delay))
 
+        self.release_all_inputs()
         note = "Достигнут предел в {} шагов — задание остановлено".format(current_max_steps)
         self.report("error", note)
         if self.has_crm and task_id:
@@ -2505,6 +2984,8 @@ class Operator:
                 time.sleep(self.poll)
                 continue
             self.task_trust_level = normalize_trust_level(task.get("trustLevel"), "") if task.get("trustLevel") else ""
+            self.task_mode = normalize_task_mode(task.get("taskMode"), "autonomous") if task.get("taskMode") else ""
+            self.task_coach_mode = normalize_coach_mode(task.get("coachMode"), "after_step") if task.get("coachMode") else ""
             limit = min(HARD_MAX_STEPS_LIMIT, max(1, int(task.get("maxSteps") or 15)))
             if self.max_steps_cap:
                 limit = min(limit, self.max_steps_cap)
@@ -2607,6 +3088,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yes", action="store_true", help="не спрашивать про опасные действия")
     parser.add_argument("--trust-level", default="", choices=["", "full", "verified", "none"],
                         help="уровень доверия ИИ: full (полный), verified (с проверкой), none (без доступа)")
+    parser.add_argument("--task-mode", default="", choices=["", "autonomous", "copilot", "game"],
+                        help="режим: autonomous (автопилот), copilot (помощник ПК), game (игра/персонаж)")
+    parser.add_argument("--coach", default="", choices=["", "off", "after_step", "agent"],
+                        help="подсказки после каждого действия: off, after_step, agent")
     parser.add_argument("--text-only", action="store_true", help="не отправлять скриншоты (без vision)")
     parser.add_argument("--max-steps", type=int, default=0, help="жёсткий предел шагов (0 — из задания)")
     parser.add_argument("--delay", type=float, default=0.8, help="пауза между шагами, сек")
@@ -2691,6 +3176,8 @@ def main() -> int:
         repeat_nudge=not args.no_repeat_nudge,
         self_reflect=not args.no_self_reflect,
         trust_level=args.trust_level,
+        task_mode=args.task_mode,
+        coach_mode=args.coach,
     )
     operator.current_task = None
 
@@ -2706,9 +3193,11 @@ def main() -> int:
     if not api_key and "127.0.0.1" not in base_url and "localhost" not in base_url:
         log("[!] Ключ API не задан — облачный провайдер ответит 401. Передайте --api-key sk-… "
             "или переменную {}; поле есть во вкладке «Оператор» → «Подключение».".format(key_hint))
-    log("Режим: {} · доверие: {}".format(
+    log("Режим: {} · доверие: {} · задача: {} · сопровождение: {}".format(
         "DRY-RUN" if args.dry_run else "ИСПОЛНЕНИЕ",
         operator.current_trust_level(),
+        operator.current_task_mode(),
+        operator.current_coach_mode(),
     ))
     log("Генерация: раздумья {}, temperature {}, top_p {}, max_tokens {}, проверка "
         "{}, саморазбор {}".format(args.reasoning,

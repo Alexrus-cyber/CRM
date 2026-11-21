@@ -133,6 +133,7 @@ export function keyEnvName(providerId: string): string {
 }
 
 import { genParamsFlags, type GenParams } from "./genParams";
+import type { OperatorCoachMode, OperatorTaskMode } from "./operatorModes";
 import type { TrustLevel } from "./trust";
 
 export type CommandOptions = {
@@ -149,6 +150,10 @@ export type CommandOptions = {
   textOnly?: boolean;
   /** Уровень доверия ИИ: full | verified | none. */
   trustLevel?: TrustLevel;
+  /** Режим поведения оператора: autonomous | copilot | game. */
+  taskMode?: OperatorTaskMode;
+  /** Сопровождение после каждого шага: off | after_step | agent. */
+  coachMode?: OperatorCoachMode;
   /** Раздумья и генерация с вкладки «Оператор» — передаются боту флагами. */
   gen?: GenParams;
   /** Проверять результат после каждого действия (по умолчанию да). */
@@ -174,6 +179,8 @@ export function buildOperatorCommand(options: CommandOptions): string {
   if (key && options.keyMode !== "env") parts.push("--api-key", key);
 
   if (options.trustLevel) parts.push("--trust-level", options.trustLevel);
+  if (options.taskMode && options.taskMode !== "autonomous") parts.push("--task-mode", options.taskMode);
+  if (options.coachMode && options.coachMode !== "after_step") parts.push("--coach", options.coachMode);
   if (options.gen) parts.push(...genParamsFlags(options.gen));
   if (options.verifyActions === false) parts.push("--no-verify-actions");
   if (options.selfReflect === false) parts.push("--no-self-reflect");

@@ -4,10 +4,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   ClipboardCopy,
+  Compass,
   Copy,
   Eye,
   EyeOff,
   FileText,
+  Gamepad2,
   Inbox,
   KeyRound,
   Loader2,
@@ -17,6 +19,7 @@ import {
   PlugZap,
   Plus,
   Rocket,
+  Send,
   Settings2,
   ShieldAlert,
   ShieldCheck,
@@ -45,6 +48,17 @@ import {
   normalizeTrustLevel,
   type TrustLevel,
 } from "@/lib/trust";
+import {
+  DEFAULT_OPERATOR_COACH_MODE,
+  DEFAULT_OPERATOR_TASK_MODE,
+  OPERATOR_COACH_MODES,
+  OPERATOR_TASK_MODES,
+  findTaskMode,
+  normalizeCoachMode,
+  normalizeTaskMode,
+  type OperatorCoachMode,
+  type OperatorTaskMode,
+} from "@/lib/operatorModes";
 import {
   OPERATOR_PROVIDERS,
   buildCommandWithKey,
@@ -97,6 +111,15 @@ const PRESETS = [
   "Открой почту и проверь новые письма",
 ];
 
+const GAME_PRESETS = [
+  "Управляй персонажем в игре: осмотри экран, беги вперёд (hold_key W), поверни камеру и взаимодействуй (E)",
+  "Помоги пройти текущий участок уровня в игре и подсказывай следующий шаг после каждого действия",
+];
+
+const COPILOT_PRESETS = [
+  "Помоги пошагово настроить и проверить открытое окно программы на экране",
+];
+
 const RUN_FILTERS = [
   { id: "all", label: "Все" },
   { id: "queued", label: "В очереди" },
@@ -107,6 +130,14 @@ const RUN_FILTERS = [
 /** Флаг из localStorage: `useStoredJson` отдаёт строку JSON. */
 function decodeFlag(raw: string): boolean {
   return raw === "true";
+}
+
+function decodeTaskModeStorage(raw: string): OperatorTaskMode {
+  return normalizeTaskMode(raw.replace(/^"|"$/g, ""));
+}
+
+function decodeCoachModeStorage(raw: string): OperatorCoachMode {
+  return normalizeCoachMode(raw.replace(/^"|"$/g, ""));
 }
 
 function statusFilterMatches(status: string, filter: string): boolean {
@@ -163,6 +194,18 @@ export function OperatorPanel() {
     DEFAULT_TRUST_LEVEL,
     decodeTrustLevel,
   );
+  const [taskMode, setTaskMode] = useStoredJson<OperatorTaskMode>(
+    "crm.ai.operator.taskmode.v1",
+    DEFAULT_OPERATOR_TASK_MODE,
+    decodeTaskModeStorage,
+  );
+  const [coachMode, setCoachMode] = useStoredJson<OperatorCoachMode>(
+    "crm.ai.operator.coachmode.v1",
+    DEFAULT_OPERATOR_COACH_MODE,
+    decodeCoachModeStorage,
+  );
+  const [guidanceInput, setGuidanceInput] = useState("");
+  const [coachBusy, setCoachBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   // Храним именно «выключено»: useStoredNumber не сохраняет 0 и переключатель
   // нельзя было выключить.
@@ -432,6 +475,8 @@ export function OperatorPanel() {
           prompt: text,
           maxSteps: Math.max(maxSteps, 1),
           trustLevel,
+          taskMode,
+          coachMode,
           files: files.map((file) => ({
             name: file.name,
             mime: file.mime,
@@ -504,6 +549,58 @@ export function OperatorPanel() {
     }
   };
 
+  const sendGuidance = async (id: number, noteText: string) => {
+    const clean = noteText.trim();
+    if (!clean || coachBusy) return;
+    setCoachBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/agent/tasks/${id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "guidance", text: clean }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
+      if (!res.ok) {
+        setError(data.error ?? "Не удалось отправить подсказку Оператору");
+        return;
+      }
+      setGuidanceInput("");
+      if (data.task) {
+        setTasks((prev) => prev.map((task) => (task.id === id ? data.task! : task)));
+      }
+      const updated = await fetchTask(id);
+      if (updated) setEvents(updated.events);
+    } finally {
+      setCoachBusy(false);
+    }
+  };
+
+  const askAgentNextStep = async (id: number) => {
+    if (coachBusy) return;
+    setCoachBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/ai/agent/coach", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId: id, userHint: guidanceInput.trim() }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
+      if (!res.ok) {
+        setError(data.error ?? "Не удалось получить совет от Агента");
+        return;
+      }
+      if (data.task) {
+        setTasks((prev) => prev.map((task) => (task.id === id ? data.task! : task)));
+      }
+      const updated = await fetchTask(id);
+      if (updated) setEvents(updated.events);
+    } finally {
+      setCoachBusy(false);
+    }
+  };
+
   const extendSteps = async (id: number, addSteps = 20) => {
     if (actionBusy) return;
     setActionBusy(true);
@@ -556,6 +653,25 @@ export function OperatorPanel() {
     return "";
   }, [events, currentAction]);
 
+  const latestGuidance = useMemo(
+    () =>
+      activeTask?.guidanceNote?.text
+        ? {
+            text: activeTask.guidanceNote.text,
+            userAdvice: activeTask.guidanceNote.userAdvice,
+            author: activeTask.guidanceNote.author,
+          }
+        : [...events]
+            .reverse()
+            .find((event) => event.kind === "guidance" && event.text)
+            ? {
+                text: [...events].reverse().find((event) => event.kind === "guidance" && event.text)!.text,
+                userAdvice: undefined,
+                author: "operator",
+              }
+            : null,
+    [activeTask, events],
+  );
   const parsedAction = describeAction(currentAction?.action ?? "");
   const pendingApproval = useMemo(
     () => parsePendingApproval(activeTask?.pendingApproval),
@@ -580,6 +696,8 @@ export function OperatorPanel() {
       assumeYes,
       textOnly,
       trustLevel,
+      taskMode,
+      coachMode,
       gen: genParams,
       verifyActions: !verifyOff,
     }),
@@ -595,6 +713,8 @@ export function OperatorPanel() {
       assumeYes,
       textOnly,
       trustLevel,
+      taskMode,
+      coachMode,
       genParams,
       verifyOff,
     ],
@@ -760,25 +880,86 @@ export function OperatorPanel() {
                   <Badge className="border-border text-muted">
                     <Play size={11} /> шагов: до {maxSteps}
                   </Badge>
+                  <Badge className={findTaskMode(taskMode).badgeClass}>
+                    {taskMode === "game" ? <Gamepad2 size={11} /> : <Compass size={11} />}
+                    {findTaskMode(taskMode).shortLabel}
+                  </Badge>
                 </span>
               }
-              subtitle="Задание уходит в очередь: бот кликает по экрану и присылает шаги."
+              subtitle="Задание уходит в очередь: бот кликает по экрану, играет или помогает шаг за шагом."
               action={
                 <Badge className="border-border text-muted">
                   <MonitorCog size={11} /> на вашем ПК
                 </Badge>
               }
             >
+              {/* Выбор режима Оператора (автопилот / помощник ПК / игра и персонаж) и сопровождения */}
+              <div className="mb-2.5 space-y-2 rounded-xl border border-border bg-card2/50 p-2">
+                <div className="flex flex-wrap items-center gap-1">
+                  <span className="mr-1 text-[10px] font-medium text-muted">Режим:</span>
+                  {OPERATOR_TASK_MODES.map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => {
+                        setTaskMode(m.id);
+                        if (m.id === "game" && maxSteps < 40) setMaxSteps(50);
+                        if (m.id !== "autonomous" && coachMode === "off") setCoachMode("agent");
+                      }}
+                      title={m.description}
+                      className={cn(
+                        "flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] font-medium transition",
+                        taskMode === m.id
+                          ? m.badgeClass
+                          : "border-border bg-card text-muted hover:text-text",
+                      )}
+                    >
+                      {m.id === "game" && <Gamepad2 size={11} />}
+                      {m.shortLabel}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+                  <span className="text-muted">После каждого шага:</span>
+                  {OPERATOR_COACH_MODES.map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      onClick={() => setCoachMode(c.id)}
+                      title={c.hint}
+                      className={cn(
+                        "rounded-lg border px-2 py-0.5 transition",
+                        coachMode === c.id
+                          ? "border-accent/50 bg-accent/15 text-text"
+                          : "border-border bg-card text-muted hover:text-text",
+                      )}
+                    >
+                      {c.label}
+                    </button>
+                  ))}
+                </div>
+                {taskMode === "game" && (
+                  <p className="text-[10px] leading-snug text-accent2">
+                    Игровой режим: доступны удержание клавиш (WASD/Space/Shift), поворот камеры мышью и быстрые серии,
+                    а после выхода клавиши автоматически отпускаются.
+                  </p>
+                )}
+              </div>
+
               <Textarea
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
                 rows={3}
                 maxLength={4000}
-                placeholder="План из чата слева или своя формулировка задачи"
+                placeholder={
+                  taskMode === "game"
+                    ? "Опишите цель в игре и управление (например: иди вперёд по тропе, нажми E у двери)"
+                    : "План из чата слева или своя формулировка задачи"
+                }
                 className="text-[11px]"
               />
               <div className="mt-2 flex flex-wrap gap-1.5">
-                {PRESETS.map((preset) => (
+                {(taskMode === "game" ? GAME_PRESETS : taskMode === "copilot" ? [...COPILOT_PRESETS, ...PRESETS] : PRESETS).map((preset) => (
                   <button
                     key={preset}
                     type="button"
@@ -884,6 +1065,27 @@ export function OperatorPanel() {
                         )}
                       >
                         {findTrustLevel(normalizeTrustLevel(activeTask.trustLevel)).shortLabel}
+                      </span>
+                    )}
+                    {activeTask.taskMode && activeTask.taskMode !== "autonomous" && (
+                      <span
+                        className={cn(
+                          "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium",
+                          findTaskMode(activeTask.taskMode).badgeClass,
+                        )}
+                      >
+                        {activeTask.taskMode === "game" ? <Gamepad2 size={10} /> : <Compass size={10} />}
+                        {findTaskMode(activeTask.taskMode).shortLabel}
+                      </span>
+                    )}
+                    {activeTask.source === "agent" && (
+                      <span className="rounded-md border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-medium text-violet-400">
+                        запущено из Агента
+                      </span>
+                    )}
+                    {activeTask.coachMode === "agent" && (
+                      <span className="rounded-md border border-cyan-500/40 bg-cyan-500/10 px-1.5 py-0.5 text-[10px] font-medium text-cyan-400">
+                        Агент подсказывает
                       </span>
                     )}
                     <span className="text-[10px] font-normal text-muted">
@@ -1078,6 +1280,62 @@ export function OperatorPanel() {
                         ))}
                       </div>
                     )}
+
+                    {/* Пошаговая помощь: что делать дальше (подсказки Агента и ручное управление) */}
+                    <div className="mt-3 space-y-2 rounded-xl border border-cyan-500/30 bg-cyan-500/5 p-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-cyan-400">
+                          <Compass size={11} /> Помощь: что делать дальше
+                        </p>
+                        {!finished && (
+                          <button
+                            type="button"
+                            onClick={() => void askAgentNextStep(activeTask.id)}
+                            disabled={coachBusy}
+                            className="flex items-center gap-1 rounded-md border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-medium text-cyan-400 hover:bg-cyan-500/20 disabled:opacity-50"
+                          >
+                            {coachBusy ? <Loader2 size={10} className="animate-spin" /> : <Sparkles size={10} />}
+                            Совет Агента
+                          </button>
+                        )}
+                      </div>
+                      {latestGuidance ? (
+                        <div className="rounded-lg border border-border bg-card px-2 py-1.5 text-[11px] leading-relaxed">
+                          <p className="text-text">{latestGuidance.userAdvice || latestGuidance.text}</p>
+                          {latestGuidance.userAdvice && latestGuidance.text !== latestGuidance.userAdvice && (
+                            <p className="mt-0.5 text-[10px] text-muted">Для Оператора: {latestGuidance.text}</p>
+                          )}
+                        </div>
+                      ) : (
+                        <p className="text-[10px] text-muted">
+                          После каждого действия здесь появится подсказка, что делать дальше — либо задайте направление вручную.
+                        </p>
+                      )}
+                      {!finished && (
+                        <div className="flex gap-1.5">
+                          <Input
+                            value={guidanceInput}
+                            onChange={(e) => setGuidanceInput(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                void sendGuidance(activeTask.id, guidanceInput);
+                              }
+                            }}
+                            placeholder="Подсказка на следующий шаг (напр. «нажми E у двери»)"
+                            className="h-8 text-[11px]"
+                          />
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => void sendGuidance(activeTask.id, guidanceInput)}
+                            disabled={coachBusy || !guidanceInput.trim()}
+                          >
+                            <Send size={11} /> Подсказать
+                          </Button>
+                        </div>
+                      )}
+                    </div>
                   </div>
 
                   {/* Лента шагов */}
@@ -1333,6 +1591,34 @@ export function OperatorPanel() {
                 <FlagToggle label="только план" checked={dryRun} onChange={setDryRun} />
                 <FlagToggle label="без вопросов" checked={assumeYes} onChange={setAssumeYes} />
                 <FlagToggle label="без скриншотов" checked={textOnly} onChange={setTextOnly} />
+                <label className="flex items-center gap-1.5 text-[10px] text-muted">
+                  Режим (--task-mode)
+                  <select
+                    value={taskMode}
+                    onChange={(event) => setTaskMode(normalizeTaskMode(event.target.value))}
+                    className="h-7 rounded-lg border border-border bg-card2 px-1.5 text-[10px] text-text"
+                  >
+                    {OPERATOR_TASK_MODES.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.shortLabel}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex items-center gap-1.5 text-[10px] text-muted">
+                  Советы (--coach)
+                  <select
+                    value={coachMode}
+                    onChange={(event) => setCoachMode(normalizeCoachMode(event.target.value))}
+                    className="h-7 rounded-lg border border-border bg-card2 px-1.5 text-[10px] text-text"
+                  >
+                    {OPERATOR_COACH_MODES.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
               </div>
             </div>
 
@@ -1480,37 +1766,49 @@ function EventRow({ event }: { event: OperatorEvent }) {
 
   const parsed = describeAction(event.action);
   const checkPassed = event.kind === "result" && event.text.startsWith("✅");
+  const isGuidance = event.kind === "guidance";
   const iconType = parsed?.type ?? (event.kind === "error" ? "error" : "info");
   const title =
     parsed?.title ||
     (event.kind === "thought"
       ? "Мысль модели"
-      : event.kind === "error"
-        ? "Ошибка"
-        : event.kind === "approval"
-          ? "Подтверждение на сайте"
-          : event.kind === "result"
-            ? checkPassed ? "Проверка: получилось" : "Проверка: результат под вопросом"
-            : event.kind === "info"
-              ? "Служебное сообщение"
-              : "Действие");
+      : isGuidance
+        ? "Что делать дальше"
+        : event.kind === "error"
+          ? "Ошибка"
+          : event.kind === "approval"
+            ? "Подтверждение на сайте"
+            : event.kind === "result"
+              ? checkPassed ? "Проверка: получилось" : "Проверка: результат под вопросом"
+              : event.kind === "info"
+                ? "Служебное сообщение"
+                : "Действие");
 
   return (
-    <div className="rounded-lg border border-border bg-card px-2 py-1.5">
+    <div
+      className={cn(
+        "rounded-lg border px-2 py-1.5",
+        isGuidance ? "border-cyan-500/40 bg-cyan-500/5" : "border-border bg-card",
+      )}
+    >
       <div className="flex items-start gap-2">
         <span
           className={cn(
             "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md",
-            event.kind === "error"
-              ? "bg-red-500/10 text-red-500"
-              : event.kind === "result"
-                ? checkPassed
-                  ? "bg-emerald-500/10 text-emerald-500"
-                  : "bg-amber-500/10 text-amber-500"
-                : "bg-card2 text-muted",
+            isGuidance
+              ? "bg-cyan-500/15 text-cyan-400"
+              : event.kind === "error"
+                ? "bg-red-500/10 text-red-500"
+                : event.kind === "result"
+                  ? checkPassed
+                    ? "bg-emerald-500/10 text-emerald-500"
+                    : "bg-amber-500/10 text-amber-500"
+                  : "bg-card2 text-muted",
           )}
         >
-          {event.kind === "thought" ? (
+          {isGuidance ? (
+            <Compass size={11} />
+          ) : event.kind === "thought" ? (
             <Sparkles size={11} />
           ) : event.kind === "error" ? (
             <TriangleAlert size={11} />
@@ -1521,10 +1819,11 @@ function EventRow({ event }: { event: OperatorEvent }) {
           )}
         </span>
         <div className="min-w-0 flex-1">
-          {(parsed && event.kind === "action") || event.kind === "result" ? (
+          {(parsed && event.kind === "action") || event.kind === "result" || isGuidance ? (
             <p
               className={cn(
                 "text-[11px] font-medium leading-snug",
+                isGuidance && "text-cyan-400",
                 event.kind === "result" && (checkPassed ? "text-emerald-500" : "text-amber-500"),
               )}
             >

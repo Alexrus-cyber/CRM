@@ -42,6 +42,11 @@ let nextMsgId = 1;
 let sseReply = "";
 let sseResponder: ((url: string, init?: RequestInit) => Promise<Response> | Response) | null = null;
 
+const operatorCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
+let operatorPollCount = 0;
+
+let operatorTaskGuidance: Record<string, unknown> | null = null;
+
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 }
@@ -55,6 +60,87 @@ function mockFetch() {
 
       if (url === "/api/ai/agent" && method === "GET") {
         return json({ available: true, tools: [] });
+      }
+      if (url === "/api/ai/agent/operator" && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        operatorCalls.push({ url, body });
+        if (body.action === "formulate") {
+          return json({
+            prompt: "Открой окно игры, зажми W на 1 с и нажми E у двери",
+            taskMode: "game",
+            coachMode: "agent",
+            maxSteps: 45,
+            notes: "Выбран игровой режим с пошаговым ведением Агента.",
+          });
+        }
+        return json({
+          ok: true,
+          task: {
+            id: 77,
+            prompt: String(body.prompt ?? ""),
+            status: "queued",
+            maxSteps: Number(body.maxSteps ?? 30),
+            steps: 0,
+            summary: "",
+            trustLevel: String(body.trustLevel ?? "verified"),
+            taskMode: String(body.taskMode ?? "copilot"),
+            coachMode: String(body.coachMode ?? "agent"),
+            source: "agent",
+            guidanceNote: operatorTaskGuidance,
+            createdAt: "2026-11-17T10:00:00.000Z",
+            updatedAt: "2026-11-17T10:00:00.000Z",
+          },
+        });
+      }
+      if (url === "/api/ai/agent/coach" && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        operatorCalls.push({ url, body });
+        operatorTaskGuidance = {
+          id: "g-1",
+          author: "agent",
+          text: "Нажми E чтобы открыть сундук",
+          userAdvice: "Персонаж подошёл к сундуку — жмём E",
+          createdAt: "2026-11-17T10:01:00.000Z",
+        };
+        return json({
+          ok: true,
+          task: {
+            id: 77,
+            prompt: "Открой окно игры, зажми W на 1 с и нажми E у двери",
+            status: "running",
+            maxSteps: 45,
+            steps: 1,
+            summary: "",
+            trustLevel: "verified",
+            taskMode: "game",
+            coachMode: "agent",
+            source: "agent",
+            guidanceNote: operatorTaskGuidance,
+            createdAt: "2026-11-17T10:00:00.000Z",
+            updatedAt: "2026-11-17T10:01:00.000Z",
+          },
+        });
+      }
+      if (url === "/api/agent/tasks/77" && method === "GET") {
+        operatorPollCount += 1;
+        return json({
+          task: {
+            id: 77,
+            prompt: "Открой окно игры, зажми W на 1 с и нажми E у двери",
+            status: "running",
+            maxSteps: 45,
+            steps: operatorPollCount,
+            summary: "",
+            trustLevel: "verified",
+            taskMode: "game",
+            coachMode: "agent",
+            source: "agent",
+            guidanceNote: operatorTaskGuidance,
+            createdAt: "2026-11-17T10:00:00.000Z",
+            updatedAt: "2026-11-17T10:00:00.000Z",
+          },
+          events: [],
+        });
       }
       if (url === "/api/ai/agent" && method === "POST") {
         sent.push(JSON.parse(String(init?.body ?? "{}")) as Sent);
@@ -170,6 +256,9 @@ describe("вкладка «Агент»", () => {
     approvalsSent.length = 0;
     transcriptsSaved.length = 0;
     savedMessages.length = 0;
+    operatorCalls.length = 0;
+    operatorPollCount = 0;
+    operatorTaskGuidance = null;
     conversations = [];
     messagesByConv = {};
     nextConvId = 1;
@@ -282,7 +371,8 @@ describe("вкладка «Агент»", () => {
     fireEvent.change(ragSelect, { target: { value: "5" } });
     fireEvent.click(screen.getByRole("checkbox", { name: /Вся база/i }));
 
-    // Стриминговый ответ с запросом подтверждения экспорта из Sandbox.
+    // Стриминговый ответ с запросом подтверждения экспорта из Sandbox:
+    // завершаем поток только после отправки подтверждения, как в реальном agent.py.
     const encoder = new TextEncoder();
     sseResponder = () => {
       const stream = new ReadableStream({
@@ -292,7 +382,9 @@ describe("вкладка «Агент»", () => {
               'event: approval_required\ndata: {"approvalId":"appr-1","kind":"sandbox_export","title":"Разрешить перенос?","description":"Экспорт проекта","source":"site","destination":"D:/out","mode":"copy","filesCount":4}\n\n',
             ),
           );
-          await new Promise((r) => setTimeout(r, 30));
+          while (approvalsSent.length === 0) {
+            await new Promise((r) => setTimeout(r, 10));
+          }
           controller.enqueue(encoder.encode('event: text\ndata: {"text":"Экспорт выполнен"}\n\n'));
           controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
           controller.close();
@@ -325,5 +417,63 @@ describe("вкладка «Агент»", () => {
     expect(await screen.findByText(/Сжатый итог работы по проекту/)).toBeTruthy();
     expect(transcriptsSaved).toHaveLength(1);
     expect(String(transcriptsSaved[0].content)).toContain("# Переписка агента");
+  });
+
+  it("вызывает Оператора только с разрешения пользователя и помогает формулировать + вести по шагам", async () => {
+    render(<AgentChat userName="Тест" />);
+    const textarea = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    await waitFor(() => expect((textarea as HTMLTextAreaElement).disabled).toBe(false));
+
+    // Сценарий 1: Агент запрашивает разрешение на вызов Оператора (approval_required call_operator).
+    const encoder = new TextEncoder();
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              'event: approval_required\ndata: {"approvalId":"appr-op-1","kind":"call_operator","title":"Разрешить Агенту вызвать Оператора на ПК?","description":"Нужно кликнуть на кнопку в программе","task":"Открой окно и нажми Сохранить","mode":"copilot","maxSteps":25,"coachAfterEachStep":true,"operatorTrustLevel":"verified"}\n\n',
+            ),
+          );
+          while (approvalsSent.length === 0) {
+            await new Promise((r) => setTimeout(r, 10));
+          }
+          controller.enqueue(encoder.encode('event: text\ndata: {"text":"Задача передана Оператору"}\n\n'));
+          controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    fireEvent.change(textarea, { target: { value: "нажми сохранить в программе" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    const approveOpBtn = await screen.findByRole("button", { name: /Разрешить и запустить Оператора/i });
+    fireEvent.click(approveOpBtn);
+
+    await waitFor(() =>
+      expect(operatorCalls.some((c) => c.url === "/api/ai/agent/operator" && c.body.action === "launch")).toBe(true),
+    );
+    await waitFor(() => expect(approvalsSent.length).toBe(1));
+    expect(approvalsSent[0]).toMatchObject({
+      approvalId: "appr-op-1",
+      approved: true,
+      taskId: 77,
+      mode: "copilot",
+      coachMode: "agent",
+    });
+
+    // Сценарий 3: В открытой live-панели Оператора можно запросить совет Агента, и кнопка «Оператор» формулирует задачу.
+    const coachBtn = await screen.findByRole("button", { name: /Совет Агента/i });
+    fireEvent.click(coachBtn);
+    await waitFor(() => expect(operatorCalls.some((c) => c.url === "/api/ai/agent/coach")).toBe(true));
+    expect(await screen.findByText(/Персонаж подошёл к сундуку/)).toBeTruthy();
+
+    fireEvent.change(textarea, { target: { value: "помоги пройти дверь в игре" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Оператор$/i }));
+    await waitFor(() =>
+      expect(operatorCalls.some((c) => c.url === "/api/ai/agent/operator" && c.body.action === "formulate")).toBe(true),
+    );
+    expect(await screen.findByDisplayValue(/Открой окно игры, зажми W на 1 с и нажми E у двери/)).toBeTruthy();
   });
 });

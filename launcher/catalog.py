@@ -46,6 +46,18 @@ TRUST_LEVELS: Tuple[Tuple[str, str], ...] = (
     ("none", "Нет доступа к компьютеру"),
 )
 
+TASK_MODES: Tuple[Tuple[str, str], ...] = (
+    ("autonomous", "Автопилот (обычная задача)"),
+    ("copilot", "Помощник на ПК (пошагово)"),
+    ("game", "Игра / управление персонажем"),
+)
+
+COACH_MODES: Tuple[Tuple[str, str], ...] = (
+    ("after_step", "Подсказывать после каждого шага"),
+    ("agent", "Агент подсказывает после каждого шага"),
+    ("off", "Без подсказок после шага"),
+)
+
 
 @dataclass(frozen=True)
 class Field:
@@ -112,6 +124,9 @@ OPERATOR = AgentSpec(
         Field("delay", "Пауза между шагами, сек", "float", 0.8),
         Field("trust_level", "Уровень доверия ИИ", "choice", "verified", choices=TRUST_LEVELS,
               hint="При проверке данных опасные действия, команды и экспорт просят согласие на сайте."),
+        Field("task_mode", "Стиль работы Оператора", "choice", "autonomous", choices=TASK_MODES,
+              hint="В игровом режиме доступны удержание клавиш (WASD/Shift/Space), поворот камеры и серии."),
+        Field("coach_mode", "Помощь после каждого действия", "choice", "after_step", choices=COACH_MODES),
         Field("yes", "Не спрашивать в консоли (--yes)", "bool", False),
         Field("dry_run", "Dry-run: только планировать", "bool", False),
         Field("text_only", "Без скриншотов (модель без vision)", "bool", False),

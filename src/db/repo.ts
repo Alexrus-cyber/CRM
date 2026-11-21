@@ -2,6 +2,15 @@ import { randomBytes } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { nowIso, q, q1, toIso, toNum, toYmd } from "./dialect";
 import { tokenize } from "@/lib/rag";
+import {
+  normalizeCoachMode,
+  normalizeTaskMode,
+  normalizeTaskSource,
+  type OperatorCoachMode,
+  type OperatorTaskMode,
+  type OperatorTaskSource,
+  type TaskGuidanceNote,
+} from "@/lib/operatorModes";
 import { normalizeTrustLevel, type TrustLevel } from "@/lib/trust";
 import { OPERATOR_MAX_EXTEND_STEPS } from "@/lib/genParams";
 import type { Role, TaskPriority, TaskStatus } from "./schema";
@@ -902,6 +911,10 @@ export type AgentTaskRow = {
   steps: number;
   summary: string;
   trustLevel: TrustLevel;
+  taskMode: OperatorTaskMode;
+  source: OperatorTaskSource;
+  coachMode: OperatorCoachMode;
+  guidanceNote: TaskGuidanceNote | null;
   pendingApproval: AgentTaskApprovalRequest | null;
   approvalResponse: AgentTaskApprovalDecision | null;
   createdAt: string;
@@ -942,6 +955,10 @@ function mapAgentTask(r: Raw): AgentTaskRow {
     steps: toNum(r.steps),
     summary: String(r.summary ?? ""),
     trustLevel: normalizeTrustLevel(r.trust_level),
+    taskMode: normalizeTaskMode(r.task_mode),
+    source: normalizeTaskSource(r.source),
+    coachMode: normalizeCoachMode(r.coach_mode),
+    guidanceNote: parseJsonObject<TaskGuidanceNote>(r.guidance_note),
     pendingApproval: parseJsonObject<AgentTaskApprovalRequest>(r.pending_approval),
     approvalResponse: parseJsonObject<AgentTaskApprovalDecision>(r.approval_response),
     createdAt: toIso(r.created_at) ?? nowIso(),
@@ -1319,12 +1336,20 @@ export async function createAgentTask(
   prompt: string,
   maxSteps: number,
   trustLevel: TrustLevel = "verified",
+  options?: {
+    taskMode?: OperatorTaskMode;
+    source?: OperatorTaskSource;
+    coachMode?: OperatorCoachMode;
+  },
 ): Promise<AgentTaskRow> {
   const now = nowIso();
   const safeTrust = normalizeTrustLevel(trustLevel);
+  const taskMode = normalizeTaskMode(options?.taskMode);
+  const source = normalizeTaskSource(options?.source);
+  const coachMode = normalizeCoachMode(options?.coachMode);
   const row = await q1<{ id: number }>(sql`
-    insert into agent_tasks (user_id, prompt, status, max_steps, steps, summary, trust_level, pending_approval, approval_response, created_at, updated_at)
-    values (${userId}, ${prompt}, 'queued', ${maxSteps}, 0, '', ${safeTrust}, '', '', ${now}, ${now}) returning id`);
+    insert into agent_tasks (user_id, prompt, status, max_steps, steps, summary, trust_level, task_mode, source, coach_mode, guidance_note, pending_approval, approval_response, created_at, updated_at)
+    values (${userId}, ${prompt}, 'queued', ${maxSteps}, 0, '', ${safeTrust}, ${taskMode}, ${source}, ${coachMode}, '', '', '', ${now}, ${now}) returning id`);
   const id = toNum(row?.id);
   return {
     id,
@@ -1335,6 +1360,10 @@ export async function createAgentTask(
     steps: 0,
     summary: "",
     trustLevel: safeTrust,
+    taskMode,
+    source,
+    coachMode,
+    guidanceNote: null,
     pendingApproval: null,
     approvalResponse: null,
     createdAt: now,
@@ -1344,16 +1373,66 @@ export async function createAgentTask(
 
 export async function listAgentTasks(userId: number, limit = 12): Promise<AgentTaskRow[]> {
   const rows = await q(sql`
-    select id, user_id, prompt, status, max_steps, steps, summary, trust_level, pending_approval, approval_response, created_at, updated_at
+    select id, user_id, prompt, status, max_steps, steps, summary, trust_level, task_mode, source, coach_mode, guidance_note, pending_approval, approval_response, created_at, updated_at
     from agent_tasks where user_id = ${userId} order by id desc limit ${limit}`);
   return rows.map(mapAgentTask);
 }
 
 export async function getAgentTask(userId: number, id: number): Promise<AgentTaskRow | null> {
   const row = await q1(sql`
-    select id, user_id, prompt, status, max_steps, steps, summary, trust_level, pending_approval, approval_response, created_at, updated_at
+    select id, user_id, prompt, status, max_steps, steps, summary, trust_level, task_mode, source, coach_mode, guidance_note, pending_approval, approval_response, created_at, updated_at
     from agent_tasks where id = ${id} and user_id = ${userId} limit 1`);
   return row ? mapAgentTask(row) : null;
+}
+
+/** Записать пошаговую подсказку/наставление «что делать дальше» в задачу Оператора. */
+export async function setAgentTaskGuidance(
+  taskId: number,
+  userId: number,
+  input: {
+    id?: string;
+    author: "agent" | "user" | "operator";
+    text: string;
+    userAdvice?: string;
+    addEvent?: boolean;
+  },
+): Promise<{ task: AgentTaskRow; guidance: TaskGuidanceNote } | null> {
+  const task = await getAgentTask(userId, taskId);
+  if (!task || task.status === "cancelled" || task.status === "done") return null;
+  const now = nowIso();
+  const cleanText = String(input.text ?? "").trim().slice(0, 2000);
+  if (!cleanText) return null;
+  const guidance: TaskGuidanceNote = {
+    id: input.id || `guid_${taskId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    author: input.author,
+    text: cleanText,
+    ...(input.userAdvice?.trim() ? { userAdvice: input.userAdvice.trim().slice(0, 1000) } : {}),
+    createdAt: now,
+  };
+  await q(sql`
+    update agent_tasks
+    set guidance_note = ${JSON.stringify(guidance)},
+        updated_at = ${now}
+    where id = ${taskId} and user_id = ${userId}`);
+  if (input.addEvent !== false) {
+    const prefix =
+      input.author === "agent"
+        ? "🤖 Совет Агента: "
+        : input.author === "user"
+          ? "👤 Подсказка пользователя: "
+          : "💡 Что делать дальше: ";
+    const adviceTail =
+      guidance.userAdvice && guidance.userAdvice !== cleanText
+        ? `\nПользователю: ${guidance.userAdvice}`
+        : "";
+    await addAgentEvent({
+      taskId,
+      kind: "guidance",
+      text: `${prefix}${cleanText}${adviceTail}`,
+    });
+  }
+  const updated = await getAgentTask(userId, taskId);
+  return updated ? { task: updated, guidance } : null;
 }
 
 /** Задача глазами бота: без привязки к пользователю, доступ уже проверен токеном. */
