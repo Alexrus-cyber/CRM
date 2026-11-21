@@ -28,6 +28,11 @@ export async function POST(req: Request) {
         operatorTrustLevel?: string;
         screenshot?: string;
         screenSummary?: string;
+        commitMessage?: string;
+        branch?: string;
+        prTitle?: string;
+        prBody?: string;
+        mergeMethod?: string;
       }
     | null;
 
@@ -47,6 +52,7 @@ export async function POST(req: Request) {
       body: JSON.stringify({
         approvalId,
         approved: Boolean(body?.approved),
+        approverUserId: me.id,
         note: typeof body?.note === "string" ? body.note.slice(0, 500) : "",
         destination: typeof body?.destination === "string" ? body.destination.slice(0, 500) : "",
         ...(Number.isFinite(body?.taskId) ? { taskId: Number(body?.taskId) } : {}),
@@ -60,6 +66,13 @@ export async function POST(req: Request) {
         ...(typeof body?.screenSummary === "string"
           ? { screenSummary: body.screenSummary.slice(0, 8000) }
           : {}),
+        ...(typeof body?.commitMessage === "string"
+          ? { commitMessage: body.commitMessage.slice(0, 1000) }
+          : {}),
+        ...(typeof body?.branch === "string" ? { branch: body.branch.slice(0, 200) } : {}),
+        ...(typeof body?.prTitle === "string" ? { prTitle: body.prTitle.slice(0, 300) } : {}),
+        ...(typeof body?.prBody === "string" ? { prBody: body.prBody.slice(0, 8000) } : {}),
+        ...(typeof body?.mergeMethod === "string" ? { mergeMethod: body.mergeMethod.slice(0, 20) } : {}),
       }),
       cache: "no-store",
       signal: AbortSignal.timeout(10_000),

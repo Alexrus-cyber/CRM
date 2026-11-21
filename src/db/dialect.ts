@@ -372,6 +372,24 @@ const PG_DDL = [
     created_at timestamptz not null default now()
   )`,
   `create index if not exists agent_usage_events_user_kind_month_idx on agent_usage_events (user_id, kind, month)`,
+  `create table if not exists github_connections (
+    id serial primary key,
+    user_id integer not null unique references users(id) on delete cascade,
+    github_user_id integer not null default 0,
+    login text not null,
+    name text not null default '',
+    email text not null default '',
+    avatar_url text not null default '',
+    token_encrypted text not null,
+    token_hint text not null default '',
+    scopes text not null default '',
+    selected_owner text not null default '',
+    selected_repo text not null default '',
+    selected_branch text not null default '',
+    enabled integer not null default 1,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+  )`,
 ];
 
 /**
@@ -709,6 +727,24 @@ const SQLITE_DDL = [
     created_at text not null
   )`,
   `create index if not exists agent_usage_events_user_kind_month_idx on agent_usage_events (user_id, kind, month)`,
+  `create table if not exists github_connections (
+    id integer primary key autoincrement,
+    user_id integer not null unique references users(id) on delete cascade,
+    github_user_id integer not null default 0,
+    login text not null,
+    name text not null default '',
+    email text not null default '',
+    avatar_url text not null default '',
+    token_encrypted text not null,
+    token_hint text not null default '',
+    scopes text not null default '',
+    selected_owner text not null default '',
+    selected_repo text not null default '',
+    selected_branch text not null default '',
+    enabled integer not null default 1,
+    created_at text not null,
+    updated_at text not null
+  )`,
 ];
 
 /* ------------------------------------------------------------------ */

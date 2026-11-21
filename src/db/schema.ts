@@ -660,7 +660,35 @@ export const agentUsageEvents = pgTable(
   (t) => [index("agent_usage_events_user_kind_month_idx").on(t.userId, t.kind, t.month)],
 );
 
+/**
+ * Персональная привязка GitHub-аккаунта пользователя CRM для блока «Агент».
+ * Токен хранится зашифрованным и передаётся только server-to-server в agent.py,
+ * чтобы Commit / Pull Request / Merge выполнялись строго от лица владельца аккаунта.
+ */
+export const githubConnections = pgTable("github_connections", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .notNull()
+    .unique()
+    .references(() => users.id, { onDelete: "cascade" }),
+  githubUserId: integer("github_user_id").notNull().default(0),
+  login: text("login").notNull(),
+  name: text("name").notNull().default(""),
+  email: text("email").notNull().default(""),
+  avatarUrl: text("avatar_url").notNull().default(""),
+  tokenEncrypted: text("token_encrypted").notNull(),
+  tokenHint: text("token_hint").notNull().default(""),
+  scopes: text("scopes").notNull().default(""),
+  selectedOwner: text("selected_owner").notNull().default(""),
+  selectedRepo: text("selected_repo").notNull().default(""),
+  selectedBranch: text("selected_branch").notNull().default(""),
+  enabled: integer("enabled").notNull().default(1),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export type User = typeof users.$inferSelect;
+export type GithubConnection = typeof githubConnections.$inferSelect;
 export type Counterparty = typeof counterparties.$inferSelect;
 export type Task = typeof tasks.$inferSelect;
 export type Message = typeof messages.$inferSelect;

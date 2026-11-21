@@ -44,6 +44,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import browser_inspector  # noqa: E402
+import github_tools  # noqa: E402
 import sandbox as sandbox_mod  # noqa: E402
 
 try:  # генератор файлов: docx/xlsx/csv/html/svg/zip — на стандартной библиотеке
@@ -111,6 +112,15 @@ SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CR
      задачи (ВСЕГДА сначала спрашивает явное разрешение пользователя на сайте!);
    - call_operator — вызвать Оператора для выполнения действий на экране/ПК или помощи
      пользователю (ВСЕГДА спрашивает разрешение пользователя на сайте перед запуском!).
+8. Работа с подключённым GitHub-репозиторием (GitHub-RAG и разработка кода):
+   - github_repo_info, github_list_files, github_read_file, github_search_code, github_status,
+     github_diff, github_list_prs — полный анализ кода, архитектуры и PR в выбранном репозитории;
+   - github_write_file, github_edit_file, github_delete_file, github_create_branch — создание и
+     исправление файлов и веток в изолированной копии репозитория в Sandbox;
+   - github_commit, github_create_pr, github_merge_pr — Commit/Push, Pull Request и Merge
+     строго от имени пользователя, привязавшего свой GitHub-аккаунт (ВСЕГДА сначала запрашивают
+     явное разрешение пользователя на сайте через approval_required — НИКОГДА не делай git commit /
+     git push / PR / merge обходным путём через run_command!).
 
 Правила безопасности и поведения:
 - Создавая проект или сайт, ВСЕГДА сначала собирай структуру папок и файлов в Sandbox через
@@ -560,10 +570,12 @@ def normalize_trust(raw: Any) -> str:
     return "verified"
 
 
-def tools_for_trust(trust_level: str) -> List[Dict[str, Any]]:
+def tools_for_trust(trust_level: str, *, has_github: bool = False) -> List[Dict[str, Any]]:
+    gh_read = list(github_tools.GITHUB_READ_TOOLS) if has_github else []
+    gh_write = list(github_tools.GITHUB_WRITE_TOOLS) if (has_github and trust_level != "none") else []
     if trust_level == "none":
-        return list(BASE_TOOLS)
-    return list(BASE_TOOLS) + list(SANDBOX_TOOLS) + list(BROWSER_TOOLS) + list(OPERATOR_TOOLS)
+        return list(BASE_TOOLS) + gh_read
+    return list(BASE_TOOLS) + list(SANDBOX_TOOLS) + list(BROWSER_TOOLS) + list(OPERATOR_TOOLS) + gh_read + gh_write
 
 
 def safe_file_name(raw: str) -> str:
@@ -595,12 +607,26 @@ def run_tool(
     approval_fn: Optional[Any] = None,
     sandbox_root: Path = SANDBOX_ROOT,
     browser_manager: Optional[browser_inspector.BrowserSessionManager] = None,
+    github_ctx: Optional[Dict[str, Any]] = None,
     unlimited: bool = False,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Выполнить инструмент с учётом Sandbox и уровня доверия."""
     args = args or {}
     events: List[Dict[str, Any]] = []
     trust = normalize_trust(trust_level)
+
+    if name in github_tools.ALL_GITHUB_TOOL_NAMES:
+        try:
+            return github_tools.run_github_tool(
+                name,
+                args,
+                github_ctx=github_ctx,
+                trust_level=trust,
+                approval_fn=approval_fn,
+                sandbox_root=sandbox_root,
+            )
+        except github_tools.GithubToolError as error:
+            raise AgentError(str(error)) from error
 
     if name == "create_file":
         raw_name = str(args.get("name") or "файл.txt")
@@ -1928,6 +1954,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             extra: Dict[str, Any] = {}
             for key in (
+                "approverUserId",
                 "taskId",
                 "taskPrompt",
                 "mode",
@@ -1935,6 +1962,11 @@ class Handler(BaseHTTPRequestHandler):
                 "operatorTrustLevel",
                 "screenshot",
                 "screenSummary",
+                "commitMessage",
+                "branch",
+                "prTitle",
+                "prBody",
+                "mergeMethod",
             ):
                 if key in body and body[key] is not None:
                     extra[key] = body[key]
@@ -2016,6 +2048,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(error)})
                 return
             self._json(200, {"ok": True, **res})
+            return
+
+        if route == "/github/sync":
+            body = self._read_json()
+            if not body:
+                self._json(400, {"error": "Некорректный JSON"})
+                return
+            try:
+                res = github_tools.ensure_repo_synced(body, sandbox_root=SANDBOX_ROOT)
+            except github_tools.GithubToolError as error:
+                self._json(400, {"ok": False, "error": str(error)})
+                return
+            self._json(200, res)
             return
 
         if route != "/run":
@@ -2154,6 +2199,48 @@ class Handler(BaseHTTPRequestHandler):
                     + rag_context
                 )
 
+        raw_gh = body.get("github")
+        github_ctx: Optional[Dict[str, Any]] = dict(raw_gh) if isinstance(raw_gh, dict) else None
+        has_github_repo = bool(
+            github_ctx
+            and str(github_ctx.get("token") or "").strip()
+            and str(github_ctx.get("owner") or "").strip()
+            and str(github_ctx.get("repo") or "").strip()
+        )
+        raw_gh_rag = str((context or {}).get("githubRagContext") or "").strip()
+        gh_meta = (context or {}).get("githubMeta") or {}
+        if has_github_repo and github_ctx is not None:
+            gh_owner = str(github_ctx.get("owner") or "")
+            gh_repo = str(github_ctx.get("repo") or "")
+            gh_branch = str(github_ctx.get("branch") or "main")
+            gh_login = str(github_ctx.get("login") or "")
+            gh_uid = int(github_ctx.get("userId") or 0)
+            rel_ws = f"_github/u{gh_uid}/{github_tools._slug(gh_owner)}__{github_tools._slug(gh_repo)}"
+            self.write(
+                sse(
+                    {
+                        "login": gh_login,
+                        "owner": gh_owner,
+                        "repo": gh_repo,
+                        "branch": gh_branch,
+                        "fileCount": int(gh_meta.get("fileCount") or 0),
+                    },
+                    "github",
+                )
+            )
+            system += (
+                f"\n\nПодключён GitHub-репозиторий пользователя CRM:\n"
+                f"- Владелец GitHub-аккаунта: @{gh_login} ({github_ctx.get('name') or gh_login} <{github_ctx.get('email') or ''}>)\n"
+                f"- Проект: {gh_owner}/{gh_repo} (ветка: {gh_branch})\n"
+                f"- Папка клона в Sandbox: {rel_ws} (используй github_* инструменты; для тестов можно run_command с cwd='{rel_ws}')\n"
+                f"- ВАЖНО: перед любым Commit/Push, Pull Request или Merge ВСЕГДА используй github_commit / github_create_pr / github_merge_pr "
+                f"(они запрашивают обязательное подтверждение владельца @{gh_login} на сайте). "
+                f"Никогда не выполняй git commit/push обходным путём через run_command."
+            )
+            if raw_gh_rag:
+                gh_rag = raw_gh_rag if unlimited_role else raw_gh_rag[:MAX_RAG_CHARS]
+                system += "\n\nGitHub-репозиторий и кодовая база (GitHub-RAG):\n" + gh_rag
+
         attachment_block = ""
         images: List[Dict[str, Any]] = []
         attachments = body.get("attachments") or []
@@ -2210,7 +2297,7 @@ class Handler(BaseHTTPRequestHandler):
                         part.get("text", "") for part in content if part.get("type") == "text"
                     )
 
-        active_tools = tools_for_trust(trust_level)
+        active_tools = tools_for_trust(trust_level, has_github=has_github_repo)
         browser_mgr = browser_inspector.BrowserSessionManager(sandbox_root=SANDBOX_ROOT)
         use_tools = True
         steps = 0
@@ -2323,6 +2410,7 @@ class Handler(BaseHTTPRequestHandler):
                             approval_fn=self.await_website_approval,
                             sandbox_root=SANDBOX_ROOT,
                             browser_manager=browser_mgr,
+                            github_ctx=github_ctx,
                             unlimited=unlimited_role,
                         )
                     except AgentError as error:
@@ -2979,6 +3067,202 @@ def self_test() -> int:
         check(
             "call_model и extract_usage извлекают prompt/completion/total из потокового usage-чанка",
             extracted_u == {"prompt": 120, "completion": 35, "total": 155},
+        )
+
+        # 20. GitHub-инструменты: read-only в trust=none, write/commit/pr/merge только при trust!=none и has_github=True
+        gh_none_names = {t["function"]["name"] for t in tools_for_trust("none", has_github=True)}
+        gh_verified_names = {t["function"]["name"] for t in tools_for_trust("verified", has_github=True)}
+        no_gh_names = {t["function"]["name"] for t in tools_for_trust("verified", has_github=False)}
+        check(
+            "tools_for_trust фильтрует GitHub-инструменты по has_github и trust_level",
+            "github_read_file" in gh_none_names
+            and "github_commit" not in gh_none_names
+            and "github_commit" in gh_verified_names
+            and "github_create_pr" in gh_verified_names
+            and "github_merge_pr" in gh_verified_names
+            and "github_read_file" not in no_gh_names,
+        )
+
+        # 21. Безопасность GitHub: маскирование токенов и защита от выхода из каталога / доступа к .git
+        secret_tok = "ghp_SuperSecretTokenValue12345"
+        b64_auth = base64.b64encode(f"x-access-token:{secret_tok}".encode("utf-8")).decode("ascii")
+        redacted = github_tools.redact_secret(f"header {b64_auth} and {secret_tok}", secret_tok)
+        gh_repo_dir = github_tools.get_repo_workspace_dir(root, 42, "owner", "demo")
+        gh_repo_dir.mkdir(parents=True, exist_ok=True)
+        path_blocked = False
+        git_blocked = False
+        try:
+            github_tools._safe_repo_file(gh_repo_dir, "../secret.txt")
+        except github_tools.GithubToolError:
+            path_blocked = True
+        try:
+            github_tools._safe_repo_file(gh_repo_dir, ".git/config")
+        except github_tools.GithubToolError:
+            git_blocked = True
+        check(
+            "github_tools маскирует токены/basic-auth и блокирует path traversal и .git/config",
+            secret_tok not in redacted
+            and b64_auth not in redacted
+            and path_blocked
+            and git_blocked,
+        )
+
+        # 22. Локальный цикл GitHub-RAG (write/edit/read/search/diff) + локальный git commit строго от лица автора
+        import subprocess
+
+        (gh_repo_dir / ".git").mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(gh_repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Init"], cwd=str(gh_repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "init@example.com"], cwd=str(gh_repo_dir), check=True, capture_output=True)
+        (gh_repo_dir / "README.md").write_text("# Demo\nHello CRM\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=str(gh_repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(gh_repo_dir), check=True, capture_output=True)
+
+        gh_ctx = {
+            "userId": 42,
+            "login": "crm_dev",
+            "name": "Иван Петров",
+            "email": "ivan@example.org",
+            "token": secret_tok,
+            "owner": "owner",
+            "repo": "demo",
+            "branch": "main",
+        }
+        run_tool(
+            "github_write_file",
+            {"path": "src/app.py", "content": "def greet():\n    return 'hi'\n"},
+            trust_level="verified",
+            sandbox_root=root,
+            github_ctx=gh_ctx,
+        )
+        run_tool(
+            "github_edit_file",
+            {"path": "src/app.py", "old_text": "return 'hi'", "new_text": "return 'привет'"},
+            trust_level="verified",
+            sandbox_root=root,
+            github_ctx=gh_ctx,
+        )
+        read_res, _ = run_tool(
+            "github_read_file",
+            {"path": "src/app.py"},
+            trust_level="none",
+            sandbox_root=root,
+            github_ctx=gh_ctx,
+        )
+        search_res, _ = run_tool(
+            "github_search_code",
+            {"query": "привет"},
+            trust_level="none",
+            sandbox_root=root,
+            github_ctx=gh_ctx,
+        )
+        diff_res, _ = run_tool(
+            "github_diff",
+            {},
+            trust_level="verified",
+            sandbox_root=root,
+            github_ctx=gh_ctx,
+        )
+        check(
+            "github_write_file / edit_file / read_file / search_code / diff работают в изолированном каталоге",
+            "2:     return 'привет'" in read_res
+            and "src/app.py:2:" in search_res
+            and "src/app.py" in diff_res,
+        )
+
+        # 23. github_commit требует подтверждения от того же userId (отклоняет чужого) и ставит автора привязавшего аккаунт
+        mismatch_blocked = False
+        try:
+            run_tool(
+                "github_commit",
+                {"message": "feat: test", "push": False},
+                trust_level="full",
+                approval_fn=lambda payload: {"approved": True, "approverUserId": 999},
+                sandbox_root=root,
+                github_ctx=gh_ctx,
+            )
+        except AgentError:
+            mismatch_blocked = True
+
+        commit_approvals: List[Dict[str, Any]] = []
+        commit_text, commit_events = run_tool(
+            "github_commit",
+            {"message": "feat: initial change", "push": False},
+            trust_level="full",
+            approval_fn=lambda payload: (
+                commit_approvals.append(payload)
+                or {"approved": True, "approverUserId": 42, "commitMessage": "feat: approved by owner"}
+            ),
+            sandbox_root=root,
+            github_ctx=gh_ctx,
+        )
+        log_author = subprocess.run(
+            ["git", "log", "-1", "--format=%an <%ae> %s"],
+            cwd=str(gh_repo_dir),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        git_cfg_text = (gh_repo_dir / ".git" / "config").read_text(encoding="utf-8")
+        check(
+            "github_commit требует совпадения approverUserId, применяет автора @login и не сохраняет токен в .git/config",
+            mismatch_blocked
+            and len(commit_approvals) == 1
+            and commit_approvals[0].get("kind") == "github_commit"
+            and "Иван Петров <ivan@example.org> feat: approved by owner" == log_author
+            and secret_tok not in git_cfg_text
+            and any(e.get("type") == "github_commit" and e.get("authorLogin") == "crm_dev" for e in commit_events)
+            and "@crm_dev" in commit_text,
+        )
+
+        # 24. github_create_pr и github_merge_pr всегда спрашивают подтверждение на сайте
+        prev_gh_api = github_tools._gh_api
+        pr_approvals: List[Dict[str, Any]] = []
+        try:
+            def fake_gh_api(path: str, tok: str, *, method: str = "GET", body: Any = None, timeout: int = 20) -> Any:
+                if method == "POST" and path.endswith("/pulls"):
+                    return {"number": 17, "html_url": "https://github.com/owner/demo/pull/17"}
+                if method == "GET" and path.endswith("/pulls/17"):
+                    return {
+                        "number": 17,
+                        "title": "PR title",
+                        "state": "open",
+                        "head": {"ref": "feat/x"},
+                        "base": {"ref": "main"},
+                        "html_url": "https://github.com/owner/demo/pull/17",
+                    }
+                if method == "PUT" and path.endswith("/pulls/17/merge"):
+                    return {"sha": "abc1234567890", "merged": True}
+                return {"default_branch": "main"}
+
+            github_tools._gh_api = fake_gh_api  # type: ignore[assignment]
+            pr_txt, pr_ev = run_tool(
+                "github_create_pr",
+                {"title": "Draft title", "body": "Desc", "head": "feat/x", "base": "main"},
+                trust_level="full",
+                approval_fn=lambda p: pr_approvals.append(p) or {"approved": True, "approverUserId": 42, "prTitle": "Final PR"},
+                sandbox_root=root,
+                github_ctx=gh_ctx,
+            )
+            mg_txt, mg_ev = run_tool(
+                "github_merge_pr",
+                {"pull_number": 17, "merge_method": "squash"},
+                trust_level="full",
+                approval_fn=lambda p: pr_approvals.append(p) or {"approved": True, "approverUserId": 42},
+                sandbox_root=root,
+                github_ctx=gh_ctx,
+            )
+        finally:
+            github_tools._gh_api = prev_gh_api  # type: ignore[assignment]
+
+        check(
+            "github_create_pr и github_merge_pr всегда запрашивают подтверждение и выполняются от @login",
+            [p.get("kind") for p in pr_approvals] == ["github_pr", "github_merge"]
+            and "#17" in pr_txt
+            and "Final PR" in pr_txt
+            and any(e.get("type") == "github_pr" for e in pr_ev)
+            and "влит в main" in mg_txt
+            and any(e.get("type") == "github_merge" for e in mg_ev),
         )
 
     passed = sum(1 for item in checks if item)

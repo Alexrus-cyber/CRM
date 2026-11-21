@@ -14,6 +14,7 @@ import {
 } from "@/lib/operatorModes";
 import { normalizeTrustLevel, type TrustLevel } from "@/lib/trust";
 import { AGENT_MAX_STEPS, isUnlimitedStepsRole, resolveStepsForRole } from "@/lib/genParams";
+import { decryptGithubToken, encryptGithubToken, maskGithubToken } from "@/lib/github";
 import type { ChatRoomKind, Role, TaskPriority, TaskStatus } from "./schema";
 
 export type UserLite = {
@@ -3327,6 +3328,162 @@ export async function getRoomActiveBots(roomId: number): Promise<ChatBotRow[]> {
     where m.room_id = ${roomId} and u.is_bot = 1 and c.is_active = 1
     order by u.name asc`);
   return rows.map(mapChatBot);
+}
+
+/* --------------------------- персональный GitHub Агента --------------- */
+
+export type GithubConnectionPublic = {
+  id: number;
+  userId: number;
+  githubUserId: number;
+  login: string;
+  name: string;
+  email: string;
+  avatarUrl: string;
+  tokenHint: string;
+  scopes: string;
+  selectedOwner: string;
+  selectedRepo: string;
+  selectedBranch: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type GithubConnectionWithSecret = GithubConnectionPublic & {
+  token: string;
+};
+
+function mapGithubPublic(row: Raw): GithubConnectionPublic {
+  return {
+    id: toNum(row.id),
+    userId: toNum(row.user_id),
+    githubUserId: toNum(row.github_user_id),
+    login: String(row.login ?? ""),
+    name: String(row.name ?? ""),
+    email: String(row.email ?? ""),
+    avatarUrl: String(row.avatar_url ?? ""),
+    tokenHint: String(row.token_hint ?? ""),
+    scopes: String(row.scopes ?? ""),
+    selectedOwner: String(row.selected_owner ?? ""),
+    selectedRepo: String(row.selected_repo ?? ""),
+    selectedBranch: String(row.selected_branch ?? ""),
+    enabled: toNum(row.enabled) !== 0,
+    createdAt: toIso(row.created_at) ?? nowIso(),
+    updatedAt: toIso(row.updated_at) ?? nowIso(),
+  };
+}
+
+export async function getGithubConnectionPublic(userId: number): Promise<GithubConnectionPublic | null> {
+  const row = await q1(sql`
+    select id, user_id, github_user_id, login, name, email, avatar_url, token_hint, scopes,
+      selected_owner, selected_repo, selected_branch, enabled, created_at, updated_at
+    from github_connections where user_id = ${userId} limit 1`);
+  return row ? mapGithubPublic(row) : null;
+}
+
+export async function getGithubConnectionWithSecret(userId: number): Promise<GithubConnectionWithSecret | null> {
+  const row = await q1(sql`
+    select id, user_id, github_user_id, login, name, email, avatar_url, token_encrypted, token_hint, scopes,
+      selected_owner, selected_repo, selected_branch, enabled, created_at, updated_at
+    from github_connections where user_id = ${userId} limit 1`);
+  if (!row) return null;
+  const pub = mapGithubPublic(row);
+  const token = decryptGithubToken(String(row.token_encrypted ?? ""));
+  if (!token) return null;
+  return { ...pub, token };
+}
+
+export async function upsertGithubConnection(input: {
+  userId: number;
+  githubUserId: number;
+  login: string;
+  name: string;
+  email: string;
+  avatarUrl: string;
+  token: string;
+  scopes?: string;
+  selectedOwner?: string;
+  selectedRepo?: string;
+  selectedBranch?: string;
+  enabled?: boolean;
+}): Promise<GithubConnectionPublic> {
+  const now = nowIso();
+  const encrypted = encryptGithubToken(input.token);
+  const hint = maskGithubToken(input.token);
+  const existing = await getGithubConnectionPublic(input.userId);
+  if (existing) {
+    const owner = input.selectedOwner !== undefined ? input.selectedOwner.trim() : existing.selectedOwner;
+    const repo = input.selectedRepo !== undefined ? input.selectedRepo.trim() : existing.selectedRepo;
+    const branch = input.selectedBranch !== undefined ? input.selectedBranch.trim() : existing.selectedBranch;
+    const enabled = input.enabled !== undefined ? (input.enabled ? 1 : 0) : (existing.enabled ? 1 : 0);
+    await q(sql`
+      update github_connections set
+        github_user_id = ${input.githubUserId},
+        login = ${input.login},
+        name = ${input.name},
+        email = ${input.email},
+        avatar_url = ${input.avatarUrl},
+        token_encrypted = ${encrypted},
+        token_hint = ${hint},
+        scopes = ${input.scopes ?? ""},
+        selected_owner = ${owner},
+        selected_repo = ${repo},
+        selected_branch = ${branch},
+        enabled = ${enabled},
+        updated_at = ${now}
+      where user_id = ${input.userId}`);
+  } else {
+    const enabled = input.enabled === false ? 0 : 1;
+    await q(sql`
+      insert into github_connections (
+        user_id, github_user_id, login, name, email, avatar_url,
+        token_encrypted, token_hint, scopes,
+        selected_owner, selected_repo, selected_branch, enabled, created_at, updated_at
+      ) values (
+        ${input.userId}, ${input.githubUserId}, ${input.login}, ${input.name}, ${input.email}, ${input.avatarUrl},
+        ${encrypted}, ${hint}, ${input.scopes ?? ""},
+        ${(input.selectedOwner ?? "").trim()}, ${(input.selectedRepo ?? "").trim()},
+        ${(input.selectedBranch ?? "").trim()}, ${enabled}, ${now}, ${now}
+      )`);
+  }
+  const saved = await getGithubConnectionPublic(input.userId);
+  if (!saved) throw new Error("Не удалось сохранить подключение GitHub");
+  return saved;
+}
+
+export async function updateGithubRepoSelection(
+  userId: number,
+  input: {
+    selectedOwner?: string;
+    selectedRepo?: string;
+    selectedBranch?: string;
+    enabled?: boolean;
+  },
+): Promise<GithubConnectionPublic | null> {
+  const existing = await getGithubConnectionPublic(userId);
+  if (!existing) return null;
+  const owner = input.selectedOwner !== undefined ? input.selectedOwner.trim() : existing.selectedOwner;
+  const repo = input.selectedRepo !== undefined ? input.selectedRepo.trim() : existing.selectedRepo;
+  const branch = input.selectedBranch !== undefined ? input.selectedBranch.trim() : existing.selectedBranch;
+  const enabled = input.enabled !== undefined ? (input.enabled ? 1 : 0) : (existing.enabled ? 1 : 0);
+  const now = nowIso();
+  await q(sql`
+    update github_connections set
+      selected_owner = ${owner},
+      selected_repo = ${repo},
+      selected_branch = ${branch},
+      enabled = ${enabled},
+      updated_at = ${now}
+    where user_id = ${userId}`);
+  return getGithubConnectionPublic(userId);
+}
+
+export async function deleteGithubConnection(userId: number): Promise<boolean> {
+  const existing = await getGithubConnectionPublic(userId);
+  if (!existing) return false;
+  await q(sql`delete from github_connections where user_id = ${userId}`);
+  return true;
 }
 
 
