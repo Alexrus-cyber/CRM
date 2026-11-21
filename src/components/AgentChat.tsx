@@ -101,8 +101,12 @@ type AgentAction = {
     | "sandbox_export"
     | "operator_plan"
     | "operator_task"
-    | "operator_screen";
+    | "operator_screen"
+    | "browser_inspect";
+  action?: string;
   url?: string;
+  title?: string;
+  viewport?: string;
   label?: string;
   autoplay?: boolean;
   command?: string;
@@ -124,6 +128,10 @@ type AgentAction = {
   operatorTrustLevel?: string;
   summary?: string;
   hasImage?: boolean;
+  issuesCount?: number;
+  animationsCount?: number;
+  errorsCount?: number;
+  preview?: string;
 };
 
 type Turn = {
@@ -187,6 +195,7 @@ type PendingApproval = {
   description: string;
   command?: string;
   cwd?: string;
+  url?: string;
   source?: string;
   destination?: string;
   mode?: string;
@@ -304,6 +313,7 @@ const PROVIDERS: Array<{ id: string; label: string; baseUrl: string; model: stri
 const EXAMPLES = [
   "Открой YouTube и включи видео про космос",
   "Создай в Sandbox проект landing-site на HTML+CSS",
+  "Зайди на мой проект http://127.0.0.1:3000 интерактивно: проверь анимации, клики, мобильную вёрстку и ошибки",
   "Помоги с действиями на экране: сформулируй задачу для Оператора и запусти его с моего согласия",
   "Сделай CSV-файл с планом на неделю по продажам",
 ];
@@ -1754,6 +1764,7 @@ export function AgentChat({ userName }: { userName: string }) {
               description: String(data.description ?? ""),
               command: data.command ? String(data.command) : undefined,
               cwd: data.cwd ? String(data.cwd) : undefined,
+              url: data.url ? String(data.url) : undefined,
               source: data.source ? String(data.source) : undefined,
               destination: data.destination ? String(data.destination) : undefined,
               mode: data.mode ? String(data.mode) : undefined,
@@ -1816,7 +1827,21 @@ export function AgentChat({ userName }: { userName: string }) {
             } else {
               const action: AgentAction = {
                 type: String(data.type ?? "command_result") as AgentAction["type"],
-                label: String(data.label ?? data.command ?? data.project ?? data.path ?? data.source ?? data.task ?? ""),
+                action: data.action ? String(data.action) : undefined,
+                label: String(
+                  data.label ??
+                    data.title ??
+                    data.url ??
+                    data.command ??
+                    data.project ??
+                    data.path ??
+                    data.source ??
+                    data.task ??
+                    "",
+                ),
+                url: data.url ? String(data.url) : undefined,
+                title: data.title ? String(data.title) : undefined,
+                viewport: data.viewport ? String(data.viewport) : undefined,
                 command: data.command ? String(data.command) : undefined,
                 cwd: data.cwd ? String(data.cwd) : undefined,
                 exitCode: typeof data.exitCode === "number" ? data.exitCode : undefined,
@@ -1836,6 +1861,10 @@ export function AgentChat({ userName }: { userName: string }) {
                 operatorTrustLevel: data.operatorTrustLevel ? String(data.operatorTrustLevel) : undefined,
                 summary: data.summary ? String(data.summary) : undefined,
                 hasImage: typeof data.hasImage === "boolean" ? data.hasImage : undefined,
+                issuesCount: typeof data.issuesCount === "number" ? data.issuesCount : undefined,
+                animationsCount: typeof data.animationsCount === "number" ? data.animationsCount : undefined,
+                errorsCount: typeof data.errorsCount === "number" ? data.errorsCount : undefined,
+                preview: typeof data.preview === "string" && data.preview.startsWith("data:image/") ? data.preview : undefined,
               };
               assistantDraft.actions.push(action);
               patch((t) => ({ ...t, actions: [...t.actions, action] }));
@@ -1870,16 +1899,23 @@ export function AgentChat({ userName }: { userName: string }) {
       let updatedTurns = history;
       if (userSaved) {
         try {
+          const persistedActions = assistantDraft.actions.map((act) => {
+            if (!act.preview) return act;
+            const copy = { ...act };
+            delete copy.preview;
+            return copy;
+          });
           const storedAssistant = await saveConversationMessage(activeId, {
             role: "assistant",
             content: assistantDraft.content,
             reasoning: assistantDraft.reasoning,
             error: assistantDraft.error,
-            actions: assistantDraft.actions,
+            actions: persistedActions,
             files: assistantDraft.files.map(({ name, mime, size }) => ({ name, mime, size })),
           });
           const mergedAssistant: Turn = {
             ...storedAssistant,
+            actions: assistantDraft.actions.length > 0 ? assistantDraft.actions : storedAssistant.actions,
             files: assistantDraft.files.length > 0 ? assistantDraft.files : storedAssistant.files,
           };
           updatedTurns = [
@@ -2829,6 +2865,7 @@ export function AgentChat({ userName }: { userName: string }) {
               </p>
               <ul className="mt-2 space-y-1 text-muted">
                 <li>• создаёт проекты и файлы строго в изолированной папке Sandbox (и выгружает наружу после вашего согласия);</li>
+                <li>• сам заходит на веб-проект в браузере, кликает, наводит курсор и проверяет анимации, вёрстку и консоль;</li>
                 <li>• запускает команды, проверяет сборку и открывает сайты в браузере;</li>
                 <li>• ищет по целым RAG-папкам любого размера и сохраняет длинные чаты через Summary в .md.</li>
               </ul>
@@ -2996,6 +3033,46 @@ export function AgentChat({ userName }: { userName: string }) {
                               </button>
                             </div>
                           ) : null}
+                        </div>
+                      );
+                    }
+                    if (action.type === "browser_inspect") {
+                      const hasProblems = (action.errorsCount ?? 0) > 0 || (action.issuesCount ?? 0) > 0;
+                      return (
+                        <div
+                          key={`browser-inspect-${index}`}
+                          className={cn(
+                            "space-y-1.5 rounded-xl border px-2.5 py-2 text-[11px]",
+                            hasProblems
+                              ? "border-amber-500/40 bg-amber-500/5"
+                              : "border-emerald-500/35 bg-emerald-500/5",
+                          )}
+                        >
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <Compass size={13} className={hasProblems ? "text-amber-500" : "text-emerald-500"} />
+                            <span className="font-medium text-text">
+                              Осмотр проекта{action.action ? ` (${action.action})` : ""}
+                            </span>
+                            {action.viewport && (
+                              <span className="rounded bg-card px-1.5 py-0.5 text-[10px] text-muted">
+                                {action.viewport}
+                              </span>
+                            )}
+                            {action.url && (
+                              <span className="min-w-0 truncate text-[10px] text-accent2" title={action.url}>
+                                {action.url}
+                              </span>
+                            )}
+                          </div>
+                          {action.summary && <p className="text-[10px] text-muted">{action.summary}</p>}
+                          {action.preview && (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img
+                              src={action.preview}
+                              alt={`Скриншот осмотра ${action.url || "проекта"}`}
+                              className="max-h-48 w-full rounded-lg border border-border object-cover object-top"
+                            />
+                          )}
                         </div>
                       );
                     }
@@ -3176,9 +3253,11 @@ export function AgentChat({ userName }: { userName: string }) {
           badgeLabel={
             pendingApproval.kind === "capture_screen"
               ? "Запрос снимка экрана"
-              : pendingApproval.kind === "call_operator"
-                ? "Запуск Оператора"
-                : "Запрос разрешения"
+              : pendingApproval.kind === "browser_inspect"
+                ? "Осмотр внешнего сайта"
+                : pendingApproval.kind === "call_operator"
+                  ? "Запуск Оператора"
+                  : "Запрос разрешения"
           }
           title={pendingApproval.title}
           description={pendingApproval.description}
@@ -3264,6 +3343,11 @@ export function AgentChat({ userName }: { userName: string }) {
               {pendingApproval.command}
               {pendingApproval.cwd ? `\n# cwd: ${pendingApproval.cwd}` : ""}
             </pre>
+          )}
+          {pendingApproval.url && (
+            <p className="truncate rounded-lg bg-card2 px-2 py-1 font-mono text-[11px] text-accent2">
+              {pendingApproval.url}
+            </p>
           )}
           {pendingApproval.kind === "sandbox_export" && (
             <div className="space-y-1.5">

@@ -785,4 +785,29 @@ describe("вкладка «Агент»", () => {
     await waitFor(() => expect(sent.length).toBe(2));
     expect(sent[1].maxSteps).toBe(800);
   });
+
+  it("показывает карточку интерактивного осмотра проекта и не пишет base64-превью в базу", async () => {
+    sseReply = [
+      'event: action\ndata: {"type":"browser_inspect","action":"inspect_animations","url":"http://127.0.0.1:8123/","viewport":"1440×900","animationsCount":3,"issuesCount":1,"errorsCount":1,"summary":"анимаций: 3, проблем: 1, ошибок: 1","preview":"data:image/jpeg;base64,RkFLRQ=="}\n\n',
+      'event: text\ndata: {"text":"Найдена зависшая анимация на карточке"}\n\n',
+      "event: done\ndata: {}\n\n",
+    ].join("");
+
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/);
+    fireEvent.change(chatBox, { target: { value: "Проверь анимации на проекте" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    expect(await screen.findByText(/Осмотр проекта \(inspect_animations\)/)).toBeTruthy();
+    expect(screen.getByText(/анимаций: 3, проблем: 1, ошибок: 1/)).toBeTruthy();
+    expect(screen.getByAltText(/Скриншот осмотра http:\/\/127\.0\.0\.1:8123\//)).toBeTruthy();
+
+    await waitFor(() =>
+      expect(savedMessages.some((m) => m.body.role === "assistant")).toBe(true),
+    );
+    const savedAssistant = savedMessages.find((m) => m.body.role === "assistant")!;
+    const savedActions = savedAssistant.body.actions as Array<Record<string, unknown>>;
+    expect(savedActions[0]?.type).toBe("browser_inspect");
+    expect(savedActions[0]?.preview).toBeUndefined();
+  });
 });

@@ -43,6 +43,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import browser_inspector  # noqa: E402
 import sandbox as sandbox_mod  # noqa: E402
 
 try:  # генератор файлов: docx/xlsx/csv/html/svg/zip — на стандартной библиотеке
@@ -92,7 +93,16 @@ SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CR
    разрешение пользователя на сайте, даже при полном доверии).
 5. export_from_sandbox — скопировать или перенести готовые файлы/проект из Sandbox в папку,
    которую указал пользователь (только после согласия пользователя).
-6. Совместная работа с Настольным Оператором экрана:
+6. Интерактивный осмотр проекта в реальном браузере (`browse_project`):
+   - сам заходит на запущенный сайт/проект (`url` или папка `sandbox_project` в Sandbox) в
+     изолированном headless-браузере, видит скриншоты, кликает, наводит курсор (`hover`),
+     скроллит, меняет размер экрана (`desktop`/`mobile`), проверяет ошибки консоли/сети,
+     горизонтальное переполнение, застрявшие `opacity: 0` блоки и живые анимации
+     (`document.getAnimations()`, CSS transition/animation, замер кадров до и после ожидания
+     через `inspect_animations`);
+   - когда пользователь просит «зайди на проект и посмотри, что не так, какие анимации не работают,
+     почему не нажимается кнопка / ломается вёрстка» — используй `browse_project` интерактивно шаг за шагом!
+7. Совместная работа с Настольным Оператором экрана:
    - formulate_operator_task — превратить просьбу пользователя (работа в программах, на экране,
      или управление персонажем в игре) в чёткое пошаговое задание для Оператора с подходящим
      режимом (autonomous | copilot | game) и правилом помощи после каждого шага;
@@ -105,6 +115,9 @@ SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CR
 Правила безопасности и поведения:
 - Создавая проект или сайт, ВСЕГДА сначала собирай структуру папок и файлов в Sandbox через
   `sandbox_create_project` или `sandbox_write_file`, а затем при необходимости запускай через `run_command`.
+- Когда веб-проект или страница собраны (или пользователь дал адрес/попросил проверить вживую),
+  вызови `browse_project`, чтобы интерактивно пройтись по экрану, проверить анимации, клики,
+  наведение, адаптивность (`mobile`/`desktop`), консоль и визуально убедиться, что всё работает.
 - Если для ответа или выполнения задачи тебе не хватает видимости того, что сейчас открыто на ПК
   пользователя, НЕ додумывай — вызови `inspect_pc_screen`, чтобы Оператор сделал снимок экрана
   и прислал данные (это произойдёт строго после разрешения пользователя).
@@ -357,6 +370,86 @@ SANDBOX_TOOLS = [
     },
 ]
 
+BROWSER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "browse_project",
+            "description": (
+                "Интерактивно зайти на веб-проект в реальном изолированном браузере и проверить что не так: "
+                "визуальный вид (скриншот), анимации и переходы (document.getAnimations(), CSS keyframes, "
+                "застрявшие opacity:0, замер движения между кадрами), клики, hover, скролл, адаптивность "
+                "(desktop/mobile), ошибки JS-консоли и сети. Сессия сохраняется между шагами вызова."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "open",
+                            "click",
+                            "hover",
+                            "type",
+                            "press",
+                            "scroll",
+                            "resize",
+                            "wait",
+                            "inspect_animations",
+                            "evaluate",
+                            "close",
+                        ],
+                        "description": "Шаг взаимодействия в браузере (начинайте с open)",
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Адрес http(s)://... или относительный путь (/tasks) для open",
+                    },
+                    "sandbox_project": {
+                        "type": "string",
+                        "description": "Папка/HTML-файл проекта внутри Sandbox (поднимет локальный сервер сам, если не передан url)",
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS-селектор или text=... для click/hover/type/scroll",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Текст кнопки/ссылки для click/hover, текст ввода для type или клавиша (Enter/Escape/Tab) для press",
+                    },
+                    "x": {"type": "integer", "description": "Координата X (если без selector)"},
+                    "y": {"type": "integer", "description": "Координата Y (если без selector)"},
+                    "direction": {
+                        "type": "string",
+                        "enum": ["down", "up", "top", "bottom"],
+                        "description": "Направление прокрутки для scroll",
+                    },
+                    "scroll_y": {"type": "integer", "description": "Точная позиция scrollY (px)"},
+                    "viewport": {
+                        "type": "string",
+                        "enum": ["desktop", "laptop", "tablet", "mobile"],
+                        "description": "Пресет размера экрана",
+                    },
+                    "width": {"type": "integer", "description": "Ширина окна (320–2560)"},
+                    "height": {"type": "integer", "description": "Высота окна (320–2000)"},
+                    "wait_ms": {
+                        "type": "integer",
+                        "description": "Пауза (мс) после действия или длительность замера анимаций (по умолчанию 450)",
+                    },
+                    "clear": {"type": "boolean", "description": "Очистить поле перед type"},
+                    "script": {"type": "string", "description": "JS-выражение для action='evaluate'"},
+                    "session_id": {"type": "string", "description": "ID вкладки (по умолчанию default)"},
+                    "capture_screenshot": {
+                        "type": "boolean",
+                        "description": "Приложить свежий скриншот (по умолчанию true)",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+]
+
 OPERATOR_TOOLS = [
     {
         "type": "function",
@@ -431,7 +524,7 @@ OPERATOR_TOOLS = [
     },
 ]
 
-TOOLS = BASE_TOOLS + SANDBOX_TOOLS + OPERATOR_TOOLS
+TOOLS = BASE_TOOLS + SANDBOX_TOOLS + BROWSER_TOOLS + OPERATOR_TOOLS
 
 
 class AgentError(Exception):
@@ -470,7 +563,7 @@ def normalize_trust(raw: Any) -> str:
 def tools_for_trust(trust_level: str) -> List[Dict[str, Any]]:
     if trust_level == "none":
         return list(BASE_TOOLS)
-    return list(BASE_TOOLS) + list(SANDBOX_TOOLS) + list(OPERATOR_TOOLS)
+    return list(BASE_TOOLS) + list(SANDBOX_TOOLS) + list(BROWSER_TOOLS) + list(OPERATOR_TOOLS)
 
 
 def safe_file_name(raw: str) -> str:
@@ -501,6 +594,7 @@ def run_tool(
     trust_level: str = "verified",
     approval_fn: Optional[Any] = None,
     sandbox_root: Path = SANDBOX_ROOT,
+    browser_manager: Optional[browser_inspector.BrowserSessionManager] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Выполнить инструмент с учётом Sandbox и уровня доверия."""
     args = args or {}
@@ -588,9 +682,21 @@ def run_tool(
     if trust == "none":
         raise AgentError(
             "Выбран уровень доверия «Нет доступа, к компьютеру для исполнения задач». "
-            "Запуск bash, работа с песочницей, перенос файлов и автозапуск Оператора отключены. "
+            "Запуск bash, работа с песочницей, браузерный осмотр, перенос файлов и автозапуск Оператора отключены. "
             "Можно использовать formulate_operator_task или create_file."
         )
+
+    if name == "browse_project":
+        mgr = browser_manager or browser_inspector.BrowserSessionManager(sandbox_root=sandbox_root)
+        try:
+            return browser_inspector.execute_browse_action(
+                mgr,
+                args,
+                trust_level=trust,
+                approval_fn=approval_fn,
+            )
+        except (browser_inspector.BrowserError, sandbox_mod.SandboxError) as error:
+            raise AgentError(str(error)) from error
 
     if name == "inspect_pc_screen":
         reason = str(args.get("reason") or "Агенту нужен снимок экрана ПК для решения задачи").strip()
@@ -1675,6 +1781,7 @@ class Handler(BaseHTTPRequestHandler):
                     "baseUrl": BASE_URL,
                     "workspace": str(WORKSPACE),
                     "sandbox": str(SANDBOX_ROOT),
+                    "browserAvailable": bool(browser_inspector.find_browser_executable()),
                     "tools": [tool["function"]["name"] for tool in TOOLS],
                     "maxSteps": MAX_STEPS,
                 },
@@ -2007,6 +2114,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
 
         active_tools = tools_for_trust(trust_level)
+        browser_mgr = browser_inspector.BrowserSessionManager(sandbox_root=SANDBOX_ROOT)
         use_tools = True
         steps = 0
         files = 0
@@ -2014,150 +2122,166 @@ class Handler(BaseHTTPRequestHandler):
         final_text = ""
         thinking = ""
 
-        while steps_limit == 0 or steps < steps_limit:
-            steps += 1
-            self.write(sse({"text": "Думаю…" if steps == 1 else f"Шаг {steps}: уточняю план…"}, "status"))
+        try:
+            while steps_limit == 0 or steps < steps_limit:
+                steps += 1
+                self.write(sse({"text": "Думаю…" if steps == 1 else f"Шаг {steps}: уточняю план…"}, "status"))
 
-            def _emit_live_reasoning(step_reasoning: str) -> None:
-                combined = ((thinking + "\n\n" if thinking else "") + step_reasoning).strip()
-                if combined:
-                    self.write(sse({"text": combined}, "reasoning"))
+                def _emit_live_reasoning(step_reasoning: str) -> None:
+                    combined = ((thinking + "\n\n" if thinking else "") + step_reasoning).strip()
+                    if combined:
+                        self.write(sse({"text": combined}, "reasoning"))
 
-            def _emit_live_text(step_text: str) -> None:
-                cleaned = step_text.strip()
-                if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
-                    self.write(sse({"text": cleaned}, "text"))
+                def _emit_live_text(step_text: str) -> None:
+                    cleaned = step_text.strip()
+                    if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
+                        self.write(sse({"text": cleaned}, "text"))
 
-            try:
-                data = call_model(
-                    base_url,
-                    api_key,
-                    model,
-                    messages,
-                    active_tools if use_tools else None,
-                    params,
-                    on_reasoning=_emit_live_reasoning,
-                    on_text=_emit_live_text,
-                )
-            except AgentError as error:
-                detail = str(error).lower()
-                if has_multimodal_images() and ("image" in detail or "vision" in detail or "modality" in detail):
-                    log("модель не принимает картинки — читаю только текст вложений")
-                    self.write(sse({"text": "Модель не принимает картинки — читаю текстовое описание"}, "status"))
-                    strip_images()
-                    images = []
-                    continue
-                if use_tools and ("tools" in detail or "400" in detail):
-                    log("function calling недоступен, включаю JSON-протокол")
-                    use_tools = False
-                    messages[0]["content"] = system + TEXT_PROTOCOL_NOTE
-                    continue
-                raise
-
-            choices = data.get("choices") or []
-            if not choices:
-                raise AgentError("Модель вернула пустой ответ")
-            message = choices[0].get("message") or {}
-            content = str(message.get("content") or "")
-            reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "").strip()
-            if reasoning:
-                thinking += ("\n\n" if thinking else "") + reasoning
-                self.write(sse({"text": thinking}, "reasoning"))
-            tool_calls = message.get("tool_calls") or []
-
-            if not tool_calls:
-                parsed = parse_text_tool_call(content)
-                if parsed:
-                    tool_calls = [
-                        {
-                            "id": f"call_{steps}",
-                            "type": "function",
-                            "function": {
-                                "name": parsed[0],
-                                "arguments": json.dumps(parsed[1], ensure_ascii=False),
-                            },
-                        }
-                    ]
-                    content = ""
-
-            if not tool_calls:
-                final_text = content.strip() or "Готово."
-                break
-
-            call_results = []
-            assistant_calls = []
-            captured_screen_images: List[Dict[str, Any]] = []
-            for index, call in enumerate(tool_calls[:6]):
-                function = call.get("function") or {}
-                name = str(function.get("name") or "")
-                raw_args = function.get("arguments") or "{}"
                 try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-                except json.JSONDecodeError:
-                    args = {}
-
-                self.write(sse({"text": f"Вызываю инструмент: {name}…"}, "status"))
-                try:
-                    result_text, events = run_tool(
-                        name,
-                        args if isinstance(args, dict) else {},
-                        trust_level=trust_level,
-                        approval_fn=self.await_website_approval,
-                        sandbox_root=SANDBOX_ROOT,
+                    data = call_model(
+                        base_url,
+                        api_key,
+                        model,
+                        messages,
+                        active_tools if use_tools else None,
+                        params,
+                        on_reasoning=_emit_live_reasoning,
+                        on_text=_emit_live_text,
                     )
                 except AgentError as error:
-                    result_text, events = f"Ошибка инструмента: {error}", []
+                    detail = str(error).lower()
+                    if has_multimodal_images() and ("image" in detail or "vision" in detail or "modality" in detail):
+                        log("модель не принимает картинки — читаю только текст вложений")
+                        self.write(sse({"text": "Модель не принимает картинки — читаю текстовое описание"}, "status"))
+                        strip_images()
+                        images = []
+                        continue
+                    if use_tools and ("tools" in detail or "400" in detail):
+                        log("function calling недоступен, включаю JSON-протокол")
+                        use_tools = False
+                        messages[0]["content"] = system + TEXT_PROTOCOL_NOTE
+                        continue
+                    raise
 
-                for event in events:
-                    img = event.pop("_image", None)
-                    if isinstance(img, str) and img.startswith("data:image/"):
-                        captured_screen_images.append({"type": "image_url", "image_url": {"url": img}})
-                    if event["type"] == "file":
-                        files += 1
-                    else:
-                        actions += 1
-                    self.write(sse(event, "action"))
+                choices = data.get("choices") or []
+                if not choices:
+                    raise AgentError("Модель вернула пустой ответ")
+                message = choices[0].get("message") or {}
+                content = str(message.get("content") or "")
+                reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "").strip()
+                if reasoning:
+                    thinking += ("\n\n" if thinking else "") + reasoning
+                    self.write(sse({"text": thinking}, "reasoning"))
+                tool_calls = message.get("tool_calls") or []
 
-                call_id = str(call.get("id") or f"call_{steps}_{index}")
-                assistant_calls.append(
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
-                    }
+                if not tool_calls:
+                    parsed = parse_text_tool_call(content)
+                    if parsed:
+                        tool_calls = [
+                            {
+                                "id": f"call_{steps}",
+                                "type": "function",
+                                "function": {
+                                    "name": parsed[0],
+                                    "arguments": json.dumps(parsed[1], ensure_ascii=False),
+                                },
+                            }
+                        ]
+                        content = ""
+
+                if not tool_calls:
+                    final_text = content.strip() or "Готово."
+                    break
+
+                call_results = []
+                assistant_calls = []
+                captured_screen_images: List[Dict[str, Any]] = []
+                has_browser_images = False
+                for index, call in enumerate(tool_calls[:6]):
+                    function = call.get("function") or {}
+                    name = str(function.get("name") or "")
+                    raw_args = function.get("arguments") or "{}"
+                    try:
+                        args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                    except json.JSONDecodeError:
+                        args = {}
+
+                    self.write(sse({"text": f"Вызываю инструмент: {name}…"}, "status"))
+                    try:
+                        result_text, events = run_tool(
+                            name,
+                            args if isinstance(args, dict) else {},
+                            trust_level=trust_level,
+                            approval_fn=self.await_website_approval,
+                            sandbox_root=SANDBOX_ROOT,
+                            browser_manager=browser_mgr,
+                        )
+                    except AgentError as error:
+                        result_text, events = f"Ошибка инструмента: {error}", []
+
+                    for event in events:
+                        img = event.pop("_image", None)
+                        if isinstance(img, str) and img.startswith("data:image/"):
+                            captured_screen_images.append({"type": "image_url", "image_url": {"url": img}})
+                        imgs = event.pop("_images", None)
+                        if isinstance(imgs, list):
+                            for item_img in imgs[:3]:
+                                if isinstance(item_img, str) and item_img.startswith("data:image/"):
+                                    captured_screen_images.append({"type": "image_url", "image_url": {"url": item_img}})
+                                    has_browser_images = True
+                        if event["type"] == "file":
+                            files += 1
+                        else:
+                            actions += 1
+                        self.write(sse(event, "action"))
+
+                    call_id = str(call.get("id") or f"call_{steps}_{index}")
+                    assistant_calls.append(
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+                        }
+                    )
+                    call_results.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
+
+                image_note = (
+                    "Скриншоты интерактивного осмотра проекта в браузере (для проверки вёрстки и анимаций):"
+                    if has_browser_images
+                    else "Снимок экрана ПК, переданный Оператором после разрешения пользователя:"
                 )
-                call_results.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
-
-            if use_tools:
-                messages.append({"role": "assistant", "content": content, "tool_calls": assistant_calls})
-                messages.extend(call_results)
-                if captured_screen_images:
+                if use_tools:
+                    messages.append({"role": "assistant", "content": content, "tool_calls": assistant_calls})
+                    messages.extend(call_results)
+                    if captured_screen_images:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": image_note},
+                                    *captured_screen_images[:3],
+                                ],
+                            }
+                        )
+                else:
+                    messages.append({"role": "assistant", "content": content or "Использую инструмент."})
+                    results_text = (
+                        "Результаты инструментов:\n"
+                        + "\n".join(item["content"] for item in call_results)
+                        + "\nЕсли нужно ещё действие — верни следующий JSON. Иначе коротко подтверди выполненное."
+                    )
                     messages.append(
                         {
                             "role": "user",
-                            "content": [
-                                {"type": "text", "text": "Снимок экрана ПК, переданный Оператором после разрешения пользователя:"},
-                                *captured_screen_images[:2],
-                            ],
+                            "content": (
+                                [{"type": "text", "text": results_text}, *captured_screen_images[:3]]
+                                if captured_screen_images
+                                else results_text
+                            ),
                         }
                     )
-            else:
-                messages.append({"role": "assistant", "content": content or "Использую инструмент."})
-                results_text = (
-                    "Результаты инструментов:\n"
-                    + "\n".join(item["content"] for item in call_results)
-                    + "\nЕсли нужно ещё действие — верни следующий JSON. Иначе коротко подтверди выполненное."
-                )
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            [{"type": "text", "text": results_text}, *captured_screen_images[:2]]
-                            if captured_screen_images
-                            else results_text
-                        ),
-                    }
-                )
+        finally:
+            browser_mgr.close_all()
 
         if not final_text:
             final_text = "Сделал максимум шагов. Уточните задачу, если нужно продолжение."
@@ -2604,6 +2728,22 @@ def self_test() -> int:
             and resolve_steps_limit(0, False) == MAX_STEPS_LIMIT
             and resolve_steps_limit(1200, False) == MAX_STEPS_LIMIT
             and resolve_steps_limit(25, False) == 25,
+        )
+
+        # 17. Интерактивный осмотр проекта (browse_project) включён при verified/full и отключён при none
+        browse_none_blocked = False
+        try:
+            run_tool("browse_project", {"action": "open", "url": "http://127.0.0.1:3000"}, trust_level="none", sandbox_root=root)
+        except AgentError:
+            browse_none_blocked = True
+        verified_names = {t["function"]["name"] for t in tools_for_trust("verified")}
+        none_names = {t["function"]["name"] for t in tools_for_trust("none")}
+        check(
+            "browse_project доступен в tools_for_trust(verified/full) и блокируется при trust=none",
+            "browse_project" in verified_names
+            and "browse_project" not in none_names
+            and browse_none_blocked
+            and browser_inspector.self_test() == 0,
         )
 
     passed = sum(1 for item in checks if item)
