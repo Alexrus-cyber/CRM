@@ -10,6 +10,7 @@ import {
   ExternalLink,
   FileText,
   Flag,
+  Gamepad2,
   Globe,
   Keyboard,
   Loader2,
@@ -23,6 +24,12 @@ import {
   Type as TypeIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import type {
+  OperatorCoachMode,
+  OperatorTaskMode,
+  OperatorTaskSource,
+  TaskGuidanceNote,
+} from "@/lib/operatorModes";
 
 /** Общие кусочки интерфейса оператора — в стиле остальной CRM. */
 
@@ -34,6 +41,10 @@ export type OperatorTask = {
   steps: number;
   summary: string;
   trustLevel?: string;
+  taskMode?: OperatorTaskMode;
+  source?: OperatorTaskSource;
+  coachMode?: OperatorCoachMode;
+  guidanceNote?: TaskGuidanceNote | null;
   pendingApproval?: PendingTaskApproval | string | null;
   approvalResponse?: Record<string, unknown> | string | null;
   createdAt: string;
@@ -141,8 +152,11 @@ export function ActionGlyph({ type, size = 14 }: { type: string; size?: number }
     case "right_click":
     case "middle_click":
     case "triple_click":
+    case "mouse_down":
+    case "mouse_up":
       return <MousePointerClick size={size} />;
     case "move":
+    case "move_mouse_rel":
       return <Move size={size} />;
     case "drag":
       return <MousePointerSquareDashed size={size} />;
@@ -151,11 +165,16 @@ export function ActionGlyph({ type, size = 14 }: { type: string; size?: number }
       return <TypeIcon size={size} />;
     case "hotkey":
     case "key":
+    case "hold_key":
+    case "key_down":
+    case "key_up":
     case "switch_language":
     case "select_all_copy":
     case "clipboard_get":
     case "clipboard_set":
       return <Keyboard size={size} />;
+    case "sequence":
+      return <Gamepad2 size={size} />;
     case "scroll":
       return <ScrollText size={size} />;
     case "wait":
@@ -237,6 +256,30 @@ export function describeAction(raw: string): ParsedAction | null {
       };
     case "key":
       return { type, title: `Клавиша ${String(action.key ?? "")}`, json: raw };
+    case "hold_key":
+      return {
+        type,
+        title: `Удержание клавиши ${String(action.key ?? "w")} (${Number(action.seconds ?? 0.5).toFixed(2)} с)`,
+        json: raw,
+      };
+    case "key_down":
+      return { type, title: `Зажата клавиша ${String(action.key ?? "")}`, json: raw };
+    case "key_up":
+      return { type, title: `Отпущена клавиша ${String(action.key ?? "")}`, json: raw };
+    case "move_mouse_rel":
+      return {
+        type,
+        title: `Смещение камеры/мыши (${Number(action.dx ?? 0)}, ${Number(action.dy ?? 0)})`,
+        json: raw,
+      };
+    case "mouse_down":
+      return { type, title: `Зажата кнопка мыши (${String(action.button ?? "left")})`, json: raw };
+    case "mouse_up":
+      return { type, title: `Отпущена кнопка мыши (${String(action.button ?? "left")})`, json: raw };
+    case "sequence": {
+      const count = Array.isArray(action.steps) ? action.steps.length : 0;
+      return { type, title: `Игровая/быстрая серия (${count} действий)`, json: raw };
+    }
     case "scroll":
       return {
         type,

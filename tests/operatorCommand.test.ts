@@ -50,4 +50,18 @@ describe("команда запуска оператора", () => {
     expect(buildOperatorCommand({ provider: "local", trustLevel: "verified" })).toContain("--trust-level verified");
     expect(buildOperatorCommand({ provider: "local", trustLevel: "none" })).toContain("--trust-level none");
   });
+
+  it("передаёт режим работы --task-mode и коучинг --coach только при не-дефолтных значениях", () => {
+    const defCmd = buildOperatorCommand({ provider: "local", taskMode: "autonomous", coachMode: "after_step" });
+    expect(defCmd).not.toContain("--task-mode");
+    expect(defCmd).not.toContain("--coach");
+
+    const gameCmd = buildOperatorCommand({ provider: "local", taskMode: "game", coachMode: "agent" });
+    expect(gameCmd).toContain("--task-mode game");
+    expect(gameCmd).toContain("--coach agent");
+
+    const copilotOff = buildOperatorCommand({ provider: "local", taskMode: "copilot", coachMode: "off" });
+    expect(copilotOff).toContain("--task-mode copilot");
+    expect(copilotOff).toContain("--coach off");
+  });
 });

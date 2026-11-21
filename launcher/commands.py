@@ -104,6 +104,12 @@ def operator_args(spec: AgentSpec, settings: LaunchSettings) -> List[str]:
     trust_level = str(values.get("trust_level") or "").strip().lower()
     if trust_level in ("full", "verified", "none"):
         args.extend(["--trust-level", trust_level])
+    task_mode = str(values.get("task_mode") or "").strip().lower()
+    if task_mode in ("copilot", "game"):
+        args.extend(["--task-mode", task_mode])
+    coach_mode = str(values.get("coach_mode") or "").strip().lower()
+    if coach_mode in ("off", "agent"):
+        args.extend(["--coach", coach_mode])
     if truthy(values.get("dry_run")):
         args.append("--dry-run")
     if truthy(values.get("text_only")):

@@ -21,8 +21,11 @@ JSON, urllib). CRM находит его по переменной `AGENT_URL`
 (по умолчанию `http://127.0.0.1:8899`).
 
 Инструменты: `create_file` (docx/xlsx/csv/md/html/svg/json/zip/txt),
-`open_website`, `play_youtube`. Адрес модели, ключ и имя модели приходят из
-интерфейса — подойдёт и локальный сервер, и облачный API.
+`open_website`, `play_youtube`, `sandbox_*` (изолированная песочница),
+`run_command`, `export_from_sandbox`, а также совместная работа с Оператором:
+`formulate_operator_task` (помощь в формулировке задачи для экрана/игры) и
+`call_operator` (запуск Оператора строго с разрешения пользователя на сайте)
++ `POST /coach` для подсказок после каждого действия.
 
 Переменные: `AGENT_HOST`, `AGENT_PORT`, `AGENT_BASE_URL`, `AGENT_MODEL`,
 `AGENT_API_KEY`, `AGENT_WORKSPACE`, `AGENT_MAX_STEPS`, `AGENT_TIMEOUT`.
@@ -32,8 +35,13 @@ JSON, urllib). CRM находит его по переменной `AGENT_URL`
 ```bash
 pip install -r agent/requirements.txt
 python3 agent/desktop_operator.py --watch --token ТОКЕН --provider local
+# игровой режим / помощник ПК + подсказки Агента после каждого действия:
+python3 agent/desktop_operator.py --watch --token ТОКЕН --task-mode game --coach agent
 ```
 
+Поддерживает три стиля работы (`--task-mode autonomous|copilot|game`), пошаговые
+подсказки (`--coach after_step|agent|off`) и игровые действия (`hold_key`,
+`key_down`/`key_up`, `move_mouse_rel`, `mouse_down`/`mouse_up`, `sequence`).
 Подробная инструкция — [`OPERATOR.md`](OPERATOR.md).
 
 Оператору нужны `pyautogui` и `Pillow`: он делает скриншоты и двигает мышь —

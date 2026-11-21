@@ -20,6 +20,11 @@ export async function POST(req: Request) {
         approved?: boolean;
         note?: string;
         destination?: string;
+        taskId?: number;
+        taskPrompt?: string;
+        mode?: string;
+        coachMode?: string;
+        operatorTrustLevel?: string;
       }
     | null;
 
@@ -37,6 +42,13 @@ export async function POST(req: Request) {
         approved: Boolean(body?.approved),
         note: typeof body?.note === "string" ? body.note.slice(0, 500) : "",
         destination: typeof body?.destination === "string" ? body.destination.slice(0, 500) : "",
+        ...(Number.isFinite(body?.taskId) ? { taskId: Number(body?.taskId) } : {}),
+        ...(typeof body?.taskPrompt === "string" ? { taskPrompt: body.taskPrompt.slice(0, 4000) } : {}),
+        ...(typeof body?.mode === "string" ? { mode: body.mode.slice(0, 40) } : {}),
+        ...(typeof body?.coachMode === "string" ? { coachMode: body.coachMode.slice(0, 40) } : {}),
+        ...(typeof body?.operatorTrustLevel === "string"
+          ? { operatorTrustLevel: body.operatorTrustLevel.slice(0, 20) }
+          : {}),
       }),
       cache: "no-store",
       signal: AbortSignal.timeout(10_000),

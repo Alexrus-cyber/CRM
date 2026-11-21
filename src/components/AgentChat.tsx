@@ -5,16 +5,19 @@ import {
   Archive,
   Bot,
   Check,
+  Compass,
   Download,
   ExternalLink,
   FileArchive,
   FileText,
   FolderOpen,
   FolderOutput,
+  Gamepad2,
   Gauge,
   History,
   Loader2,
   MessageSquarePlus,
+  MonitorCog,
   Paperclip,
   PlayCircle,
   PlugZap,
@@ -29,7 +32,7 @@ import {
   X,
 } from "lucide-react";
 import { AI_DEFAULT_BASE_URL, AI_MAX_FILE_BYTES, AI_STORAGE_SETTINGS, formatBytes, type AiSettings } from "@/lib/ai";
-import { Input } from "@/components/ui";
+import { Input, Textarea } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import { useStoredJson, useStoredNumber } from "@/lib/useStoredValue";
 import { extractFile } from "@/lib/fileExtract";
@@ -44,6 +47,12 @@ import {
 } from "@/lib/genParams";
 import { DEFAULT_TRUST_LEVEL, decodeTrustLevel, findTrustLevel, type TrustLevel } from "@/lib/trust";
 import {
+  OPERATOR_TASK_MODES,
+  findTaskMode,
+  normalizeTaskMode,
+  type OperatorTaskMode,
+} from "@/lib/operatorModes";
+import {
   DEFAULT_AGENT_CONTEXT_LIMIT,
   ROLLOVER_THRESHOLD_RATIO,
   buildTranscriptFileName,
@@ -53,6 +62,12 @@ import {
   type TranscriptTurn,
 } from "@/lib/transcripts";
 import { formatFileSize, readOperatorFiles, type OperatorAttachment } from "./operator/files";
+import {
+  StatusChip,
+  parsePendingApproval,
+  type OperatorEvent,
+  type OperatorTask,
+} from "./operator/shared";
 
 /**
  * Вкладка «Агент» блока ИИ (только главный администратор).
@@ -67,7 +82,14 @@ import { formatFileSize, readOperatorFiles, type OperatorAttachment } from "./op
 
 type AgentFile = { name: string; mime: string; size: number; data: string };
 type AgentAction = {
-  type: "open_url" | "command_result" | "sandbox_file" | "project_created" | "sandbox_export";
+  type:
+    | "open_url"
+    | "command_result"
+    | "sandbox_file"
+    | "project_created"
+    | "sandbox_export"
+    | "operator_plan"
+    | "operator_task";
   url?: string;
   label?: string;
   autoplay?: boolean;
@@ -81,6 +103,13 @@ type AgentAction = {
   destination?: string;
   mode?: string;
   filesCount?: number;
+  taskId?: number;
+  task?: string;
+  goal?: string;
+  maxSteps?: number;
+  coachMode?: string;
+  notes?: string;
+  operatorTrustLevel?: string;
 };
 
 type Turn = {
@@ -148,6 +177,10 @@ type PendingApproval = {
   destination?: string;
   mode?: string;
   filesCount?: number;
+  task?: string;
+  maxSteps?: number;
+  coachAfterEachStep?: boolean;
+  operatorTrustLevel?: string;
 };
 
 type SandboxState = {
@@ -205,6 +238,7 @@ const PROVIDERS: Array<{ id: string; label: string; baseUrl: string; model: stri
 const EXAMPLES = [
   "Открой YouTube и включи видео про космос",
   "Создай в Sandbox проект landing-site на HTML+CSS",
+  "Помоги с действиями на экране: сформулируй задачу для Оператора и запусти его с моего согласия",
   "Сделай CSV-файл с планом на неделю по продажам",
 ];
 
@@ -289,10 +323,28 @@ export function AgentChat({ userName }: { userName: string }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
 
-  // Подтверждение команд/экспорта при уровне доверия verified.
+  // Подтверждение команд/экспорта/вызова Оператора при уровне доверия verified или call_operator.
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [approvalDest, setApprovalDest] = useState("");
+  const [approvalTaskDraft, setApprovalTaskDraft] = useState("");
+  const [approvalTaskMode, setApprovalTaskMode] = useState<OperatorTaskMode>("copilot");
+  const [approvalCoachAfter, setApprovalCoachAfter] = useState(true);
+  const [approvalOpTrust, setApprovalOpTrust] = useState<"verified" | "full">("verified");
   const [approvalBusy, setApprovalBusy] = useState(false);
+
+  // Совместная работа Агента и Оператора (помощь на экране / игры / пошаговое сопровождение).
+  const [opBridgeOpen, setOpBridgeOpen] = useState(false);
+  const [opGoal, setOpGoal] = useState("");
+  const [opDraftPrompt, setOpDraftPrompt] = useState("");
+  const [opDraftMode, setOpDraftMode] = useState<OperatorTaskMode>("copilot");
+  const [opDraftSteps, setOpDraftSteps] = useState(30);
+  const [opDraftNotes, setOpDraftNotes] = useState("");
+  const [opFormulating, setOpFormulating] = useState(false);
+  const [opLaunching, setOpLaunching] = useState(false);
+  const [opTask, setOpTask] = useState<OperatorTask | null>(null);
+  const [opEvents, setOpEvents] = useState<OperatorEvent[]>([]);
+  const [opGuidanceInput, setOpGuidanceInput] = useState("");
+  const [opCoachBusy, setOpCoachBusy] = useState(false);
 
   // RAG папки и загрузка без ограничений размера папки.
   const [ragFolders, setRagFolders] = useState<RagFolder[]>([]);
@@ -749,12 +801,70 @@ export function AgentChat({ userName }: { userName: string }) {
     }
   };
 
+  const refreshOpTask = useCallback(async (taskId: number) => {
+    try {
+      const res = await fetch(`/api/agent/tasks/${taskId}`, { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { task?: OperatorTask; events?: OperatorEvent[] };
+      if (data.task) setOpTask(data.task);
+      if (Array.isArray(data.events)) setOpEvents(data.events);
+    } catch {
+      /* фоновый поллинг */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!opTask || ["done", "failed", "cancelled"].includes(opTask.status)) return;
+    const id = opTask.id;
+    const timer = window.setInterval(() => {
+      void refreshOpTask(id);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [opTask, refreshOpTask]);
+
   /* --------------------------- Подтверждение & Sandbox --------------------------- */
 
   const sendApprovalDecision = async (approved: boolean) => {
     if (!pendingApproval || approvalBusy) return;
     setApprovalBusy(true);
     try {
+      let launchedTaskId: number | undefined;
+      const finalPrompt = (approvalTaskDraft || pendingApproval.task || "").trim();
+      const finalCoachMode = approvalCoachAfter ? "agent" : "after_step";
+
+      if (approved && pendingApproval.kind === "call_operator") {
+        if (!finalPrompt) {
+          setError("Укажите задачу для Оператора перед запуском");
+          return;
+        }
+        const launchRes = await fetch("/api/ai/agent/operator", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "launch",
+            prompt: finalPrompt,
+            taskMode: approvalTaskMode,
+            coachMode: finalCoachMode,
+            maxSteps: pendingApproval.maxSteps ?? 30,
+            trustLevel: approvalOpTrust,
+          }),
+        });
+        const launchData = (await launchRes.json().catch(() => ({}))) as {
+          task?: OperatorTask;
+          error?: string;
+        };
+        if (!launchRes.ok || !launchData.task) {
+          setError(launchData.error ?? "Не удалось поставить задачу Оператору");
+          return;
+        }
+        launchedTaskId = launchData.task.id;
+        setOpTask(launchData.task);
+        setOpEvents([]);
+        setNotice(
+          `Оператор запущен по вашему разрешению (задача #${launchData.task.id}, режим: ${findTaskMode(approvalTaskMode).shortLabel}).`,
+        );
+      }
+
       const res = await fetch("/api/ai/agent/approve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -762,6 +872,15 @@ export function AgentChat({ userName }: { userName: string }) {
           approvalId: pendingApproval.approvalId,
           approved,
           destination: approvalDest.trim(),
+          ...(launchedTaskId !== undefined
+            ? {
+                taskId: launchedTaskId,
+                taskPrompt: finalPrompt,
+                mode: approvalTaskMode,
+                coachMode: finalCoachMode,
+                operatorTrustLevel: approvalOpTrust,
+              }
+            : {}),
         }),
       });
       if (!res.ok) {
@@ -771,11 +890,162 @@ export function AgentChat({ userName }: { userName: string }) {
       }
       setPendingApproval(null);
       setApprovalDest("");
+      setApprovalTaskDraft("");
     } catch {
       setError("Сеть недоступна при отправке подтверждения");
     } finally {
       setApprovalBusy(false);
     }
+  };
+
+  const formulateOperatorTask = async (goalOverride?: string) => {
+    const goal = ((goalOverride ?? opGoal) || text).trim();
+    if (!goal || opFormulating) return;
+    setOpFormulating(true);
+    setError(null);
+    try {
+      const contextSummary = turns
+        .slice(-4)
+        .map((t) => `${t.role === "user" ? "Пользователь" : "Агент"}: ${t.content.slice(0, 300)}`)
+        .join("\n");
+      const res = await fetch("/api/ai/agent/operator", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "formulate",
+          goal,
+          contextSummary,
+          settings,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        prompt?: string;
+        taskMode?: string;
+        maxSteps?: number;
+        notes?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.prompt) {
+        setError(data.error ?? "Не удалось сформулировать задачу для Оператора");
+        return;
+      }
+      if (!opGoal) setOpGoal(goal);
+      setOpDraftPrompt(data.prompt);
+      setOpDraftMode(normalizeTaskMode(data.taskMode));
+      setOpDraftSteps(Math.min(AGENT_MAX_STEPS, Math.max(5, Number(data.maxSteps ?? 30) || 30)));
+      setOpDraftNotes(String(data.notes ?? ""));
+      setOpBridgeOpen(true);
+    } catch {
+      setError("Сеть недоступна при формулировке задачи Оператора");
+    } finally {
+      setOpFormulating(false);
+    }
+  };
+
+  const launchOperatorFromDraft = async (
+    promptText: string,
+    mode: OperatorTaskMode,
+    stepsLimit = 30,
+  ) => {
+    const clean = promptText.trim();
+    if (!clean || opLaunching) return;
+    setOpLaunching(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/ai/agent/operator", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "launch",
+          prompt: clean,
+          taskMode: mode,
+          coachMode: "agent",
+          maxSteps: Math.min(AGENT_MAX_STEPS, Math.max(5, stepsLimit)),
+          trustLevel: trustLevel === "full" ? "full" : "verified",
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
+      if (!res.ok || !data.task) {
+        setError(data.error ?? "Не удалось запустить Оператора");
+        return;
+      }
+      setOpTask(data.task);
+      setOpEvents([]);
+      setNotice(`Задача #${data.task.id} отправлена Оператору по вашему согласию (режим: ${findTaskMode(mode).shortLabel}).`);
+      void refreshOpTask(data.task.id);
+    } catch {
+      setError("Сеть недоступна при запуске Оператора");
+    } finally {
+      setOpLaunching(false);
+    }
+  };
+
+  const sendOperatorGuidance = async () => {
+    if (!opTask || !opGuidanceInput.trim() || opCoachBusy) return;
+    setOpCoachBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/agent/tasks/${opTask.id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "guidance", text: opGuidanceInput.trim() }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
+      if (!res.ok) {
+        setError(data.error ?? "Не удалось передать подсказку Оператору");
+        return;
+      }
+      setOpGuidanceInput("");
+      if (data.task) setOpTask(data.task);
+      await refreshOpTask(opTask.id);
+    } finally {
+      setOpCoachBusy(false);
+    }
+  };
+
+  const askOperatorCoach = async () => {
+    if (!opTask || opCoachBusy) return;
+    setOpCoachBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/ai/agent/coach", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          taskId: opTask.id,
+          userHint: opGuidanceInput.trim(),
+          settings,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
+      if (!res.ok) {
+        setError(data.error ?? "Не удалось получить подсказку Агента");
+        return;
+      }
+      if (data.task) setOpTask(data.task);
+      await refreshOpTask(opTask.id);
+    } finally {
+      setOpCoachBusy(false);
+    }
+  };
+
+  const actOnOperatorTask = async (
+    action: "approve" | "reject" | "extend_steps" | "cancel",
+    extra?: { approvalId?: string; addSteps?: number },
+  ) => {
+    if (!opTask) return;
+    const res = await fetch(`/api/agent/tasks/${opTask.id}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ...extra }),
+    });
+    const data = (await res.json().catch(() => ({}))) as { task?: OperatorTask; error?: string };
+    if (!res.ok) {
+      setError(data.error ?? "Не удалось обновить задачу Оператора");
+      return;
+    }
+    if (data.task) setOpTask(data.task);
+    await refreshOpTask(opTask.id);
   };
 
   const runSandboxExport = async () => {
@@ -966,9 +1236,20 @@ export function AgentChat({ userName }: { userName: string }) {
               destination: data.destination ? String(data.destination) : undefined,
               mode: data.mode ? String(data.mode) : undefined,
               filesCount: typeof data.filesCount === "number" ? data.filesCount : undefined,
+              task: data.task ? String(data.task) : undefined,
+              maxSteps: typeof data.maxSteps === "number" ? data.maxSteps : undefined,
+              coachAfterEachStep:
+                typeof data.coachAfterEachStep === "boolean" ? data.coachAfterEachStep : true,
+              operatorTrustLevel: data.operatorTrustLevel ? String(data.operatorTrustLevel) : undefined,
             };
             setPendingApproval(req);
             setApprovalDest(req.destination ?? "");
+            if (req.kind === "call_operator") {
+              setApprovalTaskDraft(req.task ?? "");
+              setApprovalTaskMode(normalizeTaskMode(req.mode ?? "copilot"));
+              setApprovalCoachAfter(req.coachAfterEachStep ?? true);
+              setApprovalOpTrust(req.operatorTrustLevel === "full" ? "full" : "verified");
+            }
             scrollDown();
           } else if (event === "rag") {
             setNotice(
@@ -1008,7 +1289,7 @@ export function AgentChat({ userName }: { userName: string }) {
             } else {
               const action: AgentAction = {
                 type: String(data.type ?? "command_result") as AgentAction["type"],
-                label: String(data.label ?? data.command ?? data.project ?? data.path ?? data.source ?? ""),
+                label: String(data.label ?? data.command ?? data.project ?? data.path ?? data.source ?? data.task ?? ""),
                 command: data.command ? String(data.command) : undefined,
                 cwd: data.cwd ? String(data.cwd) : undefined,
                 exitCode: typeof data.exitCode === "number" ? data.exitCode : undefined,
@@ -1019,9 +1300,25 @@ export function AgentChat({ userName }: { userName: string }) {
                 destination: data.destination ? String(data.destination) : undefined,
                 mode: data.mode ? String(data.mode) : undefined,
                 filesCount: typeof data.filesCount === "number" ? data.filesCount : undefined,
+                taskId: typeof data.taskId === "number" ? data.taskId : undefined,
+                task: data.task ? String(data.task) : undefined,
+                goal: data.goal ? String(data.goal) : undefined,
+                maxSteps: typeof data.maxSteps === "number" ? data.maxSteps : undefined,
+                coachMode: data.coachMode ? String(data.coachMode) : undefined,
+                notes: data.notes ? String(data.notes) : undefined,
+                operatorTrustLevel: data.operatorTrustLevel ? String(data.operatorTrustLevel) : undefined,
               };
               assistantDraft.actions.push(action);
               patch((t) => ({ ...t, actions: [...t.actions, action] }));
+              if (action.type === "operator_task" && action.taskId) {
+                void refreshOpTask(action.taskId);
+              }
+              if (action.type === "operator_plan" && action.task) {
+                setOpDraftPrompt(action.task);
+                setOpDraftMode(normalizeTaskMode(action.mode));
+                setOpDraftSteps(action.maxSteps ?? 30);
+                setOpDraftNotes(action.notes ?? "");
+              }
               void refreshSandbox();
             }
             scrollDown();
@@ -1270,6 +1567,13 @@ export function AgentChat({ userName }: { userName: string }) {
               <Terminal size={13} className="text-accent2" /> Sandbox и архивы
             </span>
             <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setOpBridgeOpen((v) => !v)}
+                className="flex items-center gap-1 text-[10px] font-medium text-cyan-400 hover:underline"
+              >
+                <MonitorCog size={11} /> Оператор{opTask ? ` #${opTask.id}` : ""}
+              </button>
               <button
                 type="button"
                 onClick={() => setSandboxOpen((v) => !v)}
@@ -1546,6 +1850,226 @@ export function AgentChat({ userName }: { userName: string }) {
         </div>
       )}
 
+      {/* Панель совместной формулировки и запуска Оператора прямо из Агента */}
+      {opBridgeOpen && (
+        <div className="space-y-2.5 rounded-2xl border border-cyan-500/40 bg-card p-3 text-[11px]">
+          <div className="flex items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5 font-semibold text-text">
+              <MonitorCog size={14} className="text-cyan-400" />
+              Помощь на экране через Оператора (с вашего разрешения)
+            </span>
+            <button
+              type="button"
+              onClick={() => setOpBridgeOpen(false)}
+              className="text-muted hover:text-text"
+              aria-label="Закрыть панель Оператора"
+            >
+              <X size={13} />
+            </button>
+          </div>
+          <p className="text-[10px] text-muted">
+            Опишите, чем помочь на экране, в программе или в игре. Агент превратит просьбу в чёткое задание для Оператора,
+            а после запуска поможет ему и вам после каждого действия.
+          </p>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <Input
+              value={opGoal}
+              onChange={(e) => setOpGoal(e.target.value)}
+              placeholder="Например: помоги пройти квест в игре (WASD + E) или настрой окно программы"
+              className="h-8 min-w-0 flex-1 text-[11px]"
+            />
+            <button
+              type="button"
+              onClick={() => void formulateOperatorTask(opGoal)}
+              disabled={opFormulating || (!opGoal.trim() && !text.trim())}
+              className="flex h-8 shrink-0 items-center gap-1 rounded-lg border border-cyan-500/40 bg-cyan-500/15 px-2.5 text-[11px] font-medium text-cyan-300 hover:bg-cyan-500/25 disabled:opacity-40"
+            >
+              {opFormulating ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+              Сформулировать задачу
+            </button>
+          </div>
+
+          <div className="space-y-2 rounded-xl border border-border bg-card2/50 p-2.5">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[10px] text-muted">Режим Оператора:</span>
+              {OPERATOR_TASK_MODES.map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => setOpDraftMode(m.id)}
+                  className={cn(
+                    "flex items-center gap-1 rounded-lg border px-2 py-0.5 text-[10px] font-medium transition",
+                    opDraftMode === m.id ? m.badgeClass : "border-border bg-card text-muted hover:text-text",
+                  )}
+                >
+                  {m.id === "game" && <Gamepad2 size={10} />}
+                  {m.shortLabel}
+                </button>
+              ))}
+              <label className="ml-auto flex items-center gap-1 text-[10px] text-muted">
+                шагов
+                <Input
+                  type="number"
+                  min={5}
+                  max={AGENT_MAX_STEPS}
+                  value={opDraftSteps}
+                  onChange={(e) => setOpDraftSteps(Math.min(AGENT_MAX_STEPS, Math.max(5, Number(e.target.value) || 30)))}
+                  className="h-7 w-16 px-1.5 text-[10px]"
+                />
+              </label>
+            </div>
+            <Textarea
+              value={opDraftPrompt}
+              onChange={(e) => setOpDraftPrompt(e.target.value)}
+              rows={3}
+              placeholder="Сформулированная пошаговая инструкция для Оператора (можно отредактировать перед запуском)"
+              className="text-[11px]"
+            />
+            {opDraftNotes && <p className="text-[10px] text-muted">{opDraftNotes}</p>}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-[10px] text-muted">
+                Режим сопровождения: <strong className="text-cyan-400">Агент подсказывает после каждого шага</strong>
+              </span>
+              <button
+                type="button"
+                onClick={() => void launchOperatorFromDraft(opDraftPrompt, opDraftMode, opDraftSteps)}
+                disabled={opLaunching || !opDraftPrompt.trim()}
+                className="flex h-8 items-center gap-1.5 rounded-lg bg-emerald-600 px-3 text-[11px] font-medium text-white hover:bg-emerald-500 disabled:opacity-40"
+              >
+                {opLaunching ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+                Разрешить и запустить Оператора
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Живое сопровождение Оператора, запущенного из Агента */}
+      {opTask && (() => {
+        const opApproval = parsePendingApproval(opTask.pendingApproval);
+        const opFinished = ["done", "failed", "cancelled"].includes(opTask.status);
+        const latestGuidanceEv = [...opEvents].reverse().find((e) => e.kind === "guidance");
+        const latestActionEv = [...opEvents].reverse().find((e) => e.kind === "action");
+        const guidanceText =
+          opTask.guidanceNote?.userAdvice || opTask.guidanceNote?.text || latestGuidanceEv?.text || "";
+        return (
+          <div className="space-y-2 rounded-2xl border border-cyan-500/40 bg-card p-3 text-[11px]">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="flex items-center gap-1.5 font-semibold text-text">
+                <Compass size={13} className="text-cyan-400" /> Оператор #{opTask.id}
+              </span>
+              <StatusChip status={opTask.status} />
+              {opTask.taskMode && (
+                <span className={cn("rounded-md border px-1.5 py-0.5 text-[10px]", findTaskMode(opTask.taskMode).badgeClass)}>
+                  {findTaskMode(opTask.taskMode).shortLabel}
+                </span>
+              )}
+              <span className="text-[10px] text-muted">
+                шагов {opTask.steps}/{opTask.maxSteps}
+              </span>
+              <div className="ml-auto flex items-center gap-1.5">
+                {!opFinished && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void askOperatorCoach()}
+                      disabled={opCoachBusy}
+                      className="flex items-center gap-1 rounded-md border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-medium text-cyan-400 hover:bg-cyan-500/20 disabled:opacity-50"
+                    >
+                      {opCoachBusy ? <Loader2 size={10} className="animate-spin" /> : <Sparkles size={10} />}
+                      Совет Агента
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void actOnOperatorTask("extend_steps", { addSteps: 20 })}
+                      className="rounded-md border border-border bg-card2 px-2 py-0.5 text-[10px] text-muted hover:text-text"
+                    >
+                      +20 шагов
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void actOnOperatorTask("cancel")}
+                      className="rounded-md border border-red-500/40 bg-red-500/10 px-2 py-0.5 text-[10px] text-red-500"
+                    >
+                      Остановить
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+            <p className="truncate text-[10px] text-muted">{opTask.prompt}</p>
+            {latestActionEv && (
+              <p className="rounded-lg bg-card2 px-2 py-1 text-[10px] text-emerald-500">
+                Последнее действие: {latestActionEv.text || latestActionEv.action}
+              </p>
+            )}
+            {guidanceText && (
+              <div className="rounded-lg border border-cyan-500/30 bg-cyan-500/5 px-2.5 py-1.5 text-[11px] text-text">
+                <span className="font-medium text-cyan-400">Что делать дальше: </span>
+                {guidanceText}
+              </div>
+            )}
+            {(opApproval || opTask.status === "waiting_approval" || opTask.status === "waiting_steps") && (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5">
+                <span className="text-[11px] font-medium text-amber-400">
+                  {opApproval?.title ?? "Оператор ждёт подтверждения"}
+                </span>
+                {opApproval?.kind === "step_limit" || opTask.status === "waiting_steps" ? (
+                  <button
+                    type="button"
+                    onClick={() => void actOnOperatorTask("extend_steps", { addSteps: opApproval?.extraSteps ?? 20 })}
+                    className="ml-auto rounded-md bg-emerald-600 px-2.5 py-1 text-[10px] font-medium text-white"
+                  >
+                    Добавить шаги и продолжить
+                  </button>
+                ) : (
+                  <div className="ml-auto flex gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => void actOnOperatorTask("approve", { approvalId: opApproval?.id })}
+                      className="rounded-md bg-emerald-600 px-2.5 py-1 text-[10px] font-medium text-white"
+                    >
+                      Разрешить
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void actOnOperatorTask("reject", { approvalId: opApproval?.id })}
+                      className="rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] text-red-500"
+                    >
+                      Отклонить
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+            {!opFinished && (
+              <div className="flex gap-1.5">
+                <Input
+                  value={opGuidanceInput}
+                  onChange={(e) => setOpGuidanceInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void sendOperatorGuidance();
+                    }
+                  }}
+                  placeholder="Подсказать Оператору следующий шаг…"
+                  className="h-7 text-[11px]"
+                />
+                <button
+                  type="button"
+                  onClick={() => void sendOperatorGuidance()}
+                  disabled={opCoachBusy || !opGuidanceInput.trim()}
+                  className="rounded-lg border border-border bg-card2 px-2.5 text-[10px] font-medium text-text hover:border-accent/50 disabled:opacity-40"
+                >
+                  Подсказать
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {health !== null && !available && (
         <div className="rounded-2xl border border-border bg-card p-3 text-[11px] text-muted">
           <p className="flex items-center gap-1.5 font-semibold text-text">
@@ -1667,6 +2191,53 @@ export function AgentChat({ userName }: { userName: string }) {
                     />
                   </div>
                 )}
+                {pendingApproval.kind === "call_operator" && (
+                  <div className="space-y-2 pt-1">
+                    <Textarea
+                      value={approvalTaskDraft}
+                      onChange={(e) => setApprovalTaskDraft(e.target.value)}
+                      rows={3}
+                      placeholder="Задача для Настольного Оператора"
+                      className="text-[11px]"
+                    />
+                    <div className="flex flex-wrap items-center gap-2 text-[10px]">
+                      <span className="text-muted">Режим:</span>
+                      {OPERATOR_TASK_MODES.map((m) => (
+                        <button
+                          key={m.id}
+                          type="button"
+                          onClick={() => setApprovalTaskMode(m.id)}
+                          className={cn(
+                            "rounded-md border px-2 py-0.5 font-medium transition",
+                            approvalTaskMode === m.id ? m.badgeClass : "border-border bg-card text-muted",
+                          )}
+                        >
+                          {m.shortLabel}
+                        </button>
+                      ))}
+                      <label className="ml-auto flex items-center gap-1 text-muted">
+                        <input
+                          type="checkbox"
+                          checked={approvalCoachAfter}
+                          onChange={(e) => setApprovalCoachAfter(e.target.checked)}
+                          className="h-3 w-3 accent-[#7c5cff]"
+                        />
+                        Агент подсказывает после каждого шага
+                      </label>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted">
+                      <span>Доверие Оператора:</span>
+                      <select
+                        value={approvalOpTrust}
+                        onChange={(e) => setApprovalOpTrust(e.target.value === "full" ? "full" : "verified")}
+                        className="h-7 rounded-md border border-border bg-card px-1.5 text-[10px] text-text"
+                      >
+                        <option value="verified">С подтверждением (verified)</option>
+                        <option value="full">Полный доступ (full)</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
             <div className="flex flex-wrap gap-2">
@@ -1676,7 +2247,8 @@ export function AgentChat({ userName }: { userName: string }) {
                 disabled={approvalBusy}
                 className="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
               >
-                <Check size={12} /> Разрешить
+                <Check size={12} />{" "}
+                {pendingApproval.kind === "call_operator" ? "Разрешить и запустить Оператора" : "Разрешить"}
               </button>
               <button
                 type="button"
@@ -1796,6 +2368,75 @@ export function AgentChat({ userName }: { userName: string }) {
                               {action.output}
                             </pre>
                           )}
+                        </div>
+                      );
+                    }
+                    if (action.type === "operator_plan") {
+                      const planMode = normalizeTaskMode(action.mode);
+                      return (
+                        <div
+                          key={`op-plan-${index}`}
+                          className="space-y-1.5 rounded-xl border border-cyan-500/40 bg-cyan-500/5 px-2.5 py-2 text-[11px]"
+                        >
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <MonitorCog size={13} className="text-cyan-400" />
+                            <span className="font-semibold text-text">План для Оператора</span>
+                            <span className={cn("rounded-md border px-1.5 py-0.5 text-[10px]", findTaskMode(planMode).badgeClass)}>
+                              {findTaskMode(planMode).shortLabel}
+                            </span>
+                          </div>
+                          {action.task && <p className="whitespace-pre-wrap text-text">{action.task}</p>}
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void launchOperatorFromDraft(
+                                  action.task || "",
+                                  planMode,
+                                  action.maxSteps ?? 30,
+                                )
+                              }
+                              disabled={opLaunching || !action.task}
+                              className="flex items-center gap-1 rounded-lg bg-emerald-600 px-2.5 py-1 text-[10px] font-medium text-white hover:bg-emerald-500 disabled:opacity-40"
+                            >
+                              <Check size={11} /> Разрешить и запустить Оператора
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setOpDraftPrompt(action.task || "");
+                                setOpDraftMode(planMode);
+                                setOpDraftSteps(action.maxSteps ?? 30);
+                                setOpDraftNotes(action.notes ?? "");
+                                setOpBridgeOpen(true);
+                              }}
+                              className="rounded-lg border border-border bg-card px-2 py-1 text-[10px] text-muted hover:text-text"
+                            >
+                              Изменить план
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    }
+                    if (action.type === "operator_task") {
+                      return (
+                        <div
+                          key={`op-task-${index}`}
+                          className="flex items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-2 text-[11px]"
+                        >
+                          <MonitorCog size={13} className="shrink-0 text-emerald-500" />
+                          <span className="min-w-0 flex-1 truncate text-text">
+                            Оператор запущен #{action.taskId ?? "—"} · {action.task || action.label}
+                          </span>
+                          {action.taskId ? (
+                            <button
+                              type="button"
+                              onClick={() => void refreshOpTask(action.taskId!)}
+                              className="shrink-0 text-[10px] font-medium text-emerald-500 hover:underline"
+                            >
+                              Обновить статус
+                            </button>
+                          ) : null}
                         </div>
                       );
                     }
@@ -1925,6 +2566,16 @@ export function AgentChat({ userName }: { userName: string }) {
               disabled={historyLoading || conversationId === null}
               className="max-h-32 min-h-10 min-w-0 flex-1 resize-y rounded-xl border border-border bg-card2 px-3 py-2 text-xs outline-none focus:border-accent focus:ring-2 focus:ring-[var(--ring)] disabled:opacity-60"
             />
+            <button
+              type="button"
+              onClick={() => void formulateOperatorTask(text)}
+              disabled={running || opFormulating || historyLoading || conversationId === null || !text.trim()}
+              className="flex h-10 shrink-0 items-center gap-1 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-2.5 text-[11px] font-medium text-cyan-400 transition hover:bg-cyan-500/20 disabled:opacity-40"
+              title="Попросить Агента сформулировать задачу из текста и подготовить запуск Оператора"
+            >
+              {opFormulating ? <Loader2 size={13} className="animate-spin" /> : <MonitorCog size={13} />}
+              Оператор
+            </button>
             <button
               type="button"
               onClick={() => void send()}

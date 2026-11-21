@@ -3,6 +3,7 @@ import {
   getAgentTask,
   listAgentEvents,
   respondAgentTaskApproval,
+  setAgentTaskGuidance,
   setAgentTaskStatus,
 } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
@@ -39,6 +40,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         approvalId?: string;
         note?: string;
         addSteps?: number;
+        text?: string;
+        author?: string;
       }
     | null;
 
@@ -72,6 +75,17 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const updated = await extendAgentTaskSteps(task.id, me.id, addSteps);
     if (!updated) return Response.json({ error: "Нельзя расширить лимит завершённой задачи" }, { status: 409 });
     return Response.json({ ok: true, task: updated });
+  }
+
+  if (body?.action === "guidance") {
+    const text = String(body.text ?? "").trim();
+    if (!text) return Response.json({ error: "Укажите подсказку для Оператора" }, { status: 400 });
+    const author = body.author === "agent" ? "agent" : "user";
+    const result = await setAgentTaskGuidance(task.id, me.id, { author, text });
+    if (!result) {
+      return Response.json({ error: "Задача уже завершена или отменена" }, { status: 409 });
+    }
+    return Response.json({ ok: true, task: result.task, guidance: result.guidance });
   }
 
   return Response.json({ error: "Неизвестное действие" }, { status: 400 });

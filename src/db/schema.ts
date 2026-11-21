@@ -482,6 +482,14 @@ export const agentTasks = pgTable(
     summary: text("summary").notNull().default(""),
     /** full | verified | none */
     trustLevel: text("trust_level").notNull().default("verified"),
+    /** autonomous | copilot | game */
+    taskMode: text("task_mode").notNull().default("autonomous"),
+    /** operator | agent */
+    source: text("source").notNull().default("operator"),
+    /** off | after_step | agent */
+    coachMode: text("coach_mode").notNull().default("after_step"),
+    /** JSON последней подсказки «что делать дальше» для следующего шага. */
+    guidanceNote: text("guidance_note").notNull().default(""),
     /** JSON запроса подтверждения или расширения шагов на сайте. */
     pendingApproval: text("pending_approval").notNull().default(""),
     /** JSON ответа пользователя на сайте по последнему запросу. */

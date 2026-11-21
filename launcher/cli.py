@@ -163,6 +163,14 @@ def self_test() -> int:
     check("оператор: уровень доверия передаётся флагом --trust-level",
           "--trust-level" in trust_args and "none" in trust_args)
 
+    mode_conf = settings_mod.LaunchSettings()
+    mode_conf.set_value("operator", "task_mode", "game")
+    mode_conf.set_value("operator", "coach_mode", "agent")
+    mode_args = commands.agent_args(operator, mode_conf)
+    check("оператор: режим игры и советчик Агента передаются --task-mode и --coach",
+          "--task-mode" in mode_args and "game" in mode_args
+          and "--coach" in mode_args and "agent" in mode_args)
+
     custom_conf = settings_mod.LaunchSettings()
     custom_conf.set_value("custom", "args", '--name "Иван Петров" --fast')
     custom_args = commands.agent_args(custom, custom_conf)
