@@ -1,4 +1,5 @@
 import { addAgentEvent, createAgentTask, listAgentTasks, syncOperatorTaskToConversation } from "@/db/repo";
+import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { isUnlimitedStepsRole, resolveStepsForRole } from "@/lib/genParams";
 import { normalizeCoachMode, normalizeTaskMode, normalizeTaskSource } from "@/lib/operatorModes";
@@ -15,7 +16,9 @@ const MAX_FILE_BYTES = 10 * 1024 * 1024;
 export async function GET() {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasAgentAccess(me) && !hasOperatorAccess(me)) {
+    return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
+  }
 
   const tasks = await listAgentTasks(me.id, 200);
   return Response.json({ tasks }, { headers: { "Cache-Control": "no-store" } });
@@ -24,7 +27,6 @@ export async function GET() {
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
 
   const body = (await req.json().catch(() => null)) as
     | {
@@ -38,6 +40,12 @@ export async function POST(req: Request) {
         files?: Array<{ name?: string; mime?: string; size?: number; data?: string }>;
       }
     | null;
+
+  const source = normalizeTaskSource(body?.source);
+  const allowed = source === "agent" ? hasAgentAccess(me) : hasOperatorAccess(me);
+  if (!allowed) {
+    return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
+  }
 
   const unlimited = isUnlimitedStepsRole(me.role);
   const prompt = (body?.prompt ?? "").trim();
@@ -68,7 +76,6 @@ export async function POST(req: Request) {
   const trustLevel = normalizeTrustLevel(body?.trustLevel);
   const taskMode = normalizeTaskMode(body?.taskMode ?? body?.mode);
   const coachMode = normalizeCoachMode(body?.coachMode);
-  const source = normalizeTaskSource(body?.source);
   const task = await createAgentTask(me.id, prompt, maxSteps, trustLevel, {
     taskMode,
     coachMode,

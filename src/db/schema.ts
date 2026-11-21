@@ -40,6 +40,9 @@ export const users = pgTable("users", {
   role: text("role").$type<Role>().notNull().default("user"),
   avatarColor: text("avatar_color").notNull().default("#7c5cff"),
   avatarUrl: text("avatar_url"),
+  isBot: integer("is_bot").notNull().default(0),
+  canUseAgent: integer("can_use_agent").notNull().default(0),
+  canUseOperator: integer("can_use_operator").notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -124,6 +127,96 @@ export const tasks = pgTable(
   ],
 );
 
+export type ChatRoomKind = "group" | "shared";
+
+/**
+ * Пользовательские групповые и общие чаты (создаются сотрудниками).
+ * `kind = 'group'` — закрытая группа выбранных участников;
+ * `kind = 'shared'` — открытый общий чат для нескольких человек в команде.
+ */
+export const chatRooms = pgTable(
+  "chat_rooms",
+  {
+    id: serial("id").primaryKey(),
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    kind: text("kind").$type<ChatRoomKind>().notNull().default("group"),
+    createdBy: integer("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("chat_rooms_created_by_idx").on(t.createdBy)],
+);
+
+/** Участники группового/общего чата (сотрудники и подключённые модели-боты). */
+export const chatRoomMembers = pgTable(
+  "chat_room_members",
+  {
+    id: serial("id").primaryKey(),
+    roomId: integer("room_id")
+      .notNull()
+      .references(() => chatRooms.id, { onDelete: "cascade" }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    addedBy: integer("added_by").references(() => users.id, { onDelete: "set null" }),
+    role: text("role").$type<"owner" | "member">().notNull().default("member"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("chat_room_members_room_user_uq").on(t.roomId, t.userId),
+    index("chat_room_members_user_idx").on(t.userId),
+  ],
+);
+
+/** Курсор прочтения групповых/общих чатов. */
+export const chatRoomReads = pgTable(
+  "chat_room_reads",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    roomId: integer("room_id")
+      .notNull()
+      .references(() => chatRooms.id, { onDelete: "cascade" }),
+    lastReadId: integer("last_read_id").notNull().default(0),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("chat_room_reads_user_room_uq").on(t.userId, t.roomId)],
+);
+
+/** Модели-боты, подключённые к встроенному общему чату (# Общий чат). */
+export const chatGeneralBots = pgTable("chat_general_bots", {
+  id: serial("id").primaryKey(),
+  botUserId: integer("bot_user_id")
+    .notNull()
+    .unique()
+    .references(() => users.id, { onDelete: "cascade" }),
+  addedBy: integer("added_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Настройки модели-бота, настроенной Главным админом как пользователь для чата. */
+export const aiBotConfigs = pgTable("ai_bot_configs", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .notNull()
+    .unique()
+    .references(() => users.id, { onDelete: "cascade" }),
+  provider: text("provider").notNull().default("local"),
+  baseUrl: text("base_url").notNull().default(""),
+  apiKey: text("api_key").notNull().default(""),
+  model: text("model").notNull().default(""),
+  systemPrompt: text("system_prompt").notNull().default(""),
+  paramsJson: text("params_json").notNull().default("{}"),
+  replyMode: text("reply_mode").$type<"mention" | "always">().notNull().default("mention"),
+  isActive: integer("is_active").notNull().default(1),
+  createdBy: integer("created_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const messages = pgTable(
   "messages",
   {
@@ -132,6 +225,9 @@ export const messages = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     recipientId: integer("recipient_id").references(() => users.id, {
+      onDelete: "cascade",
+    }),
+    roomId: integer("room_id").references(() => chatRooms.id, {
       onDelete: "cascade",
     }),
     content: text("content").notNull(),
@@ -144,7 +240,10 @@ export const messages = pgTable(
       .notNull()
       .defaultNow(),
   },
-  (t) => [index("messages_created_idx").on(t.createdAt)],
+  (t) => [
+    index("messages_created_idx").on(t.createdAt),
+    index("messages_room_idx").on(t.roomId, t.id),
+  ],
 );
 
 /**
@@ -540,10 +639,35 @@ export const agentEvents = pgTable(
   (t) => [index("agent_events_task_idx").on(t.taskId, t.id)],
 );
 
+/** Учёт расхода токенов за использование Агента и Оператора (видит только Главный админ). */
+export const agentUsageEvents = pgTable(
+  "agent_usage_events",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** agent | operator */
+    kind: text("kind").$type<"agent" | "operator">().notNull(),
+    refId: integer("ref_id").notNull().default(0),
+    model: text("model").notNull().default(""),
+    promptTokens: integer("prompt_tokens").notNull().default(0),
+    completionTokens: integer("completion_tokens").notNull().default(0),
+    totalTokens: integer("total_tokens").notNull().default(0),
+    month: text("month").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("agent_usage_events_user_kind_month_idx").on(t.userId, t.kind, t.month)],
+);
+
 export type User = typeof users.$inferSelect;
 export type Counterparty = typeof counterparties.$inferSelect;
 export type Task = typeof tasks.$inferSelect;
 export type Message = typeof messages.$inferSelect;
+export type ChatRoom = typeof chatRooms.$inferSelect;
+export type ChatRoomMember = typeof chatRoomMembers.$inferSelect;
+export type AiBotConfig = typeof aiBotConfigs.$inferSelect;
+export type AgentUsageEvent = typeof agentUsageEvents.$inferSelect;
 export type TaskMessage = typeof taskMessages.$inferSelect;
 export type AgentTask = typeof agentTasks.$inferSelect;
 export type AgentEvent = typeof agentEvents.$inferSelect;

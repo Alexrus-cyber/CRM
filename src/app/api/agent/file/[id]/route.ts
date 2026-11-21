@@ -1,4 +1,5 @@
 import { getAgentEventFile } from "@/db/repo";
+import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
 /** Файл, который вернул агент: скачивание из чата в браузере. */
@@ -8,6 +9,9 @@ export const runtime = "nodejs";
 export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> }) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  if (!hasAgentAccess(me) && !hasOperatorAccess(me)) {
+    return Response.json({ error: "Нет доступа" }, { status: 403 });
+  }
 
   const { id } = await ctx.params;
   const file = await getAgentEventFile(Number(id) || 0);

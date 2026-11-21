@@ -9,21 +9,25 @@ import {
   setAgentTaskStatus,
   syncOperatorTaskToConversation,
 } from "@/db/repo";
+import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
 /** Карточка задания: шаги журнала и управление (отмена, подтверждение, расширение шагов). */
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> }) {
+export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasAgentAccess(me) && !hasOperatorAccess(me)) {
+    return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
+  }
 
   const { id } = await ctx.params;
   const task = await getAgentTask(me.id, Number(id) || 0);
   if (!task) return Response.json({ error: "Задание не найдено" }, { status: 404 });
 
+  const ensureChat = new URL(req.url).searchParams.get("ensureChat") === "1";
   const [events, latestScreen, existingConv] = await Promise.all([
     listAgentEvents(task.id, 10_000),
     getLatestAgentScreen(task.id),
@@ -31,9 +35,7 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
   ]);
   const conversationId =
     existingConv?.id ??
-    (events.length > 0 || task.status !== "queued"
-      ? await syncOperatorTaskToConversation(me.id, task.id)
-      : null);
+    (ensureChat ? await syncOperatorTaskToConversation(me.id, task.id) : null);
   return Response.json(
     { task, events, latestScreen, conversationId },
     { headers: { "Cache-Control": "no-store" } },
@@ -43,7 +45,9 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
-  if (me.role !== "super_admin") return Response.json({ error: "Только главный администратор" }, { status: 403 });
+  if (!hasAgentAccess(me) && !hasOperatorAccess(me)) {
+    return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
+  }
 
   const { id } = await ctx.params;
   const task = await getAgentTask(me.id, Number(id) || 0);
@@ -62,7 +66,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   if (body?.action === "cancel") {
     await setAgentTaskStatus(task.id, me.id, "cancelled", "Отменено пользователем");
-    await syncOperatorTaskToConversation(me.id, task.id);
+    await syncOperatorTaskToConversation(me.id, task.id, { onlyIfExisting: true });
     return Response.json({ ok: true });
   }
 
@@ -73,7 +77,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       note: typeof body.note === "string" ? body.note : undefined,
     });
     if (!updated) return Response.json({ error: "Задание уже завершено или отменено" }, { status: 409 });
-    await syncOperatorTaskToConversation(me.id, task.id);
+    await syncOperatorTaskToConversation(me.id, task.id, { onlyIfExisting: true });
     return Response.json({ ok: true, task: updated });
   }
 
@@ -84,7 +88,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       note: typeof body.note === "string" ? body.note : undefined,
     });
     if (!updated) return Response.json({ error: "Задание уже завершено или отменено" }, { status: 409 });
-    await syncOperatorTaskToConversation(me.id, task.id);
+    await syncOperatorTaskToConversation(me.id, task.id, { onlyIfExisting: true });
     return Response.json({ ok: true, task: updated });
   }
 
@@ -92,7 +96,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const addSteps = Math.max(1, Number(body.addSteps ?? 15) || 15);
     const updated = await extendAgentTaskSteps(task.id, me.id, addSteps);
     if (!updated) return Response.json({ error: "Нельзя расширить лимит завершённой задачи" }, { status: 409 });
-    await syncOperatorTaskToConversation(me.id, task.id);
+    await syncOperatorTaskToConversation(me.id, task.id, { onlyIfExisting: true });
     return Response.json({ ok: true, task: updated });
   }
 
@@ -104,7 +108,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     if (!result) {
       return Response.json({ error: "Задача уже завершена или отменена" }, { status: 409 });
     }
-    const conversationId = await syncOperatorTaskToConversation(me.id, task.id);
+    const conversationId = await syncOperatorTaskToConversation(me.id, task.id, { onlyIfExisting: true });
     return Response.json({ ok: true, task: result.task, guidance: result.guidance, conversationId });
   }
 

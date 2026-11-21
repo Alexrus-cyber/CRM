@@ -13,6 +13,7 @@ import {
   Inbox,
   KeyRound,
   Loader2,
+  MessageSquare,
   MonitorCog,
   Paperclip,
   Play,
@@ -21,7 +22,9 @@ import {
   Rocket,
   Send,
   Settings2,
+  Shield,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   Square,
   Terminal,
@@ -103,6 +106,25 @@ const SUBTABS = [
 
 type SubTab = (typeof SUBTABS)[number]["id"];
 
+type OperatorLayoutMode = "tabs" | "classic";
+type OperatorDeskTabId = "model" | "trust" | "planner" | "execution";
+
+const OPERATOR_DESK_TABS: Array<{
+  id: OperatorDeskTabId;
+  label: string;
+  hint: string;
+  icon: typeof SlidersHorizontal;
+}> = [
+  { id: "model", label: "Модель и генерация", hint: "Раздумья, параметры генерации и проверка экрана", icon: SlidersHorizontal },
+  { id: "trust", label: "Доверие и сводка", hint: "Уровень доверия ИИ и счётчики очереди", icon: Shield },
+  { id: "planner", label: "Планировщик", hint: "Составление пошагового плана перед запуском", icon: MessageSquare },
+  { id: "execution", label: "Выполнение", hint: "Запуск задания на ПК и живая лента действий", icon: Play },
+];
+
+function decodeOperatorLayoutMode(raw: string): OperatorLayoutMode {
+  return raw.replace(/^"|"$/g, "") === "classic" ? "classic" : "tabs";
+}
+
 const PRESETS = [
   "Открой блокнот, напиши план на день и сохрани в файл plan.docx",
   "Открой YouTube и включи видео про космос",
@@ -163,6 +185,12 @@ type BotCheckState = {
 
 export function OperatorPanel({ unlimited = true }: { unlimited?: boolean } = {}) {
   const [tab, setTab] = useState<SubTab>("desk");
+  const [layoutMode, setLayoutMode] = useStoredJson<OperatorLayoutMode>(
+    "crm.ai.operator.layout.v1",
+    "tabs",
+    decodeOperatorLayoutMode,
+  );
+  const [deskTab, setDeskTab] = useState<OperatorDeskTabId>("execution");
   // Подключение и токен из карточки «Подключения и токены» (хранятся в базе).
   const [connection, setConnection] = useState<ConnectionSelection | null>(null);
   // Ручная вставка: пригодится, если токен выдан на другой машине.
@@ -769,6 +797,8 @@ export function OperatorPanel({ unlimited = true }: { unlimited?: boolean } = {}
     () => tasks.filter((task) => statusFilterMatches(task.status, runFilter)),
     [tasks, runFilter],
   );
+  const isDeskTabs = layoutMode === "tabs";
+  const trustMeta = findTrustLevel(trustLevel);
 
   return (
     <div className="space-y-3">
@@ -804,6 +834,38 @@ export function OperatorPanel({ unlimited = true }: { unlimited?: boolean } = {}
         <Badge className="border-border text-muted">
           <Terminal size={11} /> desktop_operator.py
         </Badge>
+        {tab === "desk" && (
+          <div
+            role="group"
+            aria-label="Режим отображения оператора"
+            className="flex items-center rounded-lg border border-border bg-card p-0.5 text-[10px]"
+          >
+            <button
+              type="button"
+              aria-pressed={isDeskTabs}
+              onClick={() => setLayoutMode("tabs")}
+              className={cn(
+                "rounded-md px-2 py-0.5 font-medium transition",
+                isDeskTabs ? "bg-accent/20 text-text" : "text-muted hover:text-text",
+              )}
+              title="Упорядоченный вид по вкладкам с выполнением на последней вкладке"
+            >
+              По вкладкам
+            </button>
+            <button
+              type="button"
+              aria-pressed={!isDeskTabs}
+              onClick={() => setLayoutMode("classic")}
+              className={cn(
+                "rounded-md px-2 py-0.5 font-medium transition",
+                !isDeskTabs ? "bg-accent/20 text-text" : "text-muted hover:text-text",
+              )}
+              title="Классический вид: все настройки, планировщик и выполнение на одном экране"
+            >
+              Классический вид
+            </button>
+          </div>
+        )}
         <div className="ml-auto flex flex-wrap items-center gap-2">
           {connection && connection.connectionId !== null && connection.tokensCount === 0 && (
             <button
@@ -861,67 +923,168 @@ export function OperatorPanel({ unlimited = true }: { unlimited?: boolean } = {}
       {/* Пульт */}
       {tab === "desk" && (
         <div className="space-y-3">
-          <div className="grid gap-2 grid-cols-2 lg:grid-cols-4">
-            <MetricCard label="В очереди" value={counts.queued} hint="ждёт бота" icon={<Inbox size={12} />} />
-            <MetricCard label="В работе" value={counts.running} hint="выполняется сейчас" icon={<Loader2 size={12} />} />
-            <MetricCard label="Готово" value={counts.done} hint="из последних запусков" icon={<Check size={12} />} />
-            <MetricCard label="Файлы" value={files.length} hint="в открытом запуске" icon={<FileText size={12} />} />
+          {isDeskTabs && (
+            <div
+              role="tablist"
+              aria-label="Разделы пульта оператора"
+              className="flex gap-1 overflow-x-auto rounded-2xl border border-border bg-card p-1"
+            >
+              {OPERATOR_DESK_TABS.map((item) => {
+                const Icon = item.icon;
+                const selected = deskTab === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    title={item.hint}
+                    onClick={() => setDeskTab(item.id)}
+                    className={cn(
+                      "flex shrink-0 items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium transition",
+                      selected
+                        ? "bg-gradient-to-r from-accent/25 to-transparent text-text ring-1 ring-accent/30"
+                        : "text-muted hover:bg-card2 hover:text-text",
+                    )}
+                  >
+                    <Icon size={13} />
+                    {item.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          <div
+            role={isDeskTabs ? "tabpanel" : undefined}
+            aria-label="Доверие и сводка"
+            hidden={isDeskTabs && deskTab !== "trust"}
+            className="space-y-3"
+          >
+            <div className="grid gap-2 grid-cols-2 lg:grid-cols-4">
+              <MetricCard label="В очереди" value={counts.queued} hint="ждёт бота" icon={<Inbox size={12} />} />
+              <MetricCard label="В работе" value={counts.running} hint="выполняется сейчас" icon={<Loader2 size={12} />} />
+              <MetricCard label="Готово" value={counts.done} hint="из последних запусков" icon={<Check size={12} />} />
+              <MetricCard label="Файлы" value={files.length} hint="в открытом запуске" icon={<FileText size={12} />} />
+            </div>
+
+            <TrustSelector value={trustLevel} onChange={setTrustLevel} />
           </div>
 
-          <TrustSelector value={trustLevel} onChange={setTrustLevel} />
-
-          <GenSettings
-            value={genParams}
-            onChange={setGenParams}
-            defaultOpen
-            capabilities={modelCapabilities}
-            unlimited={unlimited}
-            modelName={resolvedModelName}
-            onRefreshCapabilities={() => void refreshModelCapabilities()}
-            refreshingCapabilities={refreshingCaps}
-            subtitle="Раздумья модели (подтягиваются по возможностям модели) и параметры генерации. Действуют и на планировщик, и на команду запуска бота."
+          <div
+            role={isDeskTabs ? "tabpanel" : undefined}
+            aria-label="Модель и генерация"
+            hidden={isDeskTabs && deskTab !== "model"}
+            className="space-y-3"
           >
-            <div className="grid gap-2 sm:grid-cols-2">
-              <label className="flex items-start gap-2 text-[11px] text-muted">
-                <input
-                  type="checkbox"
-                  checked={!verifyOff}
-                  onChange={(event) => setVerifyOff(!event.target.checked)}
-                  className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[#7c5cff]"
-                />
-                <span>
-                  Анализировать экран <strong className="font-medium text-text">после каждого действия</strong>:
-                  бот делает скриншот и спрашивает модель, получилось ли. Надёжнее, но на один запрос к модели больше.
-                </span>
-              </label>
-              <div className="space-y-1.5">
-                <p className="text-[10px] leading-relaxed text-muted">
-                  Бот получает эти настройки флагами{" "}
-                  <code className="font-mono">--temperature</code>, <code className="font-mono">--reasoning</code> и
-                  другими. Скопируйте команду и перезапустите бота — ключ API в CRM не сохраняется.
-                </p>
-                <Button size="sm" variant="secondary" onClick={() => void copy(commandToCopy, "gen-command")}>
-                  <ClipboardCopy size={12} />
-                  {copied === "gen-command" ? "Команда скопирована" : "Скопировать команду с этими настройками"}
-                </Button>
-              </div>
-            </div>
-          </GenSettings>
-
-          {/* Два чата: сначала план, потом действия на компьютере */}
-          <div className="grid gap-3 lg:grid-cols-2">
-            <PlannerChat
-              providerLabel={providerMeta.label}
-              params={genParams}
+            <GenSettings
+              value={genParams}
+              onChange={setGenParams}
+              defaultOpen
+              capabilities={modelCapabilities}
               unlimited={unlimited}
-              baseUrl={providerBaseUrl(provider)}
-              model={model.trim() || providerMeta.defaultModel}
-              apiKey={apiKey.trim()}
-              onOpenSetup={() => setTab("setup")}
-              onTransfer={(plan, planFiles) => createTask(plan, planFiles)}
-            />
+              modelName={resolvedModelName}
+              onRefreshCapabilities={() => void refreshModelCapabilities()}
+              refreshingCapabilities={refreshingCaps}
+              subtitle="Раздумья модели (подтягиваются по возможностям модели) и параметры генерации. Действуют и на планировщик, и на команду запуска бота."
+            >
+              <div className="grid gap-2 sm:grid-cols-2">
+                <label className="flex items-start gap-2 text-[11px] text-muted">
+                  <input
+                    type="checkbox"
+                    checked={!verifyOff}
+                    onChange={(event) => setVerifyOff(!event.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[#7c5cff]"
+                  />
+                  <span>
+                    Анализировать экран <strong className="font-medium text-text">после каждого действия</strong>:
+                    бот делает скриншот и спрашивает модель, получилось ли. Надёжнее, но на один запрос к модели больше.
+                  </span>
+                </label>
+                <div className="space-y-1.5">
+                  <p className="text-[10px] leading-relaxed text-muted">
+                    Бот получает эти настройки флагами{" "}
+                    <code className="font-mono">--temperature</code>, <code className="font-mono">--reasoning</code> и
+                    другими. Скопируйте команду и перезапустите бота — ключ API в CRM не сохраняется.
+                  </p>
+                  <Button size="sm" variant="secondary" onClick={() => void copy(commandToCopy, "gen-command")}>
+                    <ClipboardCopy size={12} />
+                    {copied === "gen-command" ? "Команда скопирована" : "Скопировать команду с этими настройками"}
+                  </Button>
+                </div>
+              </div>
+            </GenSettings>
+          </div>
 
-            <Card
+          {/* Два блока: планировщик и выполнение на компьютере */}
+          <div className={cn(isDeskTabs ? "space-y-3" : "grid gap-3 lg:grid-cols-2")}>
+            <div
+              role={isDeskTabs ? "tabpanel" : undefined}
+              aria-label="Планировщик"
+              hidden={isDeskTabs && deskTab !== "planner"}
+            >
+              <PlannerChat
+                providerLabel={providerMeta.label}
+                params={genParams}
+                unlimited={unlimited}
+                baseUrl={providerBaseUrl(provider)}
+                model={model.trim() || providerMeta.defaultModel}
+                apiKey={apiKey.trim()}
+                onOpenSetup={() => setTab("setup")}
+                onTransfer={(plan, planFiles) => {
+                  if (isDeskTabs) setDeskTab("execution");
+                  return createTask(plan, planFiles);
+                }}
+              />
+            </div>
+
+            <div
+              role={isDeskTabs ? "tabpanel" : undefined}
+              aria-label="Выполнение"
+              hidden={isDeskTabs && deskTab !== "execution"}
+              className="space-y-3"
+            >
+              {isDeskTabs && (
+                <div className="flex flex-wrap items-center gap-1.5 rounded-xl border border-border bg-card px-2.5 py-1.5 text-[10px] text-muted">
+                  <button
+                    type="button"
+                    onClick={() => setDeskTab("model")}
+                    className="rounded-md border border-border bg-card2 px-2 py-0.5 text-text hover:border-accent/50"
+                  >
+                    Модель: {resolvedModelName}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeskTab("model")}
+                    className="rounded-md border border-border bg-card2 px-2 py-0.5 hover:text-text"
+                  >
+                    Раздумья: {genParams.reasoning}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeskTab("trust")}
+                    className="rounded-md border border-border bg-card2 px-2 py-0.5 hover:text-text"
+                  >
+                    Доверие: {trustMeta.shortLabel}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeskTab("trust")}
+                    className="rounded-md border border-border bg-card2 px-2 py-0.5 hover:text-text"
+                  >
+                    Очередь: {counts.queued} · В работе: {counts.running} · Готово: {counts.done}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeskTab("planner")}
+                    className="ml-auto rounded-md border border-accent/30 bg-accent/10 px-2 py-0.5 font-medium text-accent2 hover:bg-accent/20"
+                  >
+                    Открыть планировщик →
+                  </button>
+                </div>
+              )}
+
+              <Card
               title={
                 <span className="flex flex-wrap items-center gap-2">
                   2. Выполнение
@@ -1105,8 +1268,10 @@ export function OperatorPanel({ unlimited = true }: { unlimited?: boolean } = {}
               </div>
               {error && <p className="mt-2 text-[11px] text-red-500">{error}</p>}
             </Card>
+            </div>
           </div>
 
+          <div hidden={isDeskTabs && deskTab !== "execution"}>
           {!activeTask ? (
             <EmptyState
               title="Запусков пока нет"
@@ -1364,6 +1529,7 @@ export function OperatorPanel({ unlimited = true }: { unlimited?: boolean } = {}
               </Card>
             </div>
           )}
+          </div>
         </div>
       )}
 

@@ -28,6 +28,6 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   await setAgentTaskStatus(task.id, ownerId, status, summary);
   await addAgentEvent({ taskId: task.id, kind: "info", text: summary || `Задание завершено: ${status}` });
-  const conversationId = await syncOperatorTaskToConversation(ownerId, task.id);
+  const conversationId = await syncOperatorTaskToConversation(ownerId, task.id, { onlyIfExisting: true });
   return Response.json({ ok: true, conversationId });
 }

@@ -23,6 +23,8 @@ type Toast = {
   senderName: string;
   senderColor: string;
   recipientId: number | null;
+  roomId?: number | null;
+  roomName?: string | null;
   preview: string;
 };
 
@@ -117,6 +119,8 @@ export function MessageToasts({ userId }: { userId: number }) {
             senderName: chat.senderName,
             senderColor: chat.senderColor,
             recipientId: chat.recipientId,
+            roomId: chat.roomId ?? null,
+            roomName: chat.roomName ?? null,
             preview: chat.preview,
           });
         } catch {
@@ -141,6 +145,8 @@ export function MessageToasts({ userId }: { userId: number }) {
             senderName: string;
             senderColor: string;
             recipientId: number | null;
+            roomId?: number | null;
+            roomName?: string | null;
             preview: string;
           }>;
         };
@@ -151,6 +157,8 @@ export function MessageToasts({ userId }: { userId: number }) {
             senderName: m.senderName,
             senderColor: m.senderColor,
             recipientId: m.recipientId,
+            roomId: m.roomId ?? null,
+            roomName: m.roomName ?? null,
             preview: m.preview,
           });
         }
@@ -192,9 +200,13 @@ export function MessageToasts({ userId }: { userId: number }) {
           <button
             type="button"
             onClick={() => {
-              const peer = toast.recipientId === null ? 0 : toast.senderId;
               dismiss(toast.messageId);
-              router.push(peer === 0 ? "/team?chat=0" : `/team?chat=${peer}`);
+              if (toast.roomId && toast.roomId > 0) {
+                router.push(`/team?room=${toast.roomId}`);
+              } else {
+                const peer = toast.recipientId === null ? 0 : toast.senderId;
+                router.push(peer === 0 ? "/team?chat=0" : `/team?chat=${peer}`);
+              }
             }}
             className="flex w-full items-start gap-2.5 p-3 pr-8 text-left transition hover:bg-card2"
           >
@@ -208,7 +220,7 @@ export function MessageToasts({ userId }: { userId: number }) {
               <span className="flex items-center gap-1.5">
                 <span className="truncate text-[13px] font-semibold">{toast.senderName}</span>
                 <span className="shrink-0 rounded-md bg-accent/15 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-accent2">
-                  {toast.recipientId === null ? "общий чат" : "личное"}
+                  {toast.roomId ? toast.roomName || "группа" : toast.recipientId === null ? "общий чат" : "личное"}
                 </span>
               </span>
               <span className="mt-0.5 line-clamp-2 block text-[12px] leading-snug text-muted">{toast.preview}</span>

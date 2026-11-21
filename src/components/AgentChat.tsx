@@ -150,6 +150,7 @@ type AgentConversation = {
   id: number;
   kind: "agent";
   title: string;
+  operatorTaskId?: number | null;
   messagesCount: number;
   updatedAt: string;
 };
@@ -516,6 +517,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const counter = useRef(0);
   const conversationIdRef = useRef<number | null>(null);
   const opTaskRef = useRef<OperatorTask | null>(null);
+  const dismissedOpTaskIdsRef = useRef<Set<number>>(new Set());
   const runningRef = useRef(false);
 
   useEffect(() => {
@@ -579,7 +581,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const loadHealth = useCallback(async (): Promise<Health> => {
     try {
       const res = await fetch("/api/ai/agent", { cache: "no-store" });
-      if (!res.ok) return { available: false, hint: "Агент доступен только главному администратору" };
+      if (!res.ok) return { available: false, hint: "Агент сейчас недоступен или нет прав доступа" };
       const data = (await res.json()) as Record<string, unknown>;
       return {
         available: Boolean(data.available),
@@ -786,10 +788,19 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const deleteCurrentConversation = async () => {
     if (conversationId === null || running || historyLoading) return;
     const id = conversationId;
+    const targetConv = conversations.find((c) => c.id === id) ?? null;
     setHistoryLoading(true);
     try {
       const res = await fetch(`/api/agent/conversations/${id}`, { method: "DELETE" });
       if (!res.ok) throw new Error("Не удалось удалить чат агента");
+      if (targetConv?.operatorTaskId) {
+        dismissedOpTaskIdsRef.current.add(targetConv.operatorTaskId);
+        if (opTaskRef.current?.id === targetConv.operatorTaskId) {
+          setOpTask(null);
+          setOpEvents([]);
+          setOpConversationId(null);
+        }
+      }
       const rest = conversations.filter((item) => item.id !== id);
       setConversations(rest);
       if (rest.length > 0) await openConversation(rest[0].id);
@@ -799,6 +810,32 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     } finally {
       setHistoryLoading(false);
     }
+  };
+
+  const exitOperatorTaskChat = async () => {
+    if (running || historyLoading) return;
+    const currentOpTaskId = currentConversation?.operatorTaskId;
+    if (currentOpTaskId) {
+      dismissedOpTaskIdsRef.current.add(currentOpTaskId);
+      if (opTaskRef.current?.id === currentOpTaskId) {
+        setOpTask(null);
+        setOpEvents([]);
+        setOpConversationId(null);
+      }
+    }
+    const regular = conversations.find((c) => c.id !== conversationId && !c.operatorTaskId);
+    if (regular) {
+      await selectConversation(regular.id);
+    } else {
+      await startNewConversation();
+    }
+  };
+
+  const closeOperatorTaskCard = () => {
+    if (opTask) dismissedOpTaskIdsRef.current.add(opTask.id);
+    setOpTask(null);
+    setOpEvents([]);
+    setOpConversationId(null);
   };
 
   /* --------------------------- Summary и архивация --------------------------- */
@@ -1085,8 +1122,10 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           : [];
         setRecentOpTasks(list.slice(0, 8));
         if (!opTaskRef.current) {
-          const active = list.find((t) =>
-            ["running", "waiting_approval", "waiting_steps", "queued"].includes(t.status),
+          const active = list.find(
+            (t) =>
+              !dismissedOpTaskIdsRef.current.has(t.id) &&
+              ["running", "waiting_approval", "waiting_steps", "queued"].includes(t.status),
           );
           if (active) {
             void refreshOpTask(active.id);
@@ -1359,6 +1398,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           return;
         }
         launchedTaskId = launchData.task.id;
+        dismissedOpTaskIdsRef.current.delete(launchData.task.id);
         setOpTask(launchData.task);
         setOpEvents([]);
         setNotice(
@@ -1475,6 +1515,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         setError(data.error ?? "Не удалось запустить Оператора");
         return;
       }
+      dismissedOpTaskIdsRef.current.delete(data.task.id);
       setOpTask(data.task);
       setOpEvents([]);
       setNotice(`Задача #${data.task.id} отправлена Оператору по вашему согласию (режим: ${findTaskMode(mode).shortLabel}).`);
@@ -1540,6 +1581,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     const taskId = targetTaskId ?? opTask?.id;
     if (!taskId || running || historyLoading) return;
     setError(null);
+    dismissedOpTaskIdsRef.current.delete(taskId);
     try {
       let convId = targetTaskId === opTask?.id ? opConversationId : null;
       if (!convId) {
@@ -1547,11 +1589,21 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         convId = typeof refreshed?.conversationId === "number" ? refreshed.conversationId : null;
       }
       if (!convId) {
+        const ensureRes = await fetch(`/api/agent/tasks/${taskId}?ensureChat=1`, { cache: "no-store" });
+        if (ensureRes.ok) {
+          const ensureData = (await ensureRes.json().catch(() => ({}))) as {
+            conversationId?: number | null;
+          };
+          convId = typeof ensureData.conversationId === "number" ? ensureData.conversationId : null;
+        }
+      }
+      if (!convId) {
         setError(`Чат для задачи Оператора #${taskId} ещё не сформирован`);
         return;
       }
       await refreshConversations();
       await openConversation(convId);
+      if (layoutMode === "tabs") setActiveTab("chat");
       setNotice(`Открыт чат задачи Оператора #${taskId} (история сохраняется автоматически).`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Не удалось открыть чат задачи Оператора");
@@ -2831,7 +2883,15 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   <button
                     key={t.id}
                     type="button"
-                    onClick={() => void refreshOpTask(t.id)}
+                    onClick={() => {
+                      if (opTask?.id === t.id) {
+                        closeOperatorTaskCard();
+                      } else {
+                        dismissedOpTaskIdsRef.current.delete(t.id);
+                        void refreshOpTask(t.id);
+                      }
+                    }}
+                    title={opTask?.id === t.id ? "Нажмите, чтобы свернуть карточку задачи" : "Открыть статус и ленту этой задачи"}
                     className={cn(
                       "flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[10px] transition",
                       opTask?.id === t.id
@@ -2916,6 +2976,15 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                     </button>
                   </>
                 )}
+                <button
+                  type="button"
+                  onClick={closeOperatorTaskCard}
+                  className="rounded-md border border-border bg-card2 p-1 text-muted transition hover:text-text"
+                  title="Скрыть карточку задачи Оператора"
+                  aria-label="Скрыть карточку задачи Оператора"
+                >
+                  <X size={11} />
+                </button>
               </div>
             </div>
             <p className="truncate text-[10px] text-muted">{opTask.prompt}</p>
@@ -3075,6 +3144,17 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             {summarizing ? <Loader2 size={12} className="animate-spin" /> : <Archive size={12} />}
             Сжать в Summary и новый чат
           </button>
+          {currentConversation?.operatorTaskId && (
+            <button
+              type="button"
+              onClick={() => void exitOperatorTaskChat()}
+              disabled={historyLoading || running}
+              className="flex h-8 items-center gap-1 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2 text-[10px] font-medium text-cyan-400 transition hover:bg-cyan-500/20 disabled:opacity-40"
+              title="Выйти из чата задачи Оператора в обычный чат"
+            >
+              <X size={12} /> Закрыть чат задачи
+            </button>
+          )}
           <button
             type="button"
             onClick={() => void startNewConversation()}

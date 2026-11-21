@@ -3,9 +3,10 @@ import { notFound } from "next/navigation";
 import { ArrowLeft, Mail, MessageCircle, Phone, Shield, Trophy, Briefcase, CalendarDays } from "lucide-react";
 import { requireUser } from "@/lib/auth";
 import { getAchievementSummaries, getAllTasks, getUserById, getUsers } from "@/lib/data";
-import { getAiQuotaOverride, getAiUsage, listAiChats } from "@/db/repo";
-import { aiPolicyFor } from "@/lib/aiPolicy";
+import { getAgentUsage, getAiQuotaOverride, getAiUsage, listAiChats } from "@/db/repo";
+import { aiPolicyFor, canViewAgentUsage } from "@/lib/aiPolicy";
 import { AiUsageSummary } from "@/components/AiUsageSummary";
+import { AgentUsageCard } from "@/components/AgentUsageCard";
 import { formatDate, dateToStr, isCompanyRole, OPEN_STATUSES, ROLE_LABELS, roleBadgeClass, todayStr } from "@/lib/utils";
 import { Avatar, Badge, Button, Card, StatusBadge } from "@/components/ui";
 import { UserAchievementsPanel } from "@/components/Achievements";
@@ -18,15 +19,17 @@ export default async function UserPage({ params }: { params: Promise<{ id: strin
   const { id } = await params;
   const userId = Number(id);
   if (!Number.isFinite(userId)) notFound();
-  const [user, users, allTasks, aiUsage, aiOverride, aiChats] = await Promise.all([
+  const showAgentUsage = canViewAgentUsage(me);
+  const [user, users, allTasks, aiUsage, aiOverride, aiChats, agentUsage] = await Promise.all([
     getUserById(userId),
     getUsers(),
     getAllTasks(),
     getAiUsage(userId),
     getAiQuotaOverride(userId),
     listAiChats(userId, 200),
+    showAgentUsage ? getAgentUsage(userId) : Promise.resolve(null),
   ]);
-  if (!user) notFound();
+  if (!user || user.isBot) notFound();
   const aiPolicy = aiPolicyFor(user.role, aiOverride?.monthlyLimit ?? null);
   const summaries = await getAchievementSummaries(users, allTasks);
   const idx = summaries.findIndex((s) => s.user.id === userId);
@@ -86,6 +89,13 @@ export default async function UserPage({ params }: { params: Promise<{ id: strin
               chats={aiChats.length}
               override={aiOverride?.monthlyLimit ?? null}
               summary={aiPolicy.summary}
+            />
+          )}
+          {showAgentUsage && agentUsage && (
+            <AgentUsageCard
+              usage={agentUsage}
+              title="Токены Агента и Оператора"
+              subtitle="Видно только главному администратору"
             />
           )}
           <Card title={`Открытые задачи (${userOpen.length})`} subtitle="Текущая загрузка сотрудника" action={<Link href={`/tasks?assignee=${user.id}`} className="text-xs font-medium text-accent2 hover:underline">Все →</Link>}>

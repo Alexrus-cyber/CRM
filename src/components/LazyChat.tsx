@@ -1,6 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import type { Role } from "@/db/schema";
 import type { UserLite } from "@/lib/data";
 import { LazyMount } from "./lazy";
 import { ChatSkeleton } from "./skeletons";
@@ -18,12 +19,16 @@ const ChatClient = dynamic(() => import("./ChatClient").then((module) => module.
 export function LazyChat({
   users,
   meId,
+  meRole,
   initialPeer,
+  initialRoom,
   unlimited = false,
 }: {
   users: UserLite[];
   meId: number;
+  meRole: Role;
   initialPeer?: number;
+  initialRoom?: number;
   unlimited?: boolean;
 }) {
   return (
@@ -33,7 +38,14 @@ export function LazyChat({
       label="Загружаем чат..."
       fallback={<ChatSkeleton />}
     >
-      <ChatClient users={users} meId={meId} initialPeer={initialPeer} unlimited={unlimited} />
+      <ChatClient
+        users={users}
+        meId={meId}
+        meRole={meRole}
+        initialPeer={initialPeer}
+        initialRoom={initialRoom}
+        unlimited={unlimited}
+      />
     </LazyMount>
   );
 }

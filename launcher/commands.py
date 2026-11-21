@@ -12,6 +12,7 @@ import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
+from launcher import crm_client
 from launcher.catalog import PROVIDER_PRESETS, AgentSpec
 from launcher.settings import LaunchSettings
 
@@ -43,6 +44,13 @@ def number(value: Any, kind: type) -> Any:
 def model_settings(settings: LaunchSettings) -> Dict[str, Any]:
     """Общие параметры модели в нормализованном виде."""
     provider = settings.provider if settings.provider in PROVIDER_PRESETS or settings.provider == "custom" else "local"
+    limits = crm_client.profile_limits(settings.crm_profile)
+    raw_reasoning = settings.reasoning or "default"
+    reasoning = (
+        crm_client.clamp_reasoning(raw_reasoning, limits.get("reasoning"))
+        if limits.get("reasoning")
+        else raw_reasoning
+    )
     return {
         "provider": provider,
         "base_url": settings.resolved_base_url(),
@@ -51,7 +59,7 @@ def model_settings(settings: LaunchSettings) -> Dict[str, Any]:
         "temperature": number(settings.temperature, float),
         "top_p": number(settings.top_p, float),
         "max_tokens": number(settings.max_tokens, int),
-        "reasoning": settings.reasoning or "default",
+        "reasoning": reasoning,
     }
 
 
@@ -83,8 +91,11 @@ def operator_args(spec: AgentSpec, settings: LaunchSettings) -> List[str]:
         _add_flag(args, "--reasoning", model["reasoning"])
 
     mode = str(values.get("mode") or "watch")
-    _add_flag(args, "--server", values.get("crm_server"))
-    _add_flag(args, "--token", values.get("crm_token"))
+    profile_op = settings.crm_profile.get("operator") if isinstance(settings.crm_profile, dict) else None
+    crm_server = values.get("crm_server") or (profile_op.get("serverUrl") if isinstance(profile_op, dict) else "")
+    crm_token = values.get("crm_token") or (profile_op.get("token") if isinstance(profile_op, dict) else "")
+    _add_flag(args, "--server", crm_server)
+    _add_flag(args, "--token", crm_token)
     if mode == "watch":
         args.append("--watch")
     elif mode == "once":
@@ -93,6 +104,13 @@ def operator_args(spec: AgentSpec, settings: LaunchSettings) -> List[str]:
         _add_flag(args, "--task", values.get("task"))
 
     steps = number(values.get("max_steps"), int)
+    if settings.crm_profile:
+        limits = crm_client.profile_limits(settings.crm_profile)
+        steps = crm_client.clamp_max_steps(
+            steps,
+            number(limits.get("maxSteps"), int),
+            bool(limits.get("unlimited")),
+        )
     if steps:
         args.extend(["--max-steps", str(steps)])
     delay = number(values.get("delay"), float)
@@ -135,6 +153,13 @@ def chat_agent_env(spec: AgentSpec, settings: LaunchSettings) -> Dict[str, str]:
         "AGENT_API_KEY": model["api_key"],
     }
     steps = number(values.get("max_steps"), int)
+    if settings.crm_profile:
+        limits = crm_client.profile_limits(settings.crm_profile)
+        steps = crm_client.clamp_max_steps(
+            steps,
+            number(limits.get("maxSteps"), int),
+            bool(limits.get("unlimited")),
+        )
     if steps:
         env["AGENT_MAX_STEPS"] = str(steps)
     trust_level = str(values.get("trust_level") or "verified").strip().lower()
@@ -194,11 +219,16 @@ def agent_args(spec: AgentSpec, settings: LaunchSettings) -> List[str]:
 
 def agent_env(spec: AgentSpec, settings: LaunchSettings) -> Dict[str, str]:
     """Дополнительные переменные окружения агента (без системных)."""
+    env: Dict[str, str] = {}
+    if settings.crm_url.strip():
+        env["CRM_SERVER_URL"] = crm_client.normalize_server_url(settings.crm_url)
+    if settings.crm_session_token.strip():
+        env["CRM_LAUNCHER_SESSION_TOKEN"] = settings.crm_session_token.strip()
     if spec.id == "chat_agent":
-        return chat_agent_env(spec, settings)
-    if spec.id == "custom":
-        return custom_env(spec, settings)
-    return {}
+        env.update(chat_agent_env(spec, settings))
+    elif spec.id == "custom":
+        env.update(custom_env(spec, settings))
+    return env
 
 
 def script_path(spec: AgentSpec, settings: LaunchSettings, agents_dir: Path) -> Path | None:
@@ -231,6 +261,11 @@ def validate(spec: AgentSpec, settings: LaunchSettings, agents_dir: Path) -> Lis
     model = model_settings(settings)
     values = settings.values_for(spec)
 
+    if settings.crm_profile:
+        allowed, reason = crm_client.can_launch_agent(spec.id, settings.crm_profile)
+        if not allowed and reason:
+            warnings.append(reason)
+
     if model["max_tokens"] and model["max_tokens"] > 384000:
         warnings.append("max_tokens больше 384000 — большинство серверов такой вывод не поддержат.")
 
@@ -246,7 +281,11 @@ def validate(spec: AgentSpec, settings: LaunchSettings, agents_dir: Path) -> Lis
 
     if spec.id == "operator":
         mode = str(values.get("mode") or "watch")
-        if mode != "task" and not str(values.get("crm_token") or "").strip():
+        profile_op = settings.crm_profile.get("operator") if isinstance(settings.crm_profile, dict) else None
+        effective_token = str(values.get("crm_token") or "").strip() or str(
+            (profile_op or {}).get("token") or ""
+        ).strip()
+        if mode != "task" and not effective_token:
             warnings.append("Без токена агента оператор не получит задания из CRM.")
         if mode == "task" and not str(values.get("task") or "").strip():
             warnings.append("Режим «Разовое задание», но само задание не заполнено.")
@@ -277,5 +316,7 @@ def describe_command(command: Sequence[str], env: Mapping[str, str]) -> str:
             skip_next = True
             continue
         shown.append(part if " " not in part else f'"{part}"')
-    env_part = " ".join(f"{key}=•••" for key in sorted(env) if "KEY" in key.upper())
+    env_part = " ".join(
+        f"{key}=•••" for key in sorted(env) if "KEY" in key.upper() or "TOKEN" in key.upper()
+    )
     return " ".join(shown) + (f"  [{env_part}]" if env_part else "")

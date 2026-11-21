@@ -1,7 +1,21 @@
 import { Bot, FlaskConical, Gauge, MessagesSquare, MonitorCog, Sparkles, ShieldCheck } from "lucide-react";
 import { requireUser } from "@/lib/auth";
-import { getAiQuotaOverride, getAiUsage, listAiChats } from "@/db/repo";
-import { aiPolicyFor, AI_ROLE_POLICY, formatStepLimit, formatTokenCount } from "@/lib/aiPolicy";
+import {
+  getAgentUsage,
+  getAiQuotaOverride,
+  getAiUsage,
+  listAiChats,
+  listUsersAgentUsage,
+} from "@/db/repo";
+import {
+  aiPolicyFor,
+  AI_ROLE_POLICY,
+  canViewAgentUsage,
+  formatStepLimit,
+  formatTokenCount,
+  hasAgentAccess,
+  hasOperatorAccess,
+} from "@/lib/aiPolicy";
 import { ROLE_LABELS } from "@/lib/utils";
 import { Badge, Card, PageHeader } from "@/components/ui";
 import { LazyAiChat } from "@/components/LazyAiChat";
@@ -9,16 +23,23 @@ import { AgentChat } from "@/components/AgentChat";
 import { OperatorPanel } from "@/components/OperatorPanel";
 import { AiTabs, type AiTab } from "@/components/AiTabs";
 import { AiUsageSummary } from "@/components/AiUsageSummary";
+import { AgentUsageCard } from "@/components/AgentUsageCard";
 
 export const dynamic = "force-dynamic";
 
 export default async function AiPage() {
   const user = await requireUser();
   const isSuperAdmin = user.role === "super_admin";
-  const [usage, override, chats] = await Promise.all([
+  const agentAllowed = hasAgentAccess(user);
+  const operatorAllowed = hasOperatorAccess(user);
+  const canSeeAgentUsage = canViewAgentUsage(user);
+
+  const [usage, override, chats, agentUsage, allUsersAgentUsage] = await Promise.all([
     getAiUsage(user.id),
     getAiQuotaOverride(user.id),
     listAiChats(user.id, isSuperAdmin ? 1000 : 200),
+    canSeeAgentUsage ? getAgentUsage(user.id) : Promise.resolve(null),
+    canSeeAgentUsage ? listUsersAgentUsage() : Promise.resolve([]),
   ]);
   const policy = aiPolicyFor(user.role, override?.monthlyLimit ?? null);
 
@@ -32,22 +53,71 @@ export default async function AiPage() {
     },
   ];
 
-  if (isSuperAdmin) {
+  if (agentAllowed) {
     tabs.push({
       id: "agent",
       label: "Агент",
       hint: "Эксперимент: агент создаёт файлы и управляет экраном",
       icon: <Bot size={14} />,
-      content: <AgentChat userName={user.name} unlimited />,
+      content: <AgentChat userName={user.name} unlimited={isSuperAdmin} />,
     });
+  }
+
+  if (operatorAllowed) {
     tabs.push({
       id: "operator",
       label: "Оператор",
       hint: "Бот, который управляет рабочим столом и возвращает файлы в чат",
       icon: <MonitorCog size={14} />,
-      content: <OperatorPanel unlimited />,
+      content: <OperatorPanel unlimited={isSuperAdmin} />,
     });
   }
+
+  const companyAgentSummary = agentUsage
+    ? {
+        currentMonth: agentUsage.currentMonth,
+        month: {
+          agent: {
+            prompt: 0,
+            completion: 0,
+            total: allUsersAgentUsage.reduce((s, r) => s + r.monthAgent, 0),
+            events: 0,
+          },
+          operator: {
+            prompt: 0,
+            completion: 0,
+            total: allUsersAgentUsage.reduce((s, r) => s + r.monthOperator, 0),
+            events: 0,
+          },
+          total: {
+            prompt: 0,
+            completion: 0,
+            total: allUsersAgentUsage.reduce((s, r) => s + r.monthTotal, 0),
+            events: 0,
+          },
+        },
+        all: {
+          agent: {
+            prompt: 0,
+            completion: 0,
+            total: allUsersAgentUsage.reduce((s, r) => s + r.allAgent, 0),
+            events: 0,
+          },
+          operator: {
+            prompt: 0,
+            completion: 0,
+            total: allUsersAgentUsage.reduce((s, r) => s + r.allOperator, 0),
+            events: 0,
+          },
+          total: {
+            prompt: 0,
+            completion: 0,
+            total: allUsersAgentUsage.reduce((s, r) => s + r.allTotal, 0),
+            events: agentUsage.all.total.events,
+          },
+        },
+      }
+    : null;
 
   tabs.push({
     id: "limits",
@@ -65,6 +135,30 @@ export default async function AiPage() {
           override={override?.monthlyLimit ?? null}
           summary={policy.summary}
         />
+
+        {canSeeAgentUsage && companyAgentSummary && (
+          <AgentUsageCard
+            usage={companyAgentSummary}
+            users={allUsersAgentUsage}
+            title="Расход токенов Агента и Оператора"
+            subtitle="Виден только главному администратору · токены не ограничены и не входят в квоту чата"
+          />
+        )}
+
+        {!canSeeAgentUsage && (agentAllowed || operatorAllowed) && (
+          <Card
+            title="Доступ к Агенту и Оператору"
+            subtitle="Выдан главным администратором"
+          >
+            <p className="text-xs text-muted">
+              Открыт доступ:{" "}
+              <b className="text-text">
+                {[agentAllowed ? "Агент" : "", operatorAllowed ? "Оператор" : ""].filter(Boolean).join(", ")}
+              </b>
+              . Использование этих инструментов не расходует ваш месячный лимит токенов чата с ИИ.
+            </p>
+          </Card>
+        )}
 
         <Card
           title={
@@ -123,7 +217,7 @@ export default async function AiPage() {
       <PageHeader
         title="Чат с ИИ"
         subtitle={
-          isSuperAdmin
+          agentAllowed || operatorAllowed
             ? "Диалог с моделью, агент с инструментами, оператор рабочего стола и лимиты"
             : "Тестовый harness: модель, тип раздумий, RAG-папка, файлы и картинки"
         }
@@ -133,7 +227,7 @@ export default async function AiPage() {
               <FlaskConical size={12} />
               Тестовый harness
             </Badge>
-            {isSuperAdmin && (
+            {agentAllowed && (
               <Badge className="border-accent/40 bg-accent/10 text-accent2">
                 <Sparkles size={12} />
                 Агент

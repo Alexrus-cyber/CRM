@@ -40,7 +40,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (body?.status) {
     await setAgentTaskStatus(task.id, ownerId, String(body.status), String(body.summary ?? "").slice(0, 4000));
   }
-  await syncOperatorTaskToConversation(ownerId, task.id);
+  await syncOperatorTaskToConversation(ownerId, task.id, { onlyIfExisting: true });
 
   return Response.json({ ok: true, step: task.steps + 1 });
 }

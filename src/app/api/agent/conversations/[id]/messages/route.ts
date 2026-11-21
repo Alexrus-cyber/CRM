@@ -1,4 +1,5 @@
 import { getAgentConversation, insertAgentConversationMessage } from "@/db/repo";
+import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
@@ -62,8 +63,8 @@ function cleanActions(value: unknown): Array<{ type: "open_url"; url: string; la
 async function operatorUser() {
   const user = await getCurrentUser();
   if (!user) return { response: Response.json({ error: "Unauthorized" }, { status: 401 }) };
-  if (user.role !== "super_admin") {
-    return { response: Response.json({ error: "Только главный администратор" }, { status: 403 }) };
+  if (!hasAgentAccess(user) && !hasOperatorAccess(user)) {
+    return { response: Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 }) };
   }
   return { user };
 }
@@ -82,6 +83,9 @@ export async function POST(
   }
   const conversation = await getAgentConversation(auth.user.id, id);
   if (!conversation) return Response.json({ error: "Чат не найден" }, { status: 404 });
+  if (conversation.kind === "agent" ? !hasAgentAccess(auth.user) : !hasOperatorAccess(auth.user)) {
+    return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
+  }
 
   const body = (await req.json().catch(() => null)) as
     | {

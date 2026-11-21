@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   AI_ROLE_POLICY,
   aiPolicyFor,
+  canViewAgentUsage,
   chatTokensLeft,
   formatStepLimit,
   formatTokenCount,
+  hasAgentAccess,
+  hasOperatorAccess,
   isUnlimitedAiRole,
   roleStepLimit,
 } from "@/lib/aiPolicy";
@@ -42,5 +45,18 @@ describe("политика лимитов ИИ по ролям", () => {
     expect(AI_ROLE_POLICY.manager.monthlyTokens).toBe(1_500_000);
     expect(AI_ROLE_POLICY.consultant.monthlyTokens).toBe(500_000);
     expect(AI_ROLE_POLICY.user.monthlyTokens).toBe(500_000);
+  });
+
+  it("разделяет доступ к Агенту, Оператору и статистике токенов", () => {
+    expect(hasAgentAccess({ role: "super_admin", canUseAgent: false })).toBe(true);
+    expect(hasOperatorAccess({ role: "super_admin", canUseOperator: false })).toBe(true);
+    expect(canViewAgentUsage({ role: "super_admin" })).toBe(true);
+
+    expect(hasAgentAccess({ role: "developer", canUseAgent: false })).toBe(false);
+    expect(hasAgentAccess({ role: "developer", canUseAgent: true })).toBe(true);
+    expect(hasOperatorAccess({ role: "admin", canUseOperator: false })).toBe(false);
+    expect(hasOperatorAccess({ role: "admin", canUseOperator: true })).toBe(true);
+    expect(canViewAgentUsage({ role: "admin" })).toBe(false);
+    expect(canViewAgentUsage({ role: "developer" })).toBe(false);
   });
 });

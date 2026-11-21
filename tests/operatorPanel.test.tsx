@@ -222,8 +222,11 @@ describe("ручная проверка подключения бота во в�
       expect(taskPosts.some((p) => p.url === "/api/agent/tasks/42" && p.body.action === "extend_steps")).toBe(true),
     );
 
-    // Выбор уровня доверия «Нет доступа, к компьютеру для исполнения задач» и игрового режима передаются в задачу.
+    // Выбор уровня доверия «Нет доступа, к компьютеру для исполнения задач» на вкладке «Доверие и сводка»
+    // и возврат на последнюю вкладку «Выполнение».
+    fireEvent.click(screen.getByRole("tab", { name: /Доверие и сводка/i }));
     fireEvent.click(screen.getByRole("radio", { name: /Нет доступа, к компьютеру для исполнения задач/ }));
+    fireEvent.click(screen.getByRole("tab", { name: /Выполнение/i }));
     fireEvent.click(screen.getByRole("button", { name: /^Игра$/i }));
     fireEvent.click(screen.getByRole("button", { name: /Ведёт Агент/i }));
     const promptBox = screen.getByPlaceholderText(/Опишите цель в игре/i);
@@ -247,5 +250,33 @@ describe("ручная проверка подключения бота во в�
     fireEvent.click(screen.getByRole("button", { name: /Совет Агента/i }));
     await waitFor(() => expect(taskPosts.some((p) => p.url === "/api/ai/agent/coach")).toBe(true));
     expect(await screen.findByText(/Бежим вперёд к воротам/)).toBeTruthy();
+  });
+
+  it("по умолчанию открывает вид по вкладкам с «Выполнение» последней и позволяет переключиться на «Классический вид»", async () => {
+    render(<OperatorPanel />);
+    await waitFor(() => expect(requestedUrls.some((entry) => entry.includes("/api/agent/tasks"))).toBe(true));
+
+    const deskTabs = screen.getByRole("tablist", { name: /Разделы пульта оператора/i });
+    const tabButtons = Array.from(deskTabs.querySelectorAll('[role="tab"]'));
+    expect(tabButtons.map((b) => b.textContent?.trim())).toEqual([
+      "Модель и генерация",
+      "Доверие и сводка",
+      "Планировщик",
+      "Выполнение",
+    ]);
+    expect(tabButtons[3].getAttribute("aria-selected")).toBe("true");
+    expect(screen.queryByRole("radio", { name: /Нет доступа, к компьютеру для исполнения задач/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("tab", { name: /Модель и генерация/i }));
+    expect(screen.getByText(/Скопировать команду с этими настройками/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: /Планировщик/i }));
+    expect(screen.getByLabelText(/История чатов планировщика/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Классический вид/i }));
+    expect(JSON.parse(localStorage.getItem("crm.ai.operator.layout.v1") ?? '""')).toBe("classic");
+    expect(screen.getByRole("radio", { name: /Нет доступа, к компьютеру для исполнения задач/ })).toBeTruthy();
+    expect(screen.getByLabelText(/История чатов планировщика/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /В очередь/i })).toBeTruthy();
   });
 });

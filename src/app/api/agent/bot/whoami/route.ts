@@ -1,5 +1,5 @@
 import { getUser, listAgentTasks } from "@/db/repo";
-import { botOwner, readAgentToken } from "@/lib/agentBot";
+import { inspectBotToken, readAgentToken } from "@/lib/agentBot";
 
 /**
  * Самопроверка токена бота: `GET /api/agent/bot/whoami`.
@@ -12,8 +12,18 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export async function GET(req: Request) {
-  const ownerId = await botOwner(req, { touch: req.headers.get("x-check-only") !== "1" });
-  if (!ownerId) {
+  const check = await inspectBotToken(req, { touch: req.headers.get("x-check-only") !== "1" });
+  if (check.status === "forbidden") {
+    return Response.json(
+      {
+        ok: false,
+        error: "Доступ к Оператору не выдан главным администратором",
+        hint: "Обратитесь к главному администратору для включения доступа к Оператору.",
+      },
+      { status: 403, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+  if (check.status !== "ok") {
     const token = readAgentToken(req);
     const reason = token ? "Токен не подходит" : "Токен не передан";
     return Response.json(
@@ -27,6 +37,7 @@ export async function GET(req: Request) {
       { status: 401, headers: { "Cache-Control": "no-store" } },
     );
   }
+  const ownerId = check.ownerId;
 
   const [owner, tasks] = await Promise.all([getUser(ownerId), listAgentTasks(ownerId, 100)]);
   const counts = {

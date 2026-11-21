@@ -40,6 +40,7 @@ export type CoachAdvice = {
   visionUsed?: boolean;
   tuned?: CoachTunedMeta;
   source: "agent" | "model" | "heuristic";
+  usage?: { prompt: number; completion: number; total: number; model?: string };
 };
 
 function round2(n: number): number {
@@ -174,10 +175,21 @@ export async function requestAgentStepCoaching(input: CoachInput): Promise<Coach
         visionUsed?: boolean;
         tuned?: CoachTunedMeta;
         source?: string;
+        usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; model?: string };
       };
       const forOp = String(data.guidanceForOperator ?? "").trim();
       const forUser = String(data.adviceForUser ?? "").trim();
       const reason = String(data.reason ?? "").trim();
+      const rawUsage = data.usage;
+      const usage =
+        rawUsage && (Number(rawUsage.total_tokens) > 0 || Number(rawUsage.prompt_tokens) > 0 || Number(rawUsage.completion_tokens) > 0)
+          ? {
+              prompt: Math.max(0, Math.round(Number(rawUsage.prompt_tokens ?? 0))),
+              completion: Math.max(0, Math.round(Number(rawUsage.completion_tokens ?? 0))),
+              total: Math.max(0, Math.round(Number(rawUsage.total_tokens ?? 0))),
+              model: rawUsage.model ? String(rawUsage.model) : undefined,
+            }
+          : undefined;
       if (forOp && data.source !== "heuristic") {
         return {
           guidanceForOperator: forOp,
@@ -187,6 +199,7 @@ export async function requestAgentStepCoaching(input: CoachInput): Promise<Coach
           visionUsed: data.visionUsed,
           tuned: data.tuned ?? tunedMeta,
           source: "agent",
+          ...(usage ? { usage } : {}),
         };
       }
     }
@@ -299,8 +312,17 @@ export async function requestAgentStepCoaching(input: CoachInput): Promise<Coach
         res = await callCoachLlm(false, allowReasoning);
       }
       if (res.ok) {
-        const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+        const data = (await res.json()) as {
+          choices?: Array<{ message?: { content?: string } }>;
+          usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+        };
         const raw = String(data.choices?.[0]?.message?.content ?? "").trim();
+        const estPrompt = Math.max(1, Math.ceil((sysPrompt.length + promptText.length) / 4));
+        const estCompletion = Math.max(1, Math.ceil(raw.length / 4));
+        const pTok = Number(data.usage?.prompt_tokens ?? 0) || estPrompt;
+        const cTok = Number(data.usage?.completion_tokens ?? 0) || estCompletion;
+        const tTok = Number(data.usage?.total_tokens ?? 0) || pTok + cTok;
+        const usage = { prompt: pTok, completion: cTok, total: tTok, model };
         const jsonMatch = raw.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           const parsed = JSON.parse(jsonMatch[0]) as {
@@ -322,6 +344,7 @@ export async function requestAgentStepCoaching(input: CoachInput): Promise<Coach
               visionUsed,
               tuned: tunedMeta,
               source: "model",
+              usage,
             };
           }
         }
@@ -333,6 +356,7 @@ export async function requestAgentStepCoaching(input: CoachInput): Promise<Coach
             visionUsed,
             tuned: tunedMeta,
             source: "model",
+            usage,
           };
         }
       }

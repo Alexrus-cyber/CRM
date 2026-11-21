@@ -69,6 +69,14 @@ class LaunchSettings:
     remember_key: bool = False
     last_agent: str = "operator"
     agent_values: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    crm_url: str = "http://localhost:3000"
+    crm_email: str = ""
+    crm_session_token: str = ""
+    crm_profile: Dict[str, Any] = field(default_factory=dict)
+
+    def clear_crm_auth(self) -> None:
+        self.crm_session_token = ""
+        self.crm_profile = {}
 
     # ---- значения полей -------------------------------------------------
     def values_for(self, spec: AgentSpec) -> Dict[str, Any]:
@@ -118,6 +126,10 @@ class LaunchSettings:
             "remember_key": bool(self.remember_key),
             "last_agent": self.last_agent,
             "agent_values": self.agent_values,
+            "crm_url": self.crm_url,
+            "crm_email": self.crm_email,
+            "crm_session_token": self.crm_session_token,
+            "crm_profile": self.crm_profile,
         }
         # Ключ не пишем на диск, пока пользователь не попросил.
         if self.remember_key and self.api_key:
@@ -137,6 +149,12 @@ class LaunchSettings:
         settings.remember_key = bool(raw.get("remember_key"))
         settings.api_key = str(raw.get("api_key") or "")
         settings.last_agent = str(raw.get("last_agent") or "operator")
+        settings.crm_url = str(raw.get("crm_url") or "http://localhost:3000")
+        settings.crm_email = str(raw.get("crm_email") or "")
+        settings.crm_session_token = str(raw.get("crm_session_token") or "")
+        raw_profile = raw.get("crm_profile")
+        if isinstance(raw_profile, dict):
+            settings.crm_profile = dict(raw_profile)
         values = raw.get("agent_values")
         if isinstance(values, dict):
             for agent_id, fields in values.items():
