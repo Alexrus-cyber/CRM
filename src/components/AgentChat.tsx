@@ -1,6 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ClipboardEvent,
+  type DragEvent,
+} from "react";
 import {
   Archive,
   Bot,
@@ -38,7 +47,9 @@ import { useStoredJson, useStoredNumber } from "@/lib/useStoredValue";
 import { extractFile } from "@/lib/fileExtract";
 import { splitIntoChunks } from "@/lib/rag";
 import { GenSettings } from "./GenSettings";
+import { LiveReasoningBox } from "./LiveReasoningBox";
 import { TrustSelector } from "./TrustSelector";
+import { extractClipboardFiles, hasTransferFiles } from "@/lib/clipboardFiles";
 import {
   AGENT_MAX_STEPS,
   GEN_DEFAULT_PARAMS,
@@ -301,6 +312,15 @@ const EXAMPLES = [
 const DEFAULT_SETTINGS: AiSettings = { baseUrl: AI_DEFAULT_BASE_URL, apiKey: "", model: "" };
 const DEFAULT_RAG_PREFS: RagPrefs = { folderId: 0, ragFull: false, ragChunks: 12 };
 
+function decodeSystemPrompt(raw: string): string {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "string" ? parsed.slice(0, 12_000) : "";
+  } catch {
+    return String(raw ?? "").slice(0, 12_000);
+  }
+}
+
 function decodeSettings(raw: string): AiSettings {
   const parsed = JSON.parse(raw) as Partial<AiSettings>;
   return {
@@ -365,6 +385,11 @@ export function AgentChat({ userName }: { userName: string }) {
     "crm.ai.agent.context_limit.v1",
     DEFAULT_AGENT_CONTEXT_LIMIT,
   );
+  const [systemPrompt, setSystemPrompt] = useStoredJson<string>(
+    "crm.ai.agent.system.v1",
+    "",
+    decodeSystemPrompt,
+  );
 
   const [health, setHealth] = useState<Health | null>(null);
   const [conversations, setConversations] = useState<AgentConversation[]>([]);
@@ -374,6 +399,7 @@ export function AgentChat({ userName }: { userName: string }) {
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<OperatorAttachment[]>([]);
   const [reading, setReading] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -432,6 +458,8 @@ export function AgentChat({ userName }: { userName: string }) {
   const [summarizing, setSummarizing] = useState(false);
 
   const listRef = useRef<HTMLDivElement>(null);
+  const dragDepthRef = useRef(0);
+  const autoScrollPausedRef = useRef(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const ragDirRef = useRef<HTMLInputElement>(null);
   const counter = useRef(0);
@@ -990,7 +1018,7 @@ export function AgentChat({ userName }: { userName: string }) {
     const id = opTask.id;
     const timer = window.setInterval(() => {
       void refreshOpTask(id);
-    }, 2000);
+    }, 1000);
     return () => window.clearInterval(timer);
   }, [opTask, refreshOpTask]);
 
@@ -1503,10 +1531,86 @@ export function AgentChat({ userName }: { userName: string }) {
 
   /* --------------------------- Отправка запроса --------------------------- */
 
-  const scrollDown = () => {
-    requestAnimationFrame(() => {
+  const scrollDown = useCallback((force = false) => {
+    const el = listRef.current;
+    if (!el) return;
+    if (!force && autoScrollPausedRef.current) return;
+    const apply = () => {
       if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
-    });
+    };
+    apply();
+    requestAnimationFrame(apply);
+  }, []);
+
+  const handleChatScroll = () => {
+    const el = listRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    autoScrollPausedRef.current = distanceFromBottom > 220;
+  };
+
+  useEffect(() => {
+    if (turns.length === 0) return;
+    scrollDown(false);
+  }, [turns, scrollDown]);
+
+  useEffect(() => {
+    if (!running) return;
+    const timer = window.setInterval(() => {
+      scrollDown(false);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [running, scrollDown]);
+
+  const addAgentFiles = useCallback(
+    (incoming: File[]) => {
+      if (incoming.length === 0 || running || reading || historyLoading || conversationId === null) return;
+      setError(null);
+      setReading(true);
+      void readOperatorFiles(attachments, incoming)
+        .then(({ files, errors }) => {
+          if (files.length > 0) setAttachments((prev) => [...prev, ...files]);
+          if (errors.length > 0) setError(errors[0]);
+        })
+        .finally(() => setReading(false));
+    },
+    [attachments, conversationId, historyLoading, reading, running],
+  );
+
+  const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const { files, hasPlainText } = extractClipboardFiles(event.clipboardData);
+    if (files.length === 0) return;
+    if (!hasPlainText) event.preventDefault();
+    addAgentFiles(files);
+  };
+
+  const handleDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setDragging(true);
+  };
+
+  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    if (!dragging) setDragging(true);
+  };
+
+  const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragging(false);
+  };
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    dragDepthRef.current = 0;
+    setDragging(false);
+    if (!hasTransferFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    const dropped = Array.from(event.dataTransfer.files ?? []);
+    if (dropped.length > 0) addAgentFiles(dropped);
   };
 
   const openUrl = (url: string) => {
@@ -1540,7 +1644,8 @@ export function AgentChat({ userName }: { userName: string }) {
     ]);
     setRunning(true);
     setStatus("Отправляю агенту…");
-    scrollDown();
+    autoScrollPausedRef.current = false;
+    scrollDown(true);
 
     const patch = (update: (turn: Turn) => Turn) => {
       setTurns((prev) => prev.map((t) => (t.id === assistantId ? update(t) : t)));
@@ -1579,6 +1684,7 @@ export function AgentChat({ userName }: { userName: string }) {
           messages: history.map((t) => ({ role: t.role, content: t.content })),
           settings,
           params,
+          ...(systemPrompt.trim() ? { systemPrompt: systemPrompt.trim() } : {}),
           trustLevel,
           maxSteps: Math.min(AGENT_MAX_STEPS, Math.max(1, maxSteps)),
           ragFolderId: ragPrefs.folderId,
@@ -1673,6 +1779,7 @@ export function AgentChat({ userName }: { userName: string }) {
           } else if (event === "text") {
             assistantDraft.content = String(data.text ?? "");
             patch((t) => ({ ...t, content: assistantDraft.content }));
+            scrollDown();
           } else if (event === "error") {
             assistantDraft.error = String(data.error ?? "Ошибка агента");
             patch((t) => ({ ...t, error: assistantDraft.error }));
@@ -2570,25 +2677,71 @@ export function AgentChat({ userName }: { userName: string }) {
         defaultOpen
         subtitle="Как модель думает и генерирует ответ. Пустое поле — параметр не передаём."
       >
-        <label className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
-          Лимит шагов агента
-          <Input
-            type="number"
-            min={1}
-            max={AGENT_MAX_STEPS}
-            value={maxSteps}
-            onChange={(event) =>
-              setMaxSteps(Math.min(AGENT_MAX_STEPS, Math.max(1, Number(event.target.value) || 1)))
-            }
-            className="h-8 w-20 px-2 text-[11px]"
-          />
-          <span className="text-[10px]">
-            сколько раз агент может вызвать инструменты (до {AGENT_MAX_STEPS})
-          </span>
-        </label>
+        <div className="space-y-2.5">
+          <div className="space-y-1">
+            <div className="flex items-center justify-between gap-2 text-[11px] text-muted">
+              <label htmlFor="agent-system-prompt" className="font-medium text-text">
+                Системный промпт агента
+              </label>
+              <div className="flex items-center gap-2 text-[10px]">
+                <span>{systemPrompt.length}/12000</span>
+                {systemPrompt.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setSystemPrompt("")}
+                    className="text-red-500 hover:underline"
+                  >
+                    Очистить
+                  </button>
+                )}
+              </div>
+            </div>
+            <Textarea
+              id="agent-system-prompt"
+              value={systemPrompt}
+              onChange={(event) => setSystemPrompt(event.target.value.slice(0, 12_000))}
+              rows={3}
+              placeholder="Дополнительные правила для Агента: роль, стиль отчётов, формат кода, ограничения…"
+              className="text-[11px]"
+            />
+          </div>
+
+          <label className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
+            Лимит шагов агента
+            <Input
+              type="number"
+              min={1}
+              max={AGENT_MAX_STEPS}
+              value={maxSteps}
+              onChange={(event) =>
+                setMaxSteps(Math.min(AGENT_MAX_STEPS, Math.max(1, Number(event.target.value) || 1)))
+              }
+              className="h-8 w-20 px-2 text-[11px]"
+            />
+            <span className="text-[10px]">
+              сколько раз агент может вызвать инструменты (до {AGENT_MAX_STEPS})
+            </span>
+          </label>
+        </div>
       </GenSettings>
 
-      <div className="rounded-2xl border border-border bg-card">
+      <div
+        onDragEnter={handleDragEnter}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        className={cn(
+          "relative rounded-2xl border bg-card transition",
+          dragging ? "border-accent ring-2 ring-[var(--ring)]" : "border-border",
+        )}
+      >
+        {dragging && (
+          <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-accent bg-accent/10 backdrop-blur-[1px]">
+            <p className="rounded-xl border border-accent/40 bg-card px-4 py-2 text-xs font-medium text-text shadow">
+              Отпустите файл или картинку, чтобы приложить к запросу Агенту
+            </p>
+          </div>
+        )}
         <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 pt-3 text-[11px] text-muted">
           <label className="flex items-center gap-1.5">
             Провайдер
@@ -2642,7 +2795,7 @@ export function AgentChat({ userName }: { userName: string }) {
           </label>
         </div>
 
-        <div ref={listRef} className="h-[420px] space-y-3 overflow-y-auto p-3">
+        <div ref={listRef} onScroll={handleChatScroll} className="h-[420px] space-y-3 overflow-y-auto p-3">
           {historyLoading ? (
             <div className="flex h-full items-center justify-center gap-2 text-[11px] text-muted">
               <Loader2 size={13} className="animate-spin" /> Загружаю переписку…
@@ -2674,7 +2827,9 @@ export function AgentChat({ userName }: { userName: string }) {
               </div>
             </div>
           ) : (
-            turns.map((turn) => (
+            turns.map((turn, turnIndex) => {
+              const isStreamingTurn = running && turn.role === "assistant" && turnIndex === turns.length - 1;
+              return (
               <div key={turn.id} className={cn("flex", turn.role === "user" ? "justify-end" : "justify-start")}>
                 <div
                   className={cn(
@@ -2691,14 +2846,7 @@ export function AgentChat({ userName }: { userName: string }) {
                   ) : null}
 
                   {turn.reasoning && turn.reasoning.trim() && (
-                    <details className="rounded-xl border border-border bg-card px-2 py-1.5 text-[11px]">
-                      <summary className="cursor-pointer text-muted">
-                        Размышления · {turn.reasoning.length} симв.
-                      </summary>
-                      <p className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap break-words text-muted">
-                        {turn.reasoning}
-                      </p>
-                    </details>
+                    <LiveReasoningBox text={turn.reasoning} streaming={isStreamingTurn} />
                   )}
 
                   {turn.attached && turn.attached.length > 0 && (
@@ -2895,7 +3043,8 @@ export function AgentChat({ userName }: { userName: string }) {
                   )}
                 </div>
               </div>
-            ))
+              );
+            })
           )}
         </div>
 
@@ -2909,12 +3058,18 @@ export function AgentChat({ userName }: { userName: string }) {
           {error && <p className="mb-2 text-[11px] text-red-500">{error}</p>}
           {attachments.length > 0 && (
             <div className="mb-2 flex flex-wrap gap-1">
-              {attachments.map((file) => (
+              {attachments.map((file, idx) => (
                 <span
-                  key={`${file.name}-${file.size}`}
-                  className="flex items-center gap-1 rounded-lg border border-border bg-card2 px-1.5 py-0.5 text-[10px] text-muted"
+                  key={`${file.name}-${file.size}-${idx}`}
+                  className="flex items-center gap-1.5 rounded-lg border border-border bg-card2 px-1.5 py-0.5 text-[10px] text-muted"
                 >
-                  <FileText size={10} /> {file.name} · {formatFileSize(file.size)}
+                  {file.image ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={file.image} alt={file.name} className="h-5 w-5 shrink-0 rounded object-cover" />
+                  ) : (
+                    <FileText size={10} />
+                  )}
+                  <span className="max-w-[140px] truncate">{file.name}</span> · {formatFileSize(file.size)}
                   <button
                     type="button"
                     onClick={() => setAttachments((prev) => prev.filter((item) => item !== file))}
@@ -2937,14 +3092,7 @@ export function AgentChat({ userName }: { userName: string }) {
               onChange={(event) => {
                 const list = Array.from(event.target.files ?? []);
                 event.target.value = "";
-                if (list.length === 0) return;
-                setReading(true);
-                void readOperatorFiles(attachments, list)
-                  .then(({ files, errors }) => {
-                    setAttachments((prev) => [...prev, ...files]);
-                    if (errors.length > 0) setError(errors[0]);
-                  })
-                  .finally(() => setReading(false));
+                addAgentFiles(list);
               }}
             />
             <button
@@ -2960,6 +3108,7 @@ export function AgentChat({ userName }: { userName: string }) {
             <textarea
               value={text}
               onChange={(e) => setText(e.target.value)}
+              onPaste={handlePaste}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
@@ -2967,7 +3116,7 @@ export function AgentChat({ userName }: { userName: string }) {
                 }
               }}
               rows={2}
-              placeholder="Например: открой ютуб и включи видео про космос…"
+              placeholder="Например: открой ютуб и включи видео про космос… (можно вставить фото Ctrl+V или перетащить файл)"
               disabled={historyLoading || conversationId === null}
               className="max-h-32 min-h-10 min-w-0 flex-1 resize-y rounded-xl border border-border bg-card2 px-3 py-2 text-xs outline-none focus:border-accent focus:ring-2 focus:ring-[var(--ring)] disabled:opacity-60"
             />

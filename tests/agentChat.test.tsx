@@ -5,6 +5,7 @@ import { AgentChat } from "@/components/AgentChat";
 type Sent = {
   messages?: Array<{ role: string; content: string }>;
   params?: Record<string, unknown>;
+  systemPrompt?: string;
   trustLevel?: string;
   ragFolderId?: number;
   ragFull?: boolean;
@@ -686,5 +687,79 @@ describe("вкладка «Агент»", () => {
 
     expect(await screen.findByText(/Диалог Агент ↔ Оператор #77/)).toBeTruthy();
     expect(await screen.findByText(/Размышления ·/)).toBeTruthy();
+  });
+
+  it("передаёт и сохраняет системный промпт на вкладке «Агент»", async () => {
+    render(<AgentChat userName="Тест" />);
+    const promptInput = await screen.findByLabelText("Системный промпт агента");
+    fireEvent.change(promptInput, { target: { value: "Всегда отвечай кратко и пиши команды списком." } });
+
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/);
+    fireEvent.change(chatBox, { target: { value: "Сверь файлы" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    await waitFor(() => expect(sent.length).toBe(1));
+    expect(sent[0]?.systemPrompt).toBe("Всегда отвечай кратко и пиши команды списком.");
+    expect(localStorage.getItem("crm.ai.agent.system.v1")).toContain("Всегда отвечай кратко");
+  });
+
+  it("принимает файлы через вставку из буфера (Ctrl+V) и drag-and-drop", async () => {
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/);
+
+    const pastedFile = new File(["hello screenshot"], "pasted.txt", { type: "text/plain" });
+    fireEvent.paste(chatBox, {
+      clipboardData: {
+        files: [pastedFile],
+        items: [{ kind: "file", getAsFile: () => pastedFile }],
+        getData: () => "",
+      },
+    });
+
+    expect(await screen.findByLabelText("Убрать pasted.txt")).toBeTruthy();
+
+    const droppedFile = new File(["dropped info"], "notes.md", { type: "text/markdown" });
+    const dropContainer = chatBox.closest("div.relative");
+    expect(dropContainer).toBeTruthy();
+    fireEvent.drop(dropContainer!, {
+      dataTransfer: {
+        types: ["Files"],
+        files: [droppedFile],
+      },
+    });
+
+    expect(await screen.findByLabelText("Убрать notes.md")).toBeTruthy();
+  });
+
+  it("раскрывает блок рассуждений в прямом эфире во время стриминга", async () => {
+    const gate: { release: (() => void) | null } = { release: null };
+    sseResponder = () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('event: reasoning\ndata: {"text":"Проверяю первый шаг"}\n\n'));
+          gate.release = () => {
+            controller.enqueue(encoder.encode('event: text\ndata: {"text":"Готово"}\n\n'));
+            controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
+            controller.close();
+          };
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/);
+    fireEvent.change(chatBox, { target: { value: "Покажи мысли" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    const liveBadge = await screen.findByText("в эфире");
+    expect(liveBadge).toBeTruthy();
+    const detailsEl = liveBadge.closest("details");
+    expect(detailsEl?.open).toBe(true);
+    expect(await screen.findByText("Проверяю первый шаг")).toBeTruthy();
+
+    gate.release?.();
+    expect(await screen.findByText("Готово")).toBeTruthy();
   });
 });

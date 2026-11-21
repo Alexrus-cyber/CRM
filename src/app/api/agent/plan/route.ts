@@ -22,7 +22,7 @@ const MAX_CHARS = 6000;
 const MAX_SYSTEM_PROMPT_CHARS = 12_000;
 const REQUEST_TIMEOUT = 120_000;
 
-type IncomingFile = { name?: string; text?: string; note?: string };
+type IncomingFile = { name?: string; text?: string; note?: string; image?: string };
 
 export async function POST(req: Request) {
   const me = await getCurrentUser();
@@ -56,27 +56,49 @@ export async function POST(req: Request) {
     (typeof body?.systemPrompt === "string" ? body.systemPrompt.trim().slice(0, MAX_SYSTEM_PROMPT_CHARS) : "") ||
     DEFAULT_PLAN_PROMPT;
 
-  const messages = (body?.messages ?? [])
+  const messages: Array<{ role: "user" | "assistant"; content: string | Array<Record<string, unknown>> }> = (
+    body?.messages ?? []
+  )
     .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
     .slice(-MAX_MESSAGES)
     .map((m) => ({ role: m.role as "user" | "assistant", content: String(m.content).slice(0, MAX_CHARS) }));
   if (messages.length === 0) return Response.json({ error: "Пустой запрос" }, { status: 400 });
 
-  // Файлы уже распознаны в браузере: сюда приходит текст (или пометка, что
-  // формат бинарный). Приклеиваем их к последнему сообщению пользователя.
+  // Файлы уже распознаны в браузере: сюда приходит текст или data-URL картинки.
   const files = (body?.files ?? []).slice(0, 5);
   if (files.length > 0) {
     const last = [...messages].reverse().find((m) => m.role === "user");
-    if (last) {
-      const blocks = files.map((file) => {
+    if (last && typeof last.content === "string") {
+      const blocks: string[] = [];
+      const images: Array<{ name: string; url: string }> = [];
+      for (const file of files) {
         const name = String(file.name ?? "файл").slice(0, 160);
         const text = String(file.text ?? "").slice(0, 4000);
         const note = String(file.note ?? "").slice(0, 200);
-        return text
-          ? `--- ${name}${note ? ` (${note})` : ""} ---\n${text}`
-          : `--- ${name}: содержимое не читается (${note || "бинарный формат"}) ---`;
-      });
-      last.content = `${last.content}\n\nФайлы от пользователя:\n${blocks.join("\n\n")}`.slice(0, MAX_CHARS * 2);
+        const image =
+          typeof file.image === "string" && file.image.startsWith("data:image/")
+            ? file.image.slice(0, 6_000_000)
+            : "";
+        if (image) {
+          images.push({ name, url: image });
+        } else if (text) {
+          blocks.push(`--- ${name}${note ? ` (${note})` : ""} ---\n${text}`);
+        } else {
+          blocks.push(`--- ${name}: содержимое не читается (${note || "бинарный формат"}) ---`);
+        }
+      }
+      const combinedText =
+        blocks.length > 0
+          ? `${last.content}\n\nФайлы от пользователя:\n${blocks.join("\n\n")}`.slice(0, MAX_CHARS * 2)
+          : last.content;
+      if (images.length > 0) {
+        last.content = [
+          { type: "text", text: combinedText },
+          ...images.map((img) => ({ type: "image_url", image_url: { url: img.url } })),
+        ];
+      } else {
+        last.content = combinedText;
+      }
     }
   }
 

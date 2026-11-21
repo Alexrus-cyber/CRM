@@ -71,6 +71,7 @@ export async function POST(req: Request) {
         messages?: IncomingMessage[];
         settings?: { baseUrl?: string; apiKey?: string; model?: string };
         params?: unknown;
+        systemPrompt?: string;
         maxSteps?: number;
         attachments?: IncomingAttachment[];
         trustLevel?: string;
@@ -85,7 +86,7 @@ export async function POST(req: Request) {
   const messages = (body?.messages ?? [])
     .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
     .slice(-100)
-    .map((m) => ({ role: m.role, content: String(m.content).slice(0, 32_000) }));
+    .map((m) => ({ role: m.role, content: String(m.content).slice(0, 256_000) }));
   if (messages.length === 0) {
     return Response.json({ error: "Пустой запрос" }, { status: 400 });
   }
@@ -175,12 +176,15 @@ export async function POST(req: Request) {
   );
   const trustLevel = normalizeTrustLevel(body?.trustLevel);
   const runId = typeof body?.runId === "string" && body.runId.trim() ? body.runId.trim().slice(0, 80) : undefined;
+  const systemPrompt =
+    typeof body?.systemPrompt === "string" ? body.systemPrompt.trim().slice(0, 12_000) : "";
 
   const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl ?? "") ?? undefined;
   const payload = {
     messages,
     attachments,
     params,
+    ...(systemPrompt ? { systemPrompt } : {}),
     maxSteps,
     trustLevel,
     ...(runId ? { runId } : {}),

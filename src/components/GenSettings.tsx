@@ -4,7 +4,7 @@ import { useState, type ReactNode } from "react";
 import { Brain, ChevronDown, ChevronUp, SlidersHorizontal } from "lucide-react";
 import { Badge, Button, Card, Input } from "@/components/ui";
 import { Combobox } from "@/components/Combobox";
-import { AI_REASONING_MODES, type ReasoningMode } from "@/lib/ai";
+import { AI_MAX_GENERATION_TOKENS, AI_REASONING_MODES, type ReasoningMode } from "@/lib/ai";
 import { describeGenParams, normalizeGenParams, type GenParams } from "@/lib/genParams";
 
 /**
@@ -83,6 +83,7 @@ export function GenSettings({
                 <Input
                   type="number"
                   min={64}
+                  max={AI_MAX_GENERATION_TOKENS}
                   step={64}
                   value={params.thinkingBudget ?? ""}
                   onChange={(event) =>
@@ -130,12 +131,13 @@ export function GenSettings({
               <Input
                 type="number"
                 min={1}
+                max={AI_MAX_GENERATION_TOKENS}
                 step={64}
                 value={params.maxTokens ?? ""}
                 onChange={(event) =>
                   update({ maxTokens: event.target.value === "" ? null : Number(event.target.value) })
                 }
-                placeholder="—"
+                placeholder="до 384000"
                 className="h-9 text-xs"
               />
             </Field>

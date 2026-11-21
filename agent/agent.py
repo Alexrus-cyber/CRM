@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.parse
@@ -38,7 +39,7 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1102,6 +1103,46 @@ def resolve_adaptive_coach_params(
     return resolved, meta
 
 
+def _process_stream_think_chunk(
+    piece: str,
+    in_think: bool,
+    tag_buf: str,
+) -> Tuple[str, str, bool, str]:
+    """Разделяет поток контента на обычный текст и содержимое внутри `<think>...</think>`."""
+    text = tag_buf + piece
+    out_content: List[str] = []
+    out_think: List[str] = []
+    idx = 0
+    while idx < len(text):
+        if in_think:
+            close_pos = text.find("</think>", idx)
+            if close_pos != -1:
+                out_think.append(text[idx:close_pos])
+                in_think = False
+                idx = close_pos + 8
+                continue
+            lt_pos = text.rfind("<", idx)
+            if lt_pos != -1 and len(text) - lt_pos < 8 and "</think>".startswith(text[lt_pos:]):
+                out_think.append(text[idx:lt_pos])
+                return "".join(out_content), "".join(out_think), in_think, text[lt_pos:]
+            out_think.append(text[idx:])
+            return "".join(out_content), "".join(out_think), in_think, ""
+        else:
+            open_pos = text.find("<think>", idx)
+            if open_pos != -1:
+                out_content.append(text[idx:open_pos])
+                in_think = True
+                idx = open_pos + 7
+                continue
+            lt_pos = text.rfind("<", idx)
+            if lt_pos != -1 and len(text) - lt_pos < 7 and "<think>".startswith(text[lt_pos:]):
+                out_content.append(text[idx:lt_pos])
+                return "".join(out_content), "".join(out_think), in_think, text[lt_pos:]
+            out_content.append(text[idx:])
+            return "".join(out_content), "".join(out_think), in_think, ""
+    return "".join(out_content), "".join(out_think), in_think, ""
+
+
 def call_model(
     base_url: str,
     api_key: str,
@@ -1109,12 +1150,15 @@ def call_model(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]],
     params: Optional[Dict[str, Any]] = None,
+    on_reasoning: Optional[Callable[[str], None]] = None,
+    on_text: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
+    streaming = on_reasoning is not None or on_text is not None
     payload: Dict[str, Any] = {
         "model": model or MODEL,
         "messages": messages,
         "temperature": 0.3,
-        "stream": False,
+        "stream": streaming,
     }
     apply_generation(payload, params or {})
     if tools:
@@ -1123,18 +1167,151 @@ def call_model(
     if not payload["model"]:
         raise AgentError("Не указана модель: выберите её в интерфейсе или задайте AGENT_MODEL")
 
-    def _post(body_payload: Dict[str, Any]) -> str:
+    def _consume_stream(body_payload: Dict[str, Any]) -> Dict[str, Any]:
+        headers = {"Content-Type": "application/json"}
+        if body_payload.get("stream"):
+            headers["Accept"] = "text/event-stream"
         request = urllib.request.Request(
             chat_url(base_url),
             data=json.dumps(body_payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         if api_key:
             request.add_header("Authorization", f"Bearer {api_key}")
         try:
             with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-                return response.read().decode("utf-8", "replace")
+                if not body_payload.get("stream"):
+                    raw = response.read().decode("utf-8", "replace")
+                    try:
+                        return json.loads(raw)
+                    except json.JSONDecodeError as error:
+                        raise AgentError("Сервер модели вернул не JSON") from error
+
+                # Читаем поток построчно; если сервер проигнорировал stream=True и прислал JSON,
+                # подхватываем первую строку и собираем как обычный ответ.
+                raw_lines: List[str] = []
+                content_parts: List[str] = []
+                reasoning_parts: List[str] = []
+                tool_calls_map: Dict[int, Dict[str, Any]] = {}
+                in_think = False
+                tag_buf = ""
+                last_reason_emit = 0.0
+                last_text_emit = 0.0
+                is_sse = False
+
+                for raw_bytes in response:
+                    line = raw_bytes.decode("utf-8", "replace").rstrip("\r\n")
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if not is_sse:
+                        if stripped.startswith("data:") or stripped.startswith("event:") or stripped.startswith(":"):
+                            is_sse = True
+                        elif stripped.startswith("{"):
+                            raw_lines.append(line)
+                            rest = response.read().decode("utf-8", "replace")
+                            if rest:
+                                raw_lines.append(rest)
+                            try:
+                                parsed_json = json.loads("\n".join(raw_lines))
+                            except json.JSONDecodeError as error:
+                                raise AgentError("Сервер модели вернул не JSON") from error
+                            msg = (parsed_json.get("choices") or [{}])[0].get("message") or {}
+                            r_full = str(msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+                            c_full = str(msg.get("content") or "")
+                            if r_full and on_reasoning:
+                                on_reasoning(r_full)
+                            if c_full and not msg.get("tool_calls") and on_text:
+                                on_text(c_full)
+                            return parsed_json
+                        else:
+                            is_sse = True
+
+                    if not stripped.startswith("data:"):
+                        continue
+                    data_str = stripped[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0] or {}
+                    delta = choice.get("delta") or {}
+                    msg_fb = choice.get("message") or {}
+
+                    r_piece = delta.get("reasoning_content") or delta.get("reasoning") or msg_fb.get("reasoning_content") or ""
+                    if isinstance(r_piece, str) and r_piece:
+                        reasoning_parts.append(r_piece)
+                        now = time.monotonic()
+                        if on_reasoning and (last_reason_emit == 0.0 or now - last_reason_emit >= 0.2):
+                            last_reason_emit = now
+                            on_reasoning("".join(reasoning_parts))
+
+                    c_piece = delta.get("content") if delta.get("content") is not None else msg_fb.get("content")
+                    if isinstance(c_piece, str) and c_piece:
+                        c_out, t_out, in_think, tag_buf = _process_stream_think_chunk(c_piece, in_think, tag_buf)
+                        if t_out:
+                            reasoning_parts.append(t_out)
+                            now = time.monotonic()
+                            if on_reasoning and (last_reason_emit == 0.0 or now - last_reason_emit >= 0.2):
+                                last_reason_emit = now
+                                on_reasoning("".join(reasoning_parts))
+                        if c_out:
+                            content_parts.append(c_out)
+                            now = time.monotonic()
+                            if on_text and not tool_calls_map and (last_text_emit == 0.0 or now - last_text_emit >= 0.2):
+                                last_text_emit = now
+                                on_text("".join(content_parts))
+
+                    tc_deltas = delta.get("tool_calls") or msg_fb.get("tool_calls") or []
+                    if isinstance(tc_deltas, list):
+                        for pos, tc in enumerate(tc_deltas):
+                            if not isinstance(tc, dict):
+                                continue
+                            idx = tc.get("index")
+                            if not isinstance(idx, int):
+                                idx = pos
+                            entry = tool_calls_map.setdefault(
+                                idx,
+                                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                            )
+                            if tc.get("id"):
+                                entry["id"] = str(tc["id"])
+                            if tc.get("type"):
+                                entry["type"] = str(tc["type"])
+                            fn = tc.get("function") or {}
+                            if isinstance(fn, dict):
+                                if fn.get("name"):
+                                    entry["function"]["name"] += str(fn["name"])
+                                if fn.get("arguments"):
+                                    entry["function"]["arguments"] += str(fn["arguments"])
+
+                if tag_buf:
+                    if in_think:
+                        reasoning_parts.append(tag_buf)
+                    else:
+                        content_parts.append(tag_buf)
+
+                final_reasoning = "".join(reasoning_parts)
+                final_content = "".join(content_parts)
+                assembled_tools = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
+                if final_reasoning and on_reasoning:
+                    on_reasoning(final_reasoning)
+                if final_content and not assembled_tools and on_text:
+                    on_text(final_content)
+                msg_obj: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": final_content,
+                    **({"reasoning_content": final_reasoning} if final_reasoning else {}),
+                    **({"tool_calls": assembled_tools} if assembled_tools else {}),
+                }
+                return {"choices": [{"message": msg_obj}]}
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")[:400]
             raise AgentError(f"Модель вернула ошибку {error.code}: {detail}") from error
@@ -1144,7 +1321,7 @@ def call_model(
             ) from error
 
     try:
-        body = _post(payload)
+        return _consume_stream(payload)
     except AgentError as error:
         detail = str(error).lower()
         has_tuning = any(
@@ -1159,14 +1336,8 @@ def call_model(
                 if k not in ("reasoning_effort", "thinking_budget", "chat_template_kwargs")
             }
             log("модель не принимает параметры reasoning/thinking — повторяю без них")
-            body = _post(stripped)
-        else:
-            raise
-
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError as error:
-        raise AgentError("Сервер модели вернул не JSON") from error
+            return _consume_stream(stripped)
+        raise
 
 
 def parse_text_tool_call(text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -1735,6 +1906,9 @@ class Handler(BaseHTTPRequestHandler):
             ),
         }
         system += f"\n\n{trust_notes[trust_level]}\nКорень Sandbox: {SANDBOX_ROOT}"
+        custom_system = str(body.get("systemPrompt") or "").strip()[:12_000]
+        if custom_system:
+            system += f"\n\nПользовательский системный промпт (обязательно следуй этим правилам):\n{custom_system}"
 
         if context:
             facts = []
@@ -1797,7 +1971,7 @@ class Handler(BaseHTTPRequestHandler):
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
         for item in incoming[-100:]:
             role = item.get("role")
-            content = str(item.get("content") or "")[:32_000]
+            content = str(item.get("content") or "")[:256_000]
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
         if attachment_block or images:
@@ -1832,6 +2006,16 @@ class Handler(BaseHTTPRequestHandler):
             steps += 1
             self.write(sse({"text": "Думаю…" if steps == 1 else f"Шаг {steps}: уточняю план…"}, "status"))
 
+            def _emit_live_reasoning(step_reasoning: str) -> None:
+                combined = ((thinking + "\n\n" if thinking else "") + step_reasoning).strip()
+                if combined:
+                    self.write(sse({"text": combined}, "reasoning"))
+
+            def _emit_live_text(step_text: str) -> None:
+                cleaned = step_text.strip()
+                if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
+                    self.write(sse({"text": cleaned}, "text"))
+
             try:
                 data = call_model(
                     base_url,
@@ -1840,6 +2024,8 @@ class Handler(BaseHTTPRequestHandler):
                     messages,
                     active_tools if use_tools else None,
                     params,
+                    on_reasoning=_emit_live_reasoning,
+                    on_text=_emit_live_text,
                 )
             except AgentError as error:
                 detail = str(error).lower()
@@ -2355,6 +2541,46 @@ def self_test() -> int:
             len(pc_asked) == 1
             and pc_asked[0].get("kind") == "pc_command"
             and "отклонил" in pc_denied_txt.lower(),
+        )
+
+        # 15. call_model умеет стримить рассуждения в реальном времени (reasoning_content + <think>)
+        streamed_reasons: List[str] = []
+        streamed_texts: List[str] = []
+        sse_payload = "".join(
+            [
+                'data: {"choices":[{"delta":{"reasoning_content":"Шаг 1: "}}]}\n',
+                'data: {"choices":[{"delta":{"content":"<thi"}}]}\n',
+                'data: {"choices":[{"delta":{"content":"nk>проверяю</think>Готово"}}]}\n',
+                'data: {"choices":[{"delta":{"content":"!"}}]}\n',
+                "data: [DONE]\n",
+            ]
+        ).encode("utf-8")
+        prev_urlopen2 = urllib.request.urlopen
+        try:
+            def fake_stream_urlopen(req: Any, timeout: int = 30) -> Any:
+                return io.BytesIO(sse_payload)
+
+            urllib.request.urlopen = fake_stream_urlopen  # type: ignore[assignment]
+            stream_res = call_model(
+                "http://localhost:1234",
+                "",
+                "test-model",
+                [{"role": "user", "content": "привет"}],
+                None,
+                on_reasoning=lambda txt: streamed_reasons.append(txt),
+                on_text=lambda txt: streamed_texts.append(txt),
+            )
+        finally:
+            urllib.request.urlopen = prev_urlopen2  # type: ignore[assignment]
+        stream_msg = (stream_res.get("choices") or [{}])[0].get("message") or {}
+        check(
+            "call_model стримит рассуждения и контент по SSE в прямом эфире",
+            bool(streamed_reasons)
+            and streamed_reasons[-1] == "Шаг 1: проверяю"
+            and bool(streamed_texts)
+            and streamed_texts[-1] == "Готово!"
+            and stream_msg.get("reasoning_content") == "Шаг 1: проверяю"
+            and stream_msg.get("content") == "Готово!",
         )
 
     passed = sum(1 for item in checks if item)
