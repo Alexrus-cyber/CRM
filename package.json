@@ -10,7 +10,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@types/better-sqlite3": "^9.6.0",
     "better-sqlite3": "^13.2.0",
     "date-fns": "^4.4.0",
     "dotenv": "17.3.1",
@@ -21,13 +20,16 @@
     "pg": "8.20.0",
     "react": "19.2.6",
     "react-dom": "19.2.6",
+    "read-excel-file": "^9.3.20",
     "recharts": "^3.10.1",
-    "xlsx": "^0.18.5"
+    "write-excel-file": "^4.1.1",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "4.1.17",
     "@testing-library/dom": "^10.4.2",
     "@testing-library/react": "^16.3.3",
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "22.19.15",
     "@types/pg": "8.18.0",
     "@types/react": "19.2.14",

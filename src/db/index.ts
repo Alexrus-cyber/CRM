@@ -14,6 +14,7 @@ export {
   pingDb,
   q,
   q1,
+  toBool,
   toIso,
   toNum,
   toYmd,

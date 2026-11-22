@@ -164,6 +164,58 @@ export function parseCounterpartyMatrix(matrix: unknown[][]): ParseResult {
   return { rows, missingColumns: missing, headerFound: true };
 }
 
+/** Простой RFC-4180 CSV-парсер (поддерживает запятую и точку с запятой, кавычки и BOM). */
+export function parseCsvMatrix(text: string): unknown[][] {
+  const clean = text.replace(/^\uFEFF/, "");
+  const firstLine = clean.split(/\r?\n/, 1)[0] ?? "";
+  const delimiter =
+    (firstLine.match(/;/g)?.length ?? 0) > (firstLine.match(/,/g)?.length ?? 0) ? ";" : ",";
+
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < clean.length; i += 1) {
+    const ch = clean[i];
+    if (inQuotes) {
+      if (ch === '"' && clean[i + 1] === '"') {
+        cell += '"';
+        i += 1;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        cell += ch;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === delimiter) {
+      row.push(cell);
+      cell = "";
+    } else if (ch === "\r" && clean[i + 1] === "\n") {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+      i += 1;
+    } else if (ch === "\n" || ch === "\r") {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += ch;
+    }
+  }
+  if (cell.length > 0 || row.length > 0) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows;
+}
+
 /** Содержимое шаблона, который скачивает пользователь. */
 export const IMPORT_TEMPLATE_ROWS = [
   { Наименование: "ООО «Ромашка»", ИНН: "7707083893", КПП: "773601001" },

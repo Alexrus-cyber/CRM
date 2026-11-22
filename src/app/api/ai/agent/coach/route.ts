@@ -1,9 +1,9 @@
-import { getAgentTask, listAgentEvents, recordAgentUsage, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
+import { AGENT_URL } from "@/lib/agentConfig";
+import { getAgentTask, getAiUserSettingsSecret, listAgentEvents, recordAgentUsage, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
 import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { requestAgentStepCoaching } from "@/lib/agentCoach";
 import type { GenParams } from "@/lib/genParams";
-import { AGENT_URL } from "../route";
 
 /**
  * Совет Агента после выполненного шага Оператора (вызывается из интерфейса
@@ -61,6 +61,13 @@ export async function POST(req: Request) {
     .slice(-6)
     .filter((e) => e.kind === "result" && e.text.includes("⚠️")).length;
 
+  const savedSettings = await getAiUserSettingsSecret(me.id).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
+  const mergedSettings = {
+    baseUrl: body?.settings?.baseUrl || savedSettings.baseUrl,
+    apiKey: (body?.settings?.apiKey ?? "").trim() || savedSettings.apiKey,
+    model: (body?.settings?.model ?? "").trim() || savedSettings.model,
+  };
+
   const advice = await requestAgentStepCoaching({
     agentUrl: AGENT_URL,
     taskPrompt: task.prompt,
@@ -74,7 +81,7 @@ export async function POST(req: Request) {
     failedChecks,
     params: body?.params ?? null,
     history,
-    settings: body?.settings,
+    settings: mergedSettings,
   });
 
   const saved = await setAgentTaskGuidance(task.id, me.id, {

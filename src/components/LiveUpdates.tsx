@@ -78,22 +78,6 @@ export function LiveUpdates() {
     };
     document.addEventListener("visibilitychange", onVisible);
 
-    // 1. Мгновенный канал: серверное событие.
-    try {
-      source = new EventSource("/api/events");
-      source.addEventListener("update", (event) => {
-        try {
-          const data = JSON.parse((event as MessageEvent<string>).data) as { scope?: string };
-          if (data?.scope && matchesPath(pathRef.current, data.scope)) schedule();
-        } catch {
-          /* некорректный пакет — игнорируем */
-        }
-      });
-    } catch {
-      source = null;
-    }
-
-    // 2. Страховка: тихий опрос отпечатка данных.
     const poll = async () => {
       if (disposed || document.visibilityState === "hidden") return;
       try {
@@ -113,8 +97,42 @@ export function LiveUpdates() {
         /* нет сети — попробуем на следующем тике */
       }
     };
-    void poll();
-    interval = window.setInterval(poll, POLL_INTERVAL_MS);
+
+    const startFallbackPolling = () => {
+      if (interval !== null || disposed) return;
+      void poll();
+      interval = window.setInterval(poll, POLL_INTERVAL_MS);
+    };
+
+    const stopFallbackPolling = () => {
+      if (interval !== null) {
+        window.clearInterval(interval);
+        interval = null;
+      }
+    };
+
+    // 1. Мгновенный канал: серверное событие (без постоянного HTTP-поллинга).
+    try {
+      source = new EventSource("/api/events");
+      source.onopen = () => {
+        stopFallbackPolling();
+      };
+      source.onerror = () => {
+        // Если прокси или сеть уронили SSE, включаем резервный опрос.
+        startFallbackPolling();
+      };
+      source.addEventListener("update", (event) => {
+        try {
+          const data = JSON.parse((event as MessageEvent<string>).data) as { scope?: string };
+          if (data?.scope && matchesPath(pathRef.current, data.scope)) schedule();
+        } catch {
+          /* некорректный пакет — игнорируем */
+        }
+      });
+    } catch {
+      source = null;
+      startFallbackPolling();
+    }
 
     return () => {
       disposed = true;

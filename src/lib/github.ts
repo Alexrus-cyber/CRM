@@ -1,49 +1,17 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from "crypto";
+import { decryptSecret, encryptSecret, maskSecret } from "./crypto";
 
 const GITHUB_API = "https://api.github.com";
 
-function getCipherKey(): Buffer {
-  const secret =
-    process.env.CRM_GITHUB_SECRET ||
-    process.env.AUTH_SECRET ||
-    process.env.DATABASE_URL ||
-    "crm-github-local-cipher-key-v1";
-  return createHash("sha256").update(secret, "utf8").digest();
-}
-
 export function encryptGithubToken(rawToken: string): string {
-  const token = rawToken.trim();
-  const key = getCipherKey();
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  const enc = Buffer.concat([cipher.update(token, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return `enc1:${iv.toString("hex")}:${tag.toString("hex")}:${enc.toString("hex")}`;
+  return encryptSecret(rawToken);
 }
 
 export function decryptGithubToken(stored: string): string {
-  const value = String(stored || "").trim();
-  if (!value) return "";
-  if (!value.startsWith("enc1:")) return value;
-  const parts = value.split(":");
-  if (parts.length !== 4) return "";
-  try {
-    const [, ivHex, tagHex, encHex] = parts;
-    const key = getCipherKey();
-    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(ivHex, "hex"));
-    decipher.setAuthTag(Buffer.from(tagHex, "hex"));
-    const out = Buffer.concat([decipher.update(Buffer.from(encHex, "hex")), decipher.final()]);
-    return out.toString("utf8");
-  } catch {
-    return "";
-  }
+  return decryptSecret(stored);
 }
 
 export function maskGithubToken(token: string): string {
-  const t = token.trim();
-  if (!t) return "";
-  if (t.length <= 10) return `${t.slice(0, 2)}••••${t.slice(-2)}`;
-  return `${t.slice(0, 6)}••••${t.slice(-4)}`;
+  return maskSecret(token);
 }
 
 export class GithubApiError extends Error {

@@ -1,3 +1,4 @@
+import { getAiUserSettingsSecret } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 import { AI_DEFAULT_BASE_URL, aiAuthHeaders, aiEndpoint, normalizeBaseUrl } from "@/lib/ai";
 import {
@@ -178,13 +179,15 @@ export async function GET(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
+  const saved = await getAiUserSettingsSecret(me.id).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
   const url = new URL(req.url);
   const baseUrl =
     normalizeBaseUrl(url.searchParams.get("base") ?? "") ??
+    normalizeBaseUrl(saved.baseUrl) ??
     normalizeBaseUrl(process.env.AI_BASE_URL ?? "") ??
     AI_DEFAULT_BASE_URL;
-  const apiKey = (req.headers.get("x-ai-key") ?? process.env.AI_API_KEY ?? "").trim();
-  const targetModel = (url.searchParams.get("model") ?? "").trim();
+  const apiKey = (req.headers.get("x-ai-key") ?? saved.apiKey ?? process.env.AI_API_KEY ?? "").trim();
+  const targetModel = (url.searchParams.get("model") ?? saved.model ?? "").trim();
 
   const result = await inspectModels(baseUrl, apiKey, targetModel);
   if (!result.ok) {
@@ -205,6 +208,7 @@ export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
+  const saved = await getAiUserSettingsSecret(me.id).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
   const body = (await req.json().catch(() => null)) as {
     baseUrl?: string;
     apiKey?: string;
@@ -213,10 +217,11 @@ export async function POST(req: Request) {
 
   const baseUrl =
     normalizeBaseUrl(body?.baseUrl ?? "") ??
+    normalizeBaseUrl(saved.baseUrl) ??
     normalizeBaseUrl(process.env.AI_BASE_URL ?? "") ??
     AI_DEFAULT_BASE_URL;
-  const apiKey = (body?.apiKey ?? req.headers.get("x-ai-key") ?? process.env.AI_API_KEY ?? "").trim();
-  const targetModel = (body?.model ?? "").trim();
+  const apiKey = ((body?.apiKey || "").trim() || req.headers.get("x-ai-key") || saved.apiKey || process.env.AI_API_KEY || "").trim();
+  const targetModel = ((body?.model || "").trim() || saved.model || "").trim();
 
   const result = await inspectModels(baseUrl, apiKey, targetModel);
   if (!result.ok) {

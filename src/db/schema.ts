@@ -1,17 +1,15 @@
 /**
- * Canonical PostgreSQL schema (used by `drizzle-kit push`).
+ * Canonical PostgreSQL schema (used by `drizzle-kit` and type generation).
  *
- * The CRM also supports SQLite: the mirrored DDL lives in `src/db/dialect.ts`
- * and is created automatically on first connection. Runtime queries go through
- * the dialect-agnostic helpers in `src/db/dialect.ts` / `src/db/repo.ts`, so the
- * same code works on both engines. This file remains the source of TypeScript
- * types for the whole application.
+ * SQL migrations in `drizzle/*.sql` are the single SQL source applied by
+ * `src/db/migrate.mjs` across both PostgreSQL and SQLite at runtime.
  */
 import {
   pgTable,
   serial,
   text,
   integer,
+  boolean,
   timestamp,
   date,
   real,
@@ -40,9 +38,9 @@ export const users = pgTable("users", {
   role: text("role").$type<Role>().notNull().default("user"),
   avatarColor: text("avatar_color").notNull().default("#7c5cff"),
   avatarUrl: text("avatar_url"),
-  isBot: integer("is_bot").notNull().default(0),
-  canUseAgent: integer("can_use_agent").notNull().default(0),
-  canUseOperator: integer("can_use_operator").notNull().default(0),
+  isBot: boolean("is_bot").notNull().default(false),
+  canUseAgent: boolean("can_use_agent").notNull().default(false),
+  canUseOperator: boolean("can_use_operator").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -55,16 +53,25 @@ export const sessions = pgTable(
   "sessions",
   {
     id: serial("id").primaryKey(),
+    /** Хранится только SHA-256 хеш токена (`sha256:...`). */
     token: text("token").notNull().unique(),
     userId: integer("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
+    label: text("label").notNull().default(""),
+    userAgent: text("user_agent").notNull().default(""),
+    ip: text("ip").notNull().default(""),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
   },
-  (t) => [index("sessions_user_idx").on(t.userId)],
+  (t) => [
+    index("sessions_user_idx").on(t.userId),
+    index("sessions_user_revoked_idx").on(t.userId, t.revokedAt, t.expiresAt),
+  ],
 );
 
 export const counterparties = pgTable("counterparties", {
@@ -129,11 +136,6 @@ export const tasks = pgTable(
 
 export type ChatRoomKind = "group" | "shared";
 
-/**
- * Пользовательские групповые и общие чаты (создаются сотрудниками).
- * `kind = 'group'` — закрытая группа выбранных участников;
- * `kind = 'shared'` — открытый общий чат для нескольких человек в команде.
- */
 export const chatRooms = pgTable(
   "chat_rooms",
   {
@@ -148,7 +150,6 @@ export const chatRooms = pgTable(
   (t) => [index("chat_rooms_created_by_idx").on(t.createdBy)],
 );
 
-/** Участники группового/общего чата (сотрудники и подключённые модели-боты). */
 export const chatRoomMembers = pgTable(
   "chat_room_members",
   {
@@ -169,7 +170,6 @@ export const chatRoomMembers = pgTable(
   ],
 );
 
-/** Курсор прочтения групповых/общих чатов. */
 export const chatRoomReads = pgTable(
   "chat_room_reads",
   {
@@ -186,7 +186,6 @@ export const chatRoomReads = pgTable(
   (t) => [uniqueIndex("chat_room_reads_user_room_uq").on(t.userId, t.roomId)],
 );
 
-/** Модели-боты, подключённые к встроенному общему чату (# Общий чат). */
 export const chatGeneralBots = pgTable("chat_general_bots", {
   id: serial("id").primaryKey(),
   botUserId: integer("bot_user_id")
@@ -197,7 +196,6 @@ export const chatGeneralBots = pgTable("chat_general_bots", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-/** Настройки модели-бота, настроенной Главным админом как пользователь для чата. */
 export const aiBotConfigs = pgTable("ai_bot_configs", {
   id: serial("id").primaryKey(),
   userId: integer("user_id")
@@ -206,13 +204,28 @@ export const aiBotConfigs = pgTable("ai_bot_configs", {
     .references(() => users.id, { onDelete: "cascade" }),
   provider: text("provider").notNull().default("local"),
   baseUrl: text("base_url").notNull().default(""),
+  /** Хранится зашифрованным (`enc1:...`). */
   apiKey: text("api_key").notNull().default(""),
   model: text("model").notNull().default(""),
   systemPrompt: text("system_prompt").notNull().default(""),
   paramsJson: text("params_json").notNull().default("{}"),
   replyMode: text("reply_mode").$type<"mention" | "always">().notNull().default("mention"),
-  isActive: integer("is_active").notNull().default(1),
+  isActive: boolean("is_active").notNull().default(true),
   createdBy: integer("created_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const aiUserSettings = pgTable("ai_user_settings", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .notNull()
+    .unique()
+    .references(() => users.id, { onDelete: "cascade" }),
+  baseUrl: text("base_url").notNull().default(""),
+  apiKeyEncrypted: text("api_key_encrypted").notNull().default(""),
+  apiKeyHint: text("api_key_hint").notNull().default(""),
+  model: text("model").notNull().default(""),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -231,10 +244,6 @@ export const messages = pgTable(
       onDelete: "cascade",
     }),
     content: text("content").notNull(),
-    /**
-     * Текст в нижнем регистре для поиска по чату: `lower()` в SQLite не знает
-     * кириллицу, поэтому нормализуем строку в приложении при вставке.
-     */
     contentLower: text("content_lower").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -243,13 +252,11 @@ export const messages = pgTable(
   (t) => [
     index("messages_created_idx").on(t.createdAt),
     index("messages_room_idx").on(t.roomId, t.id),
+    index("messages_sender_recipient_id_idx").on(t.senderId, t.recipientId, t.id),
+    index("messages_recipient_sender_id_idx").on(t.recipientId, t.senderId, t.id),
   ],
 );
 
-/**
- * Курсор прочтения переписки: до какого сообщения человек дочитал.
- * `peerId = 0` — общий чат, иначе — id собеседника.
- */
 export const chatReads = pgTable(
   "chat_reads",
   {
@@ -266,7 +273,7 @@ export const chatReads = pgTable(
   (t) => [uniqueIndex("chat_reads_user_peer_uq").on(t.userId, t.peerId)],
 );
 
-/** Вложение сообщения: файл или картинка (base64 в БД). */
+/** Вложение сообщения: файл в файловом хранилище (`storage_key`), поле `data` сохранено для старых записей. */
 export const messageAttachments = pgTable(
   "message_attachments",
   {
@@ -278,7 +285,8 @@ export const messageAttachments = pgTable(
     nameLower: text("name_lower").notNull().default(""),
     mime: text("mime").notNull(),
     size: integer("size").notNull(),
-    data: text("data").notNull(),
+    storageKey: text("storage_key").notNull().default(""),
+    data: text("data").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -286,7 +294,6 @@ export const messageAttachments = pgTable(
   (t) => [index("message_attachments_message_idx").on(t.messageId)],
 );
 
-/** Чат с ИИ: сессия пользователя со своим счётчиком токенов. */
 export const aiChats = pgTable(
   "ai_chats",
   {
@@ -307,7 +314,6 @@ export const aiChats = pgTable(
   (t) => [index("ai_chats_user_idx").on(t.userId, t.updatedAt)],
 );
 
-/** Сообщение чата с ИИ: текст, размышления и метаданные вложений. */
 export const aiChatMessages = pgTable(
   "ai_chat_messages",
   {
@@ -318,7 +324,6 @@ export const aiChatMessages = pgTable(
     role: text("role").$type<"user" | "assistant">().notNull(),
     content: text("content").notNull().default(""),
     reasoning: text("reasoning").notNull().default(""),
-    /** JSON-массив {name, kind, size, note}. */
     attachments: text("attachments").notNull().default("[]"),
     tokens: integer("tokens").notNull().default(0),
     promptTokens: integer("prompt_tokens").notNull().default(0),
@@ -330,7 +335,6 @@ export const aiChatMessages = pgTable(
   (t) => [index("ai_chat_messages_chat_idx").on(t.chatId)],
 );
 
-/** Журнал расхода токенов: месячные лимиты и общий счётчик аккаунта. */
 export const aiUsageEvents = pgTable(
   "ai_usage_events",
   {
@@ -338,12 +342,10 @@ export const aiUsageEvents = pgTable(
     userId: integer("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    /** Чат-источник; без FK, чтобы удаление чата не стирало историю аккаунта. */
     chatId: integer("chat_id").notNull().default(0),
     promptTokens: integer("prompt_tokens").notNull().default(0),
     completionTokens: integer("completion_tokens").notNull().default(0),
     totalTokens: integer("total_tokens").notNull().default(0),
-    /** Месяц в формате YYYY-MM — по нему считаются квоты. */
     month: text("month").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -352,7 +354,6 @@ export const aiUsageEvents = pgTable(
   (t) => [index("ai_usage_events_user_month_idx").on(t.userId, t.month)],
 );
 
-/** Расширение месячного лимита ИИ, которое выдаёт администратор. */
 export const aiQuotaOverrides = pgTable(
   "ai_quota_overrides",
   {
@@ -370,7 +371,6 @@ export const aiQuotaOverrides = pgTable(
   (t) => [uniqueIndex("ai_quota_overrides_user_month_uq").on(t.userId, t.month)],
 );
 
-/** RAG-папка пользователя для блока «Чат с ИИ» (хранится в базе, без лимита). */
 export const aiRagFolders = pgTable(
   "ai_rag_folders",
   {
@@ -392,7 +392,6 @@ export const aiRagFolders = pgTable(
   (t) => [index("ai_rag_folders_user_idx").on(t.userId)],
 );
 
-/** Фрагмент текста из файла папки — единица поиска и контекста. */
 export const aiRagChunks = pgTable(
   "ai_rag_chunks",
   {
@@ -410,7 +409,6 @@ export const aiRagChunks = pgTable(
   (t) => [index("ai_rag_chunks_folder_idx").on(t.folderId)],
 );
 
-/** Обратный индекс: основа слова → фрагмент и её частота (для BM25-поиска). */
 export const aiRagTerms = pgTable(
   "ai_rag_terms",
   {
@@ -427,10 +425,6 @@ export const aiRagTerms = pgTable(
   (t) => [index("ai_rag_terms_lookup_idx").on(t.folderId, t.term)],
 );
 
-/**
- * Per-user export journal: each closed task is downloaded once per person.
- * A unique (user_id, task_id) pair makes the "new only" export idempotent.
- */
 export const taskExports = pgTable(
   "task_exports",
   {
@@ -448,10 +442,6 @@ export const taskExports = pgTable(
   (t) => [uniqueIndex("task_exports_user_task_uq").on(t.userId, t.taskId)],
 );
 
-/**
- * Быстрая переписка по задаче: короткие сообщения участников, а не большой
- * чат. Живёт вместе с задачей (удаление задачи удаляет и обсуждение).
- */
 export const taskMessages = pgTable(
   "task_messages",
   {
@@ -463,7 +453,6 @@ export const taskMessages = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     content: text("content").notNull(),
-    /** Нижний регистр — для поиска без `lower()` (SQLite не знает кириллицу). */
     contentLower: text("content_lower").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -472,10 +461,6 @@ export const taskMessages = pgTable(
   (t) => [index("task_messages_task_idx").on(t.taskId, t.id)],
 );
 
-/**
- * Подключение бота-оператора: адрес CRM. У пользователя их может быть несколько
- * («свой сервер», «тестовый», «у заказчика»), токенов на каждое — сколько нужно.
- */
 export const agentConnections = pgTable(
   "agent_connections",
   {
@@ -485,8 +470,7 @@ export const agentConnections = pgTable(
       .references(() => users.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
     serverUrl: text("server_url").notNull().default(""),
-    /** 1 — подключение по умолчанию (для интерфейса и старых клиентов). */
-    isDefault: integer("is_default").notNull().default(0),
+    isDefault: boolean("is_default").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -496,7 +480,6 @@ export const agentConnections = pgTable(
   ],
 );
 
-/** Токены подключения: по одному на машину/оператора, отзываются по отдельности. */
 export const agentConnectionTokens = pgTable(
   "agent_connection_tokens",
   {
@@ -510,13 +493,11 @@ export const agentConnectionTokens = pgTable(
     name: text("name").notNull().default(""),
     token: text("token").notNull().unique(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-    /** Когда токен последний раз обращался к CRM — видно в списке. */
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
   },
   (t) => [index("agent_connection_tokens_conn_idx").on(t.connectionId)],
 );
 
-/** Старые токены (один на пользователя). Оставлены для совместимости и миграции. */
 export const agentTokens = pgTable("agent_tokens", {
   id: serial("id").primaryKey(),
   userId: integer("user_id")
@@ -527,7 +508,6 @@ export const agentTokens = pgTable("agent_tokens", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-/** История двух чатов: планировщик «Оператора» и интерактивный «Агент». */
 export const agentConversations = pgTable(
   "agent_conversations",
   {
@@ -537,7 +517,6 @@ export const agentConversations = pgTable(
       .references(() => users.id, { onDelete: "cascade" }),
     kind: text("kind").$type<"plan" | "agent">().notNull(),
     title: text("title").notNull().default("Новый чат"),
-    /** Настраиваемый отдельно для каждого план-чата; для агента пусто. */
     systemPrompt: text("system_prompt").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -545,7 +524,6 @@ export const agentConversations = pgTable(
   (t) => [index("agent_conversations_user_kind_idx").on(t.userId, t.kind, t.updatedAt)],
 );
 
-/** Текст истории и только метаданные вложений/созданных файлов (без их байтов). */
 export const agentConversationMessages = pgTable(
   "agent_conversation_messages",
   {
@@ -565,7 +543,6 @@ export const agentConversationMessages = pgTable(
   (t) => [index("agent_conversation_messages_conversation_idx").on(t.conversationId)],
 );
 
-/** Задание для агента-оператора: ставится в CRM, забирается ботом. */
 export const agentTasks = pgTable(
   "agent_tasks",
   {
@@ -574,24 +551,16 @@ export const agentTasks = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     prompt: text("prompt").notNull(),
-    /** queued | running | waiting_approval | waiting_steps | done | failed | cancelled | paused */
     status: text("status").notNull().default("queued"),
     maxSteps: integer("max_steps").notNull().default(15),
     steps: integer("steps").notNull().default(0),
     summary: text("summary").notNull().default(""),
-    /** full | verified | none */
     trustLevel: text("trust_level").notNull().default("verified"),
-    /** autonomous | copilot | game */
     taskMode: text("task_mode").notNull().default("autonomous"),
-    /** operator | agent */
     source: text("source").notNull().default("operator"),
-    /** off | after_step | agent */
     coachMode: text("coach_mode").notNull().default("after_step"),
-    /** JSON последней подсказки «что делать дальше» для следующего шага. */
     guidanceNote: text("guidance_note").notNull().default(""),
-    /** JSON запроса подтверждения или расширения шагов на сайте. */
     pendingApproval: text("pending_approval").notNull().default(""),
-    /** JSON ответа пользователя на сайте по последнему запросу. */
     approvalResponse: text("approval_response").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -599,7 +568,6 @@ export const agentTasks = pgTable(
   (t) => [index("agent_tasks_status_idx").on(t.status, t.id)],
 );
 
-/** Полные стенограммы переписки агента (создаются при Summary/архивации, доступны для скачивания и повторной обработки). */
 export const agentTranscripts = pgTable(
   "agent_transcripts",
   {
@@ -618,7 +586,6 @@ export const agentTranscripts = pgTable(
   (t) => [index("agent_transcripts_user_idx").on(t.userId, t.id)],
 );
 
-/** Журнал шагов агента и файлы, которые он вернул в чат. */
 export const agentEvents = pgTable(
   "agent_events",
   {
@@ -626,20 +593,19 @@ export const agentEvents = pgTable(
     taskId: integer("task_id")
       .notNull()
       .references(() => agentTasks.id, { onDelete: "cascade" }),
-    /** thought | action | result | file | error | info */
     kind: text("kind").notNull(),
     text: text("text").notNull().default(""),
     action: text("action").notNull().default(""),
     fileName: text("file_name").notNull().default(""),
     fileMime: text("file_mime").notNull().default(""),
     fileSize: integer("file_size").notNull().default(0),
+    storageKey: text("storage_key").notNull().default(""),
     fileData: text("file_data").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index("agent_events_task_idx").on(t.taskId, t.id)],
 );
 
-/** Учёт расхода токенов за использование Агента и Оператора (видит только Главный админ). */
 export const agentUsageEvents = pgTable(
   "agent_usage_events",
   {
@@ -647,7 +613,6 @@ export const agentUsageEvents = pgTable(
     userId: integer("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    /** agent | operator */
     kind: text("kind").$type<"agent" | "operator">().notNull(),
     refId: integer("ref_id").notNull().default(0),
     model: text("model").notNull().default(""),
@@ -660,11 +625,6 @@ export const agentUsageEvents = pgTable(
   (t) => [index("agent_usage_events_user_kind_month_idx").on(t.userId, t.kind, t.month)],
 );
 
-/**
- * Персональная привязка GitHub-аккаунта пользователя CRM для блока «Агент».
- * Токен хранится зашифрованным и передаётся только server-to-server в agent.py,
- * чтобы Commit / Pull Request / Merge выполнялись строго от лица владельца аккаунта.
- */
 export const githubConnections = pgTable("github_connections", {
   id: serial("id").primaryKey(),
   userId: integer("user_id")
@@ -682,13 +642,14 @@ export const githubConnections = pgTable("github_connections", {
   selectedOwner: text("selected_owner").notNull().default(""),
   selectedRepo: text("selected_repo").notNull().default(""),
   selectedBranch: text("selected_branch").notNull().default(""),
-  enabled: integer("enabled").notNull().default(1),
+  enabled: boolean("enabled").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 export type User = typeof users.$inferSelect;
 export type GithubConnection = typeof githubConnections.$inferSelect;
+export type AiUserSettingsRow = typeof aiUserSettings.$inferSelect;
 export type Counterparty = typeof counterparties.$inferSelect;
 export type Task = typeof tasks.$inferSelect;
 export type Message = typeof messages.$inferSelect;

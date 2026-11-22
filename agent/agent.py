@@ -1850,6 +1850,27 @@ def resolve_steps_limit(raw_steps: Any, unlimited: bool = False) -> int:
     return max(1, min(MAX_STEPS_LIMIT, parsed))
 
 
+def _allowed_cors_origin(origin: Optional[str]) -> Optional[str]:
+    clean = (origin or "").strip().rstrip("/")
+    if not clean:
+        return None
+    allowed = {
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://localhost:3000",
+        "https://127.0.0.1:3000",
+    }
+    crm_server = os.environ.get("CRM_SERVER", "").strip().rstrip("/")
+    if crm_server:
+        allowed.add(crm_server)
+    extra = os.environ.get("AGENT_ALLOWED_ORIGINS", "")
+    for item in extra.split(","):
+        item_clean = item.strip().rstrip("/")
+        if item_clean:
+            allowed.add(item_clean)
+    return clean if clean in allowed else None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CrmAgent/2.0"
     protocol_version = "HTTP/1.1"
@@ -1857,12 +1878,18 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         log(fmt % args)
 
+    def _send_cors_headers(self) -> None:
+        allowed = _allowed_cors_origin(self.headers.get("Origin"))
+        if allowed:
+            self.send_header("Access-Control-Allow-Origin", allowed)
+            self.send_header("Vary", "Origin")
+
     def _json(self, status: int, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -1876,7 +1903,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_headers()
         self.send_header("Access-Control-Allow-Headers", "content-type, authorization")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Content-Length", "0")
@@ -1933,7 +1960,7 @@ class Handler(BaseHTTPRequestHandler):
                 f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{urllib.parse.quote(file_name)}',
             )
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self._send_cors_headers()
             self.end_headers()
             self.wfile.write(data)
             return
@@ -2077,7 +2104,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store, no-transform")
         self.send_header("Connection", "close")
         self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_headers()
         self.end_headers()
 
         try:

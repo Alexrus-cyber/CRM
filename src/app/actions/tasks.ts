@@ -16,6 +16,7 @@ import { getCurrentUser } from "@/lib/auth";
 import { canManageData, PRIORITY_ORDER, STATUS_ORDER } from "@/lib/utils";
 import { publishLiveEvent } from "@/lib/events";
 import { normalizeTime } from "@/lib/taskTime";
+import { parseJsonBody, taskInputSchema } from "@/lib/validation";
 import type { ActionResult } from "./users";
 
 export type TaskInput = {
@@ -51,76 +52,74 @@ function statusTimestamps(
 export async function saveTaskAction(input: TaskInput): Promise<ActionResult> {
   const me = await getCurrentUser();
   if (!me) return { ok: false, error: "Не авторизован" };
-  const title = input.title.trim();
-  if (!title) return { ok: false, error: "Название задачи обязательно" };
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(input.deadline)) return { ok: false, error: "Укажите срок" };
-  if (!input.assigneeId) return { ok: false, error: "Выберите исполнителя" };
-  if (!STATUS_ORDER.includes(input.status)) return { ok: false, error: "Некорректный статус" };
-  if (!PRIORITY_ORDER.includes(input.priority)) return { ok: false, error: "Некорректная срочность" };
-  const hours = Number.isFinite(input.hours) && input.hours >= 0 ? input.hours : 0;
-  const deadlineTime = input.deadlineTime ? normalizeTime(input.deadlineTime) : null;
-  if (input.deadlineTime && !deadlineTime) return { ok: false, error: "Некорректное время (ЧЧ:ММ)" };
+  const parsed = parseJsonBody(input, taskInputSchema, "Некорректные данные задачи");
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  const data = parsed.data;
+  const title = data.title;
+  const hours = data.hours;
+  const deadlineTime = data.deadlineTime ? normalizeTime(data.deadlineTime) : null;
+  if (data.deadlineTime && !deadlineTime) return { ok: false, error: "Некорректное время (ЧЧ:ММ)" };
 
-  if (input.id) {
-    const existing = await getTaskAccess(input.id);
+  if (data.id) {
+    const existing = await getTaskAccess(data.id);
     if (!existing) return { ok: false, error: "Задача не найдена" };
     const isOwner = canManageData(me.role) || existing.authorId === me.id;
     const isAssignee = existing.assigneeId === me.id;
     if (!isOwner && !isAssignee) return { ok: false, error: "Нет доступа к задаче" };
-    if (input.status === "closed" && !isOwner && existing.status !== "closed") {
+    if (data.status === "closed" && !isOwner && existing.status !== "closed") {
       return { ok: false, error: "Закрыть задачу может только автор или администратор" };
     }
     const ts =
-      input.status !== existing.status
-        ? statusTimestamps(input.status, existing)
+      data.status !== existing.status
+        ? statusTimestamps(data.status, existing)
         : { completedAt: existing.completedAt, closedAt: existing.closedAt };
     // Taking the task into work counts as accepting it.
     const acceptedAt = ts.completedAt
       ? ts.completedAt
-      : existing.acceptedAt ?? (input.status !== "new" ? new Date().toISOString() : null);
+      : existing.acceptedAt ?? (data.status !== "new" ? new Date().toISOString() : null);
     if (isOwner) {
-      await updateTask(input.id, {
+      await updateTask(data.id, {
         title,
-        description: input.description?.trim() || null,
-        assigneeId: input.assigneeId,
+        description: data.description?.trim() || null,
+        assigneeId: data.assigneeId,
         authorId: existing.authorId,
-        counterpartyId: input.counterpartyId || null,
-        deadline: input.deadline,
+        counterpartyId: data.counterpartyId || null,
+        deadline: data.deadline,
         deadlineTime,
         hours,
-        status: input.status,
-        priority: input.priority,
+        status: data.status,
+        priority: data.priority,
         acceptedAt,
         ...ts,
       });
     } else {
-      await updateTaskAsAssignee(input.id, {
-        status: input.status,
+      await updateTaskAsAssignee(data.id, {
+        status: data.status,
         hours,
-        description: input.description?.trim() || null,
+        description: data.description?.trim() || null,
         acceptedAt,
         ...ts,
       });
     }
     revalidatePath("/", "layout");
-  publishLiveEvent("tasks", me.id);
-    return { ok: true, id: input.id };
+    publishLiveEvent("tasks", me.id);
+    return { ok: true, id: data.id };
   }
 
-  const ts = statusTimestamps(input.status, { completedAt: null, closedAt: null });
+  const ts = statusTimestamps(data.status, { completedAt: null, closedAt: null });
   const acceptedAt =
-    input.status === "new" ? null : ts.completedAt ?? new Date().toISOString();
+    data.status === "new" ? null : ts.completedAt ?? new Date().toISOString();
   const id = await insertTask({
     title,
-    description: input.description?.trim() || null,
-    assigneeId: input.assigneeId,
+    description: data.description?.trim() || null,
+    assigneeId: data.assigneeId,
     authorId: me.id,
-    counterpartyId: input.counterpartyId || null,
-    deadline: input.deadline,
+    counterpartyId: data.counterpartyId || null,
+    deadline: data.deadline,
     deadlineTime,
     hours,
-    status: input.status,
-    priority: input.priority,
+    status: data.status,
+    priority: data.priority,
     acceptedAt,
     ...ts,
   });

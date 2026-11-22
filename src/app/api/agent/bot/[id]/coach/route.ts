@@ -1,7 +1,7 @@
-import { getAgentTask, recordAgentUsage, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
+import { AGENT_URL } from "@/lib/agentConfig";
+import { getAgentTask, getAiUserSettingsSecret, recordAgentUsage, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
 import { requestAgentStepCoaching } from "@/lib/agentCoach";
-import { AGENT_URL } from "@/app/api/ai/agent/route";
 import type { GenParams } from "@/lib/genParams";
 
 /**
@@ -71,6 +71,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     );
   }
 
+  const savedSettings = await getAiUserSettingsSecret(ownerId).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
   const advice = await requestAgentStepCoaching({
     agentUrl: AGENT_URL,
     taskPrompt: task.prompt,
@@ -89,6 +90,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     params: body?.params ?? null,
     history: Array.isArray(body?.history) ? body.history.map((s) => String(s)).slice(-10) : [],
     screenshot: typeof body?.screenshot === "string" ? body.screenshot : undefined,
+    settings: savedSettings.baseUrl || savedSettings.model || savedSettings.apiKey ? savedSettings : undefined,
   });
 
   if (advice.source === "heuristic" && (task.coachMode !== "agent" || phase === "before_action")) {

@@ -17,6 +17,7 @@ import {
   IMPORT_ROW_LIMIT,
   IMPORT_TEMPLATE_ROWS,
   parseCounterpartyMatrix,
+  parseCsvMatrix,
   type ParsedCounterpartyRow,
 } from "@/lib/counterpartyImport";
 import { cn, formatDateTime } from "@/lib/utils";
@@ -27,6 +28,28 @@ import { LoadMore, useProgressiveList } from "./lazy";
 type SortKey = "name" | "inn" | "email" | "phone" | "tasksCount" | "createdAt";
 
 const empty = { name: "", phone: "", email: "", address: "", inn: "", kpp: "", notes: "" };
+
+function SortTh({
+  k,
+  sortKey,
+  onSort,
+  children,
+  className,
+}: {
+  k: SortKey;
+  sortKey: SortKey;
+  onSort: (key: SortKey) => void;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <th className={cn("px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide text-muted", className)}>
+      <button onClick={() => onSort(k)} className={cn("inline-flex items-center gap-1 hover:text-text", sortKey === k && "text-accent2")}>
+        {children} <ArrowUpDown size={12} />
+      </button>
+    </th>
+  );
+}
 
 export function CounterpartiesClient({ items, isAdmin }: { items: CounterpartyRow[]; isAdmin: boolean }) {
   const router = useRouter();
@@ -96,14 +119,6 @@ export function CounterpartiesClient({ items, isAdmin }: { items: CounterpartyRo
     });
   };
 
-  const Th = ({ k, children, className }: { k: SortKey; children: React.ReactNode; className?: string }) => (
-    <th className={cn("px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide text-muted", className)}>
-      <button onClick={() => toggleSort(k)} className={cn("inline-flex items-center gap-1 hover:text-text", sort.key === k && "text-accent2")}>
-        {children} <ArrowUpDown size={12} />
-      </button>
-    </th>
-  );
-
   const readonly = !!modal.readonly || !isAdmin;
   const current = modal.id ? items.find((c) => c.id === modal.id) : undefined;
 
@@ -145,13 +160,13 @@ export function CounterpartiesClient({ items, isAdmin }: { items: CounterpartyRo
               <table className="w-full text-sm">
                 <thead className="border-b border-border bg-card2/60">
                   <tr>
-                    <Th k="name">Название / Имя</Th>
-                    <Th k="phone">Телефон</Th>
-                    <Th k="email">Email</Th>
-                    <Th k="inn">ИНН / КПП</Th>
+                    <SortTh k="name" sortKey={sort.key} onSort={toggleSort}>Название / Имя</SortTh>
+                    <SortTh k="phone" sortKey={sort.key} onSort={toggleSort}>Телефон</SortTh>
+                    <SortTh k="email" sortKey={sort.key} onSort={toggleSort}>Email</SortTh>
+                    <SortTh k="inn" sortKey={sort.key} onSort={toggleSort}>ИНН / КПП</SortTh>
                     <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide text-muted">Адрес</th>
-                    <Th k="tasksCount" className="text-right">Задач</Th>
-                    <Th k="createdAt">Создан</Th>
+                    <SortTh k="tasksCount" sortKey={sort.key} onSort={toggleSort} className="text-right">Задач</SortTh>
+                    <SortTh k="createdAt" sortKey={sort.key} onSort={toggleSort}>Создан</SortTh>
                     <th className="px-3 py-2.5" />
                   </tr>
                 </thead>
@@ -305,8 +320,12 @@ function ImportPanel({ onImported }: { onImported: () => void }) {
     setMissing([]);
     setFileName(file.name);
 
-    if (!/\.(xlsx|xls|csv)$/i.test(file.name)) {
-      setError("Поддерживаются файлы Excel: .xlsx, .xls и .csv");
+    if (/\.xls$/i.test(file.name)) {
+      setError("Устаревший формат .xls не поддерживается — сохраните файл как .xlsx или .csv");
+      return;
+    }
+    if (!/\.(xlsx|csv)$/i.test(file.name)) {
+      setError("Поддерживаются файлы Excel (.xlsx) и CSV (.csv)");
       return;
     }
     if (file.size > FILE_LIMIT_MB * 1024 * 1024) {
@@ -316,22 +335,18 @@ function ImportPanel({ onImported }: { onImported: () => void }) {
 
     setReading(true);
     try {
-      // Библиотека xlsx читает и .xlsx, и старый .xls, и .csv — грузим её только по требованию.
-      const XLSX = await import("xlsx");
-      const wb = XLSX.read(new Uint8Array(await file.arrayBuffer()), { type: "array" });
-      const sheetName = wb.SheetNames[0];
-      const sheet = sheetName ? wb.Sheets[sheetName] : undefined;
-      if (!sheet) {
-        setError("В файле нет листов с данными");
+      let matrix: unknown[][];
+      if (/\.csv$/i.test(file.name)) {
+        matrix = parseCsvMatrix(await file.text());
+      } else {
+        const { readSheet } = await import("read-excel-file/browser");
+        matrix = (await readSheet(file)) as unknown[][];
+      }
+      if (!matrix || matrix.length === 0) {
+        setError("В файле нет данных");
         return;
       }
 
-      const matrix = XLSX.utils.sheet_to_json<unknown[]>(sheet, {
-        header: 1,
-        blankrows: false,
-        defval: "",
-        raw: true,
-      });
       const parsed = parseCounterpartyMatrix(matrix);
       setRows(parsed.rows);
       setMissing(parsed.missingColumns);
@@ -344,7 +359,7 @@ function ImportPanel({ onImported }: { onImported: () => void }) {
         setError(`В файле ${parsed.rows.length} строк — за один раз можно загрузить не более ${IMPORT_ROW_LIMIT}. Разделите файл на части.`);
       }
     } catch {
-      setError("Не удалось прочитать файл. Проверьте, что это корректный файл Excel, и попробуйте снова.");
+      setError("Не удалось прочитать файл. Проверьте, что это корректный файл Excel (.xlsx) или CSV, и попробуйте снова.");
     } finally {
       setReading(false);
     }
@@ -383,12 +398,19 @@ function ImportPanel({ onImported }: { onImported: () => void }) {
   }, [rows, duplicates]);
 
   const downloadTemplate = async () => {
-    const XLSX = await import("xlsx");
-    const ws = XLSX.utils.json_to_sheet(IMPORT_TEMPLATE_ROWS, { header: [...IMPORT_COLUMNS] });
-    ws["!cols"] = [{ wch: 42 }, { wch: 16 }, { wch: 14 }];
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Контрагенты");
-    XLSX.writeFile(wb, "counterparties-template.xlsx");
+    const { default: writeXlsxFile } = await import("write-excel-file/browser");
+    const sheetData = [
+      IMPORT_COLUMNS.map((label) => ({ value: label, fontWeight: "bold" as const })),
+      ...IMPORT_TEMPLATE_ROWS.map((row) => [
+        { type: String, value: row.Наименование },
+        { type: String, value: row.ИНН },
+        { type: String, value: row.КПП },
+      ]),
+    ];
+    await writeXlsxFile(sheetData, {
+      columns: [{ width: 42 }, { width: 16 }, { width: 14 }],
+      sheet: "Контрагенты",
+    }).toFile("counterparties-template.xlsx");
   };
 
   const submit = () => {
@@ -501,7 +523,7 @@ function ImportPanel({ onImported }: { onImported: () => void }) {
           >
             <input
               type="file"
-              accept=".xlsx,.xls,.csv"
+              accept=".xlsx,.csv"
               className="hidden"
               onChange={(e) => {
                 const file = e.target.files?.[0];
@@ -512,7 +534,7 @@ function ImportPanel({ onImported }: { onImported: () => void }) {
             {reading ? <Loader2 size={22} className="animate-spin text-accent2" /> : <Upload size={22} className="text-muted" />}
             <span className="text-sm font-medium">{fileName ?? "Перетащите файл или нажмите, чтобы выбрать"}</span>
             <span className="text-[11px] text-muted">
-              Excel (.xlsx, .xls) или CSV · до {FILE_LIMIT_MB} МБ · до {IMPORT_ROW_LIMIT} строк
+              Excel (.xlsx) или CSV · до {FILE_LIMIT_MB} МБ · до {IMPORT_ROW_LIMIT} строк
             </span>
           </label>
 

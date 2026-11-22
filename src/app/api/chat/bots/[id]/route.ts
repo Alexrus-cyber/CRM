@@ -3,6 +3,7 @@ import { getCurrentUser } from "@/lib/auth";
 import { publicChatBot } from "@/lib/chatBot";
 import { publishLiveEvent } from "@/lib/events";
 import { normalizeGenParams } from "@/lib/genParams";
+import { chatBotPatchSchema, readValidatedJson } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -23,25 +24,9 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
   const existing = await getChatBot(botUserId);
   if (!existing) return Response.json({ error: "Бот не найден" }, { status: 404 });
 
-  const body = (await req.json().catch(() => null)) as
-    | {
-        name?: string;
-        position?: string | null;
-        bio?: string | null;
-        avatarColor?: string;
-        provider?: string;
-        baseUrl?: string;
-        apiKey?: string;
-        clearApiKey?: boolean;
-        model?: string;
-        systemPrompt?: string;
-        params?: unknown;
-        replyMode?: string;
-        isActive?: boolean;
-      }
-    | null;
-
-  if (!body) return Response.json({ error: "Пустой запрос" }, { status: 400 });
+  const parsed = await readValidatedJson(req, chatBotPatchSchema, "Пустой запрос");
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.data;
 
   const avatarColor =
     body.avatarColor !== undefined && /^#[0-9a-fA-F]{6}$/.test(body.avatarColor)

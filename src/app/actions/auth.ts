@@ -1,5 +1,6 @@
 "use server";
 
+import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { findUserAuthByEmail } from "@/db/repo";
 import {
@@ -8,6 +9,13 @@ import {
   ensureSuperAdmin,
   verifyPassword,
 } from "@/lib/auth";
+import {
+  checkLoginRateLimit,
+  clearLoginFailures,
+  extractClientIp,
+  recordLoginFailure,
+} from "@/lib/rateLimit";
+import { loginInputSchema, parseJsonBody } from "@/lib/validation";
 
 export type LoginState = { error?: string } | undefined;
 
@@ -15,19 +23,42 @@ export async function loginAction(
   _prev: LoginState,
   formData: FormData,
 ): Promise<LoginState> {
-  const email = String(formData.get("email") ?? "")
-    .trim()
-    .toLowerCase();
-  const password = String(formData.get("password") ?? "");
-  if (!email || !password) {
-    return { error: "Введите email и пароль" };
+  const parsed = parseJsonBody(
+    {
+      email: String(formData.get("email") ?? "").trim().toLowerCase(),
+      password: String(formData.get("password") ?? ""),
+    },
+    loginInputSchema,
+    "Введите email и пароль",
+  );
+  if (!parsed.ok) {
+    return { error: parsed.error };
   }
+
+  const hdrs = await headers();
+  const ip = extractClientIp(hdrs);
+  const userAgent = (hdrs.get("user-agent") ?? "").slice(0, 300);
+
+  const limit = checkLoginRateLimit(ip, parsed.data.email);
+  if (!limit.allowed) {
+    return {
+      error: `Слишком много попыток входа. Повторите через ${limit.retryAfterSec} сек.`,
+    };
+  }
+
   await ensureSuperAdmin();
-  const user = await findUserAuthByEmail(email);
-  if (!user || !verifyPassword(password, user.passwordHash)) {
+  const user = await findUserAuthByEmail(parsed.data.email);
+  if (!user || !verifyPassword(parsed.data.password, user.passwordHash)) {
+    recordLoginFailure(ip, parsed.data.email);
     return { error: "Неверный email или пароль" };
   }
-  await createSession(user.id);
+
+  clearLoginFailures(ip, parsed.data.email);
+  await createSession(user.id, {
+    label: "Веб-браузер",
+    userAgent,
+    ip,
+  });
   redirect("/dashboard");
 }
 

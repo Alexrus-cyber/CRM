@@ -12,6 +12,7 @@
  */
 
 import { AI_MAX_GENERATION_TOKENS, AI_REASONING_MODES, type ReasoningMode } from "./ai";
+import { isSuperAdminRole } from "./permissions";
 
 export type GenParams = {
   /** Сколько «думать»: reasoning_effort у OpenAI-совместимых серверов. */
@@ -42,7 +43,7 @@ export const AGENT_MAX_STEPS = 500;
 export const OPERATOR_MAX_EXTEND_STEPS = 2000;
 
 export function isUnlimitedStepsRole(role: string | null | undefined): boolean {
-  return role === "super_admin";
+  return isSuperAdminRole(role);
 }
 
 export function maxStepsCapForRole(role: string | null | undefined): number | null {

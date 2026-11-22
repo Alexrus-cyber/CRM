@@ -43,10 +43,11 @@ import {
   TriangleAlert,
   X,
 } from "lucide-react";
-import { AI_DEFAULT_BASE_URL, AI_MAX_FILE_BYTES, AI_STORAGE_SETTINGS, formatBytes, type AiSettings } from "@/lib/ai";
+import { AI_DEFAULT_BASE_URL, AI_MAX_FILE_BYTES, formatBytes, type AiSettings } from "@/lib/ai";
 import { Input, Textarea } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import { useStoredJson, useStoredNumber } from "@/lib/useStoredValue";
+import { useAiSettings } from "@/lib/useAiSettings";
 import { extractFile } from "@/lib/fileExtract";
 import { splitIntoChunks } from "@/lib/rag";
 import { GenSettings } from "./GenSettings";
@@ -361,7 +362,6 @@ const EXAMPLES = [
   "Сделай CSV-файл с планом на неделю по продажам",
 ];
 
-const DEFAULT_SETTINGS: AiSettings = { baseUrl: AI_DEFAULT_BASE_URL, apiKey: "", model: "" };
 const DEFAULT_RAG_PREFS: RagPrefs = { folderId: 0, ragFull: false, ragChunks: 12 };
 
 type AgentLayoutMode = "tabs" | "classic";
@@ -398,15 +398,6 @@ function decodeAgentSteps(raw: string): number {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) return 0;
   return Math.floor(parsed);
-}
-
-function decodeSettings(raw: string): AiSettings {
-  const parsed = JSON.parse(raw) as Partial<AiSettings>;
-  return {
-    baseUrl: String(parsed.baseUrl ?? DEFAULT_SETTINGS.baseUrl),
-    apiKey: String(parsed.apiKey ?? ""),
-    model: String(parsed.model ?? ""),
-  };
 }
 
 function decodeRagPrefs(raw: string, unlimited = false): RagPrefs {
@@ -446,11 +437,13 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     decodeLayoutMode,
   );
   const [activeTab, setActiveTab] = useState<AgentTabId>("chat");
-  const [settings, setSettings] = useStoredJson<AiSettings>(
-    AI_STORAGE_SETTINGS,
-    DEFAULT_SETTINGS,
-    decodeSettings,
-  );
+  const {
+    settings,
+    serverMeta,
+    setSettings,
+    persistSettings,
+    clearSavedKey,
+  } = useAiSettings();
   const [params, setParams] = useStoredJson<GenParams>(
     "crm.ai.agent.params.v1",
     GEN_DEFAULT_PARAMS,
@@ -593,6 +586,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     if (checkingModels) return;
     setCheckingModels(true);
     try {
+      await persistSettings();
       const targetModel = settings.model.trim();
       const qs = new URLSearchParams({ base: settings.baseUrl });
       if (targetModel) qs.set("model", targetModel);
@@ -626,7 +620,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     } finally {
       setCheckingModels(false);
     }
-  }, [checkingModels, setSettings, settings]);
+  }, [checkingModels, persistSettings, setSettings, settings]);
 
   const loadHealth = useCallback(async (): Promise<Health> => {
     try {
@@ -2464,6 +2458,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               <input
                 value={settings.baseUrl}
                 onChange={(e) => saveSettings({ ...settings, baseUrl: e.target.value })}
+                onBlur={() => void persistSettings()}
                 placeholder={AI_DEFAULT_BASE_URL}
                 className="mt-1 h-8 w-full rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
               />
@@ -2497,21 +2492,39 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   aria-label="Модель"
                   value={settings.model}
                   onChange={(e) => saveSettings({ ...settings, model: e.target.value })}
+                  onBlur={() => void persistSettings()}
                   placeholder="например, qwen3:8b"
                   className="h-8 min-w-0 flex-1 rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
                 />
               </div>
             </div>
-            <label className="text-[11px] text-muted">
-              API-ключ (если нужен)
+            <div className="text-[11px] text-muted">
+              <div className="flex items-center justify-between gap-2">
+                <label htmlFor="agent-api-key">API-ключ (если нужен)</label>
+                {serverMeta.hasApiKey && (
+                  <button
+                    type="button"
+                    onClick={() => void clearSavedKey()}
+                    className="text-[10px] text-red-400 hover:underline"
+                  >
+                    Удалить ({serverMeta.apiKeyHint ?? "активен"})
+                  </button>
+                )}
+              </div>
               <input
+                id="agent-api-key"
                 value={settings.apiKey}
                 onChange={(e) => saveSettings({ ...settings, apiKey: e.target.value })}
+                onBlur={() => void persistSettings()}
                 type="password"
-                placeholder="необязательно"
+                placeholder={
+                  serverMeta.hasApiKey
+                    ? `Сохранён на сервере (${serverMeta.apiKeyHint ?? "sk-•••"})`
+                    : "необязательно"
+                }
                 className="mt-1 h-8 w-full rounded-lg border border-border bg-card2 px-2 text-[11px] text-text outline-none focus:border-accent"
               />
-            </label>
+            </div>
           </div>
         </div>
 

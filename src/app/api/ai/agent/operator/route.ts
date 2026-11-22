@@ -1,4 +1,4 @@
-import { addAgentEvent, createAgentTask, recordAgentUsage } from "@/db/repo";
+import { addAgentEvent, createAgentTask, getAiUserSettingsSecret, recordAgentUsage } from "@/db/repo";
 import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { aiAuthHeaders, aiEndpoint, estimateTokens, normalizeBaseUrl } from "@/lib/ai";
@@ -77,9 +77,10 @@ export async function POST(req: Request) {
     if (!goal) return Response.json({ error: "Опишите, чем нужно помочь на экране" }, { status: 400 });
 
     const fallback = heuristicFormulate(goal);
-    const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl ?? "");
-    const model = (body?.settings?.model ?? process.env.AI_MODEL ?? "").trim();
-    const apiKey = (body?.settings?.apiKey ?? process.env.AI_API_KEY ?? "").trim();
+    const saved = await getAiUserSettingsSecret(me.id).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
+    const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl || saved.baseUrl || "");
+    const model = ((body?.settings?.model ?? "").trim() || saved.model || process.env.AI_MODEL || "").trim();
+    const apiKey = ((body?.settings?.apiKey ?? "").trim() || saved.apiKey || process.env.AI_API_KEY || "").trim();
     if (!baseUrl || !model) {
       return Response.json({ ...fallback, source: "heuristic" }, { headers: { "Cache-Control": "no-store" } });
     }

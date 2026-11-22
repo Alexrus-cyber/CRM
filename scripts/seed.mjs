@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 /**
- * Demo data seed for the CRM. Works on PostgreSQL and SQLite.
+ * Инициализация и заполнение базы CRM (PostgreSQL и SQLite).
  *
- *   node scripts/seed.mjs                 # engine follows .env / auto-detection
- *   node scripts/seed.mjs --sqlite        # force SQLite (./data/crm.sqlite)
- *   node scripts/seed.mjs --postgres      # force PostgreSQL (DATABASE_URL)
+ *   node scripts/seed.mjs                 # движок из .env / автовыбор (создаёт только супер-админа)
+ *   node scripts/seed.mjs --demo          # или SEED_DEMO=1 — дополнительно заполняет демо-команду и задачи
+ *   node scripts/seed.mjs --sqlite        # принудительно SQLite (./data/crm.sqlite)
+ *   node scripts/seed.mjs --postgres      # принудительно PostgreSQL (DATABASE_URL)
  *
- * Idempotent: skips when the database already contains more than one user.
+ * Пароли берутся из переменных окружения (`CRM_SEED_ADMIN_PASSWORD`, `CRM_SEED_DEMO_PASSWORD`)
+ * либо генерируются случайно при первом запуске и один раз выводятся в консоль.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -14,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { randomBytes, scryptSync } from "node:crypto";
 import pg from "pg";
 import Database from "better-sqlite3";
+import { runMigrations, wrapPgPool, wrapSqliteDb } from "../src/db/migrate.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 if (fs.existsSync(path.join(root, ".env"))) {
@@ -23,23 +26,22 @@ if (fs.existsSync(path.join(root, ".env"))) {
   }
 }
 
+const args = new Set(process.argv.slice(2));
 const SQLITE_PATH = process.env.SQLITE_PATH || path.join(root, "data", "crm.sqlite");
-const flag = process.argv[2];
-const requested = flag === "--sqlite" ? "sqlite" : flag === "--postgres" ? "postgres" : (process.env.DB_DIALECT || "auto");
-
-function readDdl(name) {
-  const source = fs.readFileSync(path.join(root, "src", "db", "dialect.ts"), "utf8");
-  const marker = name === "sqlite" ? "const SQLITE_DDL = [" : "const PG_DDL = [";
-  const start = source.indexOf(marker);
-  if (start === -1) throw new Error(`DDL block ${name} not found`);
-  const block = source.slice(start + marker.length).split("\n];")[0];
-  return [...block.matchAll(/`([\s\S]*?)`/g)].map((m) => m[1]);
-}
+const requested = args.has("--sqlite")
+  ? "sqlite"
+  : args.has("--postgres")
+    ? "postgres"
+    : process.env.DB_DIALECT || "auto";
+const seedDemo = args.has("--demo") || process.env.SEED_DEMO === "1" || process.env.SEED_DEMO === "true";
 
 const hash = (password) => {
   const salt = randomBytes(16).toString("hex");
   return `${salt}:${scryptSync(password, salt, 64).toString("hex")}`;
 };
+
+const generatePassword = () => randomBytes(12).toString("base64url") + "A1!";
+
 const isoOffset = (days, hour = 15) => {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() + days);
@@ -48,7 +50,6 @@ const isoOffset = (days, hour = 15) => {
 };
 const day = (offset) => isoOffset(offset).slice(0, 10);
 
-/** Unified adapter: `?` placeholders, rewritten to `$n` for PostgreSQL. */
 function makeAdapter(dialect, pool, sqlite) {
   if (dialect === "postgres") {
     return async (text, params = []) => {
@@ -60,33 +61,41 @@ function makeAdapter(dialect, pool, sqlite) {
   }
   return async (text, params = []) => {
     const stmt = sqlite.prepare(text);
-    const args = params.map((p) => (p === undefined ? null : p));
+    const values = params.map((p) => {
+      if (p === undefined) return null;
+      if (typeof p === "boolean") return p ? 1 : 0;
+      return p;
+    });
     if (!stmt.reader) {
-      stmt.run(...args);
+      stmt.run(...values);
       return [];
     }
-    return stmt.all(...args);
+    return stmt.all(...values);
+  };
+}
+
+async function openEngineFallbackSqlite() {
+  fs.mkdirSync(path.dirname(SQLITE_PATH), { recursive: true });
+  const sqlite = new Database(SQLITE_PATH);
+  sqlite.pragma("journal_mode = WAL");
+  sqlite.pragma("foreign_keys = ON");
+  await runMigrations(wrapSqliteDb(sqlite));
+  return {
+    dialect: "sqlite",
+    label: `SQLite (${SQLITE_PATH})`,
+    query: makeAdapter("sqlite", null, sqlite),
+    close: async () => sqlite.close(),
   };
 }
 
 async function openEngine() {
   if (requested === "sqlite") {
-    fs.mkdirSync(path.dirname(SQLITE_PATH), { recursive: true });
-    const sqlite = new Database(SQLITE_PATH);
-    sqlite.pragma("journal_mode = WAL");
-    sqlite.pragma("foreign_keys = ON");
-    for (const statement of readDdl("sqlite")) sqlite.exec(statement);
-    return {
-      dialect: "sqlite",
-      label: `SQLite (${SQLITE_PATH})`,
-      query: makeAdapter("sqlite", null, sqlite),
-      close: async () => sqlite.close(),
-    };
+    return openEngineFallbackSqlite();
   }
   const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 4000 });
   try {
     await pool.query("select 1");
-    for (const statement of readDdl("postgres")) await pool.query(statement);
+    await runMigrations(wrapPgPool(pool));
     return {
       dialect: "postgres",
       label: "PostgreSQL",
@@ -101,39 +110,29 @@ async function openEngine() {
   }
 }
 
-function openEngineFallbackSqlite() {
-  fs.mkdirSync(path.dirname(SQLITE_PATH), { recursive: true });
-  const sqlite = new Database(SQLITE_PATH);
-  sqlite.pragma("journal_mode = WAL");
-  sqlite.pragma("foreign_keys = ON");
-  for (const statement of readDdl("sqlite")) sqlite.exec(statement);
-  return {
-    dialect: "sqlite",
-    label: `SQLite (${SQLITE_PATH})`,
-    query: makeAdapter("sqlite", null, sqlite),
-    close: async () => sqlite.close(),
-  };
-}
-
 const engine = await openEngine();
-const { query, dialect, label } = engine;
+const { query, label } = engine;
 
 try {
-  const countRows = await query("select count(*) as c from users");
-  if (Number(countRows[0].c) > 1) {
-    console.log(`[${label}] database already has data, skipping seed.`);
+  const countRows = await query("select count(*) as c from users where is_bot = false");
+  if (Number(countRows[0].c) > (seedDemo ? 1 : 0)) {
+    console.log(`[${label}] database already has users, skipping seed.`);
     await engine.close();
     process.exit(0);
   }
 
+  const adminEmail = (process.env.CRM_SEED_ADMIN_EMAIL || "admin@crm.local").trim().toLowerCase();
+  const envAdminPass = (process.env.CRM_SEED_ADMIN_PASSWORD || "").trim();
+  const adminPassword = envAdminPass || generatePassword();
+
   await query(
-    `insert into users (email, password_hash, name, position, role, avatar_color, phone, bio, created_at, updated_at)
-     values (?, ?, ?, ?, 'super_admin', '#7c5cff', '+7 (900) 100-00-01', ?, ?, ?)
-     on conflict (email) do update set role = 'super_admin'`,
+    `insert into users (email, password_hash, name, position, role, avatar_color, phone, bio, is_bot, can_use_agent, can_use_operator, created_at, updated_at)
+     values (?, ?, ?, ?, 'super_admin', '#7c5cff', '+7 (900) 100-00-01', ?, false, true, true, ?, ?)
+     on conflict (email) do update set role = 'super_admin', can_use_agent = true, can_use_operator = true`,
     [
-      "admin@crm.ru",
-      hash("Admin12345"),
-      "Главный администратор",
+      adminEmail,
+      hash(adminPassword),
+      process.env.CRM_SEED_ADMIN_NAME || "Главный администратор",
       "Руководитель",
       "Отвечаю за развитие продукта и команду.",
       isoOffset(-30),
@@ -141,22 +140,39 @@ try {
     ],
   );
 
+  if (!envAdminPass) {
+    console.log(`[${label}] создан super_admin: ${adminEmail} / временный пароль: ${adminPassword}`);
+  } else {
+    console.log(`[${label}] создан super_admin: ${adminEmail} (пароль из CRM_SEED_ADMIN_PASSWORD)`);
+  }
+
+  if (!seedDemo) {
+    console.log(`[${label}] базовый seed завершён (для демо-данных передайте --demo или SEED_DEMO=1).`);
+    await engine.close();
+    process.exit(0);
+  }
+
+  const envDemoPass = (process.env.CRM_SEED_DEMO_PASSWORD || "").trim();
+  const demoPassword = envDemoPass || generatePassword();
+
   const people = [
-    ["maria@crm.ru", "Мария Соколова", "Руководитель проектов", "manager", "#ec4899", "+7 (900) 100-00-02"],
-    ["ivan@crm.ru", "Иван Петров", "Frontend-разработчик", "developer", "#3b82f6", "+7 (900) 100-00-03"],
-    ["anna@crm.ru", "Анна Кузнецова", "Backend-разработчик", "developer", "#10b981", "+7 (900) 100-00-04"],
-    ["dmitry@crm.ru", "Дмитрий Волков", "QA-инженер", "consultant", "#f59e0b", "+7 (900) 100-00-05"],
-    ["olga@crm.ru", "Ольга Смирнова", "Менеджер по продажам", "manager", "#06b6d4", "+7 (900) 100-00-06"],
+    ["maria@crm.local", "Мария Соколова", "Руководитель проектов", "manager", "#ec4899", "+7 (900) 100-00-02"],
+    ["ivan@crm.local", "Иван Петров", "Frontend-разработчик", "developer", "#3b82f6", "+7 (900) 100-00-03"],
+    ["anna@crm.local", "Анна Кузнецова", "Backend-разработчик", "developer", "#10b981", "+7 (900) 100-00-04"],
+    ["dmitry@crm.local", "Дмитрий Волков", "QA-инженер", "consultant", "#f59e0b", "+7 (900) 100-00-05"],
+    ["olga@crm.local", "Ольга Смирнова", "Менеджер по продажам", "manager", "#06b6d4", "+7 (900) 100-00-06"],
   ];
   for (const [email, name, position, role, color, phone] of people) {
     await query(
-      `insert into users (email, password_hash, name, position, role, avatar_color, phone, created_at, updated_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict (email) do nothing`,
-      [email, hash("Password1"), name, position, role, color, phone, isoOffset(-25), isoOffset(-25)],
+      `insert into users (email, password_hash, name, position, role, avatar_color, phone, is_bot, can_use_agent, can_use_operator, created_at, updated_at)
+       values (?, ?, ?, ?, ?, ?, ?, false, false, false, ?, ?) on conflict (email) do nothing`,
+      [email, hash(demoPassword), name, position, role, color, phone, isoOffset(-25), isoOffset(-25)],
     );
   }
-  const users = await query("select id, email from users");
+  const users = await query("select id, email from users where is_bot = false");
   const U = Object.fromEntries(users.map((u) => [u.email.split("@")[0], Number(u.id)]));
+  const adminKey = adminEmail.split("@")[0];
+  U.admin = U[adminKey] ?? Number(users[0]?.id);
 
   const cps = [
     ["ООО «Ромашка»", "+7 (495) 111-22-33", "info@romashka.ru", "г. Москва, ул. Тверская, д. 10", "7701234567", "770101001", "Ключевой клиент. Контакт — Сергей, коммерческий директор."],
@@ -176,7 +192,6 @@ try {
     cpIds.push(Number(rows[0].id));
   }
 
-  // title, assignee, author, cpIndex, deadlineOffset, hours, status, priority, createdOffset, completedOffset, closedOffset
   const TIME_SLOTS = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00"];
   const T = [
     ["Подготовить коммерческое предложение", "olga", "admin", 0, -6, 4, "closed", "high", -14, -8, -7],
@@ -209,7 +224,6 @@ try {
     ["Обзвон тёплых лидов", "olga", "maria", 5, 1, 4, "in_progress", "medium", -2, null, null],
   ];
   for (const [index, [title, a, au, cp, dl, hours, status, prio, created, completed, closed]] of T.entries()) {
-    // Tasks keep a concrete hour slot so the "schedule by hour" views have data.
     const time = TIME_SLOTS[index % TIME_SLOTS.length];
     const accepted = status === "new" ? null : isoOffset(created, 12);
     await query(
@@ -264,7 +278,10 @@ try {
     minutesAgoIso(5),
   ]);
 
-  console.log(`[${label}] seed complete: ${users.length} users, ${cpIds.length} counterparties, ${T.length} tasks`);
+  if (!envDemoPass) {
+    console.log(`[${label}] временный пароль демо-сотрудников: ${demoPassword}`);
+  }
+  console.log(`[${label}] demo seed complete: ${users.length} users, ${cpIds.length} counterparties, ${T.length} tasks`);
 } finally {
   await engine.close();
 }

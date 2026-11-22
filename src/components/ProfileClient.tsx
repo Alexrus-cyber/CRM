@@ -1,8 +1,8 @@
 "use client";
 
-import { useRef, useState, useTransition } from "react";
+import { useEffect, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Camera, Check, KeyRound, RotateCcw, Save, Shield, Trash2, X } from "lucide-react";
+import { Camera, Check, KeyRound, Laptop, LogOut, RotateCcw, Save, Shield, Trash2, X } from "lucide-react";
 import type { Role } from "@/db/schema";
 import type { UserLite } from "@/lib/data";
 import {
@@ -14,7 +14,7 @@ import {
   updateProfileAction,
   updateUserRoleAction,
 } from "@/app/actions/users";
-import { AVATAR_COLORS, cn, ROLE_LABELS } from "@/lib/utils";
+import { AVATAR_COLORS, cn, formatDateTime, ROLE_LABELS } from "@/lib/utils";
 import { Avatar, Button, Card, Field, Input, Textarea } from "./ui";
 import { Combobox } from "./Combobox";
 
@@ -138,8 +138,146 @@ export function ProfileForm({ user }: { user: UserLite }) {
             <Button variant="secondary" onClick={changePw} disabled={pending || !pw.current || !pw.next}><KeyRound size={16} /> Сменить пароль</Button>
           </div>
         </Card>
+
+        <SessionsCard />
       </div>
     </div>
+  );
+}
+
+type ActiveSessionItem = {
+  id: number;
+  label: string | null;
+  userAgent: string | null;
+  ip: string | null;
+  createdAt: string;
+  lastSeenAt: string | null;
+  expiresAt: string;
+  current: boolean;
+};
+
+function SessionsCard() {
+  const [sessions, setSessions] = useState<ActiveSessionItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<{ msg: string; ok: boolean } | null>(null);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/auth/sessions", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { sessions?: ActiveSessionItem[] };
+      setSessions(Array.isArray(data.sessions) ? data.sessions : []);
+    } catch {
+      /* ignore */
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/auth/sessions", { cache: "no-store" });
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as { sessions?: ActiveSessionItem[] };
+        if (!cancelled) setSessions(Array.isArray(data.sessions) ? data.sessions : []);
+      } catch {
+        /* ignore */
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const revokeOne = async (id: number) => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = await fetch(`/api/auth/sessions?id=${id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const d = (await res.json().catch(() => ({}))) as { error?: string };
+        setNotice({ msg: d.error || "Не удалось завершить сессию", ok: false });
+        return;
+      }
+      setNotice({ msg: "Сессия завершена", ok: true });
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revokeOthers = async () => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = await fetch("/api/auth/sessions?others=1", { method: "DELETE" });
+      if (!res.ok) {
+        const d = (await res.json().catch(() => ({}))) as { error?: string };
+        setNotice({ msg: d.error || "Не удалось завершить другие сессии", ok: false });
+        return;
+      }
+      setNotice({ msg: "Все остальные сессии завершены", ok: true });
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const otherCount = sessions.filter((s) => !s.current).length;
+
+  return (
+    <Card title="Активные сессии" subtitle="Устройства и лаунчеры, в которых открыт ваш аккаунт">
+      <div className="space-y-2">
+        {loading && sessions.length === 0 ? (
+          <p className="text-xs text-muted">Загрузка списка сессий...</p>
+        ) : sessions.length === 0 ? (
+          <p className="text-xs text-muted">Активных сессий не найдено.</p>
+        ) : (
+          sessions.map((s) => (
+            <div
+              key={s.id}
+              className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-card2/40 px-3 py-2 text-xs"
+            >
+              <div className="min-w-0 flex-1">
+                <p className="flex items-center gap-1.5 font-medium text-text">
+                  <Laptop size={13} className="shrink-0 text-accent2" />
+                  <span className="truncate">{s.label || s.userAgent || "Браузер / приложение"}</span>
+                  {s.current && (
+                    <span className="rounded-md bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-500">
+                      текущая
+                    </span>
+                  )}
+                </p>
+                <p className="mt-0.5 text-[11px] text-muted">
+                  Вход: {formatDateTime(s.createdAt)}
+                  {s.lastSeenAt ? ` · активность: ${formatDateTime(s.lastSeenAt)}` : ""}
+                  {s.ip ? ` · IP: ${s.ip}` : ""}
+                </p>
+              </div>
+              {!s.current && (
+                <Button variant="ghost" size="sm" disabled={busy} onClick={() => void revokeOne(s.id)}>
+                  <LogOut size={13} /> Выйти
+                </Button>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+        {notice ? <Notice {...notice} /> : <span />}
+        {otherCount > 0 && (
+          <Button variant="secondary" disabled={busy} onClick={() => void revokeOthers()}>
+            <LogOut size={15} /> Выйти на остальных устройствах ({otherCount})
+          </Button>
+        )}
+      </div>
+    </Card>
   );
 }
 

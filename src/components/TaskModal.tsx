@@ -40,7 +40,13 @@ export type TaskModalProps = {
   me: { id: number; role: Role };
 };
 
-export function TaskModal({
+export function TaskModal(props: TaskModalProps) {
+  if (!props.open) return null;
+  const resetKey = `${props.task?.id ?? "new"}-${props.defaultDeadline ?? ""}-${props.defaultTime ?? ""}`;
+  return <TaskModalInner key={resetKey} {...props} />;
+}
+
+function TaskModalInner({
   open,
   onClose,
   task,
@@ -55,48 +61,23 @@ export function TaskModal({
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => new Date());
 
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
-  const [assigneeId, setAssigneeId] = useState<number>(me.id);
-  const [counterpartyId, setCounterpartyId] = useState<number | "">("");
-  const [deadline, setDeadline] = useState(defaultDeadline ?? todayStr());
-  const [deadlineTime, setDeadlineTime] = useState(defaultTime ?? DEFAULT_TASK_TIME);
-  const [hours, setHours] = useState<string>("1");
-  const [status, setStatus] = useState<TaskStatus>("new");
-  const [priority, setPriority] = useState<TaskPriority>("medium");
+  const [title, setTitle] = useState(task?.title ?? "");
+  const [description, setDescription] = useState(task?.description ?? "");
+  const [assigneeId, setAssigneeId] = useState<number>(task?.assigneeId ?? me.id);
+  const [counterpartyId, setCounterpartyId] = useState<number | "">(task?.counterpartyId ?? "");
+  const [deadline, setDeadline] = useState(task?.deadline ?? defaultDeadline ?? todayStr());
+  const [deadlineTime, setDeadlineTime] = useState(
+    task ? (task.deadlineTime ?? "") : (defaultTime ?? DEFAULT_TASK_TIME),
+  );
+  const [hours, setHours] = useState<string>(task ? String(task.hours) : "1");
+  const [status, setStatus] = useState<TaskStatus>(task?.status ?? "new");
+  const [priority, setPriority] = useState<TaskPriority>(task?.priority ?? "medium");
 
   useEffect(() => {
     if (!open) return;
     const timer = setInterval(() => setNow(new Date()), 30000);
     return () => clearInterval(timer);
   }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    setError(null);
-    setNow(new Date());
-    if (task) {
-      setTitle(task.title);
-      setDescription(task.description ?? "");
-      setAssigneeId(task.assigneeId);
-      setCounterpartyId(task.counterpartyId ?? "");
-      setDeadline(task.deadline);
-      setDeadlineTime(task.deadlineTime ?? "");
-      setHours(String(task.hours));
-      setStatus(task.status);
-      setPriority(task.priority);
-    } else {
-      setTitle("");
-      setDescription("");
-      setAssigneeId(me.id);
-      setCounterpartyId("");
-      setDeadline(defaultDeadline ?? todayStr());
-      setDeadlineTime(defaultTime ?? DEFAULT_TASK_TIME);
-      setHours("1");
-      setStatus("new");
-      setPriority("medium");
-    }
-  }, [open, task, defaultDeadline, defaultTime, me.id]);
 
   const isNew = !task;
   const isOwner = isNew || canManageData(me.role) || task?.authorId === me.id;

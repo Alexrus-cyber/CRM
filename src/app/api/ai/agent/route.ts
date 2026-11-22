@@ -1,10 +1,12 @@
 import {
+  getAiUserSettingsSecret,
   getGithubConnectionWithSecret,
   getRagFolder,
   listRagChunks,
   recordAgentUsage,
   searchRagChunks,
 } from "@/db/repo";
+import { AGENT_START_HINT, AGENT_URL } from "@/lib/agentConfig";
 import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { estimateTokens, normalizeBaseUrl } from "@/lib/ai";
@@ -31,10 +33,6 @@ import { ROLE_LABELS } from "@/lib/utils";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-export const AGENT_URL = (process.env.AGENT_URL || "http://127.0.0.1:8899").replace(/\/+$/, "");
-const START_HINT =
-  "Запустите агента в папке проекта: python3 agent/agent.py (или задайте AGENT_URL, если он на другом хосте)";
-
 export async function GET() {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
@@ -48,7 +46,7 @@ export async function GET() {
       signal: AbortSignal.timeout(4000),
     });
     if (!res.ok) {
-      return Response.json({ available: false, endpoint: AGENT_URL, hint: START_HINT });
+      return Response.json({ available: false, endpoint: AGENT_URL, hint: AGENT_START_HINT });
     }
     const data = (await res.json()) as Record<string, unknown>;
     return Response.json(
@@ -56,7 +54,7 @@ export async function GET() {
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch {
-    return Response.json({ available: false, endpoint: AGENT_URL, hint: START_HINT });
+    return Response.json({ available: false, endpoint: AGENT_URL, hint: AGENT_START_HINT });
   }
 }
 
@@ -252,7 +250,8 @@ export async function POST(req: Request) {
         : body.systemPrompt.trim().slice(0, 12_000)
       : "";
 
-  const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl ?? "") ?? undefined;
+  const savedSettings = await getAiUserSettingsSecret(me.id).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
+  const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl || savedSettings.baseUrl || "") ?? undefined;
   const payload = {
     messages,
     attachments,
@@ -264,8 +263,8 @@ export async function POST(req: Request) {
     ...(runId ? { runId } : {}),
     settings: {
       baseUrl,
-      apiKey: (body?.settings?.apiKey ?? "").trim().slice(0, 400),
-      model: (body?.settings?.model ?? "").trim().slice(0, 200),
+      apiKey: ((body?.settings?.apiKey ?? "").trim() || savedSettings.apiKey).slice(0, 400),
+      model: ((body?.settings?.model ?? "").trim() || savedSettings.model).slice(0, 200),
     },
     ...(useGithub && ghConn
       ? {
@@ -301,7 +300,7 @@ export async function POST(req: Request) {
       signal: AbortSignal.timeout(900_000),
     });
   } catch {
-    return Response.json({ error: `Агент не запущен. ${START_HINT}`, hint: START_HINT }, { status: 503 });
+    return Response.json({ error: `Агент не запущен. ${AGENT_START_HINT}`, hint: AGENT_START_HINT }, { status: 503 });
   }
 
   if (!upstream.ok || !upstream.body) {
