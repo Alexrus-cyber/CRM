@@ -12,7 +12,7 @@ import {
   type TesterMinorDecision,
   type TesterRunStatus,
 } from "@/db/repo";
-import { AGENT_START_HINT, resolveSafeAgentUrl } from "@/lib/agentConfig";
+import { AGENT_START_HINT, fetchAgent, resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { registerAgentApproval } from "@/lib/agentApprovals";
 import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
@@ -57,29 +57,46 @@ export async function GET(req: Request) {
   }
 
   try {
-    const healthTimeout = AbortSignal.timeout(6_000);
-    const healthSignal = typeof AbortSignal.any === "function" ? AbortSignal.any([req.signal, healthTimeout]) : healthTimeout;
-    const res = await fetch(`${agentUrl}/health`, {
-      cache: "no-store",
-      signal: healthSignal,
-    });
+    const { endpoint, response: res } = await fetchAgent(
+      agentUrl,
+      "/health",
+      { cache: "no-store" },
+      { timeoutMs: 6_000, reqSignal: req.signal },
+    );
     if (!res.ok) {
-      return Response.json({ available: false, endpoint: agentUrl, hint: AGENT_START_HINT });
+      return Response.json(
+        {
+          available: false,
+          endpoint,
+          errorReason: `HTTP ${res.status}`,
+          hint: `${AGENT_START_HINT} (сервер ${endpoint} ответил HTTP ${res.status})`,
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
     }
     const data = (await res.json()) as Record<string, unknown>;
     const unlimitedSteps = isUnlimitedStepsRole(me.role);
     return Response.json(
       {
         available: true,
-        endpoint: agentUrl,
+        endpoint,
         ...data,
         maxSteps: unlimitedSteps ? null : Math.min(Number(data.maxSteps ?? AGENT_MAX_STEPS) || AGENT_MAX_STEPS, AGENT_MAX_STEPS),
         agentMaxSteps: data.maxSteps ?? AGENT_MAX_STEPS,
       },
       { headers: { "Cache-Control": "no-store" } },
     );
-  } catch {
-    return Response.json({ available: false, endpoint: agentUrl, hint: AGENT_START_HINT });
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err ?? "");
+    const isTimeout =
+      err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+    const hint = isTimeout
+      ? `Агент на ${agentUrl} не ответил вовремя (таймаут 6 с). Проверьте окно/логи агента — не завис ли он и не мешает ли прокси.`
+      : `${AGENT_START_HINT} (нет ответа от ${agentUrl}${detail ? `: ${detail}` : ""})`;
+    return Response.json(
+      { available: false, endpoint: agentUrl, errorReason: detail || "unavailable", hint },
+      { headers: { "Cache-Control": "no-store" } },
+    );
   }
 }
 
@@ -412,15 +429,18 @@ export async function POST(req: Request) {
 
   let upstream: Response;
   try {
-    const runTimeout = AbortSignal.timeout(3_600_000);
-    const runSignal = typeof AbortSignal.any === "function" ? AbortSignal.any([req.signal, runTimeout]) : runTimeout;
-    upstream = await fetch(`${agentUrl}/run`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(fullPayload),
-      cache: "no-store",
-      signal: runSignal,
-    });
+    const runResult = await fetchAgent(
+      agentUrl,
+      "/run",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(fullPayload),
+        cache: "no-store",
+      },
+      { timeoutMs: 3_600_000, reqSignal: req.signal },
+    );
+    upstream = runResult.response;
   } catch {
     return Response.json({ error: `Агент не запущен. ${AGENT_START_HINT}`, hint: AGENT_START_HINT }, { status: 503 });
   }

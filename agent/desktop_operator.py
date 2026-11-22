@@ -2599,7 +2599,16 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+_NO_REDIRECT_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler)
 _ORIG_OP_URLOPEN = urllib.request.urlopen
+
+
+def _is_loopback_target(url: str) -> bool:
+    try:
+        host = (urllib.parse.urlparse(str(url or "").strip()).hostname or "").strip().lower().strip("[]")
+    except ValueError:
+        return False
+    return host in ("127.0.0.1", "localhost", "::1") or host.endswith(".localhost")
 
 
 def _assert_safe_http_target(url: str) -> None:
@@ -2629,6 +2638,12 @@ class Http:
         self.kind = kind
         self.key_hint = key_hint
 
+    def _open(self, request: urllib.request.Request, timeout: int) -> Any:
+        if urllib.request.urlopen is _ORIG_OP_URLOPEN:
+            opener = _NO_REDIRECT_LOCAL_OPENER if _is_loopback_target(request.full_url) else _NO_REDIRECT_OPENER
+            return opener.open(request, timeout=timeout)
+        return urllib.request.urlopen(request, timeout=timeout)
+
     def call(self, method: str, path: str, payload: Optional[dict] = None,
              timeout: int = 180, headers: Optional[Dict[str, str]] = None) -> dict:
         url = path if path.startswith("http") else self.base + path
@@ -2641,12 +2656,7 @@ class Http:
         for key, value in (headers or {}).items():
             request.add_header(key, value)
         try:
-            open_ctx = (
-                _NO_REDIRECT_OPENER.open(request, timeout=timeout)
-                if urllib.request.urlopen is _ORIG_OP_URLOPEN
-                else urllib.request.urlopen(request, timeout=timeout)
-            )
-            with open_ctx as response:
+            with self._open(request, timeout=timeout) as response:
                 body = response.read().decode("utf-8", "replace")
         except ValueError as error:
             raise AgentError(
@@ -2698,11 +2708,12 @@ class Http:
     def download(self, path: str, timeout: int = 60) -> bytes:
         """Скачать двоичный файл (вложение задания) с тем же токеном."""
         url = path if path.startswith("http") else self.base + path
+        _assert_safe_http_target(url)
         request = urllib.request.Request(url, method="GET")
         if self.token:
             request.add_header("x-agent-token", self.token)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with self._open(request, timeout=timeout) as response:
                 return response.read()
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")[:200]

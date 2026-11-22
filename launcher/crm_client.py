@@ -43,6 +43,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+_NO_REDIRECT_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler)
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -88,8 +89,10 @@ def _request_json(
         req.add_header("Authorization", f"Bearer {bearer_token.strip()}")
 
     try:
+        host = urllib.parse.urlparse(url).hostname or ""
+        opener = _NO_REDIRECT_LOCAL_OPENER if _is_loopback_host(host) else _NO_REDIRECT_OPENER
         ctx = (
-            _NO_REDIRECT_OPENER.open(req, timeout=timeout)
+            opener.open(req, timeout=timeout)
             if urllib.request.urlopen is _ORIG_URLOPEN
             else urllib.request.urlopen(req, timeout=timeout)
         )
