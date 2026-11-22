@@ -1,10 +1,16 @@
 import {
+  completeTesterRun,
+  createTesterRunWithConversation,
   getAiUserSettingsSecret,
   getGithubConnectionWithSecret,
   getRagFolder,
   listRagChunks,
+  listTesterRuns,
   recordAgentUsage,
   searchRagChunks,
+  updateTesterMinorDecision,
+  type TesterMinorDecision,
+  type TesterRunStatus,
 } from "@/db/repo";
 import { AGENT_START_HINT, resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { registerAgentApproval } from "@/lib/agentApprovals";
@@ -106,8 +112,24 @@ export async function POST(req: Request) {
         githubOwner?: string;
         githubRepo?: string;
         githubBranch?: string;
+        agentRole?: "agent" | "tester";
+        agentConversationId?: number | null;
+        testerConversationId?: number | null;
+        sandboxProject?: string;
       }
     | null;
+
+  const agentRole = body?.agentRole === "tester" ? "tester" : "agent";
+  const agentConversationId =
+    Number.isFinite(body?.agentConversationId) && Number(body?.agentConversationId) > 0
+      ? Math.floor(Number(body?.agentConversationId))
+      : null;
+  const testerConversationId =
+    Number.isFinite(body?.testerConversationId) && Number(body?.testerConversationId) > 0
+      ? Math.floor(Number(body?.testerConversationId))
+      : null;
+  const sandboxProject =
+    typeof body?.sandboxProject === "string" ? body.sandboxProject.trim().slice(0, 300) : "";
 
   const unlimitedSteps = isUnlimitedStepsRole(me.role);
   const rawMessages = (body?.messages ?? []).filter(
@@ -347,12 +369,43 @@ export async function POST(req: Request) {
     },
   };
 
+  const modelName = payload.settings.model || "";
+  const recentTesterReports =
+    agentRole === "agent"
+      ? await listTesterRuns(me.id, 4)
+          .then((rows) =>
+            rows.map((r) => ({
+              id: r.id,
+              testerConversationId: r.testerConversationId,
+              sandboxProject: r.sandboxProject,
+              status: r.status,
+              reportSummary: r.reportSummary.slice(0, 1200),
+              criticalIssues: r.criticalIssues.slice(0, 10),
+              minorIssues: r.minorIssues.slice(0, 10),
+              minorDecision: r.minorDecision,
+              totalTokens: r.totalTokens,
+              updatedAt: r.updatedAt,
+            })),
+          )
+          .catch(() => [])
+      : [];
+
+  const fullPayload = {
+    ...payload,
+    agentRole,
+    ...(sandboxProject ? { sandboxProject } : {}),
+    context: {
+      ...payload.context,
+      ...(recentTesterReports.length > 0 ? { recentTesterReports } : {}),
+    },
+  };
+
   let upstream: Response;
   try {
     upstream = await fetch(`${agentUrl}/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(fullPayload),
       cache: "no-store",
       signal: AbortSignal.timeout(900_000),
     });
@@ -374,7 +427,6 @@ export async function POST(req: Request) {
     estimateTokens(ragContext) +
     estimateTokens(githubRagContext) +
     attachments.reduce((sum, a) => sum + estimateTokens(a.text), 0);
-  const modelName = payload.settings.model || "";
   const upstreamReader = upstream.body.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -385,6 +437,7 @@ export async function POST(req: Request) {
   let reportedCompletion = 0;
   let reportedTotal = 0;
   let recorded = false;
+  const activeTesterRuns = new Map<string, { runId: number; testerConversationId: number }>();
 
   const flushUsage = async () => {
     if (recorded) return;
@@ -397,6 +450,7 @@ export async function POST(req: Request) {
       await recordAgentUsage({
         userId: me.id,
         kind: "agent",
+        ...(agentRole === "tester" && testerConversationId ? { refId: testerConversationId } : {}),
         model: modelName,
         prompt: promptTokens,
         completion: completionTokens,
@@ -405,7 +459,7 @@ export async function POST(req: Request) {
     }
   };
 
-  const processFrame = (frame: string): string => {
+  const processFrame = async (frame: string): Promise<string> => {
     const lines = frame.split(/\r?\n/);
     const evLine = lines.find((l) => l.startsWith("event:"));
     const dataLines = lines.filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart());
@@ -424,7 +478,116 @@ export async function POST(req: Request) {
           registerAgentApproval(approvalId, me.id, nonce);
         }
         delete parsed.nonce;
+        const rk = typeof parsed.testerRunKey === "string" ? parsed.testerRunKey : "";
+        const mapped = rk ? activeTesterRuns.get(rk) : undefined;
+        if (mapped) {
+          parsed.testerRunId = mapped.runId;
+          parsed.testerConversationId = mapped.testerConversationId;
+        }
         return `event: ${ev}\ndata: ${JSON.stringify(parsed)}\n\n`;
+      } else if (ev === "tester_start") {
+        const runKey = String(parsed.runKey ?? "default");
+        try {
+          const created = await createTesterRunWithConversation({
+            userId: me.id,
+            agentConversationId,
+            testerConversationId: agentRole === "tester" ? testerConversationId : null,
+            title: typeof parsed.title === "string" ? parsed.title : undefined,
+            sandboxProject: typeof parsed.sandboxProject === "string" ? parsed.sandboxProject : sandboxProject,
+            summary: typeof parsed.summary === "string" ? parsed.summary : "",
+            model: typeof parsed.model === "string" ? parsed.model : modelName,
+            skipInitialMessage: agentRole === "tester" && Boolean(testerConversationId),
+          });
+          activeTesterRuns.set(runKey, {
+            runId: created.run.id,
+            testerConversationId: created.conversation.id,
+          });
+          return `event: tester_run\ndata: ${JSON.stringify({
+            runKey,
+            runId: created.run.id,
+            testerConversationId: created.conversation.id,
+            run: created.run,
+            conversation: created.conversation,
+          })}\n\n`;
+        } catch {
+          return `event: tester_run\ndata: ${JSON.stringify(parsed)}\n\n`;
+        }
+      } else if (
+        ev === "tester_status" ||
+        ev === "tester_reasoning" ||
+        ev === "tester_text" ||
+        ev === "tester_action"
+      ) {
+        const runKey = String(parsed.runKey ?? "default");
+        const mapped = activeTesterRuns.get(runKey);
+        if (mapped) {
+          parsed.runId = mapped.runId;
+          parsed.testerConversationId = mapped.testerConversationId;
+        }
+        return `event: ${ev}\ndata: ${JSON.stringify(parsed)}\n\n`;
+      } else if (ev === "tester_done") {
+        const runKey = String(parsed.runKey ?? "default");
+        const mapped = activeTesterRuns.get(runKey);
+        const u = (parsed.usage && typeof parsed.usage === "object" ? parsed.usage : {}) as Record<string, unknown>;
+        const tPrompt = Math.max(
+          0,
+          Math.round(Number(u.prompt ?? u.prompt_tokens ?? parsed.promptTokens ?? 0) || 0),
+        );
+        const tCompletion = Math.max(
+          0,
+          Math.round(Number(u.completion ?? u.completion_tokens ?? parsed.completionTokens ?? 0) || 0),
+        );
+        const tTotal = Math.max(
+          0,
+          Math.round(Number(u.total ?? u.total_tokens ?? parsed.totalTokens ?? 0) || 0),
+        );
+        if (mapped) {
+          const rawStatus = String(parsed.status ?? "passed") as TesterRunStatus;
+          const rawDecision =
+            parsed.minorDecision !== undefined ? (String(parsed.minorDecision) as TesterMinorDecision) : undefined;
+          const savedRun = await completeTesterRun(me.id, mapped.runId, {
+            status: rawStatus,
+            reportSummary: typeof parsed.reportSummary === "string" ? parsed.reportSummary : "",
+            criticalIssues: parsed.criticalIssues,
+            minorIssues: parsed.minorIssues,
+            checksRun: parsed.checksRun,
+            minorDecision: rawDecision,
+            promptTokens: tPrompt,
+            completionTokens: tCompletion,
+            totalTokens: tTotal,
+            model: typeof parsed.model === "string" ? parsed.model : modelName,
+            fullResponse: typeof parsed.fullResponse === "string" ? parsed.fullResponse : "",
+            reasoning: typeof parsed.reasoning === "string" ? parsed.reasoning : "",
+            actions: Array.isArray(parsed.actions) ? parsed.actions : [],
+            files: Array.isArray(parsed.files) ? parsed.files : [],
+            error: typeof parsed.error === "string" ? parsed.error : "",
+            skipUsageRecord: agentRole === "tester" || Boolean(parsed.skipUsageRecord),
+          }).catch(() => null);
+          if (savedRun) {
+            parsed.runId = savedRun.id;
+            parsed.testerConversationId = savedRun.testerConversationId;
+            parsed.run = savedRun;
+          }
+        }
+        return `event: tester_done\ndata: ${JSON.stringify(parsed)}\n\n`;
+      } else if (ev === "tester_decision") {
+        const runKey = String(parsed.runKey ?? "default");
+        const mapped = activeTesterRuns.get(runKey);
+        const decision = parsed.decision === "approved" ? "approved" : parsed.decision === "rejected" ? "rejected" : "pending";
+        if (mapped) {
+          const updated = await updateTesterMinorDecision(
+            me.id,
+            mapped.runId,
+            decision,
+            typeof parsed.note === "string" ? parsed.note : undefined,
+          ).catch(() => null);
+          if (updated) {
+            parsed.runId = updated.id;
+            parsed.testerConversationId = updated.testerConversationId;
+            parsed.run = updated;
+          }
+        }
+        return `event: tester_decision\ndata: ${JSON.stringify(parsed)}\n\n`;
       } else if (ev === "done" && parsed.usage && typeof parsed.usage === "object") {
         const u = parsed.usage as Record<string, unknown>;
         reportedPrompt = Math.max(
@@ -446,7 +609,7 @@ export async function POST(req: Request) {
     return `${frame}\n\n`;
   };
 
-  const transformChunk = (chunkText: string, controller: ReadableStreamDefaultController<Uint8Array>) => {
+  const transformChunk = async (chunkText: string, controller: ReadableStreamDefaultController<Uint8Array>) => {
     sseBuffer += chunkText.replace(/\r\n/g, "\n");
     let sep = sseBuffer.indexOf("\n\n");
     while (sep !== -1) {
@@ -454,7 +617,7 @@ export async function POST(req: Request) {
       sseBuffer = sseBuffer.slice(sep + 2);
       sep = sseBuffer.indexOf("\n\n");
       if (frame.trim()) {
-        controller.enqueue(encoder.encode(processFrame(frame)));
+        controller.enqueue(encoder.encode(await processFrame(frame)));
       }
     }
   };
@@ -464,16 +627,16 @@ export async function POST(req: Request) {
       try {
         const { value, done } = await upstreamReader.read();
         if (done) {
-          transformChunk(decoder.decode(), controller);
+          await transformChunk(decoder.decode(), controller);
           if (sseBuffer.trim()) {
-            controller.enqueue(encoder.encode(processFrame(sseBuffer)));
+            controller.enqueue(encoder.encode(await processFrame(sseBuffer)));
             sseBuffer = "";
           }
           await flushUsage();
           controller.close();
           return;
         }
-        transformChunk(decoder.decode(value, { stream: true }), controller);
+        await transformChunk(decoder.decode(value, { stream: true }), controller);
       } catch (err) {
         await flushUsage();
         controller.error(err);

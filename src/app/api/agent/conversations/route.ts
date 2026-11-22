@@ -11,20 +11,20 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 function isKind(value: string | null): value is AgentConversationKind {
-  return value === "plan" || value === "agent";
+  return value === "plan" || value === "agent" || value === "tester";
 }
 
 function canUseKind(user: { role?: string | null; canUseAgent?: boolean | null; canUseOperator?: boolean | null }, kind: AgentConversationKind): boolean {
-  return kind === "agent" ? hasAgentAccess(user) : hasOperatorAccess(user);
+  return kind === "plan" ? hasOperatorAccess(user) : hasAgentAccess(user);
 }
 
-/** Список отдельных историй планировщика или вкладки «Агент». */
+/** Список отдельных историй планировщика, «Агента» или «Тестировщика». */
 export async function GET(req: Request) {
   const user = await getCurrentUser();
   if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
   const kind = new URL(req.url).searchParams.get("kind");
-  if (!isKind(kind)) return Response.json({ error: "Укажите тип чата: plan или agent" }, { status: 400 });
+  if (!isKind(kind)) return Response.json({ error: "Укажите тип чата: plan, agent или tester" }, { status: 400 });
   if (!canUseKind(user, kind)) {
     return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
   }
@@ -53,16 +53,17 @@ export async function POST(req: Request) {
   const body = (await req.json().catch(() => null)) as
     | { kind?: string; title?: string; systemPrompt?: string }
     | null;
-  if (!body || (body.kind !== "plan" && body.kind !== "agent")) {
-    return Response.json({ error: "Укажите тип чата: plan или agent" }, { status: 400 });
+  if (!body || (body.kind !== "plan" && body.kind !== "agent" && body.kind !== "tester")) {
+    return Response.json({ error: "Укажите тип чата: plan, agent или tester" }, { status: 400 });
   }
 
   const kind: AgentConversationKind = body.kind;
   if (!canUseKind(user, kind)) {
     return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
   }
-  const title = String(body.title ?? "").replace(/\s+/g, " ").trim().slice(0, 120) ||
-    (kind === "plan" ? "Новый план" : "Новый чат");
+  const title =
+    String(body.title ?? "").replace(/\s+/g, " ").trim().slice(0, 120) ||
+    (kind === "plan" ? "Новый план" : kind === "tester" ? "Тестирование" : "Новый чат");
   const systemPrompt =
     kind === "plan"
       ? (typeof body.systemPrompt === "string" ? body.systemPrompt.trim() : "") || DEFAULT_PLAN_PROMPT

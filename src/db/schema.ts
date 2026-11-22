@@ -529,7 +529,7 @@ export const agentConversations = pgTable(
     userId: integer("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    kind: text("kind").$type<"plan" | "agent">().notNull(),
+    kind: text("kind").$type<"plan" | "agent" | "tester">().notNull(),
     title: text("title").notNull().default("Новый чат"),
     systemPrompt: text("system_prompt").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -639,6 +639,38 @@ export const agentUsageEvents = pgTable(
   (t) => [index("agent_usage_events_user_kind_month_idx").on(t.userId, t.kind, t.month)],
 );
 
+export const agentTesterRuns = pgTable(
+  "agent_tester_runs",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    agentConversationId: integer("agent_conversation_id"),
+    testerConversationId: integer("tester_conversation_id")
+      .notNull()
+      .references(() => agentConversations.id, { onDelete: "cascade" }),
+    sandboxProject: text("sandbox_project").notNull().default(""),
+    summary: text("summary").notNull().default(""),
+    status: text("status").notNull().default("running"),
+    reportSummary: text("report_summary").notNull().default(""),
+    criticalIssues: text("critical_issues").notNull().default("[]"),
+    minorIssues: text("minor_issues").notNull().default("[]"),
+    checksRun: text("checks_run").notNull().default("[]"),
+    minorDecision: text("minor_decision").notNull().default("not_needed"),
+    promptTokens: integer("prompt_tokens").notNull().default(0),
+    completionTokens: integer("completion_tokens").notNull().default(0),
+    totalTokens: integer("total_tokens").notNull().default(0),
+    model: text("model").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("agent_tester_runs_user_idx").on(t.userId, t.createdAt),
+    index("agent_tester_runs_conv_idx").on(t.testerConversationId),
+  ],
+);
+
 export const githubConnections = pgTable("github_connections", {
   id: serial("id").primaryKey(),
   userId: integer("user_id")
@@ -671,6 +703,7 @@ export type ChatRoom = typeof chatRooms.$inferSelect;
 export type ChatRoomMember = typeof chatRoomMembers.$inferSelect;
 export type AiBotConfig = typeof aiBotConfigs.$inferSelect;
 export type AgentUsageEvent = typeof agentUsageEvents.$inferSelect;
+export type AgentTesterRun = typeof agentTesterRuns.$inferSelect;
 export type TaskMessage = typeof taskMessages.$inferSelect;
 export type AgentTask = typeof agentTasks.$inferSelect;
 export type AgentEvent = typeof agentEvents.$inferSelect;

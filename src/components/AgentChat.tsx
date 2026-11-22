@@ -20,6 +20,7 @@ import {
   ExternalLink,
   FileArchive,
   FileText,
+  FlaskConical,
   FolderOpen,
   FolderOutput,
   Gamepad2,
@@ -85,6 +86,14 @@ import {
 } from "./operator/shared";
 import { ApprovalToast } from "./ApprovalToast";
 import { GithubIcon, GithubIntegrationPanel, type GithubAccountPublic } from "./agent/GithubIntegrationPanel";
+import {
+  TesterPanel,
+  type LiveTesterState,
+  type TesterChatMessage,
+  type TesterConversationItem,
+  type TesterIssueItem,
+  type TesterRunItem,
+} from "./agent/TesterPanel";
 
 /**
  * Вкладка «Агент» блока ИИ (только главный администратор).
@@ -112,7 +121,10 @@ type AgentAction = {
     | "github_edit"
     | "github_commit"
     | "github_pr"
-    | "github_merge";
+    | "github_merge"
+    | "tester_report"
+    | "tester_minor_decision"
+    | "qa_check";
   action?: string;
   url?: string;
   title?: string;
@@ -154,6 +166,17 @@ type AgentAction = {
   head?: string;
   base?: string;
   bytes?: number;
+  runKey?: string;
+  runId?: number;
+  testerConversationId?: number;
+  sandboxProject?: string;
+  status?: string;
+  reportSummary?: string;
+  criticalCount?: number;
+  minorCount?: number;
+  minorDecision?: string;
+  totalTokens?: number;
+  approved?: boolean;
 };
 
 type Turn = {
@@ -227,6 +250,11 @@ type PendingApproval = {
   maxSteps?: number;
   coachAfterEachStep?: boolean;
   operatorTrustLevel?: string;
+  sandboxProject?: string;
+  testerRunKey?: string;
+  testerRunId?: number;
+  testerConversationId?: number;
+  minorIssues?: TesterIssueItem[];
   github?: {
     login?: string;
     authorName?: string;
@@ -365,12 +393,13 @@ const EXAMPLES = [
 const DEFAULT_RAG_PREFS: RagPrefs = { folderId: 0, ragFull: false, ragChunks: 12 };
 
 type AgentLayoutMode = "tabs" | "classic";
-type AgentTabId = "model" | "knowledge" | "workspace" | "chat";
+type AgentTabId = "model" | "knowledge" | "workspace" | "tester" | "chat";
 
 const AGENT_TABS: Array<{ id: AgentTabId; label: string; hint: string }> = [
   { id: "model", label: "Модель и генерация", hint: "Подключение, выбор модели, возможности, раздумья и системный промпт" },
   { id: "knowledge", label: "Доверие и RAG", hint: "Уровень доверия ИИ, RAG-база знаний, контекст и архив переписок" },
   { id: "workspace", label: "Sandbox и Оператор", hint: "Изолированная папка Sandbox, экспорт на ПК и совместная работа с Оператором" },
+  { id: "tester", label: "Тестировщик", hint: "Независимый QA-тестировщик в отдельном чате с теми же настройками модели" },
   { id: "chat", label: "Чат", hint: "История переписок, диалог с Агентом, вложения и запуск" },
 ];
 
@@ -552,6 +581,19 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const [transcriptsOpen, setTranscriptsOpen] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
 
+  // Под-агент Тестировщик (QA): отдельные чаты, отчёты в БД, живой поток и мелкие правки по согласию человека.
+  const [testerRuns, setTesterRuns] = useState<TesterRunItem[]>([]);
+  const [testerConversations, setTesterConversations] = useState<TesterConversationItem[]>([]);
+  const [selectedTesterConvId, setSelectedTesterConvId] = useState<number | null>(null);
+  const [selectedTesterMessages, setSelectedTesterMessages] = useState<TesterChatMessage[]>([]);
+  const [testerLoading, setTesterLoading] = useState(false);
+  const [testerDirectRunning, setTesterDirectRunning] = useState(false);
+  const [testerDirectPrompt, setTesterDirectPrompt] = useState("");
+  const [testerDirectProject, setTesterDirectProject] = useState(".");
+  const [liveTester, setLiveTester] = useState<LiveTesterState | null>(null);
+  const [testerError, setTesterError] = useState<string | null>(null);
+  const [testerDecisionBusy, setTesterDecisionBusy] = useState<number | null>(null);
+
   const listRef = useRef<HTMLDivElement>(null);
   const dragDepthRef = useRef(0);
   const autoScrollPausedRef = useRef(false);
@@ -559,6 +601,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const ragDirRef = useRef<HTMLInputElement>(null);
   const counter = useRef(0);
   const conversationIdRef = useRef<number | null>(null);
+  const selectedTesterConvIdRef = useRef<number | null>(null);
   const opTaskRef = useRef<OperatorTask | null>(null);
   const dismissedOpTaskIdsRef = useRef<Set<number>>(new Set());
   const runningRef = useRef(false);
@@ -566,6 +609,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   useEffect(() => {
     conversationIdRef.current = conversationId;
   }, [conversationId]);
+  useEffect(() => {
+    selectedTesterConvIdRef.current = selectedTesterConvId;
+  }, [selectedTesterConvId]);
   useEffect(() => {
     opTaskRef.current = opTask;
   }, [opTask]);
@@ -654,6 +700,56 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       /* фоновая проверка — тихо игнорируем */
     }
   }, []);
+
+  const loadTesterConversationMessages = useCallback(async (convId: number) => {
+    try {
+      const res = await fetch(`/api/agent/conversations/${convId}`, { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json().catch(() => null)) as { messages?: StoredTurn[] } | null;
+      if (data && Array.isArray(data.messages)) {
+        setSelectedTesterMessages(data.messages.map(decodeStoredTurn));
+      }
+    } catch {
+      /* фоновая загрузка */
+    }
+  }, []);
+
+  const refreshTesterData = useCallback(
+    async (preferConvId?: number | null) => {
+      try {
+        const res = await fetch("/api/agent/tester", { cache: "no-store" });
+        if (!res.ok) return;
+        const data = (await res.json().catch(() => null)) as {
+          runs?: TesterRunItem[];
+          conversations?: TesterConversationItem[];
+        } | null;
+        if (!data) return;
+        const nextRuns = Array.isArray(data.runs) ? data.runs : [];
+        const nextConvs = Array.isArray(data.conversations) ? data.conversations : [];
+        setTesterRuns(nextRuns);
+        setTesterConversations(nextConvs);
+        const targetId =
+          preferConvId && nextConvs.some((c) => c.id === preferConvId)
+            ? preferConvId
+            : selectedTesterConvIdRef.current && nextConvs.some((c) => c.id === selectedTesterConvIdRef.current)
+              ? selectedTesterConvIdRef.current
+              : nextConvs[0]?.id ?? null;
+        setSelectedTesterConvId(targetId);
+        if (targetId) {
+          await loadTesterConversationMessages(targetId);
+        } else {
+          setSelectedTesterMessages([]);
+        }
+      } catch {
+        /* фоновая синхронизация тестировщика */
+      }
+    },
+    [loadTesterConversationMessages],
+  );
+
+  useEffect(() => {
+    void refreshTesterData();
+  }, [refreshTesterData]);
 
   const refreshGithubConnection = useCallback(async () => {
     try {
@@ -1523,6 +1619,16 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         setError(data.error ?? "Не удалось отправить подтверждение");
         return;
       }
+      if (pendingApproval.kind === "tester_minor_fixes" && pendingApproval.testerRunId) {
+        const runId = pendingApproval.testerRunId;
+        const decVal = approved ? "approved" : "rejected";
+        setTesterRuns((prev) => prev.map((r) => (r.id === runId ? { ...r, minorDecision: decVal } : r)));
+        void fetch(`/api/agent/tester/${runId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision: decVal }),
+        }).catch(() => undefined);
+      }
       setScreenCapture(null);
       setPendingApproval(null);
       setApprovalDest("");
@@ -1802,6 +1908,320 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     return () => window.clearInterval(timer);
   }, [running, scrollDown]);
 
+  const selectTesterConversation = async (id: number) => {
+    setSelectedTesterConvId(id);
+    setTesterLoading(true);
+    try {
+      await loadTesterConversationMessages(id);
+    } finally {
+      setTesterLoading(false);
+    }
+  };
+
+  const createNewTesterChat = async () => {
+    if (testerDirectRunning || running) return;
+    setTesterLoading(true);
+    setTesterError(null);
+    try {
+      const res = await fetch("/api/agent/conversations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "tester", title: "Новый чат тестировщика" }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        conversation?: TesterConversationItem;
+        error?: string;
+      };
+      if (!res.ok || !data.conversation) {
+        throw new Error(data.error ?? "Не удалось создать чат тестировщика");
+      }
+      const created = data.conversation;
+      setTesterConversations((prev) => [created, ...prev.filter((c) => c.id !== created.id)]);
+      setSelectedTesterConvId(created.id);
+      setSelectedTesterMessages([]);
+    } catch (caught) {
+      setTesterError(caught instanceof Error ? caught.message : "Ошибка создания чата тестировщика");
+    } finally {
+      setTesterLoading(false);
+    }
+  };
+
+  const deleteTesterChat = async (id: number) => {
+    if (testerDirectRunning || running) return;
+    setTesterLoading(true);
+    setTesterError(null);
+    try {
+      const res = await fetch(`/api/agent/conversations/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Не удалось удалить чат тестировщика");
+      const nextConvs = testerConversations.filter((c) => c.id !== id);
+      setTesterConversations(nextConvs);
+      setTesterRuns((prev) => prev.filter((r) => r.testerConversationId !== id));
+      const fallback = nextConvs[0]?.id ?? null;
+      setSelectedTesterConvId(fallback);
+      if (fallback) {
+        await loadTesterConversationMessages(fallback);
+      } else {
+        setSelectedTesterMessages([]);
+      }
+    } catch (caught) {
+      setTesterError(caught instanceof Error ? caught.message : "Ошибка удаления чата тестировщика");
+    } finally {
+      setTesterLoading(false);
+    }
+  };
+
+  const decideTesterMinor = async (runId: number, decision: "approved" | "rejected") => {
+    setTesterDecisionBusy(runId);
+    setTesterError(null);
+    try {
+      const res = await fetch(`/api/agent/tester/${runId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { run?: TesterRunItem; error?: string };
+      if (!res.ok || !data.run) throw new Error(data.error ?? "Не удалось сохранить решение");
+      setTesterRuns((prev) => prev.map((r) => (r.id === runId ? data.run! : r)));
+      await refreshTesterData(data.run.testerConversationId);
+    } catch (caught) {
+      setTesterError(caught instanceof Error ? caught.message : "Ошибка сохранения решения");
+    } finally {
+      setTesterDecisionBusy(null);
+    }
+  };
+
+  const openAgentChatFromTester = async (agentConvId: number) => {
+    if (!agentConvId || running || historyLoading) return;
+    try {
+      await openConversation(agentConvId);
+      if (layoutMode === "tabs") setActiveTab("chat");
+    } catch (caught) {
+      setTesterError(caught instanceof Error ? caught.message : "Исходный чат Агента не найден");
+    }
+  };
+
+  const sendTesterDirect = async () => {
+    const promptText = testerDirectPrompt.trim();
+    if (!promptText || testerDirectRunning || running) return;
+    setTesterError(null);
+    setTesterDirectPrompt("");
+    setTesterDirectRunning(true);
+
+    let targetConvId = selectedTesterConvId;
+    let persistedByServer = false;
+    const draftId = `td_${Date.now()}`;
+
+    try {
+      if (!targetConvId) {
+        const res = await fetch("/api/agent/conversations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            kind: "tester",
+            title:
+              testerDirectProject && testerDirectProject !== "."
+                ? `Тест: ${testerDirectProject}`
+                : promptText.slice(0, 60),
+          }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          conversation?: TesterConversationItem;
+          error?: string;
+        };
+        if (!res.ok || !data.conversation) {
+          throw new Error(data.error ?? "Не удалось создать новый чат тестировщика");
+        }
+        targetConvId = data.conversation.id;
+        setTesterConversations((prev) => [data.conversation!, ...prev]);
+        setSelectedTesterConvId(targetConvId);
+      }
+
+      const userSavedRes = await fetch(`/api/agent/conversations/${targetConvId}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: "user", content: promptText }),
+      });
+      if (!userSavedRes.ok) throw new Error("Не удалось сохранить запрос в чат тестировщика");
+
+      const nextHistory: TesterChatMessage[] = [
+        ...selectedTesterMessages,
+        { id: `tu_${Date.now()}`, role: "user", content: promptText },
+      ];
+      setSelectedTesterMessages([
+        ...nextHistory,
+        { id: draftId, role: "assistant", content: "", reasoning: "" },
+      ]);
+
+      await persistSettings();
+      const res = await fetch("/api/ai/agent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agentRole: "tester",
+          testerConversationId: targetConvId,
+          sandboxProject: testerDirectProject || ".",
+          messages: nextHistory.map((m) => ({ role: m.role, content: m.content })),
+          settings: { baseUrl: settings.baseUrl, model: settings.model },
+          params,
+          trustLevel,
+          maxSteps: maxSteps <= 0 ? 0 : Math.floor(maxSteps),
+          contextLimit,
+          ...(modelCapabilities?.contextLength ? { modelContextLength: modelCapabilities.contextLength } : {}),
+          ...(ghAccount && ghAccount.enabled && ghAccount.selectedOwner && ghAccount.selectedRepo
+            ? {
+                githubEnabled: true,
+                githubOwner: ghAccount.selectedOwner,
+                githubRepo: ghAccount.selectedRepo,
+                githubBranch: ghAccount.selectedBranch || "main",
+              }
+            : { githubEnabled: false }),
+        }),
+      });
+
+      if (!res.ok || !res.body) {
+        const errData = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(errData.error ?? "Тестировщик недоступен");
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let assistantText = "";
+      let assistantReason = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary !== -1) {
+          const raw = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          boundary = buffer.indexOf("\n\n");
+          const eventLine = raw.split("\n").find((l) => l.startsWith("event:"));
+          const dataLine = raw.split("\n").find((l) => l.startsWith("data:"));
+          if (!dataLine) continue;
+          const ev = eventLine ? eventLine.slice(6).trim() : "message";
+          let data: Record<string, unknown>;
+          try {
+            data = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
+          } catch {
+            continue;
+          }
+
+          if (ev === "tester_run") {
+            const createdConv =
+              data.conversation && typeof data.conversation === "object"
+                ? (data.conversation as TesterConversationItem)
+                : null;
+            const createdRun =
+              data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
+            if (createdConv) {
+              setTesterConversations((prev) => [
+                createdConv,
+                ...prev.filter((c) => c.id !== createdConv.id),
+              ]);
+            }
+            if (createdRun) {
+              setTesterRuns((prev) => [createdRun, ...prev.filter((r) => r.id !== createdRun.id)]);
+            }
+            setLiveTester({
+              runKey: String(data.runKey ?? "direct"),
+              runId: typeof data.runId === "number" ? data.runId : createdRun?.id,
+              testerConversationId:
+                typeof data.testerConversationId === "number"
+                  ? data.testerConversationId
+                  : createdConv?.id ?? targetConvId ?? undefined,
+              sandboxProject: String(createdRun?.sandboxProject ?? testerDirectProject ?? "."),
+              summary: promptText,
+              model: String(createdRun?.model ?? settings.model ?? ""),
+              statusText: "Тестировщик начал проверку…",
+              reasoning: "",
+              content: "",
+              actions: [],
+            });
+          } else if (ev === "status") {
+            const st = String(data.text ?? "");
+            setLiveTester((prev) => (prev ? { ...prev, statusText: st } : prev));
+          } else if (ev === "reasoning") {
+            assistantReason = String(data.text ?? "");
+            setSelectedTesterMessages((prev) =>
+              prev.map((m) => (m.id === draftId ? { ...m, reasoning: assistantReason } : m)),
+            );
+          } else if (ev === "text") {
+            assistantText = String(data.text ?? "");
+            setSelectedTesterMessages((prev) =>
+              prev.map((m) => (m.id === draftId ? { ...m, content: assistantText } : m)),
+            );
+          } else if (ev === "action") {
+            setLiveTester((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    actions: [
+                      ...prev.actions,
+                      {
+                        type: String(data.type ?? "qa_check"),
+                        label: data.label ? String(data.label) : undefined,
+                        command: data.command ? String(data.command) : undefined,
+                      },
+                    ],
+                  }
+                : prev,
+            );
+          } else if (ev === "approval_required") {
+            setPendingApproval({
+              approvalId: String(data.approvalId ?? ""),
+              kind: String(data.kind ?? "command"),
+              title: String(data.title ?? "Требуется подтверждение"),
+              description: String(data.description ?? data.reason ?? ""),
+              command: data.command ? String(data.command) : undefined,
+              cwd: data.cwd ? String(data.cwd) : undefined,
+              sandboxProject: data.sandboxProject ? String(data.sandboxProject) : undefined,
+              testerRunKey: data.testerRunKey ? String(data.testerRunKey) : undefined,
+              testerRunId: typeof data.testerRunId === "number" ? data.testerRunId : undefined,
+              testerConversationId:
+                typeof data.testerConversationId === "number" ? data.testerConversationId : undefined,
+              minorIssues: Array.isArray(data.minorIssues)
+                ? (data.minorIssues as TesterIssueItem[])
+                : undefined,
+            });
+          } else if (ev === "tester_done") {
+            const savedRun =
+              data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
+            if (savedRun) {
+              persistedByServer = true;
+              setTesterRuns((prev) => [savedRun, ...prev.filter((r) => r.id !== savedRun.id)]);
+            }
+          } else if (ev === "done") {
+            setPendingApproval(null);
+          } else if (ev === "error") {
+            const errTxt = String(data.error ?? "Ошибка тестировщика");
+            setTesterError(errTxt);
+          }
+        }
+      }
+
+      if (!persistedByServer && targetConvId && assistantText) {
+        await fetch(`/api/agent/conversations/${targetConvId}/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            role: "assistant",
+            content: assistantText,
+            reasoning: assistantReason,
+          }),
+        }).catch(() => undefined);
+      }
+      await refreshTesterData(targetConvId);
+    } catch (caught) {
+      setTesterError(caught instanceof Error ? caught.message : "Не удалось запустить Тестировщика");
+    } finally {
+      setLiveTester(null);
+      setTesterDirectRunning(false);
+    }
+  };
+
   const addAgentFiles = useCallback(
     (incoming: File[]) => {
       if (incoming.length === 0 || running || reading || historyLoading || conversationId === null) return;
@@ -1922,6 +2342,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          agentConversationId: activeId,
           messages: history.map((t) => ({ role: t.role, content: t.content })),
           settings: { baseUrl: settings.baseUrl, model: settings.model },
           params,
@@ -2009,6 +2430,14 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               coachAfterEachStep:
                 typeof data.coachAfterEachStep === "boolean" ? data.coachAfterEachStep : true,
               operatorTrustLevel: data.operatorTrustLevel ? String(data.operatorTrustLevel) : undefined,
+              sandboxProject: data.sandboxProject ? String(data.sandboxProject) : undefined,
+              testerRunKey: data.testerRunKey ? String(data.testerRunKey) : undefined,
+              testerRunId: typeof data.testerRunId === "number" ? data.testerRunId : undefined,
+              testerConversationId:
+                typeof data.testerConversationId === "number" ? data.testerConversationId : undefined,
+              minorIssues: Array.isArray(data.minorIssues)
+                ? (data.minorIssues as TesterIssueItem[])
+                : undefined,
               github: ghPayload
                 ? {
                     login: ghPayload.login ? String(ghPayload.login) : undefined,
@@ -2065,6 +2494,93 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             setNotice(
               `RAG «${String(data.folderName ?? "папка")}»: подключено ${Number(data.hits ?? 0)} из ${Number(data.totalChunks ?? 0)} фрагментов${data.truncated ? " (обрезано по лимиту контекста)" : ""}.`,
             );
+          } else if (event === "tester_run") {
+            const createdConv =
+              data.conversation && typeof data.conversation === "object"
+                ? (data.conversation as TesterConversationItem)
+                : null;
+            const createdRun =
+              data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
+            if (createdConv) {
+              setTesterConversations((prev) => [
+                createdConv,
+                ...prev.filter((c) => c.id !== createdConv.id),
+              ]);
+              setSelectedTesterConvId(createdConv.id);
+            }
+            if (createdRun) {
+              setTesterRuns((prev) => [createdRun, ...prev.filter((r) => r.id !== createdRun.id)]);
+            }
+            setLiveTester({
+              runKey: String(data.runKey ?? "default"),
+              runId: typeof data.runId === "number" ? data.runId : createdRun?.id,
+              testerConversationId:
+                typeof data.testerConversationId === "number"
+                  ? data.testerConversationId
+                  : createdConv?.id,
+              sandboxProject: String(createdRun?.sandboxProject ?? data.sandboxProject ?? "."),
+              summary: String(createdRun?.summary ?? data.summary ?? ""),
+              model: String(createdRun?.model ?? data.model ?? settings.model ?? ""),
+              statusText: "Тестировщик запущен в новом чате…",
+              reasoning: "",
+              content: "",
+              actions: [],
+            });
+          } else if (event === "tester_status") {
+            const st = String(data.text ?? "");
+            setStatus(st);
+            setLiveTester((prev) => (prev ? { ...prev, statusText: st } : prev));
+          } else if (event === "tester_reasoning") {
+            const r = String(data.text ?? "");
+            setLiveTester((prev) => (prev ? { ...prev, reasoning: r } : prev));
+          } else if (event === "tester_text") {
+            const c = String(data.text ?? "");
+            setLiveTester((prev) => (prev ? { ...prev, content: c } : prev));
+          } else if (event === "tester_action") {
+            const act =
+              data.action && typeof data.action === "object"
+                ? (data.action as Record<string, unknown>)
+                : null;
+            if (act) {
+              setLiveTester((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      actions: [
+                        ...prev.actions,
+                        {
+                          type: String(act.type ?? "qa_check"),
+                          label: act.label ? String(act.label) : undefined,
+                          command: act.command ? String(act.command) : undefined,
+                          url: act.url ? String(act.url) : undefined,
+                        },
+                      ],
+                    }
+                  : prev,
+              );
+            }
+          } else if (event === "tester_done") {
+            const savedRun =
+              data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
+            if (savedRun) {
+              setTesterRuns((prev) => [savedRun, ...prev.filter((r) => r.id !== savedRun.id)]);
+            }
+            const tConvId =
+              typeof data.testerConversationId === "number"
+                ? data.testerConversationId
+                : savedRun?.testerConversationId;
+            setLiveTester(null);
+            if (tConvId) {
+              void refreshTesterData(tConvId);
+            } else {
+              void refreshTesterData();
+            }
+          } else if (event === "tester_decision") {
+            const updRun =
+              data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
+            if (updRun) {
+              setTesterRuns((prev) => prev.map((r) => (r.id === updRun.id ? updRun : r)));
+            }
           } else if (event === "reasoning") {
             assistantDraft.reasoning = String(data.text ?? "");
             patch((t) => ({ ...t, reasoning: assistantDraft.reasoning }));
@@ -2150,6 +2666,18 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 head: data.head ? String(data.head) : undefined,
                 base: data.base ? String(data.base) : undefined,
                 bytes: typeof data.bytes === "number" ? data.bytes : undefined,
+                runKey: data.runKey ? String(data.runKey) : undefined,
+                runId: typeof data.runId === "number" ? data.runId : undefined,
+                testerConversationId:
+                  typeof data.testerConversationId === "number" ? data.testerConversationId : undefined,
+                sandboxProject: data.sandboxProject ? String(data.sandboxProject) : undefined,
+                status: data.status ? String(data.status) : undefined,
+                reportSummary: data.reportSummary ? String(data.reportSummary) : undefined,
+                criticalCount: typeof data.criticalCount === "number" ? data.criticalCount : undefined,
+                minorCount: typeof data.minorCount === "number" ? data.minorCount : undefined,
+                minorDecision: data.minorDecision ? String(data.minorDecision) : undefined,
+                totalTokens: typeof data.totalTokens === "number" ? data.totalTokens : undefined,
+                approved: typeof data.approved === "boolean" ? data.approved : undefined,
               };
               assistantDraft.actions.push(action);
               patch((t) => ({ ...t, actions: [...t.actions, action] }));
@@ -2169,6 +2697,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             setStatus(null);
             setPendingApproval(null);
             setScreenCapture(null);
+            setLiveTester(null);
             void refreshSandbox();
           }
         }
@@ -2397,6 +2926,18 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 {tab.id === "workspace" && (opTask || (sandbox?.items?.length ?? 0) > 0) && (
                   <span className="rounded bg-card2 px-1 py-0.5 text-[10px] text-muted">
                     {opTask ? `#${opTask.id}` : sandbox?.items?.length ?? 0}
+                  </span>
+                )}
+                {tab.id === "tester" && (liveTester || testerRuns.length > 0) && (
+                  <span
+                    className={cn(
+                      "rounded px-1 py-0.5 text-[10px]",
+                      liveTester
+                        ? "bg-violet-500/20 text-violet-300"
+                        : "bg-card2 text-muted",
+                    )}
+                  >
+                    {liveTester ? "…" : testerRuns.length}
                   </span>
                 )}
               </button>
@@ -3280,7 +3821,45 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         );
       })()}
 
-      {/* Вкладка 4 (последняя): Чат с Агентом и история */}
+      {/* Вкладка 4: Под-агент Тестировщик (QA) с теми же настройками модели */}
+      <div
+        role={isTabs ? "tabpanel" : undefined}
+        aria-label="Тестировщик"
+        hidden={isTabs && activeTab !== "tester"}
+        className="space-y-3"
+      >
+        <TesterPanel
+          settings={settings}
+          params={params}
+          sandboxProjects={sandbox?.projects ?? []}
+          runs={testerRuns}
+          conversations={testerConversations}
+          selectedConvId={selectedTesterConvId}
+          messages={selectedTesterMessages}
+          loading={testerLoading}
+          directRunning={testerDirectRunning}
+          directPrompt={testerDirectPrompt}
+          directProject={testerDirectProject}
+          liveTester={liveTester}
+          decisionBusyRunId={testerDecisionBusy}
+          agentRunning={running}
+          error={testerError}
+          onSelectConv={(id) => void selectTesterConversation(id)}
+          onNewChat={() => void createNewTesterChat()}
+          onDeleteChat={(id) => void deleteTesterChat(id)}
+          onRefresh={() => void refreshTesterData()}
+          onChangePrompt={setTesterDirectPrompt}
+          onChangeProject={setTesterDirectProject}
+          onRunDirect={() => void sendTesterDirect()}
+          onDecideMinor={(runId, decision) => void decideTesterMinor(runId, decision)}
+          onOpenModelTab={() => {
+            if (isTabs) setActiveTab("model");
+          }}
+          onOpenAgentChat={(convId) => void openAgentChatFromTester(convId)}
+        />
+      </div>
+
+      {/* Вкладка 5 (последняя): Чат с Агентом и история */}
       <div
         role={isTabs ? "tabpanel" : undefined}
         aria-label="Чат"
@@ -3316,6 +3895,13 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               className="rounded-md border border-border bg-card2 px-2 py-0.5 hover:text-text"
             >
               Sandbox: {sandbox?.items?.length ?? 0}
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("tester")}
+              className="rounded-md border border-border bg-card2 px-2 py-0.5 hover:text-text"
+            >
+              Тестировщик: {testerRuns.length}
             </button>
           </div>
         )}
@@ -3760,6 +4346,62 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                         </div>
                       );
                     }
+                    if (action.type === "tester_report") {
+                      const hasCrit = (action.criticalCount ?? 0) > 0 || action.status === "critical_issues";
+                      const hasMinor = (action.minorCount ?? 0) > 0 || action.status === "minor_issues";
+                      return (
+                        <div
+                          key={`tester-rep-${index}`}
+                          className={cn(
+                            "space-y-1.5 rounded-xl border px-2.5 py-2 text-[11px]",
+                            hasCrit
+                              ? "border-red-500/40 bg-red-500/10"
+                              : hasMinor
+                                ? "border-amber-500/40 bg-amber-500/10"
+                                : "border-emerald-500/40 bg-emerald-500/10",
+                          )}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="flex items-center gap-1.5 font-semibold text-text">
+                              <FlaskConical size={13} className="text-violet-400" />
+                              Отчёт Тестировщика · {action.sandboxProject || "."}
+                            </span>
+                            <span className="text-[10px] text-muted">
+                              крит.: {action.criticalCount ?? 0} · мелк.: {action.minorCount ?? 0}
+                              {typeof action.totalTokens === "number" && action.totalTokens > 0
+                                ? ` · чат QA: ${action.totalTokens} ток.`
+                                : ""}
+                            </span>
+                          </div>
+                          {action.reportSummary && (
+                            <p className="text-[10px] text-muted">{action.reportSummary}</p>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (action.testerConversationId) {
+                                void selectTesterConversation(action.testerConversationId);
+                              }
+                              if (isTabs) setActiveTab("tester");
+                            }}
+                            className="inline-flex items-center gap-1 rounded-lg border border-border bg-card px-2 py-0.5 text-[10px] font-medium text-accent2 hover:underline"
+                          >
+                            Открыть отчёт в Тестировщике
+                          </button>
+                        </div>
+                      );
+                    }
+                    if (action.type === "tester_minor_decision" || action.type === "qa_check") {
+                      return (
+                        <div
+                          key={`qa-act-${index}`}
+                          className="flex items-center gap-2 rounded-xl border border-violet-500/35 bg-violet-500/10 px-2.5 py-2 text-[11px] text-text"
+                        >
+                          <FlaskConical size={13} className="shrink-0 text-violet-400" />
+                          <span className="min-w-0 flex-1 truncate">{action.label || action.type}</span>
+                        </div>
+                      );
+                    }
                     return (
                       <div
                         key={`act-${index}`}
@@ -3930,9 +4572,11 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 ? "Осмотр внешнего сайта"
                 : pendingApproval.kind === "call_operator"
                   ? "Запуск Оператора"
-                  : pendingApproval.kind.startsWith("github_")
-                    ? `GitHub · @${pendingApproval.github?.login || ghAccount?.login || "аккаунт"}`
-                    : "Запрос разрешения"
+                  : pendingApproval.kind === "tester_minor_fixes"
+                    ? "Тестировщик · мелкие замечания"
+                    : pendingApproval.kind.startsWith("github_")
+                      ? `GitHub · @${pendingApproval.github?.login || ghAccount?.login || "аккаунт"}`
+                      : "Запрос разрешения"
           }
           title={pendingApproval.title}
           description={pendingApproval.description}
@@ -4001,13 +4645,15 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   <Check size={12} />{" "}
                   {pendingApproval.kind === "call_operator"
                     ? "Разрешить и запустить Оператора"
-                    : pendingApproval.kind === "github_commit"
-                      ? `Подтвердить Commit${pendingApproval.github?.push ? " и Push" : ""} от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
-                      : pendingApproval.kind === "github_pr"
-                        ? `Создать PR от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
-                        : pendingApproval.kind === "github_merge"
-                          ? `Подтвердить Merge от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
-                          : "Разрешить"}
+                    : pendingApproval.kind === "tester_minor_fixes"
+                      ? "Внести мелкие изменения"
+                      : pendingApproval.kind === "github_commit"
+                        ? `Подтвердить Commit${pendingApproval.github?.push ? " и Push" : ""} от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
+                        : pendingApproval.kind === "github_pr"
+                          ? `Создать PR от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
+                          : pendingApproval.kind === "github_merge"
+                            ? `Подтвердить Merge от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
+                            : "Разрешить"}
                 </button>
                 <button
                   type="button"
@@ -4015,7 +4661,10 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   disabled={approvalBusy}
                   className="flex items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-500 hover:bg-red-500/20 disabled:opacity-50"
                 >
-                  <X size={12} /> Отклонить
+                  <X size={12} />{" "}
+                  {pendingApproval.kind === "tester_minor_fixes"
+                    ? "Не вносить (оставить как есть)"
+                    : "Отклонить"}
                 </button>
               </>
             )
@@ -4032,6 +4681,19 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               {pendingApproval.url}
             </p>
           )}
+          {pendingApproval.kind === "tester_minor_fixes" &&
+            pendingApproval.minorIssues &&
+            pendingApproval.minorIssues.length > 0 && (
+              <div className="max-h-36 space-y-1 overflow-auto rounded-lg border border-amber-500/30 bg-card2 p-2 text-[10px]">
+                {pendingApproval.minorIssues.map((iss, idx) => (
+                  <p key={`minor-apr-${idx}`} className="text-text">
+                    • <b>{iss.title}</b>
+                    {iss.file ? ` (${iss.file})` : ""}
+                    {iss.description && iss.description !== iss.title ? `: ${iss.description}` : ""}
+                  </p>
+                ))}
+              </div>
+            )}
           {pendingApproval.kind === "sandbox_export" && (
             <div className="space-y-1.5">
               <p className="text-[11px] text-muted">
