@@ -386,12 +386,13 @@ export async function POST(req: Request) {
   };
 
   const processFrame = (frame: string): string => {
-    const evLine = frame.split("\n").find((l) => l.startsWith("event:"));
-    const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
-    if (!dataLine) return `${frame}\n\n`;
+    const lines = frame.split(/\r?\n/);
+    const evLine = lines.find((l) => l.startsWith("event:"));
+    const dataLines = lines.filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart());
+    if (dataLines.length === 0) return `${frame}\n\n`;
     const ev = evLine ? evLine.slice(6).trim() : "message";
     try {
-      const parsed = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
+      const parsed = JSON.parse(dataLines.join("\n").trim()) as Record<string, unknown>;
       if (ev === "text" && typeof parsed.text === "string") {
         textLatest = parsed.text;
       } else if (ev === "reasoning" && typeof parsed.text === "string") {
@@ -399,7 +400,7 @@ export async function POST(req: Request) {
       } else if (ev === "approval_required") {
         const approvalId = typeof parsed.approvalId === "string" ? parsed.approvalId.trim() : "";
         const nonce = typeof parsed.nonce === "string" ? parsed.nonce.trim() : "";
-        if (approvalId && nonce) {
+        if (approvalId) {
           registerAgentApproval(approvalId, me.id, nonce);
         }
         delete parsed.nonce;
@@ -420,7 +421,7 @@ export async function POST(req: Request) {
   };
 
   const transformChunk = (chunkText: string, controller: ReadableStreamDefaultController<Uint8Array>) => {
-    sseBuffer += chunkText;
+    sseBuffer += chunkText.replace(/\r\n/g, "\n");
     let sep = sseBuffer.indexOf("\n\n");
     while (sep !== -1) {
       const frame = sseBuffer.slice(0, sep);
