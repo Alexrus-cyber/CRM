@@ -158,7 +158,24 @@ def _windows_registry_browsers() -> List[Path]:
     return found
 
 
-def find_browser_executable() -> Optional[str]:
+_BROWSER_AVAIL_LOCK = threading.Lock()
+_BROWSER_AVAIL_CACHE: Tuple[float, bool] = (0.0, False)
+
+
+def cached_browser_available(ttl_seconds: float = 60.0) -> bool:
+    """Быстрая кешированная проверка наличия браузера для `/health` без запуска subprocess."""
+    now = time.monotonic()
+    with _BROWSER_AVAIL_LOCK:
+        cached_at, cached_val = _BROWSER_AVAIL_CACHE
+        if cached_at > 0.0 and (now - cached_at) < max(1.0, float(ttl_seconds)):
+            return cached_val
+    available = bool(find_browser_executable(allow_subprocess=False))
+    with _BROWSER_AVAIL_LOCK:
+        globals()["_BROWSER_AVAIL_CACHE"] = (time.monotonic(), available)
+    return available
+
+
+def find_browser_executable(*, allow_subprocess: bool = True) -> Optional[str]:
     """Ищет установленный Chromium / Chrome / Edge (включая реестр Windows и кеш Playwright)."""
     for env_key in ("AGENT_BROWSER_PATH", "CHROME_PATH", "CHROMIUM_PATH"):
         raw = str(os.environ.get(env_key) or "").strip().strip('"')
@@ -266,29 +283,31 @@ def find_browser_executable() -> Optional[str]:
                     return str(match)
 
     # Изолированный короткий probe пакета playwright без конфликта с asyncio-loop текущего потока.
-    try:
-        probe_kwargs: Dict[str, Any] = {
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.DEVNULL,
-            "text": True,
-            "timeout": 4,
-        }
-        if system == "Windows":
-            probe_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        probe = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "from playwright.sync_api import sync_playwright\nwith sync_playwright() as p: print(p.chromium.executable_path or '')",
-            ],
-            **probe_kwargs,
-        )
-        exe = (probe.stdout or "").strip().splitlines()[-1] if probe.returncode == 0 and (probe.stdout or "").strip() else ""
-        if exe and _safe_is_file(Path(exe)):
-            return exe
-    except Exception:  # noqa: BLE001
-        pass
+    # В frozen exe (PyInstaller) sys.executable не принимает `-c` и запускает второй экземпляр exe.
+    if allow_subprocess and not getattr(sys, "frozen", False):
+        try:
+            probe_kwargs: Dict[str, Any] = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.DEVNULL,
+                "text": True,
+                "timeout": 4,
+            }
+            if system == "Windows":
+                probe_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from playwright.sync_api import sync_playwright\nwith sync_playwright() as p: print(p.chromium.executable_path or '')",
+                ],
+                **probe_kwargs,
+            )
+            exe = (probe.stdout or "").strip().splitlines()[-1] if probe.returncode == 0 and (probe.stdout or "").strip() else ""
+            if exe and _safe_is_file(Path(exe)):
+                return exe
+        except Exception:  # noqa: BLE001
+            pass
 
     return None
 

@@ -382,6 +382,65 @@ class WindowsCompatibilityAndSpecTests(unittest.TestCase):
         self.assertIn("code_tools.py", spec_text)
         self.assertIn("qa_tools.py", spec_text)
 
+    def test_health_does_not_spawn_subprocess_and_frozen_skips_playwright_cli(self) -> None:
+        import shutil
+        import urllib.request
+
+        with (
+            mock.patch.object(shutil, "which", return_value=None),
+            mock.patch.object(browser_inspector, "_safe_is_file", return_value=False),
+            mock.patch.object(browser_inspector, "_safe_is_dir", return_value=False),
+            mock.patch.object(browser_inspector, "_safe_glob", return_value=[]),
+            mock.patch("subprocess.run", side_effect=AssertionError("subprocess.run must not be called")) as sub_mock,
+        ):
+            self.assertIsNone(browser_inspector.find_browser_executable(allow_subprocess=False))
+            with mock.patch.object(sys, "frozen", True, create=True):
+                self.assertIsNone(browser_inspector.find_browser_executable(allow_subprocess=True))
+
+            with mock.patch.object(browser_inspector, "_BROWSER_AVAIL_CACHE", (0.0, False)):
+                srv = agent_mod.Server(("127.0.0.1", 0), agent_mod.Handler)
+                port = srv.server_address[1]
+                th = threading.Thread(target=srv.serve_forever, daemon=True)
+                th.start()
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3.0) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(resp.status, 200)
+                    self.assertTrue(data["ok"])
+                    self.assertIn("browserAvailable", data)
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
+                    th.join(timeout=2)
+            sub_mock.assert_not_called()
+
+    def test_desktop_operator_and_crm_client_bypass_proxy_for_loopback(self) -> None:
+        import desktop_operator as op_mod
+        from launcher import crm_client
+
+        class FakeResp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b'{"ok":true}'
+
+        with (
+            mock.patch.object(op_mod._NO_REDIRECT_LOCAL_OPENER, "open", return_value=FakeResp()) as local_op,
+            mock.patch.object(op_mod._NO_REDIRECT_OPENER, "open", side_effect=AssertionError("used proxy opener")),
+        ):
+            res = op_mod.Http("http://127.0.0.1:3000", token="crmop_123").call("GET", "/api/agent/bot/whoami")
+            self.assertTrue(res["ok"])
+            local_op.assert_called_once()
+
+        with (
+            mock.patch.object(crm_client._NO_REDIRECT_LOCAL_OPENER, "open", return_value=FakeResp()) as local_crm,
+            mock.patch.object(crm_client._NO_REDIRECT_OPENER, "open", side_effect=AssertionError("used proxy opener")),
+        ):
+            status, data = crm_client._request_json("GET", "http://localhost:3000/api/health")
+            self.assertEqual(status, 200)
+            self.assertTrue(data["ok"])
+            local_crm.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

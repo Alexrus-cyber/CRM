@@ -676,8 +676,20 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const loadHealth = useCallback(async (): Promise<Health> => {
     try {
       const res = await fetch("/api/ai/agent", { cache: "no-store" });
-      if (!res.ok) return { available: false, hint: "Агент сейчас недоступен или нет прав доступа" };
-      const data = (await res.json()) as Record<string, unknown>;
+      const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!res.ok) {
+        const hint =
+          res.status === 401
+            ? "Сессия CRM недействительна или истекла — обновите страницу и войдите в CRM заново."
+            : res.status === 403
+              ? String(data.error || "Доступ к Агенту не выдан главным администратором.")
+              : String(data.error || data.hint || `Ошибка проверки агента (HTTP ${res.status})`);
+        return {
+          available: false,
+          endpoint: data.endpoint ? String(data.endpoint) : undefined,
+          hint,
+        };
+      }
       return {
         available: Boolean(data.available),
         endpoint: data.endpoint ? String(data.endpoint) : undefined,
@@ -687,7 +699,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         tools: Array.isArray(data.tools) ? data.tools.map((t) => String(t ?? "")).filter(Boolean) : [],
       };
     } catch {
-      return { available: false, hint: "Не удалось проверить агента" };
+      return { available: false, hint: "Не удалось выполнить запрос к CRM (/api/ai/agent)" };
     }
   }, []);
 
@@ -2882,6 +2894,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           <Sparkles size={13} /> Агент
         </span>
         <span
+          title={health?.hint || (available ? "Локальный Python-агент отвечает" : undefined)}
           className={cn(
             "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-medium",
             health === null
@@ -2972,6 +2985,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         <button
           type="button"
           onClick={() => {
+            setHealth(null);
             void loadHealth().then(setHealth);
             void refreshSandbox(true);
             void refreshOperatorOverview();

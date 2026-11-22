@@ -62,9 +62,47 @@ try:  # генератор файлов: docx/xlsx/csv/html/svg/zip — на с�
 except Exception:  # noqa: BLE001 — без него останутся обычные текстовые файлы
     fileforge = None  # type: ignore
 
-HOST = os.environ.get("AGENT_HOST", "127.0.0.1")
-PORT = int(os.environ.get("AGENT_PORT", "8899"))
-BASE_URL = os.environ.get("AGENT_BASE_URL", "http://127.0.0.1:8888/v1").rstrip("/")
+def _env_int(name: str, default: int, *, minimum: int = 0, maximum: Optional[int] = None) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    val = max(minimum, val)
+    if maximum is not None:
+        val = min(maximum, val)
+    return val
+
+
+def _init_workspace() -> Path:
+    explicit = (os.environ.get("AGENT_WORKSPACE") or "").strip()
+    if explicit:
+        ws = Path(explicit).expanduser()
+        ws.mkdir(parents=True, exist_ok=True)
+        return ws
+    candidates = (
+        [Path.cwd() / "workspace"]
+        if getattr(sys, "frozen", False)
+        else [Path(__file__).resolve().parent / "workspace", Path.cwd() / "workspace"]
+    )
+    import tempfile
+
+    candidates.append(Path(tempfile.gettempdir()) / "crm-agent-workspace")
+    last_err: Optional[OSError] = None
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError as err:
+            last_err = err
+    raise last_err if last_err else OSError("Не удалось создать папку workspace")
+
+
+HOST = (os.environ.get("AGENT_HOST") or "").strip() or "127.0.0.1"
+PORT = _env_int("AGENT_PORT", 8899, minimum=1, maximum=65535)
+BASE_URL = (os.environ.get("AGENT_BASE_URL") or "http://127.0.0.1:8888/v1").strip().rstrip("/")
 MODEL = os.environ.get("AGENT_MODEL", "")
 API_KEY = os.environ.get("AGENT_API_KEY", "")
 _LAUNCHER_SECRETS: Dict[str, str] = {}
@@ -96,14 +134,13 @@ def _load_secrets_file() -> None:
 
 
 _load_secrets_file()
-MAX_STEPS = max(1, int(os.environ.get("AGENT_MAX_STEPS", "500")))
+MAX_STEPS = _env_int("AGENT_MAX_STEPS", 500, minimum=1)
 MAX_STEPS_LIMIT = MAX_STEPS
-MAX_RUN_TOKENS = max(0, int(os.environ.get("AGENT_MAX_RUN_TOKENS", "2500000") or 0))
-TIMEOUT = int(os.environ.get("AGENT_TIMEOUT", "180"))
-APPROVAL_TIMEOUT = int(os.environ.get("AGENT_APPROVAL_TIMEOUT", "600"))
+MAX_RUN_TOKENS = _env_int("AGENT_MAX_RUN_TOKENS", 2500000, minimum=0)
+TIMEOUT = _env_int("AGENT_TIMEOUT", 180, minimum=5)
+APPROVAL_TIMEOUT = _env_int("AGENT_APPROVAL_TIMEOUT", 600, minimum=10)
 
-WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", Path(__file__).resolve().parent / "workspace"))
-WORKSPACE.mkdir(parents=True, exist_ok=True)
+WORKSPACE = _init_workspace()
 SANDBOX_ROOT = sandbox_mod.get_sandbox_root()
 PROCESS_MANAGER = sandbox_mod.ProcessManager()
 
@@ -3643,7 +3680,7 @@ class Handler(BaseHTTPRequestHandler):
                     "baseUrl": BASE_URL,
                     "workspace": str(WORKSPACE),
                     "sandbox": str(SANDBOX_ROOT),
-                    "browserAvailable": bool(browser_inspector.find_browser_executable()),
+                    "browserAvailable": browser_inspector.cached_browser_available(),
                     "tools": [tool["function"]["name"] for tool in TOOLS],
                     "maxSteps": MAX_STEPS,
                     "maxRunTokens": MAX_RUN_TOKENS,
@@ -5306,7 +5343,15 @@ def main() -> int:
     if args.self_test:
         return self_test()
 
-    server = Server((HOST, PORT), Handler)
+    try:
+        server = Server((HOST, PORT), Handler)
+    except OSError as exc:
+        log(
+            f"не удалось запустить сервер на http://{HOST}:{PORT}: {exc}. "
+            "Проверьте, не запущен ли уже другой экземпляр агента или не занят ли порт "
+            "(можно задать другой AGENT_PORT, например 8901)."
+        )
+        return 1
     log(f"слушаю http://{HOST}:{PORT} · модель: {MODEL or 'из запроса'} · база: {BASE_URL}")
     log(f"папка файлов: {WORKSPACE} · Sandbox: {SANDBOX_ROOT}")
     try:

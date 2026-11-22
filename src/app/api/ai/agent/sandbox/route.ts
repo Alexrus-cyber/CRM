@@ -1,4 +1,4 @@
-import { resolveSafeAgentUrl } from "@/lib/agentConfig";
+import { fetchAgent, resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
@@ -33,9 +33,11 @@ export async function GET(req: Request) {
   const download = new URL(req.url).searchParams.get("download");
   if (download) {
     try {
-      const upstream = await fetch(
-        `${agentUrl}/sandbox/download?path=${encodeURIComponent(download)}`,
-        { cache: "no-store", signal: AbortSignal.timeout(30_000) },
+      const { response: upstream } = await fetchAgent(
+        agentUrl,
+        `/sandbox/download?path=${encodeURIComponent(download)}`,
+        { cache: "no-store" },
+        { timeoutMs: 30_000, reqSignal: req.signal },
       );
       if (!upstream.ok) {
         const err = (await upstream.json().catch(() => ({}))) as { error?: string };
@@ -53,12 +55,12 @@ export async function GET(req: Request) {
   }
 
   try {
-    const sbTimeout = AbortSignal.timeout(12_000);
-    const sbSignal = typeof AbortSignal.any === "function" ? AbortSignal.any([req.signal, sbTimeout]) : sbTimeout;
-    const upstream = await fetch(`${agentUrl}/sandbox`, {
-      cache: "no-store",
-      signal: sbSignal,
-    });
+    const { response: upstream } = await fetchAgent(
+      agentUrl,
+      "/sandbox",
+      { cache: "no-store" },
+      { timeoutMs: 12_000, reqSignal: req.signal },
+    );
     const data = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
     return Response.json(data, { status: upstream.status, headers: { "Cache-Control": "no-store" } });
   } catch {
@@ -119,13 +121,17 @@ export async function POST(req: Request) {
   }
 
   try {
-    const upstream = await fetch(`${agentUrl}${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      cache: "no-store",
-      signal: AbortSignal.timeout(30_000),
-    });
+    const { response: upstream } = await fetchAgent(
+      agentUrl,
+      path,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        cache: "no-store",
+      },
+      { timeoutMs: 30_000, reqSignal: req.signal },
+    );
     const data = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
     return Response.json(data, { status: upstream.status, headers: { "Cache-Control": "no-store" } });
   } catch {

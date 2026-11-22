@@ -25,6 +25,8 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -122,11 +124,28 @@ class SandboxError(RuntimeError):
 
 
 def get_sandbox_root(raw: Optional[str] = None) -> Path:
-    base = Path(raw or os.environ.get("AGENT_SANDBOX_DIR") or DEFAULT_SANDBOX_DIR).expanduser()
-    resolved = base.resolve(strict=False)
-    resolved.mkdir(parents=True, exist_ok=True)
-    (resolved / ".tmp").mkdir(parents=True, exist_ok=True)
-    return resolved
+    explicit = raw or os.environ.get("AGENT_SANDBOX_DIR")
+    if explicit:
+        base = Path(explicit).expanduser()
+    elif getattr(sys, "frozen", False):
+        base = Path.cwd() / "sandbox"
+    else:
+        base = DEFAULT_SANDBOX_DIR
+
+    candidates = [base]
+    if not explicit:
+        candidates.extend([Path.cwd() / "sandbox", Path(tempfile.gettempdir()) / "crm-agent-sandbox"])
+
+    last_err: Optional[OSError] = None
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=False)
+            resolved.mkdir(parents=True, exist_ok=True)
+            (resolved / ".tmp").mkdir(parents=True, exist_ok=True)
+            return resolved
+        except OSError as err:
+            last_err = err
+    raise last_err if last_err else OSError("Не удалось создать папку Sandbox")
 
 
 def _is_within_root(root: Path, candidate: Path) -> bool:
