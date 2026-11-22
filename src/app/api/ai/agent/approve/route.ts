@@ -1,6 +1,6 @@
+import { AGENT_URL } from "@/lib/agentConfig";
 import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
-import { AGENT_URL } from "../route";
 
 /**
  * Подтверждение или отклонение команды / переноса файлов из Sandbox для запущенного Python-агента.

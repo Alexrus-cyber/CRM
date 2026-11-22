@@ -1,4 +1,12 @@
 import type { Role, TaskPriority, TaskStatus } from "@/db/schema";
+import {
+  ROLE_LABELS as PERMISSION_ROLE_LABELS,
+  canManageData,
+  canManageTeam,
+  canResetPasswords,
+  isAdminRole,
+  isCompanyRole,
+} from "./permissions";
 
 export function cn(...classes: Array<string | false | null | undefined>) {
   return classes.filter(Boolean).join(" ");
@@ -70,14 +78,7 @@ export const PRIORITY_BADGE: Record<TaskPriority, string> = {
   critical: "bg-red-500/15 text-red-500 border-red-500/30",
 };
 
-export const ROLE_LABELS: Record<Role, string> = {
-  super_admin: "Главный админ",
-  admin: "Администратор",
-  developer: "Разработчик",
-  manager: "Менеджер",
-  consultant: "Консультант",
-  user: "Сотрудник",
-};
+export const ROLE_LABELS: Record<Role, string> = PERMISSION_ROLE_LABELS;
 
 export const OPEN_STATUSES: TaskStatus[] = ["new", "in_progress", "review"];
 export const FINISHED_STATUSES: TaskStatus[] = ["done", "closed"];
@@ -97,33 +98,7 @@ export const AVATAR_COLORS = [
   "#64748b",
 ];
 
-/** Полные администраторы: статистика компании, пароли, управление пользователями. */
-export function isAdminRole(role: Role) {
-  return role === "admin" || role === "super_admin";
-}
-
-/** Кто видит статистику и задачи всей компании (админы и менеджеры). */
-export function isCompanyRole(role: Role) {
-  return role === "super_admin" || role === "admin" || role === "manager";
-}
-
-/** Кто может заводить сотрудников и менять роли (менеджер — только «сотрудник»/«консультант»). */
-export function canManageTeam(role: Role) {
-  return role === "super_admin" || role === "admin" || role === "manager";
-}
-
-/**
- * Кто управляет рабочими данными (задачи, контрагенты, выгрузки):
- * админы и менеджер — «менеджер почти как админ, но без паролей».
- */
-export function canManageData(role: Role) {
-  return role === "super_admin" || role === "admin" || role === "manager";
-}
-
-/** Пароли меняет только администратор: менеджер этого не может. */
-export function canResetPasswords(role: Role) {
-  return role === "super_admin" || role === "admin";
-}
+export { isAdminRole, isCompanyRole, canManageTeam, canManageData, canResetPasswords };
 
 export function initials(name: string) {
   return name

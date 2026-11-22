@@ -1,0 +1,17 @@
+node_modules
+.next
+.git
+.env
+.env*.local
+data
+agent/workspace
+agent/sandbox
+agent/files
+.venv
+__pycache__
+*.pyc
+*.sqlite*
+*.tsbuildinfo
+dist
+build
+launcher/wheels

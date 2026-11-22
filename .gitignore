@@ -7,7 +7,7 @@ out/
 next-env.d.ts
 *.tsbuildinfo
 
-# local database / sqlite artefacts
+# local database / sqlite & file storage artefacts
 data/
 *.sqlite
 *.sqlite-wal
@@ -18,13 +18,14 @@ data/
 .env*.local
 *.log
 
-# python agent: созданные файлы и кэш
+# python agent: созданные файлы, sandbox и кэш
 agent/workspace/
+agent/sandbox/
+agent/files/
+.venv/
+.pytest_cache/
 __pycache__/
 *.pyc
-
-# локальные файлы агента-оператора
-agent/files/
 
 # PyInstaller
 dist/

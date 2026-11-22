@@ -67,6 +67,10 @@ def _request_json(
             raise CrmClientError(msg or "Неверный логин/пароль или сессия истекла") from exc
         if exc.code == 403:
             raise CrmClientError(msg or "Доступ к этой функции запрещён") from exc
+        if exc.code == 429:
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            hint = f" Повторите через {retry_after} сек." if retry_after else ""
+            raise CrmClientError(msg or f"Слишком много попыток.{hint}") from exc
         raise CrmClientError(msg) from exc
     except urllib.error.URLError as exc:
         raise CrmClientError(f"Не удалось подключиться к CRM ({exc.reason})") from exc

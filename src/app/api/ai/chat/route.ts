@@ -4,6 +4,7 @@ import {
   getAiChat,
   getAiQuotaOverride,
   getAiUsage,
+  getAiUserSettingsSecret,
   getRagFolder,
   insertAiChatMessage,
   listRagChunks,
@@ -115,14 +116,16 @@ function buildUpstreamBody(model: string, messages: AiMessage[], params: AiParam
   return body;
 }
 
-function settingsFromRequest(req: Request) {
+async function settingsFromRequest(req: Request, userId: number) {
+  const saved = await getAiUserSettingsSecret(userId).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
   const headerBase = req.headers.get("x-ai-base") ?? "";
   const baseUrl =
     normalizeBaseUrl(headerBase) ??
+    normalizeBaseUrl(saved.baseUrl) ??
     normalizeBaseUrl(process.env.AI_BASE_URL ?? "") ??
     AI_DEFAULT_BASE_URL;
-  const apiKey = (req.headers.get("x-ai-key") ?? process.env.AI_API_KEY ?? "").trim();
-  const model = (req.headers.get("x-ai-model") ?? process.env.AI_MODEL ?? "").trim();
+  const apiKey = (req.headers.get("x-ai-key") ?? saved.apiKey ?? process.env.AI_API_KEY ?? "").trim();
+  const model = (req.headers.get("x-ai-model") ?? saved.model ?? process.env.AI_MODEL ?? "").trim();
   return { baseUrl, apiKey, model };
 }
 
@@ -185,7 +188,7 @@ export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { baseUrl, apiKey, model } = settingsFromRequest(req);
+  const { baseUrl, apiKey, model } = await settingsFromRequest(req, me.id);
   if (!model) {
     return Response.json(
       { error: "Не указана модель. Впишите имя модели в настройках блока «Чат с ИИ»." },

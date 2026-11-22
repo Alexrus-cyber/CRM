@@ -5,9 +5,7 @@
  *   1. DB_DIALECT=postgres | sqlite  — explicit choice
  *   2. otherwise: if DATABASE_URL is reachable -> PostgreSQL, else -> SQLite
  *
- * All application code talks to the database through `q` / `q1` (drizzle `sql`
- * templates), so the exact same SQL source works on both engines: drizzle
- * serialises the query with the right placeholder style per dialect.
+ * Schema creation & migrations live in `drizzle/*.sql` + `src/db/migrate.mjs`.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -16,6 +14,7 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { Pool } from "pg";
 import Database from "better-sqlite3";
+import { runMigrations } from "./migrate.mjs";
 
 export type DbDialect = "postgres" | "sqlite";
 
@@ -24,6 +23,7 @@ type Executor = {
   label: string;
   all<T>(query: SQL): Promise<T[]>;
   exec(statement: string): Promise<void>;
+  queryRaw(sqlText: string, params?: unknown[]): Promise<Record<string, unknown>[]>;
   ping(): Promise<void>;
 };
 
@@ -34,721 +34,7 @@ const globalForDb = globalThis as typeof globalThis & {
 };
 
 /* ------------------------------------------------------------------ */
-/* DDL — kept in sync with src/db/schema.ts (PostgreSQL / drizzle-kit) */
-/* ------------------------------------------------------------------ */
-
-const PG_DDL = [
-  `create table if not exists users (
-    id serial primary key,
-    email text not null unique,
-    password_hash text not null,
-    name text not null,
-    phone text,
-    position text,
-    bio text,
-    role text not null default 'user',
-    avatar_color text not null default '#7c5cff',
-    avatar_url text,
-    is_bot integer not null default 0,
-    can_use_agent integer not null default 0,
-    can_use_operator integer not null default 0,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-  )`,
-  `create table if not exists sessions (
-    id serial primary key,
-    token text not null unique,
-    user_id integer not null references users(id) on delete cascade,
-    expires_at timestamptz not null,
-    created_at timestamptz not null default now()
-  )`,
-  `create index if not exists sessions_user_idx on sessions (user_id)`,
-  `create table if not exists counterparties (
-    id serial primary key,
-    name text not null,
-    phone text,
-    email text,
-    address text,
-    inn text,
-    kpp text,
-    notes text,
-    created_by_id integer references users(id) on delete set null,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-  )`,
-  `create table if not exists tasks (
-    id serial primary key,
-    title text not null,
-    description text,
-    assignee_id integer not null references users(id) on delete cascade,
-    author_id integer not null references users(id) on delete cascade,
-    counterparty_id integer references counterparties(id) on delete set null,
-    deadline date not null,
-    deadline_time text,
-    accepted_at timestamptz,
-    hours real not null default 0,
-    status text not null default 'new',
-    priority text not null default 'medium',
-    completed_at timestamptz,
-    closed_at timestamptz,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-  )`,
-  `create index if not exists tasks_assignee_idx on tasks (assignee_id)`,
-  `create index if not exists tasks_author_idx on tasks (author_id)`,
-  `create index if not exists tasks_deadline_idx on tasks (deadline)`,
-  `create table if not exists chat_rooms (
-    id serial primary key,
-    name text not null,
-    description text not null default '',
-    kind text not null default 'group',
-    created_by integer references users(id) on delete set null,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-  )`,
-  `create index if not exists chat_rooms_created_by_idx on chat_rooms (created_by)`,
-  `create table if not exists chat_room_members (
-    id serial primary key,
-    room_id integer not null references chat_rooms(id) on delete cascade,
-    user_id integer not null references users(id) on delete cascade,
-    added_by integer references users(id) on delete set null,
-    role text not null default 'member',
-    created_at timestamptz not null default now()
-  )`,
-  `create unique index if not exists chat_room_members_room_user_uq on chat_room_members (room_id, user_id)`,
-  `create index if not exists chat_room_members_user_idx on chat_room_members (user_id)`,
-  `create table if not exists chat_room_reads (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    room_id integer not null references chat_rooms(id) on delete cascade,
-    last_read_id integer not null default 0,
-    updated_at timestamptz not null default now()
-  )`,
-  `create unique index if not exists chat_room_reads_user_room_uq on chat_room_reads (user_id, room_id)`,
-  `create table if not exists chat_general_bots (
-    id serial primary key,
-    bot_user_id integer not null unique references users(id) on delete cascade,
-    added_by integer references users(id) on delete set null,
-    created_at timestamptz not null default now()
-  )`,
-  `create table if not exists ai_bot_configs (
-    id serial primary key,
-    user_id integer not null unique references users(id) on delete cascade,
-    provider text not null default 'local',
-    base_url text not null default '',
-    api_key text not null default '',
-    model text not null default '',
-    system_prompt text not null default '',
-    params_json text not null default '{}',
-    reply_mode text not null default 'mention',
-    is_active integer not null default 1,
-    created_by integer references users(id) on delete set null,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-  )`,
-  `create table if not exists messages (
-    id serial primary key,
-    sender_id integer not null references users(id) on delete cascade,
-    recipient_id integer references users(id) on delete cascade,
-    room_id integer references chat_rooms(id) on delete cascade,
-    content text not null,
-    content_lower text not null default '',
-    created_at timestamptz not null default now()
-  )`,
-  `create index if not exists messages_created_idx on messages (created_at)`,
-  `create table if not exists task_exports (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    task_id integer not null references tasks(id) on delete cascade,
-    created_at timestamptz not null default now()
-  )`,
-  `create unique index if not exists task_exports_user_task_uq on task_exports (user_id, task_id)`,
-  `create table if not exists task_messages (
-    id serial primary key,
-    task_id integer not null references tasks(id) on delete cascade,
-    author_id integer not null references users(id) on delete cascade,
-    content text not null,
-    content_lower text not null default '',
-    created_at timestamptz not null default now()
-  )`,
-  `create index if not exists task_messages_task_idx on task_messages (task_id, id)`,
-  `create table if not exists agent_tokens (
-    id serial primary key,
-    user_id integer not null unique references users(id) on delete cascade,
-    token text not null unique,
-    created_at timestamptz not null default now()
-  )`,
-  // Подключения: адрес CRM, к которому подключается бот. У пользователя их
-  // может быть несколько (свой сервер, тестовый, сервер заказчика), а токенов
-  // на каждое — сколько нужно (по одному на машину/оператора).
-  `create table if not exists agent_connections (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    name text not null,
-    server_url text not null default '',
-    is_default integer not null default 0,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    unique (user_id, name)
-  )`,
-  `create table if not exists agent_connection_tokens (
-    id serial primary key,
-    connection_id integer not null references agent_connections(id) on delete cascade,
-    user_id integer not null references users(id) on delete cascade,
-    name text not null default '',
-    token text not null unique,
-    created_at timestamptz not null default now(),
-    last_used_at timestamptz
-  )`,
-  `create table if not exists agent_conversations (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    kind text not null,
-    title text not null default 'Новый чат',
-    system_prompt text not null default '',
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-  )`,
-  `create index if not exists agent_conversations_user_kind_idx on agent_conversations (user_id, kind, updated_at)`,
-  `create table if not exists agent_conversation_messages (
-    id serial primary key,
-    conversation_id integer not null references agent_conversations(id) on delete cascade,
-    role text not null,
-    content text not null default '',
-    reasoning text not null default '',
-    attachments text not null default '[]',
-    actions text not null default '[]',
-    files text not null default '[]',
-    error text not null default '',
-    created_at timestamptz not null default now()
-  )`,
-  `create index if not exists agent_conversation_messages_conversation_idx on agent_conversation_messages (conversation_id)`,
-  `create index if not exists agent_connections_user_idx on agent_connections (user_id)`,
-  `create index if not exists agent_connection_tokens_conn_idx on agent_connection_tokens (connection_id)`,
-  `create table if not exists agent_tasks (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    prompt text not null,
-    status text not null default 'queued',
-    max_steps integer not null default 15,
-    steps integer not null default 0,
-    summary text not null default '',
-    trust_level text not null default 'verified',
-    task_mode text not null default 'autonomous',
-    source text not null default 'operator',
-    coach_mode text not null default 'after_step',
-    guidance_note text not null default '',
-    pending_approval text not null default '',
-    approval_response text not null default '',
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-  )`,
-  `create index if not exists agent_tasks_status_idx on agent_tasks (status, id)`,
-  `create table if not exists agent_transcripts (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    conversation_id integer not null default 0,
-    title text not null default 'Переписка агента',
-    summary text not null default '',
-    file_name text not null,
-    content text not null,
-    chars integer not null default 0,
-    created_at timestamptz not null default now()
-  )`,
-  `create index if not exists agent_transcripts_user_idx on agent_transcripts (user_id, id)`,
-  `create table if not exists agent_events (
-    id serial primary key,
-    task_id integer not null references agent_tasks(id) on delete cascade,
-    kind text not null,
-    text text not null default '',
-    action text not null default '',
-    file_name text not null default '',
-    file_mime text not null default '',
-    file_size integer not null default 0,
-    file_data text not null default '',
-    created_at timestamptz not null default now()
-  )`,
-  `create index if not exists agent_events_task_idx on agent_events (task_id, id)`,
-  `create table if not exists chat_reads (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    peer_id integer not null default 0,
-    last_read_id integer not null default 0,
-    updated_at timestamptz not null default now()
-  )`,
-  `create unique index if not exists chat_reads_user_peer_uq on chat_reads (user_id, peer_id)`,
-  `create table if not exists message_attachments (
-    id serial primary key,
-    message_id integer not null references messages(id) on delete cascade,
-    name text not null,
-    name_lower text not null default '',
-    mime text not null,
-    size integer not null,
-    data text not null,
-    created_at timestamptz not null default now()
-  )`,
-  `create index if not exists message_attachments_message_idx on message_attachments (message_id)`,
-  `create table if not exists ai_rag_folders (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    name text not null,
-    files_count integer not null default 0,
-    chunks_count integer not null default 0,
-    chars integer not null default 0,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-  )`,
-  `create table if not exists ai_chats (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    title text not null default 'Новый чат',
-    tokens_prompt integer not null default 0,
-    tokens_completion integer not null default 0,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-  )`,
-  `create index if not exists ai_chats_user_idx on ai_chats (user_id, updated_at)`,
-  `create table if not exists ai_chat_messages (
-    id serial primary key,
-    chat_id integer not null references ai_chats(id) on delete cascade,
-    role text not null,
-    content text not null default '',
-    reasoning text not null default '',
-    attachments text not null default '[]',
-    tokens integer not null default 0,
-    prompt_tokens integer not null default 0,
-    completion_tokens integer not null default 0,
-    created_at timestamptz not null default now()
-  )`,
-  `create index if not exists ai_chat_messages_chat_idx on ai_chat_messages (chat_id)`,
-  `create table if not exists ai_usage_events (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    chat_id integer not null default 0,
-    prompt_tokens integer not null default 0,
-    completion_tokens integer not null default 0,
-    total_tokens integer not null default 0,
-    month text not null,
-    created_at timestamptz not null default now()
-  )`,
-  `create index if not exists ai_usage_events_user_month_idx on ai_usage_events (user_id, month)`,
-  `create table if not exists ai_quota_overrides (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    month text not null,
-    monthly_limit integer not null,
-    created_by integer references users(id) on delete set null,
-    created_at timestamptz not null default now()
-  )`,
-  `create unique index if not exists ai_quota_overrides_user_month_uq on ai_quota_overrides (user_id, month)`,
-  `create index if not exists ai_rag_folders_user_idx on ai_rag_folders (user_id)`,
-  `create table if not exists ai_rag_chunks (
-    id serial primary key,
-    folder_id integer not null references ai_rag_folders(id) on delete cascade,
-    path text not null,
-    chunk_index integer not null default 0,
-    text text not null,
-    created_at timestamptz not null default now()
-  )`,
-  `create index if not exists ai_rag_chunks_folder_idx on ai_rag_chunks (folder_id)`,
-  `create table if not exists ai_rag_terms (
-    id serial primary key,
-    folder_id integer not null references ai_rag_folders(id) on delete cascade,
-    term text not null,
-    chunk_id integer not null references ai_rag_chunks(id) on delete cascade,
-    tf integer not null default 1
-  )`,
-  `create index if not exists ai_rag_terms_lookup_idx on ai_rag_terms (folder_id, term)`,
-  `create table if not exists agent_usage_events (
-    id serial primary key,
-    user_id integer not null references users(id) on delete cascade,
-    kind text not null,
-    ref_id integer not null default 0,
-    model text not null default '',
-    prompt_tokens integer not null default 0,
-    completion_tokens integer not null default 0,
-    total_tokens integer not null default 0,
-    month text not null,
-    created_at timestamptz not null default now()
-  )`,
-  `create index if not exists agent_usage_events_user_kind_month_idx on agent_usage_events (user_id, kind, month)`,
-  `create table if not exists github_connections (
-    id serial primary key,
-    user_id integer not null unique references users(id) on delete cascade,
-    github_user_id integer not null default 0,
-    login text not null,
-    name text not null default '',
-    email text not null default '',
-    avatar_url text not null default '',
-    token_encrypted text not null,
-    token_hint text not null default '',
-    scopes text not null default '',
-    selected_owner text not null default '',
-    selected_repo text not null default '',
-    selected_branch text not null default '',
-    enabled integer not null default 1,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-  )`,
-];
-
-/**
- * SQLite schema. ISO-8601 TEXT timestamps keep sorting/comparison identical
- * to PostgreSQL, so no query has to be dialect-specific.
- */
-const SQLITE_DDL = [
-  `create table if not exists users (
-    id integer primary key autoincrement,
-    email text not null unique,
-    password_hash text not null,
-    name text not null,
-    phone text,
-    position text,
-    bio text,
-    role text not null default 'user',
-    avatar_color text not null default '#7c5cff',
-    avatar_url text,
-    is_bot integer not null default 0,
-    can_use_agent integer not null default 0,
-    can_use_operator integer not null default 0,
-    created_at text not null,
-    updated_at text not null
-  )`,
-  `create table if not exists sessions (
-    id integer primary key autoincrement,
-    token text not null unique,
-    user_id integer not null references users(id) on delete cascade,
-    expires_at text not null,
-    created_at text not null
-  )`,
-  `create index if not exists sessions_user_idx on sessions (user_id)`,
-  `create table if not exists counterparties (
-    id integer primary key autoincrement,
-    name text not null,
-    phone text,
-    email text,
-    address text,
-    inn text,
-    kpp text,
-    notes text,
-    created_by_id integer references users(id) on delete set null,
-    created_at text not null,
-    updated_at text not null
-  )`,
-  `create table if not exists tasks (
-    id integer primary key autoincrement,
-    title text not null,
-    description text,
-    assignee_id integer not null references users(id) on delete cascade,
-    author_id integer not null references users(id) on delete cascade,
-    counterparty_id integer references counterparties(id) on delete set null,
-    deadline text not null,
-    deadline_time text,
-    accepted_at text,
-    hours real not null default 0,
-    status text not null default 'new',
-    priority text not null default 'medium',
-    completed_at text,
-    closed_at text,
-    created_at text not null,
-    updated_at text not null
-  )`,
-  `create index if not exists tasks_assignee_idx on tasks (assignee_id)`,
-  `create index if not exists tasks_author_idx on tasks (author_id)`,
-  `create index if not exists tasks_deadline_idx on tasks (deadline)`,
-  `create table if not exists chat_rooms (
-    id integer primary key autoincrement,
-    name text not null,
-    description text not null default '',
-    kind text not null default 'group',
-    created_by integer references users(id) on delete set null,
-    created_at text not null,
-    updated_at text not null
-  )`,
-  `create index if not exists chat_rooms_created_by_idx on chat_rooms (created_by)`,
-  `create table if not exists chat_room_members (
-    id integer primary key autoincrement,
-    room_id integer not null references chat_rooms(id) on delete cascade,
-    user_id integer not null references users(id) on delete cascade,
-    added_by integer references users(id) on delete set null,
-    role text not null default 'member',
-    created_at text not null
-  )`,
-  `create unique index if not exists chat_room_members_room_user_uq on chat_room_members (room_id, user_id)`,
-  `create index if not exists chat_room_members_user_idx on chat_room_members (user_id)`,
-  `create table if not exists chat_room_reads (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    room_id integer not null references chat_rooms(id) on delete cascade,
-    last_read_id integer not null default 0,
-    updated_at text not null
-  )`,
-  `create unique index if not exists chat_room_reads_user_room_uq on chat_room_reads (user_id, room_id)`,
-  `create table if not exists chat_general_bots (
-    id integer primary key autoincrement,
-    bot_user_id integer not null unique references users(id) on delete cascade,
-    added_by integer references users(id) on delete set null,
-    created_at text not null
-  )`,
-  `create table if not exists ai_bot_configs (
-    id integer primary key autoincrement,
-    user_id integer not null unique references users(id) on delete cascade,
-    provider text not null default 'local',
-    base_url text not null default '',
-    api_key text not null default '',
-    model text not null default '',
-    system_prompt text not null default '',
-    params_json text not null default '{}',
-    reply_mode text not null default 'mention',
-    is_active integer not null default 1,
-    created_by integer references users(id) on delete set null,
-    created_at text not null,
-    updated_at text not null
-  )`,
-  `create table if not exists messages (
-    id integer primary key autoincrement,
-    sender_id integer not null references users(id) on delete cascade,
-    recipient_id integer references users(id) on delete cascade,
-    room_id integer references chat_rooms(id) on delete cascade,
-    content text not null,
-    content_lower text not null default '',
-    created_at text not null
-  )`,
-  `create index if not exists messages_created_idx on messages (created_at)`,
-  `create table if not exists task_exports (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    task_id integer not null references tasks(id) on delete cascade,
-    created_at text not null
-  )`,
-  `create unique index if not exists task_exports_user_task_uq on task_exports (user_id, task_id)`,
-  `create table if not exists task_messages (
-    id integer primary key autoincrement,
-    task_id integer not null references tasks(id) on delete cascade,
-    author_id integer not null references users(id) on delete cascade,
-    content text not null,
-    content_lower text not null default '',
-    created_at text not null
-  )`,
-  `create index if not exists task_messages_task_idx on task_messages (task_id, id)`,
-  `create table if not exists agent_tokens (
-    id integer primary key autoincrement,
-    user_id integer not null unique references users(id) on delete cascade,
-    token text not null unique,
-    created_at text not null
-  )`,
-  `create table if not exists agent_connections (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    name text not null,
-    server_url text not null default '',
-    is_default integer not null default 0,
-    created_at text not null,
-    updated_at text not null,
-    unique (user_id, name)
-  )`,
-  `create table if not exists agent_connection_tokens (
-    id integer primary key autoincrement,
-    connection_id integer not null references agent_connections(id) on delete cascade,
-    user_id integer not null references users(id) on delete cascade,
-    name text not null default '',
-    token text not null unique,
-    created_at text not null,
-    last_used_at text
-  )`,
-  `create table if not exists agent_conversations (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    kind text not null,
-    title text not null default 'Новый чат',
-    system_prompt text not null default '',
-    created_at text not null,
-    updated_at text not null
-  )`,
-  `create index if not exists agent_conversations_user_kind_idx on agent_conversations (user_id, kind, updated_at)`,
-  `create table if not exists agent_conversation_messages (
-    id integer primary key autoincrement,
-    conversation_id integer not null references agent_conversations(id) on delete cascade,
-    role text not null,
-    content text not null default '',
-    reasoning text not null default '',
-    attachments text not null default '[]',
-    actions text not null default '[]',
-    files text not null default '[]',
-    error text not null default '',
-    created_at text not null
-  )`,
-  `create index if not exists agent_conversation_messages_conversation_idx on agent_conversation_messages (conversation_id)`,
-  `create index if not exists agent_connections_user_idx on agent_connections (user_id)`,
-  `create index if not exists agent_connection_tokens_conn_idx on agent_connection_tokens (connection_id)`,
-  `create table if not exists agent_tasks (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    prompt text not null,
-    status text not null default 'queued',
-    max_steps integer not null default 15,
-    steps integer not null default 0,
-    summary text not null default '',
-    trust_level text not null default 'verified',
-    task_mode text not null default 'autonomous',
-    source text not null default 'operator',
-    coach_mode text not null default 'after_step',
-    guidance_note text not null default '',
-    pending_approval text not null default '',
-    approval_response text not null default '',
-    created_at text not null,
-    updated_at text not null
-  )`,
-  `create index if not exists agent_tasks_status_idx on agent_tasks (status, id)`,
-  `create table if not exists agent_transcripts (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    conversation_id integer not null default 0,
-    title text not null default 'Переписка агента',
-    summary text not null default '',
-    file_name text not null,
-    content text not null,
-    chars integer not null default 0,
-    created_at text not null
-  )`,
-  `create index if not exists agent_transcripts_user_idx on agent_transcripts (user_id, id)`,
-  `create table if not exists agent_events (
-    id integer primary key autoincrement,
-    task_id integer not null references agent_tasks(id) on delete cascade,
-    kind text not null,
-    text text not null default '',
-    action text not null default '',
-    file_name text not null default '',
-    file_mime text not null default '',
-    file_size integer not null default 0,
-    file_data text not null default '',
-    created_at text not null
-  )`,
-  `create index if not exists agent_events_task_idx on agent_events (task_id, id)`,
-  `create table if not exists chat_reads (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    peer_id integer not null default 0,
-    last_read_id integer not null default 0,
-    updated_at text not null
-  )`,
-  `create unique index if not exists chat_reads_user_peer_uq on chat_reads (user_id, peer_id)`,
-  `create table if not exists message_attachments (
-    id integer primary key autoincrement,
-    message_id integer not null references messages(id) on delete cascade,
-    name text not null,
-    name_lower text not null default '',
-    mime text not null,
-    size integer not null,
-    data text not null,
-    created_at text not null
-  )`,
-  `create index if not exists message_attachments_message_idx on message_attachments (message_id)`,
-  `create table if not exists ai_rag_folders (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    name text not null,
-    files_count integer not null default 0,
-    chunks_count integer not null default 0,
-    chars integer not null default 0,
-    created_at text not null,
-    updated_at text not null
-  )`,
-  `create table if not exists ai_chats (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    title text not null default 'Новый чат',
-    tokens_prompt integer not null default 0,
-    tokens_completion integer not null default 0,
-    created_at text not null,
-    updated_at text not null
-  )`,
-  `create index if not exists ai_chats_user_idx on ai_chats (user_id, updated_at)`,
-  `create table if not exists ai_chat_messages (
-    id integer primary key autoincrement,
-    chat_id integer not null references ai_chats(id) on delete cascade,
-    role text not null,
-    content text not null default '',
-    reasoning text not null default '',
-    attachments text not null default '[]',
-    tokens integer not null default 0,
-    prompt_tokens integer not null default 0,
-    completion_tokens integer not null default 0,
-    created_at text not null
-  )`,
-  `create index if not exists ai_chat_messages_chat_idx on ai_chat_messages (chat_id)`,
-  `create table if not exists ai_usage_events (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    chat_id integer not null default 0,
-    prompt_tokens integer not null default 0,
-    completion_tokens integer not null default 0,
-    total_tokens integer not null default 0,
-    month text not null,
-    created_at text not null
-  )`,
-  `create index if not exists ai_usage_events_user_month_idx on ai_usage_events (user_id, month)`,
-  `create table if not exists ai_quota_overrides (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    month text not null,
-    monthly_limit integer not null,
-    created_by integer references users(id) on delete set null,
-    created_at text not null
-  )`,
-  `create unique index if not exists ai_quota_overrides_user_month_uq on ai_quota_overrides (user_id, month)`,
-  `create table if not exists ai_rag_chunks (
-    id integer primary key autoincrement,
-    folder_id integer not null references ai_rag_folders(id) on delete cascade,
-    path text not null,
-    chunk_index integer not null default 0,
-    text text not null,
-    created_at text not null
-  )`,
-  `create index if not exists ai_rag_chunks_folder_idx on ai_rag_chunks (folder_id)`,
-  `create table if not exists ai_rag_terms (
-    id integer primary key autoincrement,
-    folder_id integer not null references ai_rag_folders(id) on delete cascade,
-    term text not null,
-    chunk_id integer not null references ai_rag_chunks(id) on delete cascade,
-    tf integer not null default 1
-  )`,
-  `create index if not exists ai_rag_terms_lookup_idx on ai_rag_terms (folder_id, term)`,
-  `create table if not exists agent_usage_events (
-    id integer primary key autoincrement,
-    user_id integer not null references users(id) on delete cascade,
-    kind text not null,
-    ref_id integer not null default 0,
-    model text not null default '',
-    prompt_tokens integer not null default 0,
-    completion_tokens integer not null default 0,
-    total_tokens integer not null default 0,
-    month text not null,
-    created_at text not null
-  )`,
-  `create index if not exists agent_usage_events_user_kind_month_idx on agent_usage_events (user_id, kind, month)`,
-  `create table if not exists github_connections (
-    id integer primary key autoincrement,
-    user_id integer not null unique references users(id) on delete cascade,
-    github_user_id integer not null default 0,
-    login text not null,
-    name text not null default '',
-    email text not null default '',
-    avatar_url text not null default '',
-    token_encrypted text not null,
-    token_hint text not null default '',
-    scopes text not null default '',
-    selected_owner text not null default '',
-    selected_repo text not null default '',
-    selected_branch text not null default '',
-    enabled integer not null default 1,
-    created_at text not null,
-    updated_at text not null
-  )`,
-];
-
-/* ------------------------------------------------------------------ */
-/* Value normalisation (PostgreSQL may return Date / bigint-string)    */
+/* Value normalisation (PostgreSQL may return Date / bigint / boolean) */
 /* ------------------------------------------------------------------ */
 
 export function toIso(value: unknown): string | null {
@@ -766,6 +52,10 @@ export function toYmd(value: unknown): string {
 export function toNum(value: unknown): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : 0;
+}
+
+export function toBool(value: unknown): boolean {
+  return value === true || value === 1 || value === "1" || value === "t" || value === "true";
 }
 
 export function nowIso(): string {
@@ -797,7 +87,6 @@ async function buildPostgres(): Promise<Executor> {
   try {
     await pool.query("select 1");
   } catch (error) {
-    // Do not leak a half-open pool when we are about to fall back to SQLite.
     await pool.end().catch(() => undefined);
     throw error;
   }
@@ -813,6 +102,10 @@ async function buildPostgres(): Promise<Executor> {
     async exec(statement: string) {
       await pool.query(statement);
     },
+    async queryRaw(sqlText: string, params: unknown[] = []) {
+      const res = await pool.query(sqlText, params);
+      return res.rows as Record<string, unknown>[];
+    },
     async ping() {
       await pool.query("select 1");
     },
@@ -824,8 +117,6 @@ async function buildSqlite(): Promise<Executor> {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const database = new Database(file);
   database.pragma("journal_mode = WAL");
-  // 50+ concurrent users mostly read; WAL allows readers while one writer runs.
-  // busy_timeout makes writers wait for the lock instead of failing instantly.
   database.pragma("busy_timeout = 5000");
   database.pragma("synchronous = NORMAL");
   database.pragma("foreign_keys = ON");
@@ -834,34 +125,31 @@ async function buildSqlite(): Promise<Executor> {
   globalForDb.__crmSqlite = database;
   const dialect = new SQLiteSyncDialect();
 
+  const attempt = <R>(fn: () => R): R => {
+    let lastError: unknown;
+    for (let i = 0; i < 4; i += 1) {
+      try {
+        return fn();
+      } catch (error) {
+        lastError = error;
+        const code = (error as { code?: string }).code ?? "";
+        if (!code.startsWith("SQLITE_BUSY") && !code.startsWith("SQLITE_LOCKED")) break;
+        const until = Date.now() + 50 * (i + 1);
+        while (Date.now() < until) {
+          /* brief synchronous retry for WAL contention */
+        }
+      }
+    }
+    throw lastError;
+  };
+
   return {
     dialect: "sqlite",
     label: "SQLite",
     async all<T>(query: SQL): Promise<T[]> {
       const { sql: text, params } = dialect.sqlToQuery(query);
       const args = sqliteParams(params);
-      // Short retry for SQLITE_BUSY: with several writers this avoids user-facing
-      // 500s when the WAL writer lock is held by another request for a moment.
-      const attempt = <R>(fn: () => R): R => {
-        let lastError: unknown;
-        for (let i = 0; i < 4; i += 1) {
-          try {
-            return fn();
-          } catch (error) {
-            lastError = error;
-            const code = (error as { code?: string }).code ?? "";
-            if (!code.startsWith("SQLITE_BUSY") && !code.startsWith("SQLITE_LOCKED")) break;
-            const until = Date.now() + 50 * (i + 1);
-            while (Date.now() < until) {
-              /* small synchronous backoff, better-sqlite3 has no async lock wait */
-            }
-          }
-        }
-        throw lastError;
-      };
       const statement = database.prepare(text);
-      // better-sqlite3 requires run() for statements that return no rows
-      // (INSERT/UPDATE/DELETE without RETURNING); all() throws in that case.
       if (!statement.reader) {
         attempt(() => statement.run(...args));
         return [];
@@ -870,6 +158,15 @@ async function buildSqlite(): Promise<Executor> {
     },
     async exec(statement: string) {
       database.exec(statement);
+    },
+    async queryRaw(sqlText: string, params: unknown[] = []) {
+      const args = sqliteParams(params);
+      const statement = database.prepare(sqlText);
+      if (!statement.reader) {
+        attempt(() => statement.run(...args));
+        return [];
+      }
+      return attempt(() => statement.all(...args)) as Record<string, unknown>[];
     },
     async ping() {
       database.prepare("select 1").get();
@@ -886,7 +183,6 @@ async function init(): Promise<Executor> {
   } else if (requested === "postgres" || requested === "postgresql" || requested === "pg") {
     executor = await buildPostgres();
   } else {
-    // Auto: prefer PostgreSQL when reachable, otherwise fall back to SQLite.
     try {
       executor = await buildPostgres();
     } catch (error) {
@@ -895,86 +191,15 @@ async function init(): Promise<Executor> {
     }
   }
 
-  const ddl = executor.dialect === "postgres" ? PG_DDL : SQLITE_DDL;
-  for (const statement of ddl) {
-    await executor.exec(statement);
-  }
-  await migrateColumns(executor);
+  await runMigrations(executor);
   await backfillMessageSearch(executor);
   console.info(`[db] connected: ${executor.label}${executor.dialect === "sqlite" ? ` (${sqliteFile()})` : ""}`);
   return executor;
 }
 
 /**
- * Additive migrations for databases created before a column existed.
- * `add column` cannot be made idempotent in SQLite, so errors about existing
- * columns are ignored while everything else is re-thrown.
- */
-async function migrateColumns(executor: Executor): Promise<void> {
-  const timestamp = executor.dialect === "postgres" ? "timestamptz" : "text";
-  const statements = [
-    `alter table tasks add column deadline_time text`,
-    `alter table tasks add column accepted_at ${timestamp}`,
-    // Колонка для поиска по чату: lower() в SQLite не знает кириллицу,
-    // поэтому нормализуем текст в JS и ищем по готовой строке.
-    `alter table messages add column content_lower text not null default ''`,
-    `alter table message_attachments add column name_lower text not null default ''`,
-    `alter table agent_tasks add column trust_level text not null default 'verified'`,
-    `alter table agent_tasks add column task_mode text not null default 'autonomous'`,
-    `alter table agent_tasks add column source text not null default 'operator'`,
-    `alter table agent_tasks add column coach_mode text not null default 'after_step'`,
-    `alter table agent_tasks add column guidance_note text not null default ''`,
-    `alter table agent_tasks add column pending_approval text not null default ''`,
-    `alter table agent_tasks add column approval_response text not null default ''`,
-    `alter table users add column is_bot integer not null default 0`,
-    `alter table users add column can_use_agent integer not null default 0`,
-    `alter table users add column can_use_operator integer not null default 0`,
-    `alter table messages add column room_id integer references chat_rooms(id) on delete cascade`,
-  ];
-  for (const statement of statements) {
-    try {
-      await executor.exec(statement);
-    } catch (error) {
-      const message = (error as Error).message ?? "";
-      if (!/already exists|duplicate column/i.test(message)) throw error;
-    }
-  }
-  await executor.exec(`create index if not exists messages_room_idx on messages (room_id, id)`);
-  await migrateLegacyAgentTokens(executor);
-}
-
-/**
- * Старые токены (`agent_tokens`, один на пользователя) переезжают в первое
- * подключение: у пользователя появляется «Основной CRM» с одним токеном.
- * Повторный запуск ничего не делает — обе вставки проверяют `not exists`.
- */
-async function migrateLegacyAgentTokens(executor: Executor): Promise<void> {
-  const statements = [
-    `insert into agent_connections (user_id, name, server_url, is_default, created_at, updated_at)
-     select t.user_id, 'Основной CRM', '', 1, t.created_at, t.created_at
-     from agent_tokens t
-     where not exists (select 1 from agent_connections c where c.user_id = t.user_id)`,
-    `insert into agent_connection_tokens (connection_id, user_id, name, token, created_at, last_used_at)
-     select c.id, t.user_id, 'Основной', t.token, t.created_at, null
-     from agent_tokens t
-     join agent_connections c on c.user_id = t.user_id
-     where not exists (select 1 from agent_connection_tokens x where x.token = t.token)`,
-  ];
-  for (const statement of statements) {
-    try {
-      await executor.exec(statement);
-    } catch (error) {
-      // Старой таблицы может не быть (свежая база) — это нормально.
-      const message = (error as Error).message ?? "";
-      if (!/no such table|does not exist/i.test(message)) throw error;
-    }
-  }
-}
-
-/**
- * Однократное наполнение `messages.content_lower` и
- * `message_attachments.name_lower` для записей, созданных до появления поиска.
- * Дальше запрос ничего не находит и стоит копейки.
+ * Однократное наполнение `messages.content_lower` и `message_attachments.name_lower`
+ * для записей, созданных до появления поиска.
  */
 async function backfillMessageSearch(executor: Executor): Promise<void> {
   for (let batch = 0; batch < 20; batch += 1) {
@@ -991,7 +216,6 @@ async function backfillMessageSearch(executor: Executor): Promise<void> {
     break;
   }
 
-  // То же для имён вложений — по ним тоже ищем.
   for (let batch = 0; batch < 20; batch += 1) {
     const rows = await executor.all<{ id: number; name: string }>(sql`
       select id, name from message_attachments

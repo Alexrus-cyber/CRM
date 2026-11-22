@@ -17,11 +17,13 @@
 
 from __future__ import annotations
 
+import atexit
 import io
 import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -55,11 +57,33 @@ ESCAPE_PATTERNS = [
     re.compile(r"(?:^|[\s;|&`(])rm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+/(?:\s|$|\*)", re.IGNORECASE),
     re.compile(r"(?:^|[\s;|&`(])(?:mkfs|fdisk|parted|shutdown|reboot|halt|poweroff)\b", re.IGNORECASE),
     re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),  # fork bomb
-    re.compile(r"(?:/etc/(?:shadow|sudoers|passwd)|~/.ssh|/root/\.ssh)", re.IGNORECASE),
+    re.compile(
+        r"(?:/etc/(?:shadow|sudoers|passwd)|~/\.(?:ssh|aws|gnupg|kube)|/(?:root|home/[^/\s]+)/\.(?:ssh|aws|gnupg)|/proc/self/environ|/var/run/docker\.sock)",
+        re.IGNORECASE,
+    ),
     re.compile(r"[A-Za-z]:\\Windows\\System32", re.IGNORECASE),
     re.compile(r"(?:^|[\s;|&`(])cd\s+/(?:\s|$|;|&&)", re.IGNORECASE),
     re.compile(r"(?:^|[\s;|&`(])dd\s+if=.*\s+of=/dev/", re.IGNORECASE),
+    re.compile(r"(?:curl|wget)\s+[^\n|]*\|\s*(?:ba)?sh\b", re.IGNORECASE),
+    re.compile(r"(?:^|[\s;|&`(])(?:sudo|su\s+-|chmod\s+[ugo]*\+s|chown\s+root)\b", re.IGNORECASE),
+    re.compile(r"(?:/dev/tcp/|nc(?:at)?\s+[^\n]*-e\s+)", re.IGNORECASE),
 ]
+
+FORBIDDEN_EXPORT_PREFIXES = (
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/boot",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/System",
+    "C:\\Windows",
+    "C:\\Program Files",
+)
+
+FORBIDDEN_EXPORT_HOME_DIRS = {".ssh", ".gnupg", ".aws", ".kube"}
 
 MAX_OUTPUT_CHARS = 18_000
 MAX_SANDBOX_FILE_BYTES = 2_000_000
@@ -248,9 +272,17 @@ def export_path(
         raise SandboxError("Не указана папка назначения на компьютере")
 
     dest = Path(raw_dest).expanduser().resolve(strict=False)
-    # Запрещаем перенос в корень диска или в родителя Sandbox целиком.
+    # Запрещаем перенос в корень диска, системные каталоги или в родителя Sandbox целиком.
     if dest == dest.parent or str(dest) in ("/", "\\"):
         raise SandboxError("Нельзя переносить файлы в корень файловой системы")
+
+    dest_str = str(dest)
+    for prefix in FORBIDDEN_EXPORT_PREFIXES:
+        norm_pref = prefix.rstrip("/\\")
+        if dest_str.lower() == norm_pref.lower() or dest_str.lower().startswith((norm_pref + os.sep).lower()):
+            raise SandboxError(f"Запрещён экспорт в системную папку: {dest}")
+    if any(part in FORBIDDEN_EXPORT_HOME_DIRS for part in dest.parts):
+        raise SandboxError(f"Запрещён экспорт в защищённый каталог учётных данных: {dest}")
 
     root_resolved = root.resolve(strict=False)
     if _is_within_root(dest, root_resolved) and dest != root_resolved:
@@ -346,6 +378,40 @@ class ProcessManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._procs: Dict[int, Dict[str, Any]] = {}
+        atexit.register(self.stop_all)
+
+    def _terminate_proc(self, proc: subprocess.Popen[str]) -> None:
+        try:
+            if platform.system() != "Windows":
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:  # noqa: BLE001
+            try:
+                if platform.system() != "Windows":
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def stop(self, pid: int) -> bool:
+        with self._lock:
+            info = self._procs.pop(pid, None)
+        if not info:
+            return False
+        self._terminate_proc(info["proc"])
+        return True
+
+    def stop_all(self) -> None:
+        with self._lock:
+            entries = list(self._procs.values())
+            self._procs.clear()
+        for info in entries:
+            self._terminate_proc(info["proc"])
 
     def start(self, root: Path, command: str, rel_cwd: str = ".") -> Dict[str, Any]:
         issue = inspect_command_escape(command, root, rel_cwd)
@@ -438,22 +504,6 @@ class ProcessManager:
                 }
                 for pid, info in self._procs.items()
             ]
-
-    def stop(self, pid: int) -> bool:
-        with self._lock:
-            info = self._procs.pop(pid, None)
-        if not info:
-            return False
-        proc: subprocess.Popen[str] = info["proc"]
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:  # noqa: BLE001
-            try:
-                proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
-        return True
 
 
 def _detect_local_url(command: str, output: str) -> str:

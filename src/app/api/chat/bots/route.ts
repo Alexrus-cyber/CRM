@@ -3,6 +3,7 @@ import { getCurrentUser } from "@/lib/auth";
 import { publicChatBot } from "@/lib/chatBot";
 import { publishLiveEvent } from "@/lib/events";
 import { normalizeGenParams } from "@/lib/genParams";
+import { chatBotCreateSchema, readValidatedJson } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -38,45 +39,29 @@ export async function POST(req: Request) {
     );
   }
 
-  const body = (await req.json().catch(() => null)) as
-    | {
-        name?: string;
-        position?: string;
-        bio?: string;
-        avatarColor?: string;
-        provider?: string;
-        baseUrl?: string;
-        apiKey?: string;
-        model?: string;
-        systemPrompt?: string;
-        params?: unknown;
-        replyMode?: string;
-        isActive?: boolean;
-      }
-    | null;
+  const parsed = await readValidatedJson(req, chatBotCreateSchema, "Укажите имя бота");
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.data;
 
-  const name = String(body?.name ?? "").trim();
-  if (!name) return Response.json({ error: "Укажите имя бота" }, { status: 400 });
-
-  const avatarColor = /^#[0-9a-fA-F]{6}$/.test(String(body?.avatarColor ?? ""))
-    ? String(body?.avatarColor)
+  const avatarColor = /^#[0-9a-fA-F]{6}$/.test(String(body.avatarColor ?? ""))
+    ? String(body.avatarColor)
     : "#06b6d4";
-  const params = normalizeGenParams(body?.params, { unlimited: true });
+  const params = normalizeGenParams(body.params, { unlimited: true });
 
   const created = await createChatBot({
     createdBy: me.id,
-    name,
-    position: body?.position ?? "ИИ-модель (бот)",
-    bio: body?.bio ?? null,
+    name: body.name,
+    position: body.position ?? "ИИ-модель (бот)",
+    bio: body.bio ?? null,
     avatarColor,
-    provider: body?.provider ?? "local",
-    baseUrl: body?.baseUrl ?? "",
-    apiKey: body?.apiKey ?? "",
-    model: body?.model ?? "",
-    systemPrompt: body?.systemPrompt ?? "",
+    provider: body.provider ?? "local",
+    baseUrl: body.baseUrl ?? "",
+    apiKey: body.apiKey ?? "",
+    model: body.model ?? "",
+    systemPrompt: body.systemPrompt ?? "",
     paramsJson: JSON.stringify(params),
-    replyMode: body?.replyMode === "always" ? "always" : "mention",
-    isActive: body?.isActive !== false,
+    replyMode: body.replyMode === "always" ? "always" : "mention",
+    isActive: body.isActive !== false,
   });
 
   publishLiveEvent("users", me.id);

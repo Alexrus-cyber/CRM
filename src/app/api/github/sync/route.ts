@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
+import { AGENT_URL } from "@/lib/agentConfig";
 import { getGithubConnectionWithSecret } from "@/db/repo";
 import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { GithubApiError, buildGithubRagSnapshot } from "@/lib/github";
-import { AGENT_URL } from "@/app/api/ai/agent/route";
 
 export const dynamic = "force-dynamic";
 

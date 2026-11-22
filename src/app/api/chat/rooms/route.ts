@@ -5,6 +5,7 @@ import {
 } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 import { publishLiveEvent } from "@/lib/events";
+import { chatRoomCreateSchema, readValidatedJson } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -29,31 +30,19 @@ export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
-  const body = (await req.json().catch(() => null)) as
-    | {
-        name?: string;
-        description?: string;
-        kind?: string;
-        memberIds?: unknown;
-        botIds?: unknown;
-      }
-    | null;
+  const parsed = await readValidatedJson(req, chatRoomCreateSchema, "Укажите название чата");
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.data;
 
-  const name = String(body?.name ?? "").replace(/\s+/g, " ").trim();
-  if (!name) return Response.json({ error: "Укажите название чата" }, { status: 400 });
-
-  const kind = body?.kind === "shared" ? "shared" : "group";
-  const memberIds = Array.isArray(body?.memberIds)
-    ? body!.memberIds.map((n) => Number(n)).filter((n) => Number.isSafeInteger(n) && n > 0)
-    : [];
-  const botIds = Array.isArray(body?.botIds)
-    ? body!.botIds.map((n) => Number(n)).filter((n) => Number.isSafeInteger(n) && n > 0)
-    : [];
+  const name = body.name.replace(/\s+/g, " ").trim();
+  const kind = body.kind === "shared" ? "shared" : "group";
+  const memberIds = body.memberIds ?? [];
+  const botIds = body.botIds ?? [];
 
   const room = await createChatRoom({
     creatorId: me.id,
     name,
-    description: typeof body?.description === "string" ? body.description : "",
+    description: body.description ?? "",
     kind,
     memberIds,
     botIds,

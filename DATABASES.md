@@ -23,9 +23,12 @@ SQLite-файл. Схема создаётся автоматически (`crea
 ## Архитектура
 
 ```
-src/db/schema.ts     — каноническая схема PostgreSQL (drizzle-kit push) + типы
-src/db/dialect.ts    — DDL для обоих диалектов, пул PostgreSQL, драйвер SQLite, q()/q1()
-src/db/repo.ts       — все запросы приложения (drizzle sql-шаблоны, dialect-agnostic)
+drizzle/*.sql        — версионированные миграции PostgreSQL (baseline + безопасность и индексы)
+src/db/migrate.mjs   — раннер миграций для PostgreSQL и SQLite (с трансляцией DDL и FTS5/tsvector)
+src/db/schema.ts     — каноническая схема PostgreSQL + типы Drizzle
+src/db/dialect.ts    — пул PostgreSQL, драйвер SQLite, q()/q1() и делегирование в migrate.mjs
+src/db/repos/*       — доменные репозитории (users, tasks, chat, ai, agent)
+src/db/repo.ts       — barrel-фасад над доменными репозиториями
 src/db/index.ts      — публичная точка входа для серверного кода
 ```
 
@@ -58,17 +61,19 @@ node scripts/db-sync.mjs status    # количество строк в обои
 # .env
 DB_DIALECT=sqlite
 SQLITE_PATH=./data/crm.sqlite
+CRM_SECRET=your-32-char-random-secret
+CRM_ADMIN_EMAIL=admin@crm.local
+CRM_ADMIN_PASSWORD=your-strong-password
 # DATABASE_URL не нужен
 ```
 
-Главный администратор (`admin@crm.ru` / `Admin12345`) создаётся автоматически
-при первом открытии страницы входа, поэтому SQLite-инсталляция готова к работе
-сразу после `npm run build && npm start`. Демо-данные добавляются командой
-`node scripts/seed.mjs --sqlite`.
+При запуске `node scripts/seed.mjs` (или при наличии `CRM_ADMIN_PASSWORD` в окружении при первом входе)
+создаётся учётная запись главного администратора (`super_admin`) без захардкоженных паролей в коде.
+Демо-данные добавляются командой `node scripts/seed.mjs --sqlite --demo`.
 
-## Импорт контрагентов из Excel
+## Импорт контрагентов из Excel и CSV
 
-Страница «Контрагенты» умеет загружать справочник из файла `.xlsx` / `.xls` / `.csv`
+Страница «Контрагенты» умеет загружать справочник из файла `.xlsx` / `.csv`
 (кнопка **«Загрузить из Excel»**, доступна только администраторам).
 
 | Столбец | Обязателен | Проверка |
@@ -79,8 +84,9 @@ SQLITE_PATH=./data/crm.sqlite
 
 Как это работает:
 
-* файл читается **в браузере** (`xlsx` подключается динамически), заголовок
-  ищется в первых 10 строках, синонимы принимаются («Название организации»,
+* `.xlsx` читается **в браузере** через `read-excel-file/browser` (шаблон выгружается
+  через `write-excel-file/browser`), а `.csv` разбирается встроенным RFC-4180 парсером (`parseCsvMatrix`).
+  Заголовок ищется в первых 10 строках, синонимы принимаются («Название организации»,
   «ИНН контрагента» и т. п.). Перед загрузкой показывается предпросмотр
   с отметками «К загрузке / Дубль ИНН / Ошибка»;
 * строки отправляются в server action `importCounterpartiesAction`

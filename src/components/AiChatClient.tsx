@@ -38,13 +38,11 @@ import {
   AI_MAX_GENERATION_TOKENS,
   AI_REASONING_MODES,
   AI_STORAGE_PARAMS,
-  AI_STORAGE_SETTINGS,
   estimateMessagesTokens,
   estimateTokens,
   formatBytes,
   normalizeParams,
   type AiParams,
-  type AiSettings,
   type ReasoningMode,
 } from "@/lib/ai";
 import { LiveReasoningBox } from "./LiveReasoningBox";
@@ -58,6 +56,7 @@ import {
   type ModelCapabilities,
 } from "@/lib/modelCapabilities";
 import { useStoredJson, useStoredNumber } from "@/lib/useStoredValue";
+import { useAiSettings } from "@/lib/useAiSettings";
 import type { Role } from "@/db/schema";
 
 /* --------------------------------- типы --------------------------------- */
@@ -139,18 +138,6 @@ const STORAGE_RAG = "crm.ai.rag.v1";
 const STORAGE_CHAT = "crm.ai.chat.v1";
 
 /* ------------------------------- хранилище ------------------------------ */
-
-const DEFAULT_SETTINGS: AiSettings = { baseUrl: AI_DEFAULT_BASE_URL, apiKey: "", model: "" };
-
-/** Разбор сохранённых настроек — вызывается уже после гидратации. */
-function decodeSettings(raw: string): AiSettings {
-  const parsed = JSON.parse(raw) as Partial<AiSettings>;
-  return {
-    baseUrl: parsed.baseUrl?.trim() || DEFAULT_SETTINGS.baseUrl,
-    apiKey: parsed.apiKey ?? "",
-    model: parsed.model ?? "",
-  };
-}
 
 function decodeParams(raw: string): AiParams {
   return normalizeParams(JSON.parse(raw));
@@ -240,11 +227,14 @@ const ATTACHMENT_ICON: Record<AttKind, ReactNode> = {
 };
 
 export function AiChatClient({ userName, unlimited = false }: { userName: string; unlimited?: boolean }) {
-  const [settings, setSettings] = useStoredJson<AiSettings>(
-    AI_STORAGE_SETTINGS,
-    DEFAULT_SETTINGS,
-    decodeSettings,
-  );
+  const {
+    settings,
+    serverMeta,
+    updateSettings,
+    persistSettings,
+    clearSavedKey,
+    resetSettings,
+  } = useAiSettings();
   const [params, setParams] = useStoredJson<AiParams>(AI_STORAGE_PARAMS, AI_DEFAULT_PARAMS, (raw) =>
     normalizeParams(JSON.parse(raw), { unlimited }),
   );
@@ -290,8 +280,8 @@ export function AiChatClient({ userName, unlimited = false }: { userName: string
 
   const activeFolder = folders.find((folder) => folder.id === folderId) ?? null;
 
-  const updateSettings = (patch: Partial<AiSettings>) => {
-    setSettings((prev) => ({ ...prev, ...patch }));
+  const updateChatSettings = (patch: Partial<typeof settings>) => {
+    updateSettings(patch);
     setNotice(null);
   };
 
@@ -699,6 +689,7 @@ export function AiChatClient({ userName, unlimited = false }: { userName: string
     setNotice(null);
     setModels([]);
     try {
+      await persistSettings();
       const modelQuery = settings.model.trim() ? `&model=${encodeURIComponent(settings.model.trim())}` : "";
       const res = await fetch(`/api/ai/models?base=${encodeURIComponent(settings.baseUrl)}${modelQuery}`, {
         headers: settings.apiKey.trim() ? { "x-ai-key": settings.apiKey } : undefined,
@@ -728,7 +719,7 @@ export function AiChatClient({ userName, unlimited = false }: { userName: string
       if (list.length === 0) {
         setNotice("Подключение есть, но сервер не вернул список моделей. Впишите имя модели вручную.");
       } else if (!settings.model.trim() || !list.includes(settings.model)) {
-        updateSettings({ model: list[0] });
+        updateChatSettings({ model: list[0] });
         setNotice(`Подключение работает. Выбрана модель «${list[0]}» — при необходимости замените.`);
       } else {
         setNotice(`Подключение работает, доступно моделей: ${list.length}.`);
@@ -989,7 +980,7 @@ export function AiChatClient({ userName, unlimited = false }: { userName: string
         headers: {
           "Content-Type": "application/json",
           "x-ai-base": settings.baseUrl,
-          "x-ai-key": settings.apiKey,
+          ...(settings.apiKey.trim() ? { "x-ai-key": settings.apiKey.trim() } : {}),
           "x-ai-model": settings.model,
         },
         body: JSON.stringify({
@@ -1128,7 +1119,7 @@ export function AiChatClient({ userName, unlimited = false }: { userName: string
   };
 
   const resetConnection = () => {
-    setSettings({ baseUrl: AI_DEFAULT_BASE_URL, apiKey: "", model: "" });
+    void resetSettings();
     setModels([]);
     setError(null);
     setNotice(null);
@@ -1305,7 +1296,8 @@ export function AiChatClient({ userName, unlimited = false }: { userName: string
               <Field label="Base URL">
                 <Input
                   value={settings.baseUrl}
-                  onChange={(event) => updateSettings({ baseUrl: event.target.value })}
+                  onChange={(event) => updateChatSettings({ baseUrl: event.target.value })}
+                  onBlur={() => void persistSettings()}
                   placeholder={AI_DEFAULT_BASE_URL}
                   spellCheck={false}
                   autoComplete="off"
@@ -1316,8 +1308,13 @@ export function AiChatClient({ userName, unlimited = false }: { userName: string
                   <Input
                     type={showKey ? "text" : "password"}
                     value={settings.apiKey}
-                    onChange={(event) => updateSettings({ apiKey: event.target.value })}
-                    placeholder="sk-unsloth-YOUR_KEY"
+                    onChange={(event) => updateChatSettings({ apiKey: event.target.value })}
+                    onBlur={() => void persistSettings()}
+                    placeholder={
+                      serverMeta.hasApiKey
+                        ? `Сохранён на сервере (${serverMeta.apiKeyHint ?? "sk-•••"})`
+                        : "sk-unsloth-YOUR_KEY"
+                    }
                     spellCheck={false}
                     autoComplete="off"
                     className="pr-10"
@@ -1331,12 +1328,25 @@ export function AiChatClient({ userName, unlimited = false }: { userName: string
                     {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
                   </button>
                 </div>
+                {serverMeta.hasApiKey && (
+                  <div className="mt-1 flex items-center justify-between text-[10px] text-muted">
+                    <span>Ключ зашифрован на сервере ({serverMeta.apiKeyHint ?? "активен"})</span>
+                    <button
+                      type="button"
+                      onClick={() => void clearSavedKey()}
+                      className="text-red-400 hover:underline"
+                    >
+                      Удалить
+                    </button>
+                  </div>
+                )}
               </Field>
               <Field label="Модель">
                 <div className="flex gap-2">
                   <Input
                     value={settings.model}
-                    onChange={(event) => updateSettings({ model: event.target.value })}
+                    onChange={(event) => updateChatSettings({ model: event.target.value })}
+                    onBlur={() => void persistSettings()}
                     placeholder="YOUR_MODEL"
                     list="ai-model-options"
                     spellCheck={false}

@@ -46,6 +46,28 @@ const TaskModal = dynamic(() => import("./TaskModal").then((module) => module.Ta
 
 type SortKey = "title" | "assignee" | "author" | "counterparty" | "deadline" | "hours" | "status" | "priority";
 
+function SortTh({
+  k,
+  sortKey,
+  onSort,
+  children,
+  className,
+}: {
+  k: SortKey;
+  sortKey: SortKey;
+  onSort: (key: SortKey) => void;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <th className={cn("px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide text-muted", className)}>
+      <button onClick={() => onSort(k)} className={cn("inline-flex items-center gap-1 hover:text-text", sortKey === k && "text-accent2")}>
+        {children} <ArrowUpDown size={12} />
+      </button>
+    </th>
+  );
+}
+
 export type ExportState = {
   exportedTaskIds: number[];
   lastExportAt: string | null;
@@ -170,14 +192,6 @@ export function TasksClient({
     hours: filtered.reduce((s, t) => s + t.hours, 0),
   };
 
-  const Th = ({ k, children, className }: { k: SortKey; children: React.ReactNode; className?: string }) => (
-    <th className={cn("px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide text-muted", className)}>
-      <button onClick={() => toggleSort(k)} className={cn("inline-flex items-center gap-1 hover:text-text", sort.key === k && "text-accent2")}>
-        {children} <ArrowUpDown size={12} />
-      </button>
-    </th>
-  );
-
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -279,14 +293,14 @@ export function TasksClient({
               <table className="w-full text-sm">
                 <thead className="border-b border-border bg-card2/60">
                   <tr>
-                    <Th k="title">Название</Th>
-                    <Th k="assignee">Исполнитель</Th>
-                    <Th k="author">Автор</Th>
-                    <Th k="counterparty">Контрагент</Th>
-                    <Th k="deadline">Срок</Th>
-                    <Th k="hours" className="text-right">Часы</Th>
-                    <Th k="status">Статус</Th>
-                    <Th k="priority">Срочность</Th>
+                    <SortTh k="title" sortKey={sort.key} onSort={toggleSort}>Название</SortTh>
+                    <SortTh k="assignee" sortKey={sort.key} onSort={toggleSort}>Исполнитель</SortTh>
+                    <SortTh k="author" sortKey={sort.key} onSort={toggleSort}>Автор</SortTh>
+                    <SortTh k="counterparty" sortKey={sort.key} onSort={toggleSort}>Контрагент</SortTh>
+                    <SortTh k="deadline" sortKey={sort.key} onSort={toggleSort}>Срок</SortTh>
+                    <SortTh k="hours" sortKey={sort.key} onSort={toggleSort} className="text-right">Часы</SortTh>
+                    <SortTh k="status" sortKey={sort.key} onSort={toggleSort}>Статус</SortTh>
+                    <SortTh k="priority" sortKey={sort.key} onSort={toggleSort}>Срочность</SortTh>
                   </tr>
                 </thead>
                 <tbody>

@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { Sparkles } from "lucide-react";
-import { ensureSuperAdmin, getCurrentUser, SUPER_ADMIN_CREDENTIALS } from "@/lib/auth";
+import { countSuperAdmins } from "@/db/repo";
+import { ensureSuperAdmin, getCurrentUser } from "@/lib/auth";
 import { LoginForm } from "./LoginForm";
 
 export const dynamic = "force-dynamic";
@@ -8,8 +9,11 @@ export const dynamic = "force-dynamic";
 export default async function LoginPage() {
   const user = await getCurrentUser();
   if (user) redirect("/dashboard");
+
+  let needsBootstrap = false;
   try {
     await ensureSuperAdmin();
+    needsBootstrap = (await countSuperAdmins()) === 0;
   } catch {
     // DB may not be migrated yet; login action will retry.
   }
@@ -68,15 +72,16 @@ export default async function LoginPage() {
           <div className="mt-6">
             <LoginForm />
           </div>
-          <div className="mt-6 rounded-xl border border-dashed border-accent/40 bg-accent/5 p-4 text-xs">
-            <p className="font-medium">Учётная запись главного администратора</p>
-            <p className="mt-1 text-muted">
-              Email: <span className="font-mono text-text">{SUPER_ADMIN_CREDENTIALS.email}</span>
-            </p>
-            <p className="text-muted">
-              Пароль: <span className="font-mono text-text">{SUPER_ADMIN_CREDENTIALS.password}</span>
-            </p>
-          </div>
+          {needsBootstrap && (
+            <div className="mt-6 rounded-xl border border-dashed border-accent/40 bg-accent/5 p-4 text-xs text-muted">
+              <p className="font-medium text-text">Первичная настройка</p>
+              <p className="mt-1">
+                Главный администратор ещё не создан. Выполните <code className="font-mono text-text">node scripts/seed.mjs</code> или
+                задайте переменные <code className="font-mono text-text">CRM_ADMIN_EMAIL</code> и{" "}
+                <code className="font-mono text-text">CRM_ADMIN_PASSWORD</code>.
+              </p>
+            </div>
+          )}
         </div>
       </div>
     </div>

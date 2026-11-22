@@ -22,6 +22,12 @@
 import type { Role } from "@/db/schema";
 import type { ReasoningMode } from "./ai";
 import { AGENT_MAX_STEPS } from "./genParams";
+import {
+  canViewAgentUsage,
+  hasAgentAccess,
+  hasOperatorAccess,
+  isSuperAdminRole,
+} from "./permissions";
 
 export type AiRolePolicy = {
   role: Role;
@@ -45,7 +51,7 @@ const FULL_REASONING: ReasoningMode[] = ["default", "off", "low", "medium", "hig
 const LIGHT_REASONING: ReasoningMode[] = ["off", "low"];
 
 export function isUnlimitedAiRole(role: string | null | undefined): boolean {
-  return role === "super_admin";
+  return isSuperAdminRole(role);
 }
 
 export const AI_ROLE_POLICY: Record<Role, AiRolePolicy> = {
@@ -154,23 +160,4 @@ export function reasoningAllowed(policy: AiRolePolicy, mode: ReasoningMode): boo
   return policy.reasoning.includes(mode);
 }
 
-/** Доступ к «Агенту» есть у Главного админа всегда, а у остальных — только по выдаче Главным админом. */
-export function hasAgentAccess(
-  user: { role?: string | null; canUseAgent?: boolean | null } | null | undefined,
-): boolean {
-  if (!user) return false;
-  return user.role === "super_admin" || Boolean(user.canUseAgent);
-}
-
-/** Доступ к «Оператору» есть у Главного админа всегда, а у остальных — только по выдаче Главным админом. */
-export function hasOperatorAccess(
-  user: { role?: string | null; canUseOperator?: boolean | null } | null | undefined,
-): boolean {
-  if (!user) return false;
-  return user.role === "super_admin" || Boolean(user.canUseOperator);
-}
-
-/** Статистику токенов Агента и Оператора видит только Главный админ. */
-export function canViewAgentUsage(user: { role?: string | null } | null | undefined): boolean {
-  return user?.role === "super_admin";
-}
+export { hasAgentAccess, hasOperatorAccess, canViewAgentUsage };

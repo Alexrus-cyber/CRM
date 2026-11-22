@@ -11,18 +11,13 @@ import {
   insertSession,
   insertUser,
   promoteSuperAdmin,
+  touchSession,
   type UserLite,
 } from "@/db/repo";
-import { isAdminRole } from "./utils";
+import { canManageRole, isAdminRole } from "./permissions";
 
-const SESSION_COOKIE = "crm_session";
+export const SESSION_COOKIE = "crm_session";
 const SESSION_DAYS = 30;
-
-export const SUPER_ADMIN_CREDENTIALS = {
-  email: "admin@crm.ru",
-  password: "Admin12345",
-  name: "Главный администратор",
-};
 
 /** Authenticated user shape — works for both database engines. */
 export type SafeUser = UserLite;
@@ -42,28 +37,52 @@ export function verifyPassword(password: string, stored: string): boolean {
   return timingSafeEqual(candidate, expected);
 }
 
-/** Ensures that the main administrator account always exists. */
+/**
+ * Первичная инициализация `super_admin` без зашитых паролей в коде.
+ *
+ * Если ни одного `super_admin` ещё нет, аккаунт создаётся/повышается только
+ * при наличии явно заданной переменной `CRM_ADMIN_PASSWORD` (или `CRM_SEED_ADMIN_PASSWORD`).
+ */
 export async function ensureSuperAdmin() {
   if ((await countSuperAdmins()) > 0) return;
-  const existingId = await findUserIdByEmail(SUPER_ADMIN_CREDENTIALS.email);
+
+  const email = (process.env.CRM_ADMIN_EMAIL || process.env.CRM_SEED_ADMIN_EMAIL || "admin@crm.local")
+    .trim()
+    .toLowerCase();
+  const password = (process.env.CRM_ADMIN_PASSWORD || process.env.CRM_SEED_ADMIN_PASSWORD || "").trim();
+  const name = (process.env.CRM_ADMIN_NAME || process.env.CRM_SEED_ADMIN_NAME || "Главный администратор").trim();
+
+  const existingId = await findUserIdByEmail(email);
   if (existingId) {
     await promoteSuperAdmin(existingId);
     return;
   }
+
+  if (!password) {
+    console.warn(
+      "[auth] Нет super_admin в базе и не задан CRM_ADMIN_PASSWORD. " +
+        "Запустите `node scripts/seed.mjs` или задайте CRM_ADMIN_EMAIL и CRM_ADMIN_PASSWORD.",
+    );
+    return;
+  }
+
   await insertUser({
-    name: SUPER_ADMIN_CREDENTIALS.name,
-    email: SUPER_ADMIN_CREDENTIALS.email,
-    passwordHash: hashPassword(SUPER_ADMIN_CREDENTIALS.password),
+    name,
+    email,
+    passwordHash: hashPassword(password),
     role: "super_admin",
     position: "Руководитель",
     avatarColor: "#7c5cff",
   });
 }
 
-export async function createSession(userId: number) {
+export async function createSession(
+  userId: number,
+  meta?: { label?: string; userAgent?: string; ip?: string },
+) {
   const token = randomBytes(32).toString("hex");
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400000);
-  await insertSession(token, userId, expiresAt.toISOString());
+  await insertSession(token, userId, expiresAt.toISOString(), meta);
   const store = await cookies();
   store.set(SESSION_COOKIE, token, {
     httpOnly: true,
@@ -75,10 +94,17 @@ export async function createSession(userId: number) {
 }
 
 /** Создаёт долгоживущую сессию для настольного лаунчера (возвращает Bearer-токен). */
-export async function createLauncherSession(userId: number): Promise<{ token: string; expiresAt: string }> {
+export async function createLauncherSession(
+  userId: number,
+  meta?: { label?: string; userAgent?: string; ip?: string },
+): Promise<{ token: string; expiresAt: string }> {
   const token = randomBytes(32).toString("hex");
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400000).toISOString();
-  await insertSession(token, userId, expiresAt);
+  await insertSession(token, userId, expiresAt, {
+    label: meta?.label || "Лаунчер",
+    userAgent: meta?.userAgent || "",
+    ip: meta?.ip || "",
+  });
   return { token, expiresAt };
 }
 
@@ -92,13 +118,20 @@ export async function findUserByBearer(req: Request): Promise<SafeUser | null> {
   const token = match ? match[1].trim() : "";
   if (!token) return null;
   const found = await findSessionUser(token);
-  return found?.user ?? null;
+  if (!found) return null;
+  touchSession(token).catch(() => undefined);
+  return found.user;
 }
 
 export async function getRequestUser(req: Request): Promise<SafeUser | null> {
   const bearer = await findUserByBearer(req);
   if (bearer) return bearer;
   return getCurrentUser();
+}
+
+export async function getCurrentSessionToken(): Promise<string | null> {
+  const store = await cookies();
+  return store.get(SESSION_COOKIE)?.value ?? null;
 }
 
 export async function destroySession() {
@@ -115,7 +148,9 @@ export const getCurrentUser = cache(async (): Promise<SafeUser | null> => {
   const token = store.get(SESSION_COOKIE)?.value;
   if (!token) return null;
   const found = await findSessionUser(token);
-  return found?.user ?? null;
+  if (!found) return null;
+  touchSession(token).catch(() => undefined);
+  return found.user;
 });
 
 export async function requireUser(): Promise<SafeUser> {
@@ -130,9 +165,9 @@ export async function requireAdmin(): Promise<SafeUser> {
   return user;
 }
 
-export function canManageRole(actor: Role, target: Role) {
-  if (actor === "super_admin") return true;
-  // Администратор и менеджер оперируют только рядовыми ролями.
-  if (actor === "admin" || actor === "manager") return target === "user" || target === "consultant";
-  return false;
+export { canManageRole };
+
+export function canAssignRole(actorRole: Role, targetRole: Role): boolean {
+  if (!isAdminRole(actorRole) && actorRole !== "manager") return false;
+  return canManageRole(actorRole, targetRole);
 }

@@ -20,6 +20,7 @@ import {
   normalizeKpp,
 } from "@/lib/counterpartyImport";
 import { canManageData } from "@/lib/utils";
+import { counterpartyInputSchema, parseJsonBody } from "@/lib/validation";
 import type { ActionResult } from "./users";
 
 export type CounterpartyInput = {
@@ -43,30 +44,32 @@ export async function saveCounterpartyAction(input: CounterpartyInput): Promise<
   if (!me || !canManageData(me.role)) {
     return { ok: false, error: "Создавать и редактировать контрагентов могут только администраторы" };
   }
-  const name = input.name.trim();
-  if (!name) return { ok: false, error: "Название / Имя обязательно" };
-  const inn = clean(input.inn);
+  const parsed = parseJsonBody(input, counterpartyInputSchema, "Некорректные данные контрагента");
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  const data = parsed.data;
+  const name = data.name;
+  const inn = clean(data.inn);
   if (inn && !/^\d{10}$|^\d{12}$/.test(inn)) return { ok: false, error: "ИНН должен содержать 10 или 12 цифр" };
-  const kpp = clean(input.kpp);
+  const kpp = clean(data.kpp);
   if (kpp && !/^\d{9}$/.test(kpp)) return { ok: false, error: "КПП должен содержать 9 цифр" };
-  const email = clean(input.email);
+  const email = clean(data.email);
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { ok: false, error: "Некорректный email" };
 
   const values: CounterpartyValues = {
     name,
-    phone: clean(input.phone),
+    phone: clean(data.phone),
     email,
-    address: clean(input.address),
+    address: clean(data.address),
     inn,
     kpp,
-    notes: clean(input.notes),
+    notes: clean(data.notes),
   };
 
-  if (input.id) {
-    await updateCounterparty(input.id, values);
+  if (data.id) {
+    await updateCounterparty(data.id, values);
     revalidatePath("/", "layout");
     publishLiveEvent("counterparties", me.id);
-    return { ok: true, id: input.id };
+    return { ok: true, id: data.id };
   }
   const id = await insertCounterparty(values, me.id);
   revalidatePath("/", "layout");

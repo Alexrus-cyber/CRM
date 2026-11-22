@@ -1,6 +1,6 @@
+import { AGENT_URL } from "@/lib/agentConfig";
 import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
-import { AGENT_URL } from "../route";
 
 /**
  * Управление изолированной песочницей `agent/sandbox`:
