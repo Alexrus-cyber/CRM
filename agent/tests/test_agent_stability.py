@@ -441,6 +441,33 @@ class WindowsCompatibilityAndSpecTests(unittest.TestCase):
             self.assertTrue(data["ok"])
             local_crm.assert_called_once()
 
+    def test_broken_stdout_does_not_cause_empty_http_response(self) -> None:
+        import urllib.request
+
+        class BrokenStdout:
+            encoding = "utf-8"
+            def write(self, _s: str) -> int:
+                raise BrokenPipeError("broken stdout pipe")
+            def flush(self) -> None:
+                raise BrokenPipeError("broken stdout pipe")
+
+        srv = agent_mod.Server(("127.0.0.1", 0), agent_mod.Handler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            with mock.patch.object(sys, "stdout", BrokenStdout()):
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3.0) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(resp.status, 200)
+                self.assertTrue(body["ok"])
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico", timeout=3.0) as fav:
+                    self.assertEqual(fav.status, 204)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            th.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()
