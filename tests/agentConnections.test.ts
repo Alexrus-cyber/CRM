@@ -85,16 +85,30 @@ describe("подключения оператора", () => {
     const connections = await repo.listAgentConnections(userId);
     expect(connections[0].activeTokens).toBe(1);
 
-    const revealed = await repo.revealAgentToken(userId, tokens[0].id);
-    expect(revealed).toBe(created!.token);
+    // Повторное раскрытие старого токена больше невозможно (P0-2) — вместо этого работает перевыпуск.
+    expect("revealAgentToken" in repo).toBe(false);
+    const storedRow = await db.q1<{ token: string; token_hash: string }>(
+      sql`select token, token_hash from agent_connection_tokens where id = ${tokens[0].id}`,
+    );
+    expect(storedRow?.token).toMatch(/^sha256:/);
+    expect(storedRow?.token_hash).toBe(storedRow?.token);
 
-    // Чужой пользователь не видит и не раскрывает чужой токен.
-    expect(await repo.revealAgentToken(userId + 999, tokens[0].id)).toBeNull();
+    // Чужой пользователь не видит и не перевыпускает чужой токен.
+    expect(await repo.reissueAgentConnectionToken(userId + 999, tokens[0].id)).toBeNull();
     expect(await repo.listAgentTokens(userId + 999, connection.id)).toHaveLength(0);
 
-    expect(await repo.deleteAgentConnectionToken(userId, tokens[0].id)).toBe(true);
-    expect(await repo.listAgentTokens(userId, connection.id)).toHaveLength(0);
+    // Владелец может перевыпустить токен: старый немедленно перестаёт работать, новый действует.
+    const reissued = await repo.reissueAgentConnectionToken(userId, tokens[0].id);
+    expect(reissued).not.toBeNull();
+    expect(reissued!.token).not.toBe(created!.token);
     expect(await repo.findAgentTokenOwner(created!.token)).toBeNull();
+    expect(await repo.findAgentTokenOwner(reissued!.token)).toBe(userId);
+
+    const activeList = await repo.listAgentTokens(userId, connection.id);
+    expect(activeList).toHaveLength(1);
+    expect(await repo.deleteAgentConnectionToken(userId, activeList[0].id)).toBe(true);
+    expect(await repo.listAgentTokens(userId, connection.id)).toHaveLength(0);
+    expect(await repo.findAgentTokenOwner(reissued!.token)).toBeNull();
   });
 
   it("удаление подключения уносит его токены и передаёт основность", async () => {

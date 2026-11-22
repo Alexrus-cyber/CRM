@@ -29,10 +29,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
 /**
  * Управление участниками и ботами группового/общего чата:
- *   - подключить/убрать бота (доступно всем участникам чата);
- *   - добавить/удалить сотрудника;
- *   - войти в открытый общий чат (`action: "join"`) или выйти (`action: "leave"`);
- *   - переименовать.
+ *   - войти в открытый общий чат (`action: "join"`) или выйти (`action: "leave"`) — любой пользователь;
+ *   - подключить/убрать бота, добавить/удалить участника, переименовать/изменить описание —
+ *     только владелец комнаты (`myRole === "owner"` / `createdBy === me.id`) или `super_admin` (P1).
  */
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const me = await getCurrentUser();
@@ -74,9 +73,15 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     return Response.json({ ok: true });
   }
 
-  // Для любых остальных изменений в группе нужен статус участника (или открытый shared-чат).
-  if (!room.isMember && room.kind !== "shared") {
-    return Response.json({ error: "Вы не участник этого чата" }, { status: 403 });
+  const canManageRoom =
+    me.role === "super_admin" ||
+    room.myRole === "owner" ||
+    (room.createdBy !== null && room.createdBy === me.id);
+  if (!canManageRoom) {
+    return Response.json(
+      { error: "Управлять участниками, ботами и настройками чата может только его владелец или главный администратор" },
+      { status: 403 },
+    );
   }
 
   if (body.addBotId) {

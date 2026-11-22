@@ -89,7 +89,6 @@ export const OPERATOR_PROVIDERS: OperatorProvider[] = [
     id: "deepseek",
     label: "DeepSeek",
     keyEnv: "DEEPSEEK_API_KEY",
-    // У DeepSeek картинки понимает deepseek-flash; deepseek-chat — только текст.
     defaultModel: "deepseek-flash",
     baseUrl: "https://api.deepseek.com/v1",
     needsKey: true,
@@ -132,6 +131,25 @@ export function keyEnvName(providerId: string): string {
   return findProvider(providerId).keyEnv;
 }
 
+const SAFE_UNQUOTED_TOKEN = /^[A-Za-z0-9_.:/@-]+$/;
+
+/**
+ * Безопасное POSIX-экранирование аргумента для оболочки.
+ * Секреты (`forceQuote=true`) или значения с пробелами/метасимволами всегда
+ * заключаются в одинарные кавычки с экранированием `'` и удалением CR/LF.
+ */
+export function shQuote(rawValue: string, forceQuote = false): string {
+  const clean = String(rawValue ?? "").replace(/[\r\n\0]+/g, " ").trim();
+  if (!clean) return "''";
+  if (!forceQuote && SAFE_UNQUOTED_TOKEN.test(clean)) {
+    return clean;
+  }
+  return `'${clean.replace(/'/g, `'"'"'`)}'`;
+}
+
+export const SHELL_HISTORY_WARNING =
+  "Внимание: секреты, переданные в CLI-команде (--token / --api-key), сохраняются в истории оболочки (~/.bash_history / ~/.zsh_history) и видны в списке процессов. Рекомендуется запускать через CRM Launcher или режим переменной окружения (HISTIGNORE).";
+
 import { genParamsFlags, type GenParams } from "./genParams";
 import type { OperatorCoachMode, OperatorTaskMode } from "./operatorModes";
 import type { TrustLevel } from "./trust";
@@ -162,25 +180,26 @@ export type CommandOptions = {
   selfReflect?: boolean;
 };
 
-/** Команда запуска бота — ровно те флаги, которые понимает скрипт. */
+/** Команда запуска бота — безопасно экранированная для оболочки. */
 export function buildOperatorCommand(options: CommandOptions): string {
   const parts = ["python3 agent/desktop_operator.py", options.once ? "--once" : "--watch"];
 
-  parts.push("--token", (options.token ?? "").trim() || "<токен из шага 1>");
-  parts.push("--provider", options.provider || "local");
+  const rawToken = (options.token ?? "").trim();
+  parts.push("--token", rawToken ? shQuote(rawToken, true) : "'<токен из шага 1>'");
+  parts.push("--provider", shQuote(options.provider || "local"));
 
   const model = (options.model ?? "").trim();
-  if (model) parts.push("--model", model);
+  if (model) parts.push("--model", shQuote(model));
 
   const server = (options.server ?? "").trim().replace(/\/+$/, "");
-  if (server && server !== "http://localhost:3000") parts.push("--server", server);
+  if (server && server !== "http://localhost:3000") parts.push("--server", shQuote(server));
 
   const key = (options.apiKey ?? "").trim();
-  if (key && options.keyMode !== "env") parts.push("--api-key", key);
+  if (key && options.keyMode !== "env") parts.push("--api-key", shQuote(key, true));
 
-  if (options.trustLevel) parts.push("--trust-level", options.trustLevel);
-  if (options.taskMode && options.taskMode !== "autonomous") parts.push("--task-mode", options.taskMode);
-  if (options.coachMode && options.coachMode !== "after_step") parts.push("--coach", options.coachMode);
+  if (options.trustLevel) parts.push("--trust-level", shQuote(options.trustLevel));
+  if (options.taskMode && options.taskMode !== "autonomous") parts.push("--task-mode", shQuote(options.taskMode));
+  if (options.coachMode && options.coachMode !== "after_step") parts.push("--coach", shQuote(options.coachMode));
   if (options.gen) parts.push(...genParamsFlags(options.gen));
   if (options.verifyActions === false) parts.push("--no-verify-actions");
   if (options.selfReflect === false) parts.push("--no-self-reflect");
@@ -192,11 +211,11 @@ export function buildOperatorCommand(options: CommandOptions): string {
   return parts.join(" ");
 }
 
-/** Строка `export DEEPSEEK_API_KEY=…` для режима переменной окружения. */
+/** Строка `export DEEPSEEK_API_KEY='…'` с POSIX-экранированием для режима переменной окружения. */
 export function buildEnvLine(providerId: string, apiKey: string): string {
   const key = (apiKey ?? "").trim();
   if (!key) return "";
-  return `export ${keyEnvName(providerId)}=${key}`;
+  return `export ${keyEnvName(providerId)}=${shQuote(key, true)}`;
 }
 
 /** Что скопировать в терминал целиком. */

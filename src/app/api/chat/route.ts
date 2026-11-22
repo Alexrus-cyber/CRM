@@ -19,6 +19,7 @@ import {
 import { getCurrentUser } from "@/lib/auth";
 import { findTriggeredBots } from "@/lib/chatBot";
 import { publishChatMessage } from "@/lib/events";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -79,6 +80,15 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
+  const rl = checkApiRateLimit({
+    scope: "chat_send",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 60,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
 
   const contentType = req.headers.get("content-type") ?? "";
   let peer = 0;

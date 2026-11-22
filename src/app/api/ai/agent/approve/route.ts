@@ -1,9 +1,12 @@
-import { AGENT_URL } from "@/lib/agentConfig";
+import { getAgentTask } from "@/db/repo";
+import { consumeAgentApproval } from "@/lib/agentApprovals";
+import { resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
 /**
  * Подтверждение или отклонение команды / переноса файлов из Sandbox для запущенного Python-агента.
+ * Требует владения approvalId + одноразовый серверный nonce (P0-4).
  */
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -13,6 +16,13 @@ export async function POST(req: Request) {
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
   if (!hasAgentAccess(me) && !hasOperatorAccess(me)) {
     return Response.json({ error: "Доступ к Агенту не выдан главным администратором" }, { status: 403 });
+  }
+
+  let agentUrl: string;
+  try {
+    agentUrl = resolveSafeAgentUrl();
+  } catch (err) {
+    return Response.json({ error: (err as Error).message }, { status: 400 });
   }
 
   const body = (await req.json().catch(() => null)) as
@@ -41,16 +51,29 @@ export async function POST(req: Request) {
     return Response.json({ error: "Не указан approvalId" }, { status: 400 });
   }
 
+  if (Number.isFinite(body?.taskId) && Number(body?.taskId) > 0) {
+    const ownedTask = await getAgentTask(me.id, Number(body?.taskId));
+    if (!ownedTask) {
+      return Response.json({ error: "Чужая или несуществующая задача Оператора" }, { status: 403 });
+    }
+  }
+
+  const consumed = consumeAgentApproval(approvalId, me.id);
+  if (!consumed.ok) {
+    return Response.json({ error: consumed.error }, { status: consumed.status });
+  }
+
   const rawScreenshot = typeof body?.screenshot === "string" ? body.screenshot : "";
   const validScreenshot =
     rawScreenshot.startsWith("data:image/") && rawScreenshot.length <= 2_800_000 ? rawScreenshot : "";
 
   try {
-    const upstream = await fetch(`${AGENT_URL}/approve`, {
+    const upstream = await fetch(`${agentUrl}/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         approvalId,
+        nonce: consumed.nonce,
         approved: Boolean(body?.approved),
         approverUserId: me.id,
         note: typeof body?.note === "string" ? body.note.slice(0, 500) : "",

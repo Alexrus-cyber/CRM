@@ -82,6 +82,32 @@ except ImportError:
 
 DEFAULT_SERVER = os.environ.get("CRM_SERVER", "http://localhost:3000")
 DEFAULT_TOKEN = os.environ.get("CRM_AGENT_TOKEN", "")
+_OPERATOR_SECRETS: Dict[str, str] = {}
+
+
+def _load_operator_secrets_file() -> None:
+    global DEFAULT_TOKEN
+    secrets_path = os.environ.pop("CRM_SECRETS_FILE", "").strip()
+    if not secrets_path:
+        return
+    try:
+        data = json.loads(Path(secrets_path).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    _OPERATOR_SECRETS[k] = v
+            if not DEFAULT_TOKEN and _OPERATOR_SECRETS.get("CRM_AGENT_TOKEN"):
+                DEFAULT_TOKEN = _OPERATOR_SECRETS["CRM_AGENT_TOKEN"]
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            Path(secrets_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+_load_operator_secrets_file()
 DEFAULT_MAX_WIDTH = 1600
 MAX_IMAGE_BYTES = 3_000_000
 FILES_DIR = Path(__file__).resolve().parent / "files"
@@ -2561,6 +2587,39 @@ def type_text(text: str) -> None:
     pyautogui.write(text, interval=0.02)
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        raise urllib.error.HTTPError(
+            newurl,
+            code,
+            "HTTP-редиректы запрещены политикой безопасности",
+            headers,
+            fp,
+        )
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+_ORIG_OP_URLOPEN = urllib.request.urlopen
+
+
+def _assert_safe_http_target(url: str) -> None:
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise AgentError("Допускаются только URL http:// или https://")
+    if parsed.username or parsed.password:
+        raise AgentError("Учётные данные в URL запрещены")
+    host = (parsed.hostname or "").strip().lower().strip("[]")
+    if host in (
+        "169.254.169.254",
+        "metadata.google.internal",
+        "metadata.goog",
+        "metadata.azure.internal",
+        "metadata.aws.internal",
+        "instance-data",
+    ) or host.startswith("169.254.") or host.startswith("fe80:"):
+        raise AgentError("Запрещённый адрес назначения (metadata / link-local)")
+
+
 class Http:
     """Минимальный HTTP-клиент без внешних зависимостей."""
 
@@ -2573,6 +2632,7 @@ class Http:
     def call(self, method: str, path: str, payload: Optional[dict] = None,
              timeout: int = 180, headers: Optional[Dict[str, str]] = None) -> dict:
         url = path if path.startswith("http") else self.base + path
+        _assert_safe_http_target(url)
         data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(url, data=data, method=method)
         request.add_header("Content-Type", "application/json")
@@ -2581,7 +2641,12 @@ class Http:
         for key, value in (headers or {}).items():
             request.add_header(key, value)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            open_ctx = (
+                _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+                if urllib.request.urlopen is _ORIG_OP_URLOPEN
+                else urllib.request.urlopen(request, timeout=timeout)
+            )
+            with open_ctx as response:
                 body = response.read().decode("utf-8", "replace")
         except ValueError as error:
             raise AgentError(
@@ -4674,7 +4739,13 @@ def resolve_provider(args: argparse.Namespace) -> Tuple[str, str, str]:
     preset = PROVIDERS.get(args.provider or "local", PROVIDERS["local"])
     base_url = args.base_url or preset["base_url"]
     model = args.model or preset["model"]
-    api_key = args.api_key or os.environ.get(preset.get("key_env", ""), "") or os.environ.get("OPERATOR_API_KEY", "")
+    api_key = (
+        args.api_key
+        or _OPERATOR_SECRETS.get("OPERATOR_API_KEY", "")
+        or _OPERATOR_SECRETS.get(preset.get("key_env", ""), "")
+        or os.environ.get(preset.get("key_env", ""), "")
+        or os.environ.get("OPERATOR_API_KEY", "")
+    )
     return base_url, model, api_key
 
 

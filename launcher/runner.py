@@ -8,17 +8,21 @@ GUI только показывает строки, вся работа с пр�
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Mapping, Sequence
+
+from launcher import bundle
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
@@ -55,8 +59,12 @@ def strip_ansi(text: str) -> str:
 
 
 def build_env(extra: Mapping[str, str] | None = None) -> Dict[str, str]:
-    """Окружение агента: UTF-8, без буферизации, плюс переданные переменные."""
-    env = dict(os.environ)
+    """Окружение агента: только разрешённые системные переменные, UTF-8 и переданные параметры."""
+    env: Dict[str, str] = {}
+    for key in bundle.SAFE_CHILD_ENV_KEYS:
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
     env.update({
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUNBUFFERED": "1",
@@ -67,6 +75,26 @@ def build_env(extra: Mapping[str, str] | None = None) -> Dict[str, str]:
     return env
 
 
+def _write_secrets_file(secrets_map: Mapping[str, str]) -> Path:
+    temp_dir, _ = bundle.prepare_temp_dir()
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    fd, raw_path = tempfile.mkstemp(prefix="crm-sec-", suffix=".json", dir=str(temp_dir))
+    try:
+        try:
+            os.chmod(raw_path, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({str(k): str(v) for k, v in secrets_map.items()}, fh, ensure_ascii=False)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return Path(raw_path)
+
+
 @dataclass
 class AgentRun:
     """Один запуск агента."""
@@ -75,11 +103,13 @@ class AgentRun:
     command: Sequence[str]
     cwd: Path
     env: Mapping[str, str]
+    secrets: Mapping[str, str] | None = None
     started_at: float = field(default_factory=time.time)
     process: subprocess.Popen | None = None
     exit_code: int | None = None
     lines: List[str] = field(default_factory=list)
     _queue: "queue.Queue[str | None]" = field(default_factory=queue.Queue)
+    _secrets_path: Path | None = None
 
     # ---- управление -----------------------------------------------------
     def start(self) -> None:
@@ -91,6 +121,9 @@ class AgentRun:
         child_env.setdefault("PYTHONIOENCODING", "utf-8")
         child_env.setdefault("PYTHONUTF8", "1")
         child_env.setdefault("PYTHONUNBUFFERED", "1")
+        if self.secrets:
+            self._secrets_path = _write_secrets_file(self.secrets)
+            child_env["CRM_SECRETS_FILE"] = str(self._secrets_path)
         self.process = subprocess.Popen(
             list(self.command),
             cwd=str(self.cwd),
@@ -106,10 +139,19 @@ class AgentRun:
         )
         threading.Thread(target=self._pump, name=f"agent-{self.agent_id}", daemon=True).start()
 
+    def _cleanup_secrets(self) -> None:
+        if self._secrets_path is not None:
+            try:
+                self._secrets_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._secrets_path = None
+
     def _pump(self) -> None:
         """Читает вывод построчно и складывает в очередь для интерфейса."""
         process = self.process
         if process is None or process.stdout is None:
+            self._cleanup_secrets()
             self._queue.put(None)
             return
         try:
@@ -122,6 +164,7 @@ class AgentRun:
         finally:
             code = process.wait()
             self.exit_code = code
+            self._cleanup_secrets()
             self.lines.append(f"— агент завершился с кодом {code} —")
             self._queue.put(f"— агент завершился с кодом {code} —")
             self._queue.put(None)

@@ -1,8 +1,10 @@
 /**
- * Rate-limiter в памяти процесса для защиты входа от подбора пароля.
+ * Rate-limiter в памяти процесса для защиты входа и дорогостоящих API-ручек.
  *
- * Отслеживает попытки по IP и по паре (IP + email), поддерживает сброс при
- * успешном входе и периодическую очистку устаревших записей.
+ * - Извлечение IP учитывает `CRM_TRUST_PROXY=1` (чтобы клиент не мог подделать
+ *   `X-Forwarded-For` при прямом подключении).
+ * - Поддерживает как лимитер логинов с блокировкой, так и sliding-window лимитер
+ *   по `(scope, userId/ip)` с ограничением размера кэша.
  */
 
 type Bucket = {
@@ -23,10 +25,13 @@ export type RateLimitDecision =
 const DEFAULT_WINDOW_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_FAILURES = 7;
 const DEFAULT_BLOCK_MS = 10 * 60 * 1000;
+const MAX_STORE_ENTRIES = 20_000;
 
 const globalForRl = globalThis as typeof globalThis & {
   __crmLoginRateLimit?: Map<string, Bucket>;
   __crmLoginRlLastPrune?: number;
+  __crmApiRateLimit?: Map<string, number[]>;
+  __crmApiRlLastPrune?: number;
 };
 
 function getStore(): Map<string, Bucket> {
@@ -36,11 +41,18 @@ function getStore(): Map<string, Bucket> {
   return globalForRl.__crmLoginRateLimit;
 }
 
+function getApiStore(): Map<string, number[]> {
+  if (!globalForRl.__crmApiRateLimit) {
+    globalForRl.__crmApiRateLimit = new Map<string, number[]>();
+  }
+  return globalForRl.__crmApiRateLimit;
+}
+
 function pruneExpired(now: number, windowMs: number) {
   const last = globalForRl.__crmLoginRlLastPrune ?? 0;
-  if (now - last < 60_000) return;
-  globalForRl.__crmLoginRlLastPrune = now;
   const store = getStore();
+  if (now - last < 60_000 && store.size < MAX_STORE_ENTRIES) return;
+  globalForRl.__crmLoginRlLastPrune = now;
   for (const [key, bucket] of store.entries()) {
     const recent = bucket.failures.filter((ts) => now - ts < windowMs);
     if (recent.length === 0 && bucket.blockedUntil <= now) {
@@ -49,23 +61,66 @@ function pruneExpired(now: number, windowMs: number) {
       bucket.failures = recent;
     }
   }
+  while (store.size > MAX_STORE_ENTRIES) {
+    const oldest = store.keys().next().value;
+    if (!oldest) break;
+    store.delete(oldest);
+  }
 }
 
-export function extractClientIp(headers: Headers): string {
-  const xff = headers.get("x-forwarded-for");
-  if (xff) {
-    const first = xff.split(",")[0]?.trim();
-    if (first) return first.slice(0, 64);
+function pruneApiStore(now: number, windowMs: number) {
+  const last = globalForRl.__crmApiRlLastPrune ?? 0;
+  const store = getApiStore();
+  if (now - last < 30_000 && store.size < MAX_STORE_ENTRIES) return;
+  globalForRl.__crmApiRlLastPrune = now;
+  for (const [key, stamps] of store.entries()) {
+    const recent = stamps.filter((ts) => now - ts < windowMs);
+    if (recent.length === 0) store.delete(key);
+    else store.set(key, recent);
   }
-  const realIp = headers.get("x-real-ip")?.trim();
-  if (realIp) return realIp.slice(0, 64);
-  return "local";
+  while (store.size > MAX_STORE_ENTRIES) {
+    const oldest = store.keys().next().value;
+    if (!oldest) break;
+    store.delete(oldest);
+  }
+}
+
+/**
+ * Безопасное извлечение клиентского IP.
+ *
+ * Заголовки `x-forwarded-for` и `x-real-ip` учитываются ТОЛЬКО при
+ * `CRM_TRUST_PROXY=1`. В случае XFF используется правый доверенный hop
+ * (согласно `CRM_TRUST_PROXY_HOPS`, по умолчанию 1), а не подделываемый левый элемент.
+ */
+export function extractClientIp(headers: Headers): string {
+  const trustProxy = process.env.CRM_TRUST_PROXY === "1";
+  if (trustProxy) {
+    const realIp = headers.get("x-real-ip")?.trim();
+    if (realIp) return realIp.slice(0, 64);
+
+    const xff = headers.get("x-forwarded-for");
+    if (xff) {
+      const hops = Math.max(1, Number.parseInt(process.env.CRM_TRUST_PROXY_HOPS ?? "1", 10) || 1);
+      const list = xff
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (list.length > 0) {
+        const idx = Math.max(0, list.length - hops);
+        return list[idx].slice(0, 64);
+      }
+    }
+  }
+
+  // Fallback при прямом подключении без trusted proxy: изолированный маркер + User-Agent не доверяем как IP,
+  // но x-forwarded-for при недоверенном прокси игнорируем, чтобы злоумышленник не обходил лимиты подменой XFF.
+  return "direct";
 }
 
 function keysFor(ip: string, email: string): string[] {
   const normIp = (ip || "local").trim().toLowerCase();
   const normEmail = (email || "").trim().toLowerCase();
-  return normEmail ? [`ip:${normIp}`, `acct:${normIp}:${normEmail}`] : [`ip:${normIp}`];
+  return normEmail ? [`ip:${normIp}`, `acct:${normIp}:${normEmail}`, `mail:${normEmail}`] : [`ip:${normIp}`];
 }
 
 export function checkLoginRateLimit(
@@ -110,8 +165,7 @@ export function recordLoginFailure(
   const store = getStore();
 
   for (const key of keysFor(ip, email)) {
-    const isIpOnly = key.startsWith("ip:");
-    const limit = isIpOnly ? maxFailures * 3 : maxFailures;
+    const limit = key.startsWith("ip:") ? maxFailures * 3 : key.startsWith("mail:") ? maxFailures * 2 : maxFailures;
     const bucket = store.get(key) ?? { failures: [], blockedUntil: 0 };
     bucket.failures = bucket.failures.filter((ts) => now - ts < windowMs);
     bucket.failures.push(now);
@@ -128,11 +182,76 @@ export function clearLoginAttempts(ip: string, email: string): void {
   const normEmail = (email || "").trim().toLowerCase();
   if (normEmail) {
     store.delete(`acct:${normIp}:${normEmail}`);
+    store.delete(`mail:${normEmail}`);
   }
 }
 
 export const clearLoginFailures = clearLoginAttempts;
 
+export type ApiRateLimitConfig = {
+  scope: string;
+  userId?: number | null;
+  ip?: string;
+  maxRequests: number;
+  windowMs: number;
+};
+
+/**
+ * Sliding-window rate limiter для API-ручек (по userId и по IP).
+ */
+export function checkApiRateLimit(
+  cfg: ApiRateLimitConfig,
+  now = Date.now(),
+): RateLimitDecision {
+  pruneApiStore(now, cfg.windowMs);
+  const store = getApiStore();
+  const keys: Array<{ key: string; limit: number }> = [];
+  if (cfg.userId && cfg.userId > 0) {
+    keys.push({ key: `${cfg.scope}:u:${cfg.userId}`, limit: cfg.maxRequests });
+  }
+  if (cfg.ip) {
+    keys.push({
+      key: `${cfg.scope}:ip:${cfg.ip}`,
+      limit: cfg.userId ? cfg.maxRequests * 3 : cfg.maxRequests,
+    });
+  }
+  if (keys.length === 0) {
+    keys.push({ key: `${cfg.scope}:global`, limit: cfg.maxRequests });
+  }
+
+  for (const { key, limit } of keys) {
+    const recent = (store.get(key) ?? []).filter((ts) => now - ts < cfg.windowMs);
+    if (recent.length >= limit) {
+      const oldest = recent[0] ?? now;
+      const retryAfterSec = Math.max(1, Math.ceil((oldest + cfg.windowMs - now) / 1000));
+      return {
+        allowed: false,
+        retryAfterSec,
+        message: `Слишком много запросов (${cfg.scope}). Повторите через ${retryAfterSec} сек.`,
+      };
+    }
+  }
+
+  for (const { key } of keys) {
+    const recent = (store.get(key) ?? []).filter((ts) => now - ts < cfg.windowMs);
+    recent.push(now);
+    store.set(key, recent);
+  }
+
+  return { allowed: true };
+}
+
+export function rateLimitErrorResponse(decision: Extract<RateLimitDecision, { allowed: false }>): Response {
+  return Response.json(
+    { error: decision.message },
+    {
+      status: 429,
+      headers: { "Retry-After": String(decision.retryAfterSec) },
+    },
+  );
+}
+
 export function resetAllRateLimitsForTests(): void {
   getStore().clear();
+  getApiStore().clear();
 }

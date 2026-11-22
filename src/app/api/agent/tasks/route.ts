@@ -3,6 +3,7 @@ import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { isUnlimitedStepsRole, resolveStepsForRole } from "@/lib/genParams";
 import { normalizeCoachMode, normalizeTaskMode, normalizeTaskSource } from "@/lib/operatorModes";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 import { normalizeTrustLevel } from "@/lib/trust";
 
 /** Очередь заданий для бота-оператора рабочего стола. */
@@ -27,6 +28,15 @@ export async function GET() {
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
+  const rl = checkApiRateLimit({
+    scope: "agent_tasks_create",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 30,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
 
   const body = (await req.json().catch(() => null)) as
     | {

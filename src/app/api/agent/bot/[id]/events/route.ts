@@ -1,5 +1,7 @@
 import { addAgentEvent, bumpAgentTaskStep, getAgentTask, setAgentTaskStatus, syncOperatorTaskToConversation } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
+import { agentTaskStatusSchema } from "@/lib/validation";
 
 /** Журнал шага, который выполнил бот: мысль модели, действие, результат, ошибка. */
 export const dynamic = "force-dynamic";
@@ -11,6 +13,15 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const ownerId = await botOwner(req);
   if (!ownerId) return Response.json({ error: "Неверный токен агента" }, { status: 401 });
 
+  const rl = checkApiRateLimit({
+    scope: "bot_events",
+    userId: ownerId,
+    ip: extractClientIp(req.headers),
+    maxRequests: 180,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
+
   const { id } = await ctx.params;
   const task = await getAgentTask(ownerId, Number(id) || 0);
   if (!task) return Response.json({ error: "Задание не найдено" }, { status: 404 });
@@ -21,6 +32,15 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const body = (await req.json().catch(() => null)) as
     | { kind?: string; text?: string; action?: unknown; status?: string; summary?: string }
     | null;
+
+  let validatedStatus: string | null = null;
+  if (body?.status !== undefined && body?.status !== null && String(body.status).trim() !== "") {
+    const parsedStatus = agentTaskStatusSchema.safeParse(String(body.status).trim());
+    if (!parsedStatus.success) {
+      return Response.json({ error: "Недопустимый статус задачи" }, { status: 400 });
+    }
+    validatedStatus = parsedStatus.data;
+  }
 
   // action обычно приходит готовой JSON-строкой, но объект тоже принимаем.
   const action = body?.action;
@@ -37,8 +57,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   });
 
   if (cleanKind === "action") await bumpAgentTaskStep(task.id);
-  if (body?.status) {
-    await setAgentTaskStatus(task.id, ownerId, String(body.status), String(body.summary ?? "").slice(0, 4000));
+  if (validatedStatus) {
+    await setAgentTaskStatus(task.id, ownerId, validatedStatus, String(body?.summary ?? "").slice(0, 4000));
   }
   await syncOperatorTaskToConversation(ownerId, task.id, { onlyIfExisting: true });
 

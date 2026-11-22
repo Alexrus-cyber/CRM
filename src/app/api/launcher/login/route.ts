@@ -1,5 +1,5 @@
 import { findUserAuthByEmail, getUser } from "@/db/repo";
-import { createLauncherSession, ensureSuperAdmin, verifyPassword } from "@/lib/auth";
+import { createLauncherSession, verifyPasswordAsync, verifyUserTotp } from "@/lib/auth";
 import { buildLauncherProfile } from "@/lib/launcherProfile";
 import {
   checkLoginRateLimit,
@@ -13,8 +13,6 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export async function POST(req: Request) {
-  await ensureSuperAdmin();
-
   const parsed = await readValidatedJson(req, launcherLoginSchema, "Введите email и пароль");
   if (!parsed.ok) return parsed.response;
 
@@ -35,9 +33,27 @@ export async function POST(req: Request) {
   }
 
   const authRow = await findUserAuthByEmail(email);
-  if (!authRow || !verifyPassword(password, authRow.passwordHash)) {
+  if (!authRow || !(await verifyPasswordAsync(password, authRow.passwordHash))) {
     recordLoginFailure(ip, email);
     return Response.json({ ok: false, error: "Неверный email или пароль" }, { status: 401 });
+  }
+
+  if (authRow.totpEnabled) {
+    const code = parsed.data.totpCode?.trim() ?? "";
+    if (!code) {
+      return Response.json(
+        { ok: false, requiresTotp: true, error: "Введите 6-значный код двухфакторной аутентификации (2FA)" },
+        { status: 401, headers: { "Cache-Control": "no-store" } },
+      );
+    }
+    const validTotp = await verifyUserTotp(authRow.id, code);
+    if (!validTotp) {
+      recordLoginFailure(ip, email);
+      return Response.json(
+        { ok: false, requiresTotp: true, error: "Неверный код 2FA" },
+        { status: 401, headers: { "Cache-Control": "no-store" } },
+      );
+    }
   }
 
   const user = await getUser(authRow.id);
@@ -54,7 +70,7 @@ export async function POST(req: Request) {
 
   const [session, profile] = await Promise.all([
     createLauncherSession(user.id, { label: "Десктоп-лаунчер", userAgent, ip }),
-    buildLauncherProfile(user, origin),
+    buildLauncherProfile(user, origin, { issueToken: true }),
   ]);
 
   return Response.json(

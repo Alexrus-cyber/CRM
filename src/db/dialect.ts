@@ -176,19 +176,29 @@ async function buildSqlite(): Promise<Executor> {
 
 async function init(): Promise<Executor> {
   const requested = (process.env.DB_DIALECT || "").trim().toLowerCase();
+  const hasDatabaseUrl = Boolean(process.env.DATABASE_URL?.trim());
+  const allowSqliteFallback = process.env.CRM_ALLOW_SQLITE_FALLBACK === "1";
   let executor: Executor;
 
   if (requested === "sqlite" || requested === "sqlite3") {
     executor = await buildSqlite();
   } else if (requested === "postgres" || requested === "postgresql" || requested === "pg") {
     executor = await buildPostgres();
-  } else {
+  } else if (hasDatabaseUrl) {
     try {
       executor = await buildPostgres();
     } catch (error) {
-      console.warn("[db] PostgreSQL is unavailable, using SQLite instead:", (error as Error).message);
+      if (!allowSqliteFallback) {
+        throw new Error(
+          `[db] Не удалось подключиться к PostgreSQL по DATABASE_URL: ${(error as Error).message}. ` +
+            "Аварийный откат на SQLite отключён (задайте DB_DIALECT=sqlite или CRM_ALLOW_SQLITE_FALLBACK=1 при необходимости).",
+        );
+      }
+      console.error("[db] CRITICAL FALLBACK: PostgreSQL unavailable, falling back to SQLite:", (error as Error).message);
       executor = await buildSqlite();
     }
+  } else {
+    executor = await buildSqlite();
   }
 
   await runMigrations(executor);

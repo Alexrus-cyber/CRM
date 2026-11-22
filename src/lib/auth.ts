@@ -1,34 +1,62 @@
 import { cache } from "react";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { randomBytes, scryptSync, timingSafeEqual } from "crypto";
+import { randomBytes, scrypt, scryptSync, timingSafeEqual } from "crypto";
 import type { Role } from "@/db/schema";
 import {
-  countSuperAdmins,
   deleteSession,
   findSessionUser,
-  findUserIdByEmail,
+  getUserTotpSecret,
   insertSession,
-  insertUser,
-  promoteSuperAdmin,
   touchSession,
   type UserLite,
 } from "@/db/repo";
+import { verifyTotpCode } from "./totp";
+import { MAX_PASSWORD_LENGTH } from "./validation";
 import { canManageRole, isAdminRole } from "./permissions";
 
 export const SESSION_COOKIE = "crm_session";
 const SESSION_DAYS = 30;
+const MAX_CONCURRENT_SCRYPT = 8;
+
+let activeScryptOps = 0;
+const scryptWaitQueue: Array<() => void> = [];
+
+async function withScryptSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeScryptOps >= MAX_CONCURRENT_SCRYPT) {
+    await new Promise<void>((resolve) => scryptWaitQueue.push(resolve));
+  }
+  activeScryptOps += 1;
+  try {
+    return await fn();
+  } finally {
+    activeScryptOps = Math.max(0, activeScryptOps - 1);
+    const next = scryptWaitQueue.shift();
+    if (next) next();
+  }
+}
+
+function scryptAsync(password: string, salt: string, keylen = 64): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    scrypt(password, salt, keylen, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(derivedKey);
+    });
+  });
+}
 
 /** Authenticated user shape — works for both database engines. */
 export type SafeUser = UserLite;
 
 export function hashPassword(password: string): string {
+  const safe = String(password || "").slice(0, MAX_PASSWORD_LENGTH);
   const salt = randomBytes(16).toString("hex");
-  const hash = scryptSync(password, salt, 64).toString("hex");
+  const hash = scryptSync(safe, salt, 64).toString("hex");
   return `${salt}:${hash}`;
 }
 
 export function verifyPassword(password: string, stored: string): boolean {
+  if (!password || password.length > MAX_PASSWORD_LENGTH) return false;
   const [salt, hash] = stored.split(":");
   if (!salt || !hash) return false;
   const candidate = scryptSync(password, salt, 64);
@@ -38,42 +66,32 @@ export function verifyPassword(password: string, stored: string): boolean {
 }
 
 /**
- * Первичная инициализация `super_admin` без зашитых паролей в коде.
- *
- * Если ни одного `super_admin` ещё нет, аккаунт создаётся/повышается только
- * при наличии явно заданной переменной `CRM_ADMIN_PASSWORD` (или `CRM_SEED_ADMIN_PASSWORD`).
+ * Неблокирующий scrypt с ограничением параллельности (P1-4):
+ * не блокирует event loop и защищает CPU от флуда одновременными логинами.
  */
-export async function ensureSuperAdmin() {
-  if ((await countSuperAdmins()) > 0) return;
-
-  const email = (process.env.CRM_ADMIN_EMAIL || process.env.CRM_SEED_ADMIN_EMAIL || "admin@crm.local")
-    .trim()
-    .toLowerCase();
-  const password = (process.env.CRM_ADMIN_PASSWORD || process.env.CRM_SEED_ADMIN_PASSWORD || "").trim();
-  const name = (process.env.CRM_ADMIN_NAME || process.env.CRM_SEED_ADMIN_NAME || "Главный администратор").trim();
-
-  const existingId = await findUserIdByEmail(email);
-  if (existingId) {
-    await promoteSuperAdmin(existingId);
-    return;
+export async function hashPasswordAsync(password: string): Promise<string> {
+  if (!password || password.length > MAX_PASSWORD_LENGTH) {
+    throw new Error(`Пароль не должен превышать ${MAX_PASSWORD_LENGTH} символов`);
   }
+  const salt = randomBytes(16).toString("hex");
+  const derived = await withScryptSlot(() => scryptAsync(password, salt, 64));
+  return `${salt}:${derived.toString("hex")}`;
+}
 
-  if (!password) {
-    console.warn(
-      "[auth] Нет super_admin в базе и не задан CRM_ADMIN_PASSWORD. " +
-        "Запустите `node scripts/seed.mjs` или задайте CRM_ADMIN_EMAIL и CRM_ADMIN_PASSWORD.",
-    );
-    return;
-  }
+export async function verifyPasswordAsync(password: string, stored: string): Promise<boolean> {
+  if (!password || password.length > MAX_PASSWORD_LENGTH) return false;
+  const [salt, hash] = stored.split(":");
+  if (!salt || !hash || !/^[0-9a-f]+$/i.test(hash)) return false;
+  const expected = Buffer.from(hash, "hex");
+  const candidate = await withScryptSlot(() => scryptAsync(password, salt, 64));
+  if (candidate.length !== expected.length) return false;
+  return timingSafeEqual(candidate, expected);
+}
 
-  await insertUser({
-    name,
-    email,
-    passwordHash: hashPassword(password),
-    role: "super_admin",
-    position: "Руководитель",
-    avatarColor: "#7c5cff",
-  });
+export async function verifyUserTotp(userId: number, code: string): Promise<boolean> {
+  const { enabled, secret } = await getUserTotpSecret(userId);
+  if (!enabled || !secret) return true;
+  return verifyTotpCode(secret, code);
 }
 
 export async function createSession(

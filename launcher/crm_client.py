@@ -10,8 +10,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import secrets
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
@@ -19,14 +23,52 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 class CrmClientError(RuntimeError):
     """Понятная пользователю ошибка связи или доступа CRM."""
 
+    def __init__(self, message: str, *, requires_totp: bool = False) -> None:
+        super().__init__(message)
+        self.requires_totp = requires_totp
+
+
+_ORIG_URLOPEN = urllib.request.urlopen
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        raise urllib.error.HTTPError(
+            newurl,
+            code,
+            "HTTP-редиректы на сервере CRM запрещены политикой безопасности",
+            headers,
+            fp,
+        )
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _is_loopback_host(host: str) -> bool:
+    clean = (host or "").strip().lower().strip("[]")
+    return clean in ("localhost", "127.0.0.1", "::1") or clean.endswith(".localhost")
+
 
 def normalize_server_url(raw: str) -> str:
     url = (raw or "").strip().rstrip("/")
     if not url:
         return ""
     if not (url.startswith("http://") or url.startswith("https://")):
-        url = "http://" + url
+        host_part = url.split("/", 1)[0]
+        host_only = host_part[1:].split("]", 1)[0] if host_part.startswith("[") else host_part.split(":", 1)[0]
+        scheme = "http://" if _is_loopback_host(host_only) else "https://"
+        url = scheme + url
     return url.rstrip("/")
+
+
+def _assert_safe_crm_transport(url: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise CrmClientError("Некорректный URL CRM (нужен http:// для localhost или https://)")
+    host = parsed.hostname or ""
+    if parsed.scheme == "http" and not _is_loopback_host(host) and os.environ.get("CRM_LAUNCHER_ALLOW_HTTP") != "1":
+        raise CrmClientError("Для удалённого сервера CRM требуется HTTPS (http:// разрешён только для localhost)")
 
 
 def _request_json(
@@ -36,6 +78,7 @@ def _request_json(
     bearer_token: str = "",
     timeout: float = 12.0,
 ) -> Tuple[int, Dict[str, Any]]:
+    _assert_safe_crm_transport(url)
     data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Accept", "application/json")
@@ -45,7 +88,12 @@ def _request_json(
         req.add_header("Authorization", f"Bearer {bearer_token.strip()}")
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        ctx = (
+            _NO_REDIRECT_OPENER.open(req, timeout=timeout)
+            if urllib.request.urlopen is _ORIG_URLOPEN
+            else urllib.request.urlopen(req, timeout=timeout)
+        )
+        with ctx as resp:
             raw_body = resp.read().decode("utf-8", "replace")
             try:
                 parsed = json.loads(raw_body or "{}")
@@ -64,7 +112,11 @@ def _request_json(
         if not msg:
             msg = f"HTTP {exc.code}"
         if exc.code == 401:
-            raise CrmClientError(msg or "Неверный логин/пароль или сессия истекла") from exc
+            needs_totp = bool(isinstance(err_json, dict) and err_json.get("requiresTotp"))
+            raise CrmClientError(
+                msg or "Неверный логин/пароль или сессия истекла",
+                requires_totp=needs_totp,
+            ) from exc
         if exc.code == 403:
             raise CrmClientError(msg or "Доступ к этой функции запрещён") from exc
         if exc.code == 429:
@@ -83,27 +135,44 @@ def check_health(server_url: str, timeout: float = 8.0) -> Tuple[bool, str]:
     clean = normalize_server_url(server_url)
     if not clean:
         return False, "Укажите адрес сервера CRM (например, http://localhost:3000)"
+    probe = secrets.token_hex(12)
+    expected_ack = hashlib.sha256(f"nova-crm-health:{probe}".encode("utf-8")).hexdigest()
     try:
-        status, data = _request_json("GET", f"{clean}/api/health", timeout=timeout)
+        status, data = _request_json(
+            "GET",
+            f"{clean}/api/health?probe={urllib.parse.quote(probe)}",
+            timeout=timeout,
+        )
     except CrmClientError as exc:
         return False, str(exc)
     if status != 200 or not data.get("ok"):
         return False, "Сервер ответил, но не подтвердил статус CRM (/api/health)"
+    if str(data.get("app") or "") != "nova-crm" or str(data.get("probeAck") or "") != expected_ack:
+        return False, "Сервер ответил, но не прошёл проверку подлинности ответа (/api/health)"
     return True, f"CRM доступна ({clean})"
 
 
-def login(server_url: str, email: str, password: str, timeout: float = 15.0) -> Dict[str, Any]:
-    """Шаг 2: вход в аккаунт CRM по логину и паролю."""
+def login(
+    server_url: str,
+    email: str,
+    password: str,
+    timeout: float = 15.0,
+    totp_code: str = "",
+) -> Dict[str, Any]:
+    """Шаг 2: вход в аккаунт CRM по логину и паролю (+ при необходимости 2FA)."""
     clean = normalize_server_url(server_url)
     if not clean:
         raise CrmClientError("Сначала укажите и проверьте URL CRM")
     clean_email = (email or "").strip()
     if not clean_email or not password:
         raise CrmClientError("Введите email и пароль от аккаунта CRM")
+    payload: Dict[str, Any] = {"email": clean_email, "password": password, "serverUrl": clean}
+    if totp_code.strip():
+        payload["totpCode"] = totp_code.strip()
     _status, data = _request_json(
         "POST",
         f"{clean}/api/launcher/login",
-        {"email": clean_email, "password": password, "serverUrl": clean},
+        payload,
         timeout=timeout,
     )
     if not data.get("ok") or not data.get("sessionToken"):

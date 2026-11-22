@@ -3,6 +3,7 @@ import { getCurrentUser } from "@/lib/auth";
 import { publicChatBot } from "@/lib/chatBot";
 import { publishLiveEvent } from "@/lib/events";
 import { normalizeGenParams } from "@/lib/genParams";
+import { assertSafeAiUrl } from "@/lib/ssrf";
 import { chatBotPatchSchema, readValidatedJson } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
@@ -27,6 +28,17 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
   const parsed = await readValidatedJson(req, chatBotPatchSchema, "Пустой запрос");
   if (!parsed.ok) return parsed.response;
   const body = parsed.data;
+
+  if (body.baseUrl?.trim()) {
+    try {
+      await assertSafeAiUrl(body.baseUrl.trim());
+    } catch (err) {
+      return Response.json(
+        { error: err instanceof Error ? err.message : "Запрещённый адрес модели" },
+        { status: 400 },
+      );
+    }
+  }
 
   const avatarColor =
     body.avatarColor !== undefined && /^#[0-9a-fA-F]{6}$/.test(body.avatarColor)

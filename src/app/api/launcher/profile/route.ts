@@ -9,7 +9,8 @@ export async function GET(req: Request) {
   if (!user) {
     return Response.json({ ok: false, error: "Сессия недействительна или истекла" }, { status: 401 });
   }
-  const origin = new URL(req.url).origin;
-  const profile = await buildLauncherProfile(user, origin);
+  const url = new URL(req.url);
+  const issueToken = url.searchParams.get("reissue") === "1";
+  const profile = await buildLauncherProfile(user, url.origin, { issueToken });
   return Response.json(profile, { headers: { "Cache-Control": "no-store" } });
 }

@@ -4,12 +4,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   ClipboardCopy,
-  Eye,
-  EyeOff,
   KeyRound,
   Loader2,
   Plus,
   RefreshCw,
+  RotateCcw,
   Server,
   Star,
   Trash2,
@@ -22,13 +21,10 @@ import { cn, formatDateTime } from "@/lib/utils";
 /**
  * Подключения бота и их токены.
  *
- * Подключение — это адрес CRM, с которым работает бот. У пользователя их может
- * быть несколько (свой сервер, тестовый, у заказчика), а токенов на каждое —
- * сколько нужно: по одному на машину. Всё хранится в базе под пользователем,
- * поэтому список одинаков на любом компьютере и после перезагрузки.
- *
- * Токен в списке всегда маскирован; полное значение приходит только по кнопке
- * «Показать» и сразу попадает в команду запуска.
+ * Токены хранятся в БД в виде криптографического SHA-256 хеша (P0-2).
+ * Полное значение выдаётся единоразово при создании или перевыпуске
+ * («Перевыпустить»), сразу подставляется в команду запуска и не может
+ * быть прочитано повторно после перезагрузки страницы.
  */
 
 export type AgentConnection = {
@@ -49,6 +45,9 @@ export type AgentToken = {
   hint: string;
   createdAt: string;
   lastUsedAt: string | null;
+  expiresAt?: string | null;
+  isExpired?: boolean;
+  expiringSoon?: boolean;
 };
 
 export type ConnectionSelection = {
@@ -103,8 +102,7 @@ export function ConnectionsCard({
   const [newName, setNewName] = useState("");
   const [newServer, setNewServer] = useState(defaultServer);
   const [tokenName, setTokenName] = useState("");
-  const [freshToken, setFreshToken] = useState<string | null>(null);
-  const [revealed, setRevealed] = useState<Record<number, string>>({});
+  const [freshToken, setFreshToken] = useState<{ id: number; token: string; name: string } | null>(null);
   const [activeToken, setActiveToken] = useState<{ id: number; token: string; name: string } | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -159,15 +157,10 @@ export function ConnectionsCard({
     }
   }, []);
 
-  /**
-   * Выбор подключения: сбрасываем показанные токены и подтягиваем список.
-   * Живёт в обработчиках, а не в эффекте, — так нет каскадных рендеров.
-   */
   const selectConnection = useCallback(
     async (id: number) => {
       setConnectionId(id);
       setFreshToken(null);
-      setRevealed({});
       setActiveToken(null);
       setConfirmDelete(false);
       setError(null);
@@ -183,7 +176,6 @@ export function ConnectionsCard({
 
   useEffect(() => {
     alive.current = true;
-    // Загрузка на старте: сначала подключения, затем токены выбранного.
     void Promise.resolve()
       .then(() => loadConnections())
       .then((list) => {
@@ -200,7 +192,6 @@ export function ConnectionsCard({
     };
   }, [loadConnections, selectConnection]);
 
-  // Выбранное подключение и токен уходят наверх: из них собирается команда.
   useEffect(() => {
     onChange({
       connectionId: connection?.id ?? null,
@@ -305,55 +296,54 @@ export function ConnectionsCard({
         setError(data.error ?? "Не удалось создать токен");
         return;
       }
-      setFreshToken(data.token);
-      setActiveToken({ id: data.item.id, token: data.token, name: data.item.name });
+      const nextFresh = { id: data.item.id, token: data.token, name: data.item.name };
+      setFreshToken(nextFresh);
+      setActiveToken(nextFresh);
       setTokenName("");
       await loadTokens(connectionId);
       await loadConnections();
-      flash("Токен создан и уже подставлен в команду запуска");
+      flash("Токен создан, показан один раз и подставлен в команду запуска");
     } finally {
       setBusy(false);
     }
   };
 
-  const revealToken = async (token: AgentToken): Promise<string | null> => {
-    if (revealed[token.id]) {
-      // Скрыли — значит токена не должно быть ни в списке, ни в команде запуска.
-      setRevealed((prev) => {
-        const next = { ...prev };
-        delete next[token.id];
-        return next;
-      });
-      setActiveToken((current) => (current?.id === token.id ? null : current));
-      return null;
-    }
+  const reissueToken = async (token: AgentToken) => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
     try {
-      const res = await fetch("/api/agent/tokens/reveal", {
+      const res = await fetch("/api/agent/tokens", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: token.id }),
+        body: JSON.stringify({ action: "reissue", id: token.id }),
       });
-      const data = (await res.json().catch(() => ({}))) as { token?: string; error?: string };
-      if (!res.ok || !data.token) {
-        setError(data.error ?? "Не удалось показать токен");
-        return null;
+      const data = (await res.json().catch(() => ({}))) as {
+        token?: string;
+        item?: AgentToken;
+        error?: string;
+      };
+      if (!res.ok || !data.token || !data.item) {
+        setError(data.error ?? "Не удалось перевыпустить токен");
+        return;
       }
-      setRevealed((prev) => ({ ...prev, [token.id]: data.token as string }));
-      setActiveToken({ id: token.id, token: data.token, name: token.name });
-      return data.token;
+      const nextFresh = { id: data.item.id, token: data.token, name: data.item.name };
+      setFreshToken(nextFresh);
+      setActiveToken(nextFresh);
+      await loadTokens(connectionId);
+      await loadConnections();
+      flash(`Токен «${token.name}» перевыпущен и подставлен в команду`);
     } catch {
-      setError("Сеть недоступна — не удалось показать токен");
-      return null;
+      setError("Сеть недоступна — не удалось перевыпустить токен");
+    } finally {
+      setBusy(false);
     }
   };
 
-  const copyToken = async (token: AgentToken) => {
-    const value = revealed[token.id] ?? (await revealToken(token));
-    if (!value) return;
+  const copyFreshValue = async (value: string, key: string) => {
     try {
       await navigator.clipboard.writeText(value);
-      setCopied(`token-${token.id}`);
-      setActiveToken({ id: token.id, token: value, name: token.name });
+      setCopied(key);
       window.setTimeout(() => setCopied(null), 2000);
     } catch {
       setError("Браузер не разрешил доступ к буферу обмена — скопируйте вручную");
@@ -371,7 +361,7 @@ export function ConnectionsCard({
         return;
       }
       if (activeToken?.id === token.id) setActiveToken(null);
-      if (freshToken && revealed[token.id] === freshToken) setFreshToken(null);
+      if (freshToken?.id === token.id) setFreshToken(null);
       await loadTokens(connectionId);
       await loadConnections();
       flash(`Токен «${token.name}» отозван`);
@@ -417,7 +407,7 @@ export function ConnectionsCard({
   return (
     <Card
       title="1. Подключения и токены"
-      subtitle="Подключение — это адрес CRM. У каждого свой список токенов: по одному на каждую машину."
+      subtitle="Подключение — это адрес CRM. Токены выдаются единоразово при создании или перевыпуске (в базе хранится только хеш)."
       action={
         <Badge className="border-border text-muted">
           <Server size={11} />
@@ -509,7 +499,7 @@ export function ConnectionsCard({
                 </p>
               )}
               {tokens.map((token) => {
-                const full = revealed[token.id];
+                const full = freshToken?.id === token.id ? freshToken.token : null;
                 const active = activeToken?.id === token.id;
                 return (
                   <div key={token.id} className="flex flex-col gap-1.5 px-2.5 py-2 sm:flex-row sm:items-center sm:justify-between">
@@ -519,23 +509,32 @@ export function ConnectionsCard({
                         {active && (
                           <Badge className="border-emerald-500/40 bg-emerald-500/10 text-emerald-500">в команде</Badge>
                         )}
+                        {token.isExpired && (
+                          <Badge className="border-red-500/40 bg-red-500/10 text-red-500">истёк</Badge>
+                        )}
+                        {!token.isExpired && token.expiringSoon && (
+                          <Badge className="border-amber-500/40 bg-amber-500/10 text-amber-500">скоро истечёт</Badge>
+                        )}
                       </p>
                       <code className="mt-0.5 block truncate rounded bg-card2 px-1.5 py-0.5 font-mono text-[10px]">
                         {full ?? token.hint}
                       </code>
                       <p className="mt-0.5 text-[10px] text-muted">
                         создан {when(token.createdAt)} · {token.lastUsedAt ? `работал ${when(token.lastUsedAt)}` : when(null)}
+                        {token.expiresAt ? ` · до ${when(token.expiresAt)}` : ""}
                       </p>
                     </div>
                     <div className="flex shrink-0 flex-wrap items-center gap-1">
-                      <Button size="sm" variant="secondary" onClick={() => void revealToken(token)} disabled={busy}>
-                        {full ? <EyeOff size={12} /> : <Eye size={12} />}
-                        {full ? "Скрыть" : "Показать"}
+                      <Button size="sm" variant="secondary" onClick={() => void reissueToken(token)} disabled={busy}>
+                        <RotateCcw size={12} />
+                        Перевыпустить
                       </Button>
-                      <Button size="sm" variant="ghost" onClick={() => void copyToken(token)} disabled={busy}>
-                        {copied === `token-${token.id}` ? <Check size={12} /> : <ClipboardCopy size={12} />}
-                        {copied === `token-${token.id}` ? "скопирован" : "копировать"}
-                      </Button>
+                      {full && (
+                        <Button size="sm" variant="ghost" onClick={() => void copyFreshValue(full, `token-${token.id}`)} disabled={busy}>
+                          {copied === `token-${token.id}` ? <Check size={12} /> : <ClipboardCopy size={12} />}
+                          {copied === `token-${token.id}` ? "скопирован" : "копировать"}
+                        </Button>
+                      )}
                       <Button
                         size="sm"
                         variant="ghost"
@@ -576,22 +575,14 @@ export function ConnectionsCard({
           {freshToken && (
             <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-2.5">
               <p className="text-[10px] text-muted">
-                Токен создан. Он уже подставлен в команду; позже его можно снова показать кнопкой «Показать».
+                Токен показан один раз и уже подставлен в команду запуска. Сохраните его — повторно прочитать старый токен нельзя (доступен только перевыпуск).
               </p>
               <div className="mt-1.5 flex items-center gap-2">
-                <code className="min-w-0 flex-1 truncate rounded-lg bg-card2 px-2 py-1.5 font-mono text-[11px]">{freshToken}</code>
+                <code className="min-w-0 flex-1 truncate rounded-lg bg-card2 px-2 py-1.5 font-mono text-[11px]">{freshToken.token}</code>
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={async () => {
-                    try {
-                      await navigator.clipboard.writeText(freshToken);
-                      setCopied("fresh");
-                      window.setTimeout(() => setCopied(null), 2000);
-                    } catch {
-                      setError("Браузер не разрешил доступ к буферу обмена — скопируйте вручную");
-                    }
-                  }}
+                  onClick={() => void copyFreshValue(freshToken.token, "fresh")}
                 >
                   {copied === "fresh" ? <Check size={12} /> : <ClipboardCopy size={12} />}
                   {copied === "fresh" ? "скопирован" : "копировать"}
@@ -607,7 +598,7 @@ export function ConnectionsCard({
           ) : (
             tokens.length > 0 && (
               <p className="text-[10px] text-muted">
-                Пока токен скрыт, в команде его нет: нажмите «Показать» у нужного токена — он подставится сам.
+                Старые токены захешированы и не подставляются автоматически: создайте новый или нажмите «Перевыпустить» у нужного токена.
               </p>
             )
           )}

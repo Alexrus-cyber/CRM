@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { nowIso, q, q1, toBool, toIso, toNum } from "../dialect";
+import { hashOpaqueToken, safeEqualText } from "@/lib/crypto";
+import { agentTaskStatusSchema } from "@/lib/validation";
 import {
   findTaskMode,
   normalizeCoachMode,
@@ -101,6 +103,9 @@ export type AgentTokenRow = {
   hint: string;
   createdAt: string;
   lastUsedAt: string | null;
+  expiresAt?: string | null;
+  isExpired?: boolean;
+  expiringSoon?: boolean;
 };
 
 export type AgentConversationKind = "plan" | "agent";
@@ -222,18 +227,45 @@ function mapAgentTask(r: Raw): AgentTaskRow {
   };
 }
 
+const OPERATOR_TOKEN_TTL_DAYS = 90;
+const OPERATOR_TOKEN_TTL_MS = OPERATOR_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
+const OPERATOR_TOKEN_WARN_MS = 14 * 24 * 60 * 60 * 1000;
+const TOKEN_TOUCH_MIN_MS = 60_000;
+const STALE_REAP_THROTTLE_MS = 60_000;
+
+const globalForAgentPerf = globalThis as typeof globalThis & {
+  __crmTokenTouchMap?: Map<string, number>;
+  __crmLastStaleReapMs?: number;
+};
+
+function tokenTouchMap(): Map<string, number> {
+  if (!globalForAgentPerf.__crmTokenTouchMap) {
+    globalForAgentPerf.__crmTokenTouchMap = new Map();
+  }
+  return globalForAgentPerf.__crmTokenTouchMap;
+}
+
+function defaultTokenExpiryIso(fromMs = Date.now()): string {
+  return new Date(fromMs + OPERATOR_TOKEN_TTL_MS).toISOString();
+}
+
 export async function getAgentToken(userId: number): Promise<string | null> {
-  const row = await q1(sql`select token from agent_tokens where user_id = ${userId} limit 1`);
-  return row ? String(row.token) : null;
+  // Возвращается только маскированная подсказка, никогда не сырой токен (P0-2).
+  const row = await q1<{ token_hint: string }>(sql`
+    select token_hint from agent_connection_tokens
+    where user_id = ${userId} and revoked_at is null
+    order by id desc limit 1`);
+  return row?.token_hint ? String(row.token_hint) : null;
 }
 
 export async function saveAgentToken(userId: number, token: string): Promise<void> {
+  const hashed = token.startsWith("sha256:") ? token : hashOpaqueToken(token);
   const existing = await q1<{ id: number }>(sql`select id from agent_tokens where user_id = ${userId} limit 1`);
   if (existing) {
-    await q(sql`update agent_tokens set token = ${token} where user_id = ${userId}`);
+    await q(sql`update agent_tokens set token = ${hashed} where user_id = ${userId}`);
     return;
   }
-  await q(sql`insert into agent_tokens (user_id, token, created_at) values (${userId}, ${token}, ${nowIso()})`);
+  await q(sql`insert into agent_tokens (user_id, token, created_at) values (${userId}, ${hashed}, ${nowIso()})`);
 }
 
 export async function findAgentTokenOwner(
@@ -241,19 +273,56 @@ export async function findAgentTokenOwner(
   options?: { touch?: boolean },
 ): Promise<number | null> {
   if (!token) return null;
+  const candidateHash = hashOpaqueToken(token);
+  const now = nowIso();
+  const nowMs = Date.now();
 
-  const fresh = await q1<{ user_id: number }>(
-    sql`select user_id from agent_connection_tokens where token = ${token} limit 1`,
-  );
+  const fresh = await q1<{
+    id: number;
+    user_id: number;
+    token_hash: string;
+    token: string;
+    expires_at: unknown;
+    last_used_at: unknown;
+    revoked_at: unknown;
+  }>(sql`
+    select t.id, t.user_id, t.token_hash, t.token, t.expires_at, t.last_used_at, t.revoked_at
+    from agent_connection_tokens t
+    join users u on u.id = t.user_id
+    where (t.token_hash = ${candidateHash} or t.token = ${candidateHash})
+      and t.revoked_at is null
+      and u.deleted_at is null
+    limit 1`);
+
   if (fresh) {
+    const storedHash = String(fresh.token_hash || fresh.token || "");
+    if (!safeEqualText(storedHash, candidateHash)) return null;
+
+    const expIso = toIso(fresh.expires_at);
+    const expMs = expIso ? new Date(expIso).getTime() : NaN;
+    const lastUsedIso = toIso(fresh.last_used_at);
+    const lastUsedMs = lastUsedIso ? new Date(lastUsedIso).getTime() : NaN;
+    const inactiveExpired = !Number.isNaN(lastUsedMs) && nowMs - lastUsedMs > OPERATOR_TOKEN_TTL_MS;
+    const ttlExpired = !Number.isNaN(expMs) && expMs <= nowMs;
+
+    if (ttlExpired || inactiveExpired) {
+      await q(sql`update agent_connection_tokens set revoked_at = ${now} where id = ${toNum(fresh.id)}`);
+      return null;
+    }
+
     if (options?.touch !== false) {
-      await q(sql`update agent_connection_tokens set last_used_at = ${nowIso()} where token = ${token}`);
+      const cache = tokenTouchMap();
+      const prevTouch = cache.get(candidateHash) ?? 0;
+      if (nowMs - prevTouch >= TOKEN_TOUCH_MIN_MS) {
+        if (cache.size > 10_000) cache.clear();
+        cache.set(candidateHash, nowMs);
+        await q(sql`update agent_connection_tokens set last_used_at = ${now} where id = ${toNum(fresh.id)}`);
+      }
     }
     return toNum(fresh.user_id);
   }
 
-  const row = await q1(sql`select user_id from agent_tokens where token = ${token} limit 1`);
-  return row ? toNum(row.user_id) : null;
+  return null;
 }
 
 const BOT_ONLINE_WINDOW_SEC = 30;
@@ -263,26 +332,29 @@ export async function getAgentBotConnectionStatus(
   userId: number,
   connectionId?: number,
 ): Promise<AgentBotConnectionStatus> {
+  await maybeReapStaleAgentTasks();
   const scopeId = connectionId && connectionId > 0 ? connectionId : 0;
+  const now = nowIso();
 
   const totalConnRow = await q1<{ count: number }>(sql`
-    select count(*) as count from agent_connection_tokens where user_id = ${userId}`);
-  const legacyRow = await q1<{ count: number }>(sql`
-    select count(*) as count from agent_tokens where user_id = ${userId}`);
-  const totalTokensCount = toNum(totalConnRow?.count) + toNum(legacyRow?.count);
+    select count(*) as count from agent_connection_tokens
+    where user_id = ${userId} and revoked_at is null and (expires_at is null or expires_at > ${now})`);
+  const totalTokensCount = toNum(totalConnRow?.count);
 
   const tokenRows = scopeId
     ? await q(sql`
-        select t.id, t.name, t.token, t.last_used_at, c.name as connection_name
+        select t.id, t.name, t.token_hint, t.last_used_at, c.name as connection_name
         from agent_connection_tokens t
         join agent_connections c on c.id = t.connection_id
         where t.user_id = ${userId} and t.connection_id = ${scopeId}
+          and t.revoked_at is null and (t.expires_at is null or t.expires_at > ${now})
         order by t.last_used_at desc, t.id desc`)
     : await q(sql`
-        select t.id, t.name, t.token, t.last_used_at, c.name as connection_name
+        select t.id, t.name, t.token_hint, t.last_used_at, c.name as connection_name
         from agent_connection_tokens t
         join agent_connections c on c.id = t.connection_id
         where t.user_id = ${userId}
+          and t.revoked_at is null and (t.expires_at is null or t.expires_at > ${now})
         order by t.last_used_at desc, t.id desc`);
 
   const tokensCount = scopeId ? tokenRows.length : totalTokensCount;
@@ -339,7 +411,7 @@ export async function getAgentBotConnectionStatus(
     secondsAgo,
     lastSeenAt,
     tokenName: latestRow ? String(latestRow.name ?? "") : "",
-    tokenHint: latestRow ? maskToken(String(latestRow.token ?? "")) : "",
+    tokenHint: latestRow ? String(latestRow.token_hint ?? "") : "",
     connectionName: latestRow ? String(latestRow.connection_name ?? "") : "",
     tokensCount,
     totalTokensCount,
@@ -366,22 +438,34 @@ function mapAgentConnection(row: Raw): AgentConnectionRow {
 }
 
 function mapAgentToken(row: Raw): AgentTokenRow {
+  const expiresAt = toIso(row.expires_at);
+  const expMs = expiresAt ? new Date(expiresAt).getTime() : NaN;
+  const nowMs = Date.now();
+  const isExpired = !Number.isNaN(expMs) && expMs <= nowMs;
+  const expiringSoon = !isExpired && !Number.isNaN(expMs) && expMs - nowMs <= OPERATOR_TOKEN_WARN_MS;
+  const hint = String(row.token_hint ?? "") || maskToken(String(row.token ?? ""));
   return {
     id: toNum(row.id),
     connectionId: toNum(row.connection_id),
     name: String(row.name ?? ""),
-    hint: maskToken(String(row.token ?? "")),
+    hint,
     createdAt: toIso(row.created_at) ?? nowIso(),
     lastUsedAt: toIso(row.last_used_at),
+    expiresAt,
+    isExpired,
+    expiringSoon,
   };
 }
 
 export async function listAgentConnections(userId: number): Promise<AgentConnectionRow[]> {
+  const now = nowIso();
   const rows = await q(sql`
     select c.*,
-           (select count(*) from agent_connection_tokens t where t.connection_id = c.id) as tokens_count,
+           (select count(*) from agent_connection_tokens t where t.connection_id = c.id and t.revoked_at is null) as tokens_count,
            (select count(*) from agent_connection_tokens t
               where t.connection_id = c.id
+                and t.revoked_at is null
+                and (t.expires_at is null or t.expires_at > ${now})
                 and (t.last_used_at is null or t.last_used_at > ${dayAgoIso()})) as active_tokens
     from agent_connections c
     where c.user_id = ${userId}
@@ -390,11 +474,14 @@ export async function listAgentConnections(userId: number): Promise<AgentConnect
 }
 
 export async function getAgentConnection(userId: number, id: number): Promise<AgentConnectionRow | null> {
+  const now = nowIso();
   const row = await q1(sql`
     select c.*,
-           (select count(*) from agent_connection_tokens t where t.connection_id = c.id) as tokens_count,
+           (select count(*) from agent_connection_tokens t where t.connection_id = c.id and t.revoked_at is null) as tokens_count,
            (select count(*) from agent_connection_tokens t
               where t.connection_id = c.id
+                and t.revoked_at is null
+                and (t.expires_at is null or t.expires_at > ${now})
                 and (t.last_used_at is null or t.last_used_at > ${dayAgoIso()})) as active_tokens
     from agent_connections c
     where c.id = ${id} and c.user_id = ${userId} limit 1`);
@@ -459,9 +546,9 @@ export async function deleteAgentConnection(userId: number, id: number): Promise
 
 export async function listAgentTokens(userId: number, connectionId: number): Promise<AgentTokenRow[]> {
   const rows = await q(sql`
-    select id, connection_id, name, token, created_at, last_used_at
+    select id, connection_id, name, token, token_hint, expires_at, created_at, last_used_at
     from agent_connection_tokens
-    where user_id = ${userId} and connection_id = ${connectionId}
+    where user_id = ${userId} and connection_id = ${connectionId} and revoked_at is null
     order by id desc`);
   return rows.map(mapAgentToken);
 }
@@ -469,7 +556,7 @@ export async function listAgentTokens(userId: number, connectionId: number): Pro
 export async function countAgentTokens(userId: number, connectionId: number): Promise<number> {
   const row = await q1<{ count: number }>(sql`
     select count(*) as count from agent_connection_tokens
-    where user_id = ${userId} and connection_id = ${connectionId}`);
+    where user_id = ${userId} and connection_id = ${connectionId} and revoked_at is null`);
   return toNum(row?.count);
 }
 
@@ -481,10 +568,13 @@ export async function createAgentConnectionToken(
   const connection = await getAgentConnection(userId, connectionId);
   if (!connection) return null;
   const token = `crmop_${randomBytes(24).toString("hex")}`;
+  const tokenHash = hashOpaqueToken(token);
+  const hint = maskToken(token);
   const now = nowIso();
+  const expiresAt = defaultTokenExpiryIso();
   const inserted = await q1<{ id: number }>(sql`
-    insert into agent_connection_tokens (connection_id, user_id, name, token, created_at)
-    values (${connectionId}, ${userId}, ${name}, ${token}, ${now}) returning id`);
+    insert into agent_connection_tokens (connection_id, user_id, name, token, token_hash, token_hint, expires_at, created_at)
+    values (${connectionId}, ${userId}, ${name}, ${tokenHash}, ${tokenHash}, ${hint}, ${expiresAt}, ${now}) returning id`);
   const id = toNum(inserted?.id);
   return {
     token,
@@ -492,25 +582,74 @@ export async function createAgentConnectionToken(
       id,
       connectionId,
       name,
-      hint: maskToken(token),
+      hint,
       createdAt: now,
       lastUsedAt: null,
+      expiresAt,
+      isExpired: false,
+      expiringSoon: false,
     },
   };
 }
 
-export async function revealAgentToken(userId: number, tokenId: number): Promise<string | null> {
-  const row = await q1<{ token: string }>(
-    sql`select token from agent_connection_tokens where id = ${tokenId} and user_id = ${userId} limit 1`,
-  );
-  return row ? String(row.token) : null;
+/**
+ * Перевыпускает токен (ротация): старый хеш немедленно заменяется новым и больше не работает,
+ * новый токен возвращается единоразово.
+ */
+export async function reissueAgentConnectionToken(
+  userId: number,
+  tokenId: number,
+): Promise<{ token: string; item: AgentTokenRow } | null> {
+  const row = await q1(sql`
+    select id, connection_id, name, token_hash, token
+    from agent_connection_tokens
+    where id = ${tokenId} and user_id = ${userId} and revoked_at is null
+    limit 1`);
+  if (!row) return null;
+
+  const oldHash = String(row.token_hash || row.token || "");
+  if (oldHash) tokenTouchMap().delete(oldHash);
+
+  const token = `crmop_${randomBytes(24).toString("hex")}`;
+  const tokenHash = hashOpaqueToken(token);
+  const hint = maskToken(token);
+  const now = nowIso();
+  const expiresAt = defaultTokenExpiryIso();
+
+  await q(sql`
+    update agent_connection_tokens
+    set token = ${tokenHash},
+        token_hash = ${tokenHash},
+        token_hint = ${hint},
+        created_at = ${now},
+        last_used_at = ${null},
+        expires_at = ${expiresAt},
+        revoked_at = ${null}
+    where id = ${tokenId} and user_id = ${userId}`);
+
+  return {
+    token,
+    item: {
+      id: toNum(row.id),
+      connectionId: toNum(row.connection_id),
+      name: String(row.name ?? ""),
+      hint,
+      createdAt: now,
+      lastUsedAt: null,
+      expiresAt,
+      isExpired: false,
+      expiringSoon: false,
+    },
+  };
 }
 
 export async function deleteAgentConnectionToken(userId: number, tokenId: number): Promise<boolean> {
-  const row = await q1<{ id: number }>(
-    sql`select id from agent_connection_tokens where id = ${tokenId} and user_id = ${userId} limit 1`,
+  const row = await q1<{ id: number; token_hash: string; token: string }>(
+    sql`select id, token_hash, token from agent_connection_tokens where id = ${tokenId} and user_id = ${userId} limit 1`,
   );
   if (!row) return false;
+  const oldHash = String(row.token_hash || row.token || "");
+  if (oldHash) tokenTouchMap().delete(oldHash);
   await q(sql`delete from agent_connection_tokens where id = ${tokenId} and user_id = ${userId}`);
   return true;
 }
@@ -558,6 +697,7 @@ export async function createAgentTask(
 }
 
 export async function listAgentTasks(userId: number, limit = 100): Promise<AgentTaskRow[]> {
+  await maybeReapStaleAgentTasks();
   const rows = await q(sql`
     select id, user_id, prompt, status, max_steps, steps, summary, trust_level, task_mode, source, coach_mode, guidance_note, pending_approval, approval_response, created_at, updated_at
     from agent_tasks where user_id = ${userId} order by id desc limit ${Math.max(1, Math.floor(limit))}`);
@@ -624,17 +764,62 @@ export async function getAgentTaskForBot(id: number, userId: number): Promise<Ag
   return getAgentTask(userId, id);
 }
 
+function defaultStaleTimeoutMs(): number {
+  const mins = Number(process.env.AGENT_TASK_STALE_MINUTES ?? 15);
+  const safeMins = Number.isFinite(mins) && mins >= 1 ? mins : 15;
+  return safeMins * 60_000;
+}
+
+/**
+ * Переводит зависшие задачи (`running`, `waiting_approval`, `waiting_steps`),
+ * не обновлявшиеся дольше `maxIdleMs`, в статус `failed` с записью в лог.
+ */
+export async function reapStaleAgentTasks(maxIdleMs = defaultStaleTimeoutMs()): Promise<number> {
+  const cutoff = new Date(Date.now() - Math.max(1000, maxIdleMs)).toISOString();
+  const now = nowIso();
+  const staleMsg = "Задача остановлена по таймауту (нет отклика от бота)";
+  const reaped = await q<{ id: number }>(sql`
+    update agent_tasks
+    set status = 'failed',
+        pending_approval = '',
+        summary = case when summary = '' then ${staleMsg} else summary end,
+        updated_at = ${now}
+    where status in ('running', 'waiting_approval', 'waiting_steps')
+      and updated_at < ${cutoff}
+    returning id`);
+  for (const row of reaped) {
+    await addAgentEvent({ taskId: toNum(row.id), kind: "error", text: staleMsg }).catch(() => undefined);
+  }
+  return reaped.length;
+}
+
+export async function maybeReapStaleAgentTasks(): Promise<void> {
+  const nowMs = Date.now();
+  const prev = globalForAgentPerf.__crmLastStaleReapMs ?? 0;
+  if (nowMs - prev < STALE_REAP_THROTTLE_MS) return;
+  globalForAgentPerf.__crmLastStaleReapMs = nowMs;
+  await reapStaleAgentTasks().catch(() => undefined);
+}
+
+/**
+ * Атомарный захват следующей задачи из очереди (без гонки между двумя ботами).
+ */
 export async function claimAgentTask(userId: number): Promise<AgentTaskRow | null> {
-  const row = await q1<{ id: number }>(sql`
-    select id from agent_tasks where user_id = ${userId} and status = 'queued' order by id asc limit 1`);
-  if (!row) return null;
-  const id = toNum(row.id);
+  await maybeReapStaleAgentTasks();
   const now = nowIso();
   const taken = await q1<{ id: number }>(sql`
-    update agent_tasks set status = 'running', updated_at = ${now}
-    where id = ${id} and status = 'queued' returning id`);
+    update agent_tasks
+    set status = 'running', updated_at = ${now}
+    where id = (
+      select id from agent_tasks
+      where user_id = ${userId} and status = 'queued'
+      order by id asc limit 1
+    )
+      and user_id = ${userId}
+      and status = 'queued'
+    returning id`);
   if (!taken) return null;
-  return getAgentTask(userId, id);
+  return getAgentTask(userId, toNum(taken.id));
 }
 
 export async function setAgentTaskStatus(
@@ -643,11 +828,12 @@ export async function setAgentTaskStatus(
   status: string,
   summary?: string,
 ): Promise<void> {
+  const parsedStatus = agentTaskStatusSchema.parse(status);
   const now = nowIso();
-  const clearPending = ["done", "failed", "cancelled"].includes(status);
+  const clearPending = ["done", "failed", "cancelled"].includes(parsedStatus);
   if (summary === undefined) {
     await q(sql`update agent_tasks
-      set status = ${status},
+      set status = ${parsedStatus},
           pending_approval = case when ${clearPending} then '' else pending_approval end,
           updated_at = ${now}
       where id = ${id} and user_id = ${userId}`);
@@ -655,7 +841,7 @@ export async function setAgentTaskStatus(
   }
   await q(sql`
     update agent_tasks
-    set status = ${status},
+    set status = ${parsedStatus},
         summary = ${summary},
         pending_approval = case when ${clearPending} then '' else pending_approval end,
         updated_at = ${now}
@@ -1444,7 +1630,7 @@ export async function listUsersAgentUsage(month = aiMonthKey()): Promise<UserAge
       coalesce((select sum(e.total_tokens) from agent_usage_events e where e.user_id = u.id and e.kind = 'agent'), 0) as all_agent,
       coalesce((select sum(e.total_tokens) from agent_usage_events e where e.user_id = u.id and e.kind = 'operator'), 0) as all_operator
     from users u
-    where u.is_bot = false
+    where u.is_bot = false and u.deleted_at is null
     order by u.name asc`);
   return rows.map((r) => {
     const monthAgent = toNum(r.month_agent);

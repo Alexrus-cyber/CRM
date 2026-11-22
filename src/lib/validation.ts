@@ -1,10 +1,98 @@
 import { z } from "zod";
 import { ALL_ROLES } from "./permissions";
 import { PRIORITY_ORDER, STATUS_ORDER } from "./utils";
+import { isBlockedCloudOrSpecialIp } from "./ssrf";
 
 /**
  * Централизованные Zod-схемы и помощники валидации входных данных.
  */
+
+export const MIN_PASSWORD_LENGTH = 10;
+export const MAX_PASSWORD_LENGTH = 256;
+
+const WEAK_PASSWORDS = new Set([
+  "1234567890",
+  "12345678901",
+  "0987654321",
+  "password123",
+  "password1234",
+  "qwerty1234",
+  "qwerty12345",
+  "admin12345",
+  "admin123456",
+  "crm1234567",
+  "letmein1234",
+  "welcome123",
+]);
+
+export function validateStrongPassword(password: string): { ok: true } | { ok: false; error: string } {
+  if (typeof password !== "string" || password.length < MIN_PASSWORD_LENGTH) {
+    return { ok: false, error: `Пароль должен содержать минимум ${MIN_PASSWORD_LENGTH} символов` };
+  }
+  if (password.length > MAX_PASSWORD_LENGTH) {
+    return { ok: false, error: `Пароль не должен превышать ${MAX_PASSWORD_LENGTH} символов` };
+  }
+  const lower = password.trim().toLowerCase();
+  if (WEAK_PASSWORDS.has(lower) || /^(.)\1+$/.test(lower)) {
+    return { ok: false, error: "Пароль слишком простой — выберите более надёжную комбинацию" };
+  }
+  const hasLetter = /[A-Za-zА-Яа-яЁё]/.test(password);
+  const hasDigitOrSymbol = /[\d\W_]/.test(password);
+  if (!hasLetter || !hasDigitOrSymbol) {
+    return { ok: false, error: "Пароль должен содержать буквы и хотя бы одну цифру или спецсимвол" };
+  }
+  return { ok: true };
+}
+
+export const strongPasswordSchema = z
+  .string()
+  .min(MIN_PASSWORD_LENGTH, `Пароль минимум ${MIN_PASSWORD_LENGTH} символов`)
+  .max(MAX_PASSWORD_LENGTH, `Пароль максимум ${MAX_PASSWORD_LENGTH} символов`)
+  .superRefine((val, ctx) => {
+    const check = validateStrongPassword(val);
+    if (!check.ok) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: check.error });
+    }
+  });
+
+export function isSafeHttpUrlSyntax(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return true;
+  let u: URL;
+  try {
+    u = new URL(trimmed);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+  if (u.username || u.password) return false;
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host || host === "metadata.google.internal" || host === "metadata.goog" || host === "169.254.169.254") {
+    return false;
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) && isBlockedCloudOrSpecialIp(host)) {
+    return false;
+  }
+  return true;
+}
+
+export const safeBaseUrlSchema = z
+  .string()
+  .trim()
+  .max(400)
+  .refine(isSafeHttpUrlSyntax, "Некорректный или запрещённый URL модели");
+
+export const AGENT_TASK_STATUSES = [
+  "queued",
+  "running",
+  "waiting_approval",
+  "waiting_steps",
+  "done",
+  "failed",
+  "cancelled",
+] as const;
+
+export const agentTaskStatusSchema = z.enum(AGENT_TASK_STATUSES);
 
 export function parseJsonBody<T>(
   raw: unknown,
@@ -33,14 +121,66 @@ export async function readValidatedJson<T>(
   return { ok: true, data: parsed.data };
 }
 
+/**
+ * Потоковое чтение JSON-тела со строгим лимитом байт ДО вызова `JSON.parse`.
+ * Защищает Node.js от OOM при огромном теле запроса (P0-7).
+ */
+export async function readJsonWithByteLimit<T = unknown>(
+  req: Request,
+  maxBytes: number,
+): Promise<{ ok: true; data: T } | { ok: false; response: Response }> {
+  const contentLen = Number(req.headers.get("content-length") ?? 0);
+  if (Number.isFinite(contentLen) && contentLen > maxBytes) {
+    return {
+      ok: false,
+      response: Response.json({ error: "Размер запроса превышает допустимый лимит" }, { status: 413 }),
+    };
+  }
+  if (!req.body) {
+    return { ok: false, response: Response.json({ error: "Пустой запрос" }, { status: 400 }) };
+  }
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        return {
+          ok: false,
+          response: Response.json({ error: "Размер запроса превышает допустимый лимит" }, { status: 413 }),
+        };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { ok: false, response: Response.json({ error: "Ошибка чтения тела запроса" }, { status: 400 }) };
+  }
+
+  try {
+    const text = Buffer.concat(chunks, total).toString("utf8");
+    const parsed = JSON.parse(text) as T;
+    return { ok: true, data: parsed };
+  } catch {
+    return { ok: false, response: Response.json({ error: "Некорректный JSON" }, { status: 400 }) };
+  }
+}
+
 export const loginInputSchema = z.object({
   email: z.string().trim().min(1, "Введите email и пароль").email("Некорректный email"),
-  password: z.string().min(1, "Введите email и пароль"),
+  password: z.string().min(1, "Введите email и пароль").max(MAX_PASSWORD_LENGTH),
+  totpCode: z.string().trim().max(12).optional(),
 });
 
 export const launcherLoginSchema = z.object({
   email: z.string({ error: "Введите email и пароль" }).trim().min(1, "Введите email и пароль"),
-  password: z.string({ error: "Введите email и пароль" }).min(1, "Введите email и пароль"),
+  password: z.string({ error: "Введите email и пароль" }).min(1, "Введите email и пароль").max(MAX_PASSWORD_LENGTH),
+  totpCode: z.string().trim().max(12).optional(),
   serverUrl: z.string().optional(),
 });
 
@@ -51,7 +191,7 @@ export const taskPrioritySchema = z.enum(PRIORITY_ORDER as [typeof PRIORITY_ORDE
 export const createUserSchema = z.object({
   name: z.string().trim().min(1, "Имя и email обязательны").max(120),
   email: z.string().trim().toLowerCase().email("Некорректный email").max(160),
-  password: z.string().min(6, "Пароль минимум 6 символов").max(200),
+  password: strongPasswordSchema,
   role: roleSchema.default("user"),
   position: z.string().optional(),
   phone: z.string().optional(),
@@ -82,7 +222,7 @@ export const counterpartyInputSchema = z.object({
 });
 
 export const aiSettingsUpdateSchema = z.object({
-  baseUrl: z.string().trim().max(400).optional(),
+  baseUrl: safeBaseUrlSchema.optional(),
   apiKey: z.string().max(400).optional(),
   clearApiKey: z.boolean().optional(),
   model: z.string().trim().max(200).optional(),
@@ -94,7 +234,7 @@ export const chatBotCreateSchema = z.object({
   bio: z.string().max(500).optional(),
   avatarColor: z.string().optional(),
   provider: z.string().max(40).optional(),
-  baseUrl: z.string().max(400).optional(),
+  baseUrl: safeBaseUrlSchema.optional(),
   apiKey: z.string().max(400).optional(),
   model: z.string().max(160).optional(),
   systemPrompt: z.string().max(4000).optional(),
@@ -109,7 +249,7 @@ export const chatBotPatchSchema = z.object({
   bio: z.string().max(500).nullable().optional(),
   avatarColor: z.string().optional(),
   provider: z.string().max(40).optional(),
-  baseUrl: z.string().max(400).optional(),
+  baseUrl: safeBaseUrlSchema.optional(),
   apiKey: z.string().max(400).optional(),
   clearApiKey: z.boolean().optional(),
   model: z.string().max(160).optional(),

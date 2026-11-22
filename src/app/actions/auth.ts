@@ -6,8 +6,8 @@ import { findUserAuthByEmail } from "@/db/repo";
 import {
   createSession,
   destroySession,
-  ensureSuperAdmin,
-  verifyPassword,
+  verifyPasswordAsync,
+  verifyUserTotp,
 } from "@/lib/auth";
 import {
   checkLoginRateLimit,
@@ -17,16 +17,23 @@ import {
 } from "@/lib/rateLimit";
 import { loginInputSchema, parseJsonBody } from "@/lib/validation";
 
-export type LoginState = { error?: string } | undefined;
+export type LoginState =
+  | { error?: string; requiresTotp?: boolean; email?: string }
+  | undefined;
 
 export async function loginAction(
   _prev: LoginState,
   formData: FormData,
 ): Promise<LoginState> {
+  const rawEmail = String(formData.get("email") ?? "").trim().toLowerCase();
+  const rawPassword = String(formData.get("password") ?? "");
+  const rawTotp = String(formData.get("totpCode") ?? "").trim();
+
   const parsed = parseJsonBody(
     {
-      email: String(formData.get("email") ?? "").trim().toLowerCase(),
-      password: String(formData.get("password") ?? ""),
+      email: rawEmail,
+      password: rawPassword,
+      totpCode: rawTotp || undefined,
     },
     loginInputSchema,
     "Введите email и пароль",
@@ -46,11 +53,30 @@ export async function loginAction(
     };
   }
 
-  await ensureSuperAdmin();
   const user = await findUserAuthByEmail(parsed.data.email);
-  if (!user || !verifyPassword(parsed.data.password, user.passwordHash)) {
+  if (!user || !(await verifyPasswordAsync(parsed.data.password, user.passwordHash))) {
     recordLoginFailure(ip, parsed.data.email);
     return { error: "Неверный email или пароль" };
+  }
+
+  if (user.totpEnabled) {
+    const code = parsed.data.totpCode ?? "";
+    if (!code) {
+      return {
+        requiresTotp: true,
+        email: parsed.data.email,
+        error: "Введите 6-значный код из приложения-аутентификатора (2FA)",
+      };
+    }
+    const validTotp = await verifyUserTotp(user.id, code);
+    if (!validTotp) {
+      recordLoginFailure(ip, parsed.data.email);
+      return {
+        requiresTotp: true,
+        email: parsed.data.email,
+        error: "Неверный код 2FA",
+      };
+    }
   }
 
   clearLoginFailures(ip, parsed.data.email);
@@ -59,6 +85,10 @@ export async function loginAction(
     userAgent,
     ip,
   });
+
+  if (user.mustChangePassword) {
+    redirect("/profile?forcePasswordChange=1");
+  }
   redirect("/dashboard");
 }
 

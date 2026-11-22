@@ -54,6 +54,15 @@ class SandboxSecurityTests(unittest.TestCase):
                 with self.assertRaises(sandbox_mod.SandboxError):
                     sandbox_mod.export_path(root, "app/index.html", bad_dest)
 
+            # Симлинк внутри экспортируемой/архивируемой директории наружу должен блокироваться
+            outside_secret = Path(tmp) / "host_secret.txt"
+            outside_secret.write_text("SECRET_HOST", encoding="utf-8")
+            os.symlink(str(outside_secret), str(root / "app" / "leak.txt"))
+            with self.assertRaises(sandbox_mod.SandboxError):
+                sandbox_mod.export_path(root, "app", str(Path(tmp) / "export_out"))
+            with self.assertRaises(sandbox_mod.SandboxError):
+                sandbox_mod.zip_path(root, "app")
+
     def test_sanitized_env_strips_secrets_and_executes_safe_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
@@ -90,6 +99,51 @@ class AgentCorsAndFileforgeTests(unittest.TestCase):
         self.assertIn("spreadsheetml", xlsx_mime)
         self.assertTrue(xlsx_name.endswith(".xlsx"))
         self.assertTrue(xlsx_bytes.startswith(b"PK"))
+
+    def test_approval_nonce_and_ssrf_guard(self) -> None:
+        import threading
+
+        for bad_url in (
+            "http://169.254.169.254/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1",
+            "http://user:pass@127.0.0.1:8888/v1",
+            "file:///etc/passwd",
+        ):
+            with self.assertRaises(agent_mod.AgentError):
+                agent_mod.assert_safe_ai_url(bad_url)
+        self.assertEqual(agent_mod.assert_safe_ai_url("http://127.0.0.1:8888/v1"), "http://127.0.0.1:8888/v1")
+
+        ev = threading.Event()
+        with agent_mod.APPROVAL_LOCK:
+            agent_mod.PENDING_APPROVALS["appr-sec-1"] = {
+                "event": ev,
+                "nonce": "secret-nonce-123",
+                "owner_user_id": 42,
+                "approved": False,
+                "note": "",
+                "destination": "",
+            }
+        try:
+            code_bad, _ = agent_mod.verify_and_resolve_approval(
+                "appr-sec-1", True, nonce="wrong", require_nonce=True, approver_user_id=42
+            )
+            self.assertEqual(code_bad, 403)
+            self.assertFalse(ev.is_set())
+
+            code_owner, _ = agent_mod.verify_and_resolve_approval(
+                "appr-sec-1", True, nonce="secret-nonce-123", require_nonce=True, approver_user_id=99
+            )
+            self.assertEqual(code_owner, 403)
+            self.assertFalse(ev.is_set())
+
+            code_ok, _ = agent_mod.verify_and_resolve_approval(
+                "appr-sec-1", True, nonce="secret-nonce-123", require_nonce=True, approver_user_id=42
+            )
+            self.assertEqual(code_ok, 200)
+            self.assertTrue(ev.is_set())
+        finally:
+            with agent_mod.APPROVAL_LOCK:
+                agent_mod.PENDING_APPROVALS.pop("appr-sec-1", None)
 
 
 if __name__ == "__main__":

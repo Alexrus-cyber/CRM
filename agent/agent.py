@@ -25,10 +25,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hmac
+import ipaddress
 import json
 import mimetypes
 import os
 import re
+import secrets
+import socket
 import sys
 import threading
 import time
@@ -57,6 +61,35 @@ PORT = int(os.environ.get("AGENT_PORT", "8899"))
 BASE_URL = os.environ.get("AGENT_BASE_URL", "http://127.0.0.1:8888/v1").rstrip("/")
 MODEL = os.environ.get("AGENT_MODEL", "")
 API_KEY = os.environ.get("AGENT_API_KEY", "")
+_LAUNCHER_SECRETS: Dict[str, str] = {}
+
+
+def _load_secrets_file() -> None:
+    global API_KEY
+    secrets_path = os.environ.pop("CRM_SECRETS_FILE", "").strip()
+    if not secrets_path:
+        return
+    try:
+        raw = Path(secrets_path).read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    _LAUNCHER_SECRETS[k] = v
+            if not API_KEY and _LAUNCHER_SECRETS.get("AGENT_API_KEY"):
+                API_KEY = _LAUNCHER_SECRETS["AGENT_API_KEY"]
+    except OSError:
+        pass
+    except ValueError:
+        pass
+    finally:
+        try:
+            Path(secrets_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+_load_secrets_file()
 MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "500"))
 MAX_STEPS_LIMIT = 500
 TIMEOUT = int(os.environ.get("AGENT_TIMEOUT", "180"))
@@ -68,6 +101,7 @@ SANDBOX_ROOT = sandbox_mod.get_sandbox_root()
 PROCESS_MANAGER = sandbox_mod.ProcessManager()
 
 MAX_FILE_BYTES = 400_000
+MAX_HTTP_BODY_BYTES = 48 * 1024 * 1024
 MAX_NAME = 120
 MAX_ATTACHMENT_CHARS = 120_000
 MAX_ATTACHMENTS = 8
@@ -75,6 +109,89 @@ MAX_RAG_CHARS = 2_000_000
 
 PENDING_APPROVALS: Dict[str, Dict[str, Any]] = {}
 APPROVAL_LOCK = threading.Lock()
+_ORIG_URLOPEN = urllib.request.urlopen
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        raise urllib.error.HTTPError(
+            newurl,
+            code,
+            "HTTP-редиректы на сервере модели запрещены политикой безопасности",
+            headers,
+            fp,
+        )
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _is_blocked_metadata_ip(ip_str: str) -> bool:
+    clean = str(ip_str or "").strip().split("%")[0]
+    try:
+        ip_obj = ipaddress.ip_address(clean)
+    except ValueError:
+        return True
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        ip_obj = ip_obj.ipv4_mapped
+    if isinstance(ip_obj, ipaddress.IPv4Address):
+        return (
+            ip_obj in ipaddress.ip_network("0.0.0.0/8")
+            or ip_obj in ipaddress.ip_network("169.254.0.0/16")
+            or ip_obj in ipaddress.ip_network("224.0.0.0/4")
+            or ip_obj in ipaddress.ip_network("240.0.0.0/4")
+        )
+    return (
+        ip_obj == ipaddress.ip_address("::")
+        or ip_obj in ipaddress.ip_network("fe80::/10")
+        or ip_obj in ipaddress.ip_network("ff00::/8")
+        or ip_obj == ipaddress.ip_address("fd00:ec2::254")
+    )
+
+
+def assert_safe_ai_url(raw_url: str) -> str:
+    url = str(raw_url or "").strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise AgentError("Нужен адрес http:// или https://")
+    if parsed.username or parsed.password:
+        raise AgentError("Учётные данные в URL запрещены")
+    host = (parsed.hostname or "").strip().lower().strip("[]")
+    if not host or host in (
+        "169.254.169.254",
+        "metadata.google.internal",
+        "metadata.goog",
+        "metadata.azure.internal",
+        "metadata.aws.internal",
+        "instance-data",
+    ) or host.endswith(".metadata.google.internal"):
+        raise AgentError("Запрещён доступ к служебным metadata-адресам")
+    try:
+        ipaddress.ip_address(host.split("%")[0])
+        is_literal_ip = True
+    except ValueError:
+        is_literal_ip = False
+    if is_literal_ip:
+        if _is_blocked_metadata_ip(host):
+            raise AgentError("Запрещён доступ к link-local и metadata-адресам")
+        return url
+    if host == "localhost" or host.endswith(".localhost"):
+        return url
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        for info in infos:
+            addr = str(info[4][0])
+            if _is_blocked_metadata_ip(addr):
+                raise AgentError("Домен указывает на запрещённый link-local или metadata-адрес")
+    except socket.gaierror:
+        pass
+    return url
+
+
+def _safe_model_urlopen(request: urllib.request.Request, timeout: int = TIMEOUT) -> Any:
+    if urllib.request.urlopen is _ORIG_URLOPEN:
+        return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout)
 
 SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CRM). Общайся по-русски, кратко и по делу.
 
@@ -596,6 +713,11 @@ def http_url(raw: str) -> str:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise AgentError("Нужен обычный адрес http:// или https://")
+    if parsed.username or parsed.password:
+        raise AgentError("Учётные данные в URL запрещены")
+    host = (parsed.hostname or "").strip().lower().strip("[]")
+    if host in ("169.254.169.254", "metadata.google.internal", "metadata.goog") or host.startswith("169.254."):
+        raise AgentError("Запрещённый адрес")
     return url
 
 
@@ -1356,6 +1478,7 @@ def call_model(
         raise AgentError("Не указана модель: выберите её в интерфейсе или задайте AGENT_MODEL")
 
     def _consume_stream(body_payload: Dict[str, Any]) -> Dict[str, Any]:
+        assert_safe_ai_url(base_url)
         headers = {"Content-Type": "application/json"}
         if body_payload.get("stream"):
             headers["Accept"] = "text/event-stream"
@@ -1368,7 +1491,7 @@ def call_model(
         if api_key:
             request.add_header("Authorization", f"Bearer {api_key}")
         try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            with _safe_model_urlopen(request, timeout=TIMEOUT) as response:
                 if not body_payload.get("stream"):
                     raw = response.read().decode("utf-8", "replace")
                     try:
@@ -1598,6 +1721,43 @@ def sse(data: Dict[str, Any], event: str = "message") -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+def verify_and_resolve_approval(
+    approval_id: str,
+    approved: bool,
+    note: str = "",
+    destination: str = "",
+    extra: Optional[Dict[str, Any]] = None,
+    *,
+    nonce: Optional[str] = None,
+    require_nonce: bool = False,
+    approver_user_id: Optional[Any] = None,
+) -> Tuple[int, str]:
+    with APPROVAL_LOCK:
+        entry = PENDING_APPROVALS.get(approval_id)
+        if not entry:
+            return 404, "Запрос подтверждения не найден или уже закрыт"
+        expected_nonce = str(entry.get("nonce") or "")
+        if expected_nonce:
+            if not hmac.compare_digest(str(nonce or ""), expected_nonce):
+                return 403, "Неверный или просроченный одноразовый ключ подтверждения (nonce)"
+        elif require_nonce:
+            return 403, "Отсутствует одноразовый ключ подтверждения (nonce)"
+        expected_owner = entry.get("owner_user_id")
+        if expected_owner is not None and approver_user_id is not None:
+            try:
+                if int(approver_user_id) != int(expected_owner):
+                    return 403, "Подтвердить операцию может только инициатор запуска агента"
+            except (TypeError, ValueError):
+                return 403, "Некорректный идентификатор пользователя"
+        entry["approved"] = bool(approved)
+        entry["note"] = note
+        entry["destination"] = destination
+        if isinstance(extra, dict):
+            entry["extra"] = extra
+        entry["event"].set()
+        return 200, ""
+
+
 def resolve_approval(
     approval_id: str,
     approved: bool,
@@ -1605,17 +1765,15 @@ def resolve_approval(
     destination: str = "",
     extra: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    with APPROVAL_LOCK:
-        entry = PENDING_APPROVALS.get(approval_id)
-        if not entry:
-            return False
-        entry["approved"] = bool(approved)
-        entry["note"] = note
-        entry["destination"] = destination
-        if isinstance(extra, dict):
-            entry["extra"] = extra
-        entry["event"].set()
-        return True
+    code, _ = verify_and_resolve_approval(
+        approval_id,
+        approved,
+        note,
+        destination,
+        extra=extra,
+        require_nonce=False,
+    )
+    return code == 200
 
 
 def parse_coach_response(raw_text: str) -> Dict[str, str]:
@@ -1896,7 +2054,10 @@ class Handler(BaseHTTPRequestHandler):
     def _read_json(self) -> Optional[Dict[str, Any]]:
         try:
             length = int(self.headers.get("Content-Length") or 0)
-            data = json.loads(self.rfile.read(length) or b"{}")
+            if length < 0 or length > MAX_HTTP_BODY_BYTES:
+                return None
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            data = json.loads(raw or b"{}")
             return data if isinstance(data, dict) else None
         except (ValueError, json.JSONDecodeError):
             return None
@@ -1997,15 +2158,18 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 if key in body and body[key] is not None:
                     extra[key] = body[key]
-            ok = resolve_approval(
+            code, err_msg = verify_and_resolve_approval(
                 approval_id,
                 bool(body.get("approved")),
                 str(body.get("note") or ""),
                 str(body.get("destination") or ""),
                 extra=extra,
+                nonce=str(body.get("nonce") or ""),
+                require_nonce=True,
+                approver_user_id=body.get("approverUserId"),
             )
-            if not ok:
-                self._json(404, {"error": "Запрос подтверждения не найден или уже закрыт"})
+            if code != 200:
+                self._json(code, {"error": err_msg})
                 return
             self._json(200, {"ok": True})
             return
@@ -2126,9 +2290,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def await_website_approval(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         approval_id = str(payload.get("approvalId") or uuid.uuid4().hex)
+        nonce = secrets.token_urlsafe(24)
         event = threading.Event()
         entry: Dict[str, Any] = {
             "event": event,
+            "nonce": nonce,
+            "owner_user_id": getattr(self, "_owner_user_id", None),
             "approved": False,
             "note": "",
             "destination": str(payload.get("destination") or ""),
@@ -2137,7 +2304,7 @@ class Handler(BaseHTTPRequestHandler):
             PENDING_APPROVALS[approval_id] = entry
 
         try:
-            self.write(sse({"approvalId": approval_id, **payload}, "approval_required"))
+            self.write(sse({"approvalId": approval_id, "nonce": nonce, **payload}, "approval_required"))
             self.write(sse({"text": "Жду подтверждения на сайте…"}, "status"))
             deadline = threading.Event()
             elapsed = 0
@@ -2160,11 +2327,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def run_agent(self, body: Dict[str, Any]) -> None:
         settings = body.get("settings") or {}
-        base_url = str(settings.get("baseUrl") or BASE_URL)
+        base_url = assert_safe_ai_url(str(settings.get("baseUrl") or BASE_URL))
         api_key = str(settings.get("apiKey") or API_KEY)
         model = str(settings.get("model") or MODEL)
         context = body.get("context") or {}
         params = body.get("params") or {}
+        self._owner_user_id = body.get("ownerUserId")
         trust_level = normalize_trust(body.get("trustLevel"))
         unlimited_role = bool(body.get("unlimited"))
         steps_limit = resolve_steps_limit(body.get("maxSteps"), unlimited_role)
@@ -2537,7 +2705,7 @@ def _report_launcher_usage(
 ) -> None:
     """Если агент запущен через лаунчер с сессией CRM, отправляет учёт токенов."""
     server_url = os.environ.get("CRM_SERVER_URL", "").strip().rstrip("/")
-    session_token = os.environ.get("CRM_LAUNCHER_SESSION_TOKEN", "").strip()
+    session_token = (_LAUNCHER_SECRETS.get("CRM_LAUNCHER_SESSION_TOKEN") or os.environ.get("CRM_LAUNCHER_SESSION_TOKEN", "")).strip()
     if not server_url or not session_token:
         return
     if total_tokens <= 0 and prompt_tokens <= 0 and completion_tokens <= 0:

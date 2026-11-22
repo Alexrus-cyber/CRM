@@ -1,9 +1,10 @@
-import { AGENT_URL } from "@/lib/agentConfig";
+import { resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { getAgentTask, getAiUserSettingsSecret, listAgentEvents, recordAgentUsage, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
 import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { requestAgentStepCoaching } from "@/lib/agentCoach";
 import type { GenParams } from "@/lib/genParams";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 
 /**
  * Совет Агента после выполненного шага Оператора (вызывается из интерфейса
@@ -19,6 +20,22 @@ export async function POST(req: Request) {
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
   if (!hasAgentAccess(me) && !hasOperatorAccess(me)) {
     return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
+  }
+
+  const rl = checkApiRateLimit({
+    scope: "ai_agent_coach",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 40,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
+
+  let safeAgentUrl: string;
+  try {
+    safeAgentUrl = resolveSafeAgentUrl();
+  } catch (err) {
+    return Response.json({ error: (err as Error).message }, { status: 400 });
   }
 
   const body = (await req.json().catch(() => null)) as
@@ -69,7 +86,7 @@ export async function POST(req: Request) {
   };
 
   const advice = await requestAgentStepCoaching({
-    agentUrl: AGENT_URL,
+    agentUrl: safeAgentUrl,
     taskPrompt: task.prompt,
     taskMode: task.taskMode,
     step: task.steps,

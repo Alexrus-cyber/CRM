@@ -6,10 +6,13 @@ import {
   recordAgentUsage,
   searchRagChunks,
 } from "@/db/repo";
-import { AGENT_START_HINT, AGENT_URL } from "@/lib/agentConfig";
+import { AGENT_START_HINT, resolveSafeAgentUrl } from "@/lib/agentConfig";
+import { registerAgentApproval } from "@/lib/agentApprovals";
 import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { estimateTokens, normalizeBaseUrl } from "@/lib/ai";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
+import { assertSafeAiUrl } from "@/lib/ssrf";
 import { AGENT_MAX_STEPS, isUnlimitedStepsRole, normalizeGenParams, resolveStepsForRole } from "@/lib/genParams";
 import { buildGithubRagSnapshot } from "@/lib/github";
 import {
@@ -40,21 +43,28 @@ export async function GET() {
     return Response.json({ error: "Доступ к Агенту не выдан главным администратором" }, { status: 403 });
   }
 
+  let agentUrl: string;
   try {
-    const res = await fetch(`${AGENT_URL}/health`, {
+    agentUrl = resolveSafeAgentUrl();
+  } catch (err) {
+    return Response.json({ available: false, error: (err as Error).message, hint: AGENT_START_HINT }, { status: 400 });
+  }
+
+  try {
+    const res = await fetch(`${agentUrl}/health`, {
       cache: "no-store",
       signal: AbortSignal.timeout(4000),
     });
     if (!res.ok) {
-      return Response.json({ available: false, endpoint: AGENT_URL, hint: AGENT_START_HINT });
+      return Response.json({ available: false, endpoint: agentUrl, hint: AGENT_START_HINT });
     }
     const data = (await res.json()) as Record<string, unknown>;
     return Response.json(
-      { available: true, endpoint: AGENT_URL, ...data },
+      { available: true, endpoint: agentUrl, ...data },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch {
-    return Response.json({ available: false, endpoint: AGENT_URL, hint: AGENT_START_HINT });
+    return Response.json({ available: false, endpoint: agentUrl, hint: AGENT_START_HINT });
   }
 }
 
@@ -67,6 +77,15 @@ export async function POST(req: Request) {
   if (!hasAgentAccess(me)) {
     return Response.json({ error: "Доступ к Агенту не выдан главным администратором" }, { status: 403 });
   }
+
+  const rl = checkApiRateLimit({
+    scope: "ai_agent",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 30,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
 
   const body = (await req.json().catch(() => null)) as
     | {
@@ -252,10 +271,28 @@ export async function POST(req: Request) {
 
   const savedSettings = await getAiUserSettingsSecret(me.id).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
   const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl || savedSettings.baseUrl || "") ?? undefined;
+  if (baseUrl) {
+    try {
+      await assertSafeAiUrl(baseUrl);
+    } catch (err) {
+      return Response.json(
+        { error: err instanceof Error ? err.message : "Запрещённый адрес модели" },
+        { status: 400 },
+      );
+    }
+  }
+  let agentUrl: string;
+  try {
+    agentUrl = resolveSafeAgentUrl();
+  } catch (err) {
+    return Response.json({ error: (err as Error).message }, { status: 400 });
+  }
+
   const payload = {
     messages,
     attachments,
     params,
+    ownerUserId: me.id,
     ...(systemPrompt ? { systemPrompt } : {}),
     maxSteps,
     unlimited: unlimitedSteps,
@@ -292,7 +329,7 @@ export async function POST(req: Request) {
 
   let upstream: Response;
   try {
-    upstream = await fetch(`${AGENT_URL}/run`, {
+    upstream = await fetch(`${agentUrl}/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -320,6 +357,7 @@ export async function POST(req: Request) {
   const modelName = payload.settings.model || "";
   const upstreamReader = upstream.body.getReader();
   const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
   let sseBuffer = "";
   let textLatest = "";
   let reasoningLatest = "";
@@ -347,34 +385,49 @@ export async function POST(req: Request) {
     }
   };
 
-  const inspectChunk = (chunkText: string) => {
+  const processFrame = (frame: string): string => {
+    const evLine = frame.split("\n").find((l) => l.startsWith("event:"));
+    const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+    if (!dataLine) return `${frame}\n\n`;
+    const ev = evLine ? evLine.slice(6).trim() : "message";
+    try {
+      const parsed = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
+      if (ev === "text" && typeof parsed.text === "string") {
+        textLatest = parsed.text;
+      } else if (ev === "reasoning" && typeof parsed.text === "string") {
+        reasoningLatest = parsed.text;
+      } else if (ev === "approval_required") {
+        const approvalId = typeof parsed.approvalId === "string" ? parsed.approvalId.trim() : "";
+        const nonce = typeof parsed.nonce === "string" ? parsed.nonce.trim() : "";
+        if (approvalId && nonce) {
+          registerAgentApproval(approvalId, me.id, nonce);
+        }
+        delete parsed.nonce;
+        return `event: ${ev}\ndata: ${JSON.stringify(parsed)}\n\n`;
+      } else if (ev === "done" && parsed.usage && typeof parsed.usage === "object") {
+        const u = parsed.usage as Record<string, unknown>;
+        reportedPrompt = Math.max(reportedPrompt, Math.round(Number(u.prompt_tokens ?? u.promptTokens ?? 0) || 0));
+        reportedCompletion = Math.max(
+          reportedCompletion,
+          Math.round(Number(u.completion_tokens ?? u.completionTokens ?? 0) || 0),
+        );
+        reportedTotal = Math.max(reportedTotal, Math.round(Number(u.total_tokens ?? u.totalTokens ?? 0) || 0));
+      }
+    } catch {
+      /* ignore malformed SSE frame */
+    }
+    return `${frame}\n\n`;
+  };
+
+  const transformChunk = (chunkText: string, controller: ReadableStreamDefaultController<Uint8Array>) => {
     sseBuffer += chunkText;
     let sep = sseBuffer.indexOf("\n\n");
     while (sep !== -1) {
       const frame = sseBuffer.slice(0, sep);
       sseBuffer = sseBuffer.slice(sep + 2);
       sep = sseBuffer.indexOf("\n\n");
-      const evLine = frame.split("\n").find((l) => l.startsWith("event:"));
-      const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
-      if (!dataLine) continue;
-      const ev = evLine ? evLine.slice(6).trim() : "message";
-      try {
-        const parsed = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
-        if (ev === "text" && typeof parsed.text === "string") {
-          textLatest = parsed.text;
-        } else if (ev === "reasoning" && typeof parsed.text === "string") {
-          reasoningLatest = parsed.text;
-        } else if (ev === "done" && parsed.usage && typeof parsed.usage === "object") {
-          const u = parsed.usage as Record<string, unknown>;
-          reportedPrompt = Math.max(reportedPrompt, Math.round(Number(u.prompt_tokens ?? u.promptTokens ?? 0) || 0));
-          reportedCompletion = Math.max(
-            reportedCompletion,
-            Math.round(Number(u.completion_tokens ?? u.completionTokens ?? 0) || 0),
-          );
-          reportedTotal = Math.max(reportedTotal, Math.round(Number(u.total_tokens ?? u.totalTokens ?? 0) || 0));
-        }
-      } catch {
-        /* ignore malformed SSE frame */
+      if (frame.trim()) {
+        controller.enqueue(encoder.encode(processFrame(frame)));
       }
     }
   };
@@ -384,13 +437,16 @@ export async function POST(req: Request) {
       try {
         const { value, done } = await upstreamReader.read();
         if (done) {
-          inspectChunk(decoder.decode());
+          transformChunk(decoder.decode(), controller);
+          if (sseBuffer.trim()) {
+            controller.enqueue(encoder.encode(processFrame(sseBuffer)));
+            sseBuffer = "";
+          }
           await flushUsage();
           controller.close();
           return;
         }
-        controller.enqueue(value);
-        inspectChunk(decoder.decode(value, { stream: true }));
+        transformChunk(decoder.decode(value, { stream: true }), controller);
       } catch (err) {
         await flushUsage();
         controller.error(err);

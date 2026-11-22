@@ -826,9 +826,13 @@ export function ChatClient({
     setBotFetchingModels(true);
     setBotError(null);
     try {
-      const qs = new URLSearchParams({ base: botForm.baseUrl.trim() });
-      const res = await fetch(`/api/ai/models?${qs.toString()}`, {
-        headers: botForm.apiKey.trim() ? { "x-ai-key": botForm.apiKey.trim() } : undefined,
+      const res = await fetch("/api/ai/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseUrl: botForm.baseUrl.trim(),
+          ...(botForm.apiKey.trim() ? { apiKey: botForm.apiKey.trim() } : {}),
+        }),
         cache: "no-store",
       });
       const data = (await res.json().catch(() => ({}))) as { models?: string[]; error?: string };
@@ -1861,8 +1865,11 @@ export function ChatClient({
           </div>
         )}
 
-        {activeRoom && (
+        {activeRoom && (() => {
+          const canManageRoom = activeRoom.createdBy === meId || isSuperAdmin;
+          return (
           <div className="space-y-4">
+            {canManageRoom ? (
             <Field label="Название чата">
               <div className="flex gap-2">
                 <Input
@@ -1880,6 +1887,11 @@ export function ChatClient({
                 </Button>
               </div>
             </Field>
+            ) : (
+              <p className="rounded-xl border border-border bg-card2/50 px-3 py-2 text-[11px] text-muted">
+                Управлять составом и названием чата может его создатель или главный администратор.
+              </p>
+            )}
 
             <div className="space-y-2">
               <p className="text-xs font-semibold">Текущие участники ({activeRoom.members.length})</p>
@@ -1895,7 +1907,7 @@ export function ChatClient({
                       <span className="truncate font-medium">{m.name}</span>
                       {m.isBot && <span className="text-[10px] text-cyan-400">бот</span>}
                     </div>
-                    {m.userId !== meId && (
+                    {canManageRoom && m.userId !== meId && (
                       <button
                         type="button"
                         disabled={manageBusy}
@@ -1916,7 +1928,7 @@ export function ChatClient({
             </div>
 
             {/* Добавить коллег */}
-            {others.some((u) => !activeRoom.members.some((m) => m.userId === u.id)) && (
+            {canManageRoom && others.some((u) => !activeRoom.members.some((m) => m.userId === u.id)) && (
               <div className="space-y-2">
                 <p className="text-xs font-semibold">Добавить сотрудника</p>
                 <div className="flex flex-wrap gap-1.5">
@@ -1938,7 +1950,7 @@ export function ChatClient({
             )}
 
             {/* Подключить ботов */}
-            {bots.some((b) => !activeRoom.members.some((m) => m.userId === b.userId)) && (
+            {canManageRoom && bots.some((b) => !activeRoom.members.some((m) => m.userId === b.userId)) && (
               <div className="space-y-2">
                 <p className="text-xs font-semibold">Подключить модель-бота</p>
                 <div className="flex flex-wrap gap-1.5">
@@ -1975,7 +1987,7 @@ export function ChatClient({
                   Покинуть чат
                 </Button>
               )}
-              {(activeRoom.createdBy === meId || isSuperAdmin) && (
+              {canManageRoom && (
                 <Button
                   size="sm"
                   variant="danger"
@@ -1992,7 +2004,8 @@ export function ChatClient({
             </div>
             {manageError && <p className="text-xs text-red-500">{manageError}</p>}
           </div>
-        )}
+          );
+        })()}
       </Modal>
 
       {/* Модалка: Настройка модели-бота (только super_admin) */}

@@ -172,7 +172,7 @@ class LauncherApp:
         self.run: AgentRun | None = None
         self._stopped_by_user = False
         self._retried = False
-        self._last_launch: tuple[Path, List[str], Dict[str, str], Path] | None = None
+        self._last_launch: tuple[Path, List[str], Dict[str, str], Path, Dict[str, str]] | None = None
         self.field_vars: Dict[str, Any] = {}
         self.choice_maps: Dict[str, Dict[str, str]] = {}
         self._drain_after_id: str | None = None
@@ -600,10 +600,29 @@ class LauncherApp:
         try:
             data = crm_client.login(url, email, password)
         except crm_client.CrmClientError as exc:
-            self.crm_auth_status_var.set(f"Ошибка входа: {exc}")
-            self._log(f"вход в CRM отклонён: {exc}")
-            messagebox.showerror(APP_NAME, str(exc))
-            return False
+            if getattr(exc, "requires_totp", False):
+                from tkinter import simpledialog  # ленивый импорт для совместимости с _tkstub
+
+                totp_code = simpledialog.askstring(
+                    APP_NAME,
+                    "Включена двухфакторная аутентификация (2FA).\nВведите 6-значный код:",
+                    parent=self.root,
+                )
+                if not totp_code:
+                    self.crm_auth_status_var.set("Вход отменён: не введён код 2FA.")
+                    return False
+                try:
+                    data = crm_client.login(url, email, password, totp_code=totp_code.strip())
+                except crm_client.CrmClientError as exc2:
+                    self.crm_auth_status_var.set(f"Ошибка входа (2FA): {exc2}")
+                    self._log(f"вход в CRM отклонён (2FA): {exc2}")
+                    messagebox.showerror(APP_NAME, str(exc2))
+                    return False
+            else:
+                self.crm_auth_status_var.set(f"Ошибка входа: {exc}")
+                self._log(f"вход в CRM отклонён: {exc}")
+                messagebox.showerror(APP_NAME, str(exc))
+                return False
 
         self.crm_password_var.set("")
         self.settings.crm_url = url
@@ -942,9 +961,10 @@ class LauncherApp:
 
         args = commands.agent_args(self.spec, self.settings)
         env = commands.agent_env(self.spec, self.settings)
+        launch_secrets = commands.agent_secrets(self.spec, self.settings)
         cwd = commands.working_dir(self.spec, self.settings, bundle.agents_dir(), settings_mod.workspace_dir())
         bundle.ensure_dir(cwd)
-        self._last_launch = (script, args, env, cwd)
+        self._last_launch = (script, args, env, cwd, launch_secrets)
         self._retried = False
         self._spawn(reuse_runtime=True)
 
@@ -952,7 +972,7 @@ class LauncherApp:
         """Запуск агента; `reuse_runtime=False` — вторая попытка без _PYI_* подсказок."""
         if self._last_launch is None:
             return
-        script, args, env, cwd = self._last_launch
+        script, args, env, cwd, launch_secrets = self._last_launch
         command = bundle.run_agent_args(script, args)
         if reuse_runtime:
             self._log("")
@@ -965,6 +985,7 @@ class LauncherApp:
                 cwd=cwd,
                 env=bundle.child_env({key: value for key, value in env.items() if value},
                                      reuse_runtime=reuse_runtime),
+                secrets=launch_secrets,
             )
             run.start()
         except OSError as error:

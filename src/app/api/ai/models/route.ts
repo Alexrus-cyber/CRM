@@ -7,6 +7,8 @@ import {
   resolveModelCapabilities,
   type ModelCapabilities,
 } from "@/lib/modelCapabilities";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
+import { assertSafeAiUrl, safeAiFetch } from "@/lib/ssrf";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -31,7 +33,7 @@ async function fetchJsonSafe(
   timeoutMs = PROBE_TIMEOUT_MS,
 ): Promise<Record<string, unknown> | null> {
   try {
-    const res = await fetch(url, {
+    const res = await safeAiFetch(url, {
       ...init,
       signal: AbortSignal.timeout(timeoutMs),
       cache: "no-store",
@@ -47,9 +49,19 @@ async function fetchJsonSafe(
 }
 
 async function inspectModels(baseUrl: string, apiKey: string, targetModel: string) {
+  try {
+    await assertSafeAiUrl(baseUrl);
+  } catch (err) {
+    return {
+      ok: false as const,
+      status: 400,
+      error: err instanceof Error ? err.message : "Запрещённый адрес модели",
+    };
+  }
+
   let upstream: Response;
   try {
-    upstream = await fetch(aiEndpoint(baseUrl, "/models"), {
+    upstream = await safeAiFetch(aiEndpoint(baseUrl, "/models"), {
       headers: { Accept: "application/json", ...aiAuthHeaders(apiKey) },
       signal: AbortSignal.timeout(TIMEOUT_MS),
       cache: "no-store",
@@ -179,6 +191,15 @@ export async function GET(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
+  const rl = checkApiRateLimit({
+    scope: "ai_models",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 40,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
+
   const saved = await getAiUserSettingsSecret(me.id).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
   const url = new URL(req.url);
   const baseUrl =
@@ -207,6 +228,15 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
+  const rl = checkApiRateLimit({
+    scope: "ai_models",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 40,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
 
   const saved = await getAiUserSettingsSecret(me.id).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
   const body = (await req.json().catch(() => null)) as {

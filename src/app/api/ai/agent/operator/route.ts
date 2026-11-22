@@ -3,6 +3,8 @@ import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { aiAuthHeaders, aiEndpoint, estimateTokens, normalizeBaseUrl } from "@/lib/ai";
 import { isUnlimitedStepsRole, resolveStepsForRole } from "@/lib/genParams";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
+import { safeAiFetch } from "@/lib/ssrf";
 import {
   normalizeCoachMode,
   normalizeTaskMode,
@@ -55,6 +57,15 @@ export async function POST(req: Request) {
     return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
   }
 
+  const rl = checkApiRateLimit({
+    scope: "ai_agent_operator",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 30,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
+
   const body = (await req.json().catch(() => null)) as
     | {
         action?: "formulate" | "launch";
@@ -86,7 +97,7 @@ export async function POST(req: Request) {
     }
 
     try {
-      const res = await fetch(aiEndpoint(baseUrl, "/chat/completions"), {
+      const res = await safeAiFetch(aiEndpoint(baseUrl, "/chat/completions"), {
         method: "POST",
         headers: { "Content-Type": "application/json", ...aiAuthHeaders(apiKey) },
         body: JSON.stringify({

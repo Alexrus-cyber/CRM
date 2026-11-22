@@ -4,6 +4,8 @@ import { getCurrentUser } from "@/lib/auth";
 import { estimateTokens, normalizeBaseUrl } from "@/lib/ai";
 import { applyGenParams, isUnlimitedStepsRole, normalizeGenParams } from "@/lib/genParams";
 import { DEFAULT_PLAN_PROMPT } from "@/lib/operatorPlan";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
+import { assertSafeAiUrl, safeAiFetch } from "@/lib/ssrf";
 
 /**
  * Планировщик оператора: `POST /api/agent/plan`.
@@ -33,6 +35,15 @@ export async function POST(req: Request) {
     return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
   }
 
+  const rl = checkApiRateLimit({
+    scope: "agent_plan",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 40,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
+
   const body = (await req.json().catch(() => null)) as
     | {
         messages?: Array<{ role?: string; content?: string }>;
@@ -46,6 +57,14 @@ export async function POST(req: Request) {
   if (!baseUrl) {
     return Response.json(
       { error: "Укажите Base URL модели в «Подключении» — без него планировщик не работает" },
+      { status: 400 },
+    );
+  }
+  try {
+    await assertSafeAiUrl(baseUrl);
+  } catch (err) {
+    return Response.json(
+      { error: err instanceof Error ? err.message : "Запрещённый адрес модели" },
       { status: 400 },
     );
   }
@@ -114,7 +133,7 @@ export async function POST(req: Request) {
   applyGenParams(payload, normalizeGenParams(body?.settings?.params, { unlimited }), { unlimited });
 
   try {
-    const res = await fetch(`${baseUrl}/chat/completions`, {
+    const res = await safeAiFetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

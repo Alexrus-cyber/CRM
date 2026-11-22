@@ -79,6 +79,15 @@ function sha256Opaque(value) {
   return `sha256:${crypto.createHash("sha256").update(value, "utf8").digest("hex")}`;
 }
 
+function maskOpaqueHint(value) {
+  const s = String(value || "");
+  return s ? `…${s.slice(-6)}` : "";
+}
+
+function defaultTokenExpiryIso() {
+  return new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
+}
+
 /**
  * Обновляет старые базы данных, созданные до появления новых колонок.
  * Выполняется до создания индексов из последующих миграций.
@@ -104,11 +113,22 @@ async function ensureLegacyColumns(executor) {
     `alter table users add column ${ifNotExists}is_bot boolean not null default false`,
     `alter table users add column ${ifNotExists}can_use_agent boolean not null default false`,
     `alter table users add column ${ifNotExists}can_use_operator boolean not null default false`,
+    `alter table users add column ${ifNotExists}deleted_at ${ts}`,
+    `alter table users add column ${ifNotExists}must_change_password boolean not null default false`,
+    `alter table users add column ${ifNotExists}totp_secret_encrypted text not null default ''`,
+    `alter table users add column ${ifNotExists}totp_enabled boolean not null default false`,
+    `alter table users add column ${ifNotExists}pending_email text`,
+    `alter table users add column ${ifNotExists}pending_email_token_hash text`,
+    `alter table users add column ${ifNotExists}pending_email_expires_at ${ts}`,
     `alter table sessions add column ${ifNotExists}label text not null default ''`,
     `alter table sessions add column ${ifNotExists}user_agent text not null default ''`,
     `alter table sessions add column ${ifNotExists}ip text not null default ''`,
     `alter table sessions add column ${ifNotExists}last_seen_at ${ts}`,
     `alter table sessions add column ${ifNotExists}revoked_at ${ts}`,
+    `alter table agent_connection_tokens add column ${ifNotExists}token_hash text not null default ''`,
+    `alter table agent_connection_tokens add column ${ifNotExists}token_hint text not null default ''`,
+    `alter table agent_connection_tokens add column ${ifNotExists}expires_at ${ts}`,
+    `alter table agent_connection_tokens add column ${ifNotExists}revoked_at ${ts}`,
   ];
   for (const statement of statements) {
     try {
@@ -126,6 +146,8 @@ async function convertPostgresIntegerBooleans(executor) {
     ["users", "is_bot", false],
     ["users", "can_use_agent", false],
     ["users", "can_use_operator", false],
+    ["users", "must_change_password", false],
+    ["users", "totp_enabled", false],
     ["ai_bot_configs", "is_active", true],
     ["agent_connections", "is_default", false],
     ["github_connections", "enabled", true],
@@ -148,24 +170,89 @@ async function convertPostgresIntegerBooleans(executor) {
 }
 
 async function migrateLegacyAgentTokens(executor) {
-  const statements = [
-    `insert into agent_connections (user_id, name, server_url, is_default, created_at, updated_at)
-     select t.user_id, 'Основной CRM', '', true, t.created_at, t.created_at
-     from agent_tokens t
-     where not exists (select 1 from agent_connections c where c.user_id = t.user_id)`,
-    `insert into agent_connection_tokens (connection_id, user_id, name, token, created_at, last_used_at)
-     select c.id, t.user_id, 'Основной', t.token, t.created_at, null
-     from agent_tokens t
-     join agent_connections c on c.user_id = t.user_id
-     where not exists (select 1 from agent_connection_tokens x where x.token = t.token)`,
-  ];
-  for (const statement of statements) {
-    try {
-      await executor.exec(statement);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!/no such table|does not exist/i.test(message)) throw error;
+  try {
+    await executor.exec(
+      `insert into agent_connections (user_id, name, server_url, is_default, created_at, updated_at)
+       select t.user_id, 'Основной CRM', '', true, t.created_at, t.created_at
+       from agent_tokens t
+       where not exists (select 1 from agent_connections c where c.user_id = t.user_id)`,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/no such table|does not exist/i.test(message)) throw error;
+  }
+
+  let legacyRows = [];
+  try {
+    legacyRows = await executor.queryRaw(`select id, user_id, token, created_at from agent_tokens`, []);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/no such table|does not exist/i.test(message)) return;
+    throw error;
+  }
+
+  const graceExpiry = defaultTokenExpiryIso();
+  for (const row of legacyRows) {
+    const raw = String(row.token || "");
+    if (!raw) continue;
+    const isAlreadyHashed = raw.startsWith("sha256:");
+    const hashed = isAlreadyHashed ? raw : sha256Opaque(raw);
+    const hint = isAlreadyHashed ? "" : maskOpaqueHint(raw);
+    const connRows = await executor.queryRaw(
+      executor.dialect === "postgres"
+        ? `select id from agent_connections where user_id = $1 order by is_default desc, id asc limit 1`
+        : `select id from agent_connections where user_id = ? order by is_default desc, id asc limit 1`,
+      [row.user_id],
+    );
+    const connId = connRows[0]?.id;
+    if (connId) {
+      const existing = await executor.queryRaw(
+        executor.dialect === "postgres"
+          ? `select id from agent_connection_tokens where token = $1 or token = $2 or token_hash = $3 limit 1`
+          : `select id from agent_connection_tokens where token = ? or token = ? or token_hash = ? limit 1`,
+        [raw, hashed, hashed],
+      );
+      if (existing.length === 0) {
+        await executor.queryRaw(
+          executor.dialect === "postgres"
+            ? `insert into agent_connection_tokens (connection_id, user_id, name, token, token_hash, token_hint, expires_at, created_at, last_used_at)
+               values ($1, $2, 'Основной', $3, $4, $5, $6, $7, null)`
+            : `insert into agent_connection_tokens (connection_id, user_id, name, token, token_hash, token_hint, expires_at, created_at, last_used_at)
+               values (?, ?, 'Основной', ?, ?, ?, ?, ?, null)`,
+          [connId, row.user_id, hashed, hashed, hint, graceExpiry, row.created_at],
+        );
+      }
     }
+    if (!isAlreadyHashed) {
+      await executor.queryRaw(
+        executor.dialect === "postgres"
+          ? `update agent_tokens set token = $1 where id = $2`
+          : `update agent_tokens set token = ? where id = ?`,
+        [hashed, row.id],
+      );
+    }
+  }
+}
+
+async function migratePlaintextAgentTokensToHashed(executor) {
+  const rows = await executor.queryRaw(
+    `select id, token, token_hash, token_hint, expires_at from agent_connection_tokens where token not like 'sha256:%' or token_hash = ''`,
+    [],
+  );
+  const graceExpiry = defaultTokenExpiryIso();
+  for (const row of rows) {
+    const raw = String(row.token || "");
+    if (!raw) continue;
+    const isHashed = raw.startsWith("sha256:");
+    const hashed = isHashed ? raw : sha256Opaque(raw);
+    const hint = String(row.token_hint || "") || (isHashed ? "" : maskOpaqueHint(raw));
+    const exp = row.expires_at ? String(row.expires_at) : graceExpiry;
+    await executor.queryRaw(
+      executor.dialect === "postgres"
+        ? `update agent_connection_tokens set token = $1, token_hash = $2, token_hint = $3, expires_at = $4 where id = $5`
+        : `update agent_connection_tokens set token = ?, token_hash = ?, token_hint = ?, expires_at = ? where id = ?`,
+      [hashed, hashed, hint, exp, row.id],
+    );
   }
 }
 
@@ -283,7 +370,12 @@ export async function runMigrations(executor) {
     if (!applied.has(file)) {
       for (const stmt of statements) {
         const sqlText = executor.dialect === "sqlite" ? pgStatementToSqlite(stmt) : stmt;
-        await executor.exec(sqlText);
+        try {
+          await executor.exec(sqlText);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (!/already exists|duplicate column/i.test(message)) throw error;
+        }
       }
       if (file === "0001_baseline.sql") {
         await ensureLegacyColumns(executor);
@@ -304,6 +396,7 @@ export async function runMigrations(executor) {
   }
 
   await migrateLegacyAgentTokens(executor);
+  await migratePlaintextAgentTokensToHashed(executor);
   await migrateLegacySessionTokens(executor);
   await ensureFullTextSearch(executor);
 }
