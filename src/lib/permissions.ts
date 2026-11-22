@@ -142,7 +142,7 @@ export const ROLE_CAPABILITIES: Record<Role, RoleCapabilities> = {
 };
 
 export function capabilitiesForRole(role: string | null | undefined): RoleCapabilities {
-  if (role && role in ROLE_CAPABILITIES) {
+  if (role && Object.hasOwn(ROLE_CAPABILITIES, role)) {
     return ROLE_CAPABILITIES[role as Role];
   }
   return ROLE_CAPABILITIES.user;

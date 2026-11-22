@@ -120,10 +120,17 @@ export const AI_ROLE_POLICY: Record<Role, AiRolePolicy> = {
 /** Политика роли с учётом расширения месяца, которое выдал администратор. */
 export function aiPolicyFor(role: Role, monthlyOverride: number | null = null): AiRolePolicy {
   const base = AI_ROLE_POLICY[role] ?? AI_ROLE_POLICY.user;
-  if (monthlyOverride === null) return base;
+  if (monthlyOverride === null || base.monthlyTokens === null) return base;
+  if (monthlyOverride <= 0) {
+    return {
+      ...base,
+      monthlyTokens: null,
+      summary: `${base.summary} · на этот месяц администратор снял лимит токенов`,
+    };
+  }
   return {
     ...base,
-    monthlyTokens: Math.max(base.monthlyTokens ?? 0, monthlyOverride),
+    monthlyTokens: Math.max(base.monthlyTokens, monthlyOverride),
     summary: `${base.summary} · на этот месяц лимит расширен администратором до ${formatTokenCount(monthlyOverride)}`,
   };
 }

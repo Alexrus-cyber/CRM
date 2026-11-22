@@ -65,8 +65,15 @@ export async function GET() {
       return Response.json({ available: false, endpoint: agentUrl, hint: AGENT_START_HINT });
     }
     const data = (await res.json()) as Record<string, unknown>;
+    const unlimitedSteps = isUnlimitedStepsRole(me.role);
     return Response.json(
-      { available: true, endpoint: agentUrl, ...data },
+      {
+        available: true,
+        endpoint: agentUrl,
+        ...data,
+        maxSteps: unlimitedSteps ? null : Math.min(Number(data.maxSteps ?? AGENT_MAX_STEPS) || AGENT_MAX_STEPS, AGENT_MAX_STEPS),
+        agentMaxSteps: data.maxSteps ?? AGENT_MAX_STEPS,
+      },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch {
@@ -335,6 +342,7 @@ export async function POST(req: Request) {
     ownerUserId: me.id,
     ...(systemPrompt ? { systemPrompt } : {}),
     maxSteps,
+    maxRunTokens: unlimitedSteps ? 0 : 2_500_000,
     unlimited: unlimitedSteps,
     trustLevel,
     ...(contextLimit > 0 ? { contextLimit } : {}),

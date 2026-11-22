@@ -14,7 +14,8 @@ export function resolveSafeAgentUrl(raw?: string): string {
 export const AGENT_URL = (() => {
   try {
     return resolveSafeAgentUrl(process.env.AGENT_URL);
-  } catch {
+  } catch (err) {
+    console.error("[agentConfig] Invalid AGENT_URL, falling back to local agent:", (err as Error).message);
     return "http://127.0.0.1:8899";
   }
 })();

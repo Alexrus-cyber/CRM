@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { nowIso, q, q1, toBool, toIso, toNum } from "../dialect";
 import { decryptSecret, encryptSecret } from "@/lib/crypto";
-import { readStoredBase64, saveStoredBase64 } from "@/lib/storage";
+import { deleteStoredFile, readStoredBase64, saveStoredBase64 } from "@/lib/storage";
 import type { ChatRoomKind } from "../schema";
 import type { Raw } from "./shared";
 
@@ -570,7 +570,24 @@ export async function updateChatBot(
 export async function deleteChatBot(botUserId: number): Promise<boolean> {
   const existing = await getChatBot(botUserId);
   if (!existing) return false;
+  const attachmentRows = await q<{ storage_key: string }>(sql`
+    select ma.storage_key
+    from message_attachments ma
+    join messages m on m.id = ma.message_id
+    where m.sender_id = ${botUserId} or m.recipient_id = ${botUserId}`);
+
+  await q(sql`delete from chat_general_bots where bot_user_id = ${botUserId}`);
+  await q(sql`delete from chat_room_members where user_id = ${botUserId}`);
+  await q(sql`delete from message_attachments where message_id in (select id from messages where sender_id = ${botUserId} or recipient_id = ${botUserId})`);
+  await q(sql`delete from messages where sender_id = ${botUserId} or recipient_id = ${botUserId}`);
+  await q(sql`delete from ai_bot_configs where user_id = ${botUserId}`);
   await q(sql`delete from users where id = ${botUserId} and is_bot = true`);
+
+  for (const row of attachmentRows) {
+    if (row.storage_key) {
+      await deleteStoredFile(String(row.storage_key));
+    }
+  }
   return true;
 }
 

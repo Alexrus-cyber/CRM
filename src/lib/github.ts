@@ -63,8 +63,14 @@ async function ghFetch(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options?.timeoutMs ?? 12_000);
   try {
-    const url = path.startsWith("http") ? path : `${GITHUB_API}${path}`;
-    const res = await fetch(url, {
+    const url = path.startsWith("http://") || path.startsWith("https://")
+      ? path
+      : `${GITHUB_API}${path.startsWith("/") ? path : `/${path}`}`;
+    const parsedUrl = new URL(url);
+    if (parsedUrl.protocol !== "https:" || parsedUrl.hostname !== "api.github.com") {
+      throw new GithubApiError("Разрешены только HTTPS-запросы к api.github.com", 400);
+    }
+    const res = await fetch(parsedUrl.toString(), {
       method: options?.method ?? "GET",
       headers: {
         Accept: "application/vnd.github+json",
