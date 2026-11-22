@@ -90,9 +90,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run Vitest DB & security tests against PostgreSQL
+      - name: Run PostgreSQL migrations & DB smoke tests
         env:
           DB_DIALECT: postgres
           DATABASE_URL: postgres://crm:crm_test_password@localhost:5432/crm_test
           CRM_SECRET: ci-postgres-ephemeral-secret-32-chars-min
-        run: npx vitest run tests/agentTester.test.ts tests/teamRoomsBotsAndAccess.test.ts tests/securityP0P1.test.ts
+        run: npx vitest run tests/postgresSmoke.test.ts
