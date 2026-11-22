@@ -14,6 +14,7 @@ import { formatServerBotApproval } from "@/lib/approvalFormat";
 import {
   clearAgentApprovalsForTests,
   consumeAgentApproval,
+  peekAgentApproval,
   registerAgentApproval,
 } from "@/lib/agentApprovals";
 import { readJsonWithByteLimit, validateStrongPassword } from "@/lib/validation";
@@ -109,6 +110,18 @@ describe("P0/P1 security guards (SSRF, crypto HKDF, TOTP, approval nonces, passw
     clearAgentApprovalsForTests();
     registerAgentApproval("appr-100", 7, "nonce-secret-abc");
 
+    // Peek validates without consuming
+    expect(peekAgentApproval("appr-100", 7)).toEqual({ ok: true, nonce: "nonce-secret-abc" });
+    expect(peekAgentApproval("appr-100", 99)).toEqual({
+      ok: false,
+      status: 403,
+      error: "Чужой запрос подтверждения",
+    });
+
+    // Disk persistence recovers across in-memory HMR/worker resets
+    (globalThis as { __crmPendingAgentApprovals?: Map<string, unknown> }).__crmPendingAgentApprovals?.clear();
+    expect(peekAgentApproval("appr-100", 7)).toEqual({ ok: true, nonce: "nonce-secret-abc" });
+
     // Wrong owner rejected without consuming
     expect(consumeAgentApproval("appr-100", 99)).toEqual({
       ok: false,
@@ -123,6 +136,11 @@ describe("P0/P1 security guards (SSRF, crypto HKDF, TOTP, approval nonces, passw
       status: 404,
       error: "Запрос подтверждения не найден или уже истёк",
     });
+
+    // Legacy agents that do not emit a nonce still register owner-scoped approval
+    registerAgentApproval("appr-legacy", 7, "");
+    expect(peekAgentApproval("appr-legacy", 99).ok).toBe(false);
+    expect(consumeAgentApproval("appr-legacy", 7)).toEqual({ ok: true, nonce: "" });
   });
 
   it("enforces strong password rules and streaming byte limit on JSON bodies", async () => {

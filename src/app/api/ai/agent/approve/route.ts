@@ -1,5 +1,5 @@
 import { getAgentTask } from "@/db/repo";
-import { consumeAgentApproval } from "@/lib/agentApprovals";
+import { consumeAgentApproval, peekAgentApproval } from "@/lib/agentApprovals";
 import { resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
@@ -58,9 +58,9 @@ export async function POST(req: Request) {
     }
   }
 
-  const consumed = consumeAgentApproval(approvalId, me.id);
-  if (!consumed.ok) {
-    return Response.json({ error: consumed.error }, { status: consumed.status });
+  const checked = peekAgentApproval(approvalId, me.id);
+  if (!checked.ok) {
+    return Response.json({ error: checked.error }, { status: checked.status });
   }
 
   const rawScreenshot = typeof body?.screenshot === "string" ? body.screenshot : "";
@@ -73,7 +73,7 @@ export async function POST(req: Request) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         approvalId,
-        nonce: consumed.nonce,
+        ...(checked.nonce ? { nonce: checked.nonce } : {}),
         approved: Boolean(body?.approved),
         approverUserId: me.id,
         note: typeof body?.note === "string" ? body.note.slice(0, 500) : "",
@@ -101,6 +101,9 @@ export async function POST(req: Request) {
       signal: AbortSignal.timeout(10_000),
     });
     const data = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
+    if (upstream.ok || upstream.status === 404 || upstream.status === 403) {
+      consumeAgentApproval(approvalId, me.id);
+    }
     return Response.json(data, { status: upstream.status, headers: { "Cache-Control": "no-store" } });
   } catch {
     return Response.json({ error: "Агент недоступен" }, { status: 503 });
