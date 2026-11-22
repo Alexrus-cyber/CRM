@@ -833,7 +833,7 @@ describe("вкладка «Агент»", () => {
     const liveBadge = await screen.findByText("в эфире");
     expect(liveBadge).toBeTruthy();
     const detailsEl = liveBadge.closest("details");
-    expect(detailsEl?.open).toBe(true);
+    await waitFor(() => expect(detailsEl?.open).toBe(true));
     expect(await screen.findByText("Проверяю первый шаг")).toBeTruthy();
 
     gate.release?.();

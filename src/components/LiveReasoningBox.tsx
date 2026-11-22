@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 
 /**
@@ -23,13 +23,19 @@ export function LiveReasoningBox({
   const bodyRef = useRef<HTMLParagraphElement>(null);
   const userToggledRef = useRef(false);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!streaming) {
       userToggledRef.current = false;
       return;
     }
     if (detailsRef.current && !userToggledRef.current) {
       detailsRef.current.open = true;
+    }
+  }, [streaming]);
+
+  useEffect(() => {
+    if (!streaming) {
+      return;
     }
     const scrollBody = () => {
       if (bodyRef.current) {
