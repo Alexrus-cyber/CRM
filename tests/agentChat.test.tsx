@@ -833,7 +833,7 @@ describe("вкладка «Агент»", () => {
     const liveBadge = await screen.findByText("в эфире");
     expect(liveBadge).toBeTruthy();
     const detailsEl = liveBadge.closest("details");
-    expect(detailsEl?.open).toBe(true);
+    await waitFor(() => expect(detailsEl?.open).toBe(true));
     expect(await screen.findByText("Проверяю первый шаг")).toBeTruthy();
 
     gate.release?.();
@@ -1170,5 +1170,74 @@ describe("вкладка «Агент»", () => {
       settings: { model: "o3-mini" },
     });
     expect(await screen.findByText(/Проверка завершена успешно, багов не найдено\./i)).toBeTruthy();
+  });
+
+  it("показывает карточку liveTester прямо во вкладке «Чат», парсит CRLF SSE и корректно останавливает запрос кнопкой «Остановить»", async () => {
+    const encoder = new TextEncoder();
+    let aborted = false;
+
+    sseResponder = (_url, init) => {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_run\r\ndata: ${JSON.stringify({
+                runKey: "rk-ui",
+                runId: 55,
+                testerConversationId: 1,
+                sandboxProject: "shop-demo",
+                summary: "Аудит магазина",
+              })}\r\n\r\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_status\r\ndata: ${JSON.stringify({ runKey: "rk-ui", text: "Проверяю вёрстку и кнопки…" })}\r\n\r\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_action\r\ndata: ${JSON.stringify({ runKey: "rk-ui", action: { type: "qa_check", label: "HTTP-аудит /" } })}\r\n\r\n`,
+            ),
+          );
+          init?.signal?.addEventListener("abort", () => {
+            aborted = true;
+            try {
+              controller.error(new DOMException("Aborted", "AbortError"));
+            } catch {
+              // ignore
+            }
+          });
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Создай и проверь shop-demo" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    // На активной вкладке «Чат» видна живая карточка Тестировщика и кнопка «Остановить»
+    expect(await screen.findByText(/Тестировщик · shop-demo/i)).toBeTruthy();
+    expect((await screen.findAllByText(/Проверяю вёрстку и кнопки…/i)).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText(/HTTP-аудит \//i).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByRole("button", { name: /Открыть Тестировщик/i })).toBeTruthy();
+
+    const stopBtn = screen.getByRole("button", { name: /Остановить/i });
+    fireEvent.click(stopBtn);
+
+    await waitFor(() => expect(aborted).toBe(true));
+    expect(await screen.findByText(/Выполнение остановлено пользователем\./i)).toBeTruthy();
+  });
+
+  it("показывает ошибку при неожиданном обрыве SSE-потока без события done и ответа", async () => {
+    sseReply = ": keepalive\n\n";
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Проверь обрыв" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    expect(await screen.findByText(/Поток ответа от агента оборвался без завершения/i)).toBeTruthy();
   });
 });

@@ -102,13 +102,22 @@ def _validate_gh_rev(raw: str) -> str:
     return clean
 
 
+def _safe_int(value: Any, default: int) -> int:
+    if value is None or value == "" or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _slug(raw: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw or "").strip()).strip("._")
     return cleaned or "repo"
 
 
 def get_repo_workspace_dir(sandbox_root: Path, user_id: Any, owner: str, repo: str) -> Path:
-    uid = int(user_id or 0)
+    uid = _safe_int(user_id, 0)
     folder = f"{_slug(owner)}__{_slug(repo)}"
     root = sandbox_root.resolve()
     target = (root / "_github" / f"u{uid}" / folder).resolve()
@@ -204,6 +213,30 @@ def _run_git(
         "GIT_TERMINAL_PROMPT": "0",
         "GCM_INTERACTIVE": "never",
     }
+    for sys_key in (
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "USERPROFILE",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "COMMONPROGRAMFILES",
+        "SystemDrive",
+        "TMP",
+        "TEMP",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ):
+        if sys_key in os.environ:
+            env[sys_key] = os.environ[sys_key]
     if author_name:
         env["GIT_AUTHOR_NAME"] = author_name
         env["GIT_COMMITTER_NAME"] = author_name
@@ -421,7 +454,7 @@ def run_github_tool(
     if name == "github_list_files":
         sub = str(args.get("path") or "").strip().lstrip("/")
         pattern = str(args.get("pattern") or "").strip().lower()
-        max_items = max(10, min(500, int(args.get("max_items") or 200)))
+        max_items = max(10, min(500, _safe_int(args.get("max_items"), 200)))
         files: List[str] = []
         try:
             sync_info = ensure_repo_synced(ctx, sandbox_root=sandbox_root, branch_override=branch)
@@ -450,8 +483,8 @@ def run_github_tool(
         rel_path = str(args.get("path") or "").strip().lstrip("/")
         if not rel_path:
             raise GithubToolError("Укажите path файла")
-        offset = max(1, int(args.get("offset") or 1))
-        limit = max(1, min(600, int(args.get("limit") or 220)))
+        offset = max(1, _safe_int(args.get("offset"), 1))
+        limit = max(1, min(600, _safe_int(args.get("limit"), 220)))
         text_content: Optional[str] = None
         if (repo_dir / ".git").exists():
             fp = _safe_repo_file(repo_dir, rel_path)
@@ -492,11 +525,11 @@ def run_github_tool(
         use_regex = bool(args.get("regex", True))
         case_sensitive = bool(args.get("case_sensitive", False))
         whole_word = bool(args.get("whole_word", False))
-        context_lines = max(0, min(5, int(args.get("context_lines") or 0)))
+        context_lines = max(0, min(5, _safe_int(args.get("context_lines"), 0)))
         files_only = bool(args.get("files_only", False))
         count_only = bool(args.get("count_only", False))
         force_remote = bool(args.get("remote", False))
-        max_hits = max(1, min(150, int(args.get("max_hits") or 40)))
+        max_hits = max(1, min(150, _safe_int(args.get("max_hits"), 40)))
 
         def _match_pat(rel_p: str, pat: str) -> bool:
             p = pat.strip().replace("\\", "/").lstrip("/")
@@ -577,8 +610,8 @@ def run_github_tool(
         raw_items = args.get("files") or args.get("paths")
         if not isinstance(raw_items, list) or not raw_items:
             raise GithubToolError("Передайте непустой массив files (до 12 путей или объектов {path, offset, limit})")
-        def_offset = max(1, int(args.get("offset") or 1))
-        def_limit = max(1, min(400, int(args.get("limit") or 160)))
+        def_offset = max(1, _safe_int(args.get("offset"), 1))
+        def_limit = max(1, min(400, _safe_int(args.get("limit"), 160)))
         wdir = repo_dir
         if not (wdir / ".git").exists():
             sync_info = ensure_repo_synced(ctx, sandbox_root=sandbox_root, branch_override=branch)
@@ -591,8 +624,8 @@ def run_github_tool(
                 rel_p, off, lim = item.strip().lstrip("/"), def_offset, def_limit
             elif isinstance(item, dict):
                 rel_p = str(item.get("path") or "").strip().lstrip("/")
-                off = max(1, int(item.get("offset") or def_offset))
-                lim = max(1, min(400, int(item.get("limit") or def_limit)))
+                off = max(1, _safe_int(item.get("offset"), def_offset))
+                lim = max(1, min(400, _safe_int(item.get("limit"), def_limit)))
             else:
                 continue
             if not rel_p:
@@ -661,7 +694,7 @@ def run_github_tool(
 
     if name == "github_ci_status":
         ref = str(args.get("ref") or "").strip()
-        pull_number = int(args.get("pull_number") or 0)
+        pull_number = _safe_int(args.get("pull_number"), 0)
         if pull_number > 0 and not ref:
             pr_data = _gh_api(f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}/pulls/{pull_number}", token)
             ref = str(((pr_data.get("head") or {}).get("sha")) or branch)
@@ -696,7 +729,7 @@ def run_github_tool(
         return "\n".join(lines), events
 
     if name == "github_get_pr_diff":
-        pull_number = int(args.get("pull_number") or 0)
+        pull_number = _safe_int(args.get("pull_number"), 0)
         if pull_number <= 0:
             raise GithubToolError("Укажите корректный номер PR (pull_number)")
         pr = _gh_api(f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}/pulls/{pull_number}", token)
@@ -1070,7 +1103,7 @@ def run_github_tool(
         ), events
 
     if name == "github_merge_pr":
-        pull_number = int(args.get("pull_number") or 0)
+        pull_number = _safe_int(args.get("pull_number"), 0)
         if pull_number <= 0:
             raise GithubToolError("Укажите корректный номер Pull Request (pull_number)")
         merge_method = str(args.get("merge_method") or "merge").strip().lower()

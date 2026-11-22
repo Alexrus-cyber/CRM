@@ -131,6 +131,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+_NO_REDIRECT_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler)
 
 
 def _is_blocked_metadata_ip(ip_str: str) -> bool:
@@ -197,6 +198,12 @@ def assert_safe_ai_url(raw_url: str) -> str:
 
 def _safe_model_urlopen(request: urllib.request.Request, timeout: int = TIMEOUT) -> Any:
     if urllib.request.urlopen is _ORIG_URLOPEN:
+        try:
+            host = (urlparse(request.full_url).hostname or "").strip().lower().strip("[]")
+        except Exception:  # noqa: BLE001
+            host = ""
+        if host in ("127.0.0.1", "localhost", "::1") or host.endswith(".localhost"):
+            return _NO_REDIRECT_LOCAL_OPENER.open(request, timeout=timeout)
         return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
     return urllib.request.urlopen(request, timeout=timeout)
 
@@ -1009,6 +1016,7 @@ def run_tool(
         try:
             report_sink = qa_state.get("report") if isinstance(qa_state, dict) else None
             checks_sink = qa_state.get("checks") if isinstance(qa_state, dict) else None
+            run_key = str((qa_state or {}).get("runKey") or "")
             return qa_tools.run_qa_tool(
                 name,
                 args,
@@ -1020,6 +1028,7 @@ def run_tool(
                 report_sink=report_sink,
                 checks_sink=checks_sink,
                 unlimited=unlimited,
+                tester_run_key=run_key,
             )
         except qa_tools.QaToolError as error:
             raise AgentError(str(error)) from error
@@ -2270,6 +2279,7 @@ def call_model(
     params: Optional[Dict[str, Any]] = None,
     on_reasoning: Optional[Callable[[str], None]] = None,
     on_text: Optional[Callable[[str], None]] = None,
+    on_status: Optional[Callable[[str], None]] = None,
     context_limit: int = 0,
     state_out: Optional[Dict[str, Any]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
@@ -2337,6 +2347,17 @@ def call_model(
                 last_text_emit = 0.0
                 is_sse = False
                 stream_usage: Optional[Dict[str, Any]] = None
+                saw_finish = False
+
+                def _shrink_response_socket_timeout(seconds: float) -> None:
+                    try:
+                        fp = getattr(response, "fp", None)
+                        raw_fp = getattr(fp, "raw", None)
+                        sock = getattr(raw_fp, "_sock", None)
+                        if sock is not None and hasattr(sock, "settimeout"):
+                            sock.settimeout(seconds)
+                    except Exception:  # noqa: BLE001
+                        pass
 
                 for raw_bytes in response:
                     if cancel_check and cancel_check():
@@ -2357,6 +2378,10 @@ def call_model(
                                 parsed_json = json.loads("\n".join(raw_lines))
                             except json.JSONDecodeError as error:
                                 raise AgentError("Сервер модели вернул не JSON", retryable=True) from error
+                            if isinstance(parsed_json, dict) and parsed_json.get("error"):
+                                err_obj = parsed_json["error"]
+                                err_msg = str(err_obj.get("message") if isinstance(err_obj, dict) else err_obj)
+                                raise AgentError(f"Модель вернула ошибку: {err_msg}", retryable=True)
                             msg = (parsed_json.get("choices") or [{}])[0].get("message") or {}
                             r_full = str(msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
                             c_full = str(msg.get("content") or "")
@@ -2378,13 +2403,23 @@ def call_model(
                     except json.JSONDecodeError:
                         continue
 
+                    if isinstance(chunk, dict) and chunk.get("error"):
+                        err_obj = chunk["error"]
+                        err_msg = str(err_obj.get("message") if isinstance(err_obj, dict) else err_obj)
+                        err_code = str(err_obj.get("code") or err_obj.get("type") or "") if isinstance(err_obj, dict) else ""
+                        retryable = any(w in (err_msg + " " + err_code).lower() for w in ("rate", "timeout", "overload", "502", "503", "504", "429"))
+                        raise AgentError(f"Модель вернула ошибку в потоке: {err_msg}", retryable=retryable)
+
                     if isinstance(chunk.get("usage"), dict):
                         stream_usage = chunk["usage"]
 
                     choices = chunk.get("choices") or []
                     if not choices:
+                        if saw_finish and stream_usage:
+                            break
                         continue
                     choice = choices[0] or {}
+                    finish_reason = choice.get("finish_reason")
                     delta = choice.get("delta") or {}
                     msg_fb = choice.get("message") or {}
 
@@ -2435,6 +2470,13 @@ def call_model(
                                 if fn.get("arguments"):
                                     entry["function"]["arguments"] += str(fn["arguments"])
 
+                    if finish_reason:
+                        saw_finish = True
+                        if stream_usage:
+                            break
+                        # Если сервер забыл отправить [DONE] или держит keep-alive — ждём хвост не более 2.5с.
+                        _shrink_response_socket_timeout(2.5)
+
                 if tag_buf:
                     if in_think:
                         reasoning_parts.append(tag_buf)
@@ -2459,6 +2501,8 @@ def call_model(
                     result_obj["usage"] = stream_usage
                 return result_obj
         except BrokenPipeError:
+            raise
+        except AgentError:
             raise
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")[:800]
@@ -2501,6 +2545,8 @@ def call_model(
                 reported_msgs = overflow.get("msg_tokens")
                 if state_out is not None and known_ctx:
                     state_out["max_context"] = known_ctx
+                if on_status:
+                    on_status("Сжимаю контекст под лимит модели…")
                 if known_ctx:
                     effective_ctx = int(known_ctx * (0.85 ** (overflow_retries - 1))) if overflow_retries > 1 else int(known_ctx)
                     fitted_msgs, fitted_payload, fit_info = _fit_request_to_context(
@@ -2598,45 +2644,92 @@ def call_model(
 
             if error.retryable and transient_retries < 3:
                 transient_retries += 1
-                if cur_payload.get("stream") and transient_retries >= 2:
+                if cur_payload.get("stream") and (transient_retries >= 2 or "timed out" in detail):
                     cur_payload["stream"] = False
                     cur_payload.pop("stream_options", None)
                     log(f"сбой потока модели (повтор #{transient_retries}/3): переключаюсь на non-stream JSON")
+                    if on_status:
+                        on_status(f"Повтор запроса модели (#{transient_retries}/3, JSON-режим)…")
                 else:
                     log(f"временный сбой модели (повтор #{transient_retries}/3): {raw_err[:200]}")
+                    if on_status:
+                        on_status(f"Повтор запроса модели (#{transient_retries}/3)…")
                 time.sleep(min(4.0, 1.2 * transient_retries))
                 continue
             raise
     raise AgentError("Превышено число повторных попыток вызова модели")
 
 
+def _extract_balanced_json_objects(text: str) -> List[str]:
+    """Извлекает сбалансированные JSON-объекты `{...}` с корректным учётом строк и экранирования."""
+    results: List[str] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        escaped = False
+        j = i
+        while j < n:
+            ch = text[j]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        results.append(text[i : j + 1])
+                        i = j
+                        break
+            j += 1
+        i += 1
+    return results
+
+
 def parse_text_tool_call(text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
-    candidates = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text or "")
-    if not candidates:
-        match = re.search(r'\{[^{}]*"tool"[\s\S]*\}', text or "")
-        candidates = [match.group(0)] if match else []
+    src = text or ""
+    candidates = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", src)
+    # Если внутри JSON-аргументов встречались вложенные тройные кавычки, берём полные сбалансированные {...}.
+    for obj_str in _extract_balanced_json_objects(src):
+        if ('"tool"' in obj_str or '"name"' in obj_str) and obj_str not in candidates:
+            candidates.append(obj_str)
     for raw in candidates:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             continue
+        if not isinstance(data, dict):
+            continue
         tool = data.get("tool") or data.get("name")
-        if isinstance(tool, str):
+        if isinstance(tool, str) and tool.strip():
             args = data.get("args") or data.get("arguments") or {}
             if isinstance(args, str):
                 try:
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
-            return tool, args if isinstance(args, dict) else {}
+            return tool.strip(), args if isinstance(args, dict) else {}
     return None
 
 
 TEXT_PROTOCOL_NOTE = """
 
-Дополнительно: function calling недоступен, поэтому когда нужно действие,
+Дополнительно: function calling недоступен (или схемы не помещаются в контекст), поэтому когда нужно действие,
 ответь РОВНО одним JSON-объектом в блоке ```json:
 {"tool": "...", "args": {...}}
+Основные инструменты: sandbox_create_project, sandbox_write_file, sandbox_read_file, sandbox_list, run_command, browse_project, call_tester, create_file, open_website, qa_static_review, qa_run_tests, qa_http_audit, qa_browser_audit, qa_submit_report.
 Без пояснений вокруг. Если действие не нужно — отвечай обычным текстом.
 """
 
@@ -2765,7 +2858,7 @@ def run_tester_session(
         {"role": "user", "content": "\n".join(handoff_parts)},
     ]
 
-    qa_state: Dict[str, Any] = {"report": {}, "checks": []}
+    qa_state: Dict[str, Any] = {"report": {}, "checks": [], "runKey": run_key}
     tester_run_state: Dict[str, Any] = {}
     tester_tools = tools_for_trust(trust_level, has_github=has_github_repo, role="tester")
     local_browser_mgr = browser_manager or browser_inspector.BrowserSessionManager(sandbox_root=sandbox_root)
@@ -2821,6 +2914,7 @@ def run_tester_session(
                     params,
                     on_reasoning=_on_t_reason,
                     on_text=_on_t_text,
+                    on_status=lambda msg_s: _emit("tester_status", {"runKey": run_key, "text": msg_s}),
                     context_limit=discovered_max_context,
                     state_out=call_state,
                     cancel_check=cancel_check if callable(cancel_check) else None,
@@ -2835,11 +2929,9 @@ def run_tester_session(
                     tester_messages[:] = call_state["compacted_messages"]
                 raw_err = str(error)
                 detail = raw_err.lower()
-                if (
-                    use_tools
-                    and _parse_context_overflow_error(raw_err) is None
-                    and _parse_max_tokens_limit_error(raw_err) is None
-                    and ("tools" in detail or "400" in detail)
+                if use_tools and (
+                    _parse_context_overflow_error(raw_err) is not None
+                    or ("tools" in detail or "400" in detail)
                 ):
                     use_tools = False
                     tester_messages[0]["content"] = tester_messages[0].get("content", tester_system) + TEXT_PROTOCOL_NOTE
@@ -3014,6 +3106,15 @@ def run_tester_session(
 
     report = qa_state.get("report") if qa_state.get("report") else None
     if not report:
+        if not tester_final_text and not run_error and steps >= steps_cap:
+            checks_list = qa_state.get("checks") or []
+            if checks_list:
+                summary_lines = [f"Достигнут лимит шагов Тестировщика ({steps_cap}) до явного qa_submit_report; итоги выполненных проверок:"]
+                for chk in checks_list:
+                    summary_lines.append(f"- {chk.get('name')}: {chk.get('status')} — {chk.get('details')}")
+                tester_final_text = "\n".join(summary_lines)
+            elif tester_actions:
+                tester_final_text = f"Достигнут лимит шагов Тестировщика ({steps_cap}). Выполнено действий: {len(tester_actions)}."
         report = qa_tools.extract_fallback_qa_report(tester_final_text, qa_state.get("checks"))
         if run_error and not report.get("criticalIssues"):
             report["status"] = "error"
@@ -3025,32 +3126,8 @@ def run_tester_session(
     status = "error" if (run_error and not critical_issues and not minor_issues and not tester_final_text) else str(report.get("status") or "passed")
     report_summary = str(report.get("summary") or tester_final_text or "Проверка завершена.").strip()
 
-    minor_decision = "not_needed"
-    minor_note = ""
-    if minor_issues and not critical_issues:
-        if approval_fn is not None:
-            minor_preview = "\n".join(
-                f"• {m.get('title')}: {m.get('description')}" for m in minor_issues[:10]
-            )
-            dec = approval_fn(
-                {
-                    "kind": "tester_minor_fixes",
-                    "title": "Тестировщик нашёл некритические / мелкие замечания — вносить изменения?",
-                    "description": (
-                        f"Критических ошибок в «{proj_clean}» нет.\n"
-                        f"Мелкие замечания ({len(minor_issues)}):\n{minor_preview}"
-                    ),
-                    "minorIssues": minor_issues,
-                    "sandboxProject": proj_clean,
-                    "testerRunKey": run_key,
-                }
-            )
-            minor_decision = "approved" if dec.get("approved") else "rejected"
-            minor_note = str(dec.get("note") or "").strip()
-        else:
-            minor_decision = "pending"
-    elif minor_issues and critical_issues:
-        minor_decision = "pending"
+    needs_minor_approval = bool(minor_issues and not critical_issues)
+    initial_minor_decision = "pending" if minor_issues else "not_needed"
 
     usage_out = {
         "prompt": tester_usage_prompt,
@@ -3059,6 +3136,7 @@ def run_tester_session(
         "model": model or MODEL,
     }
 
+    # Сначала закрываем прогон Тестировщика в БД и убираем спиннер в UI, затем спрашиваем решение по мелким правкам.
     done_payload = {
         "runKey": run_key,
         "sandboxProject": proj_clean,
@@ -3067,7 +3145,7 @@ def run_tester_session(
         "criticalIssues": critical_issues,
         "minorIssues": minor_issues,
         "checksRun": checks_run,
-        "minorDecision": minor_decision,
+        "minorDecision": initial_minor_decision,
         "model": model or MODEL,
         "fullResponse": tester_final_text or report_summary,
         "reasoning": tester_thinking,
@@ -3077,6 +3155,32 @@ def run_tester_session(
         "usage": usage_out,
     }
     _emit("tester_done", done_payload)
+
+    minor_decision = initial_minor_decision
+    minor_note = ""
+    if needs_minor_approval and approval_fn is not None:
+        minor_preview = "\n".join(
+            f"• {m.get('title')}: {m.get('description')}" for m in minor_issues[:10]
+        )
+        dec = approval_fn(
+            {
+                "kind": "tester_minor_fixes",
+                "title": "Тестировщик нашёл некритические / мелкие замечания — вносить изменения?",
+                "description": (
+                    f"Критических ошибок в «{proj_clean}» нет.\n"
+                    f"Мелкие замечания ({len(minor_issues)}):\n{minor_preview}"
+                ),
+                "minorIssues": minor_issues,
+                "sandboxProject": proj_clean,
+                "testerRunKey": run_key,
+            }
+        )
+        minor_decision = "approved" if dec.get("approved") else "rejected"
+        minor_note = str(dec.get("note") or "").strip()
+        _emit(
+            "tester_decision",
+            {"runKey": run_key, "decision": minor_decision, "note": minor_note},
+        )
 
     recent_cache = ctx.get("recent_reports")
     if isinstance(recent_cache, list):
@@ -3142,7 +3246,11 @@ def run_tester_session(
         "model": model or MODEL,
         "label": f"QA Тестировщик: {proj_clean} ({status})",
     }
-    return {"agentText": "\n".join(lines), "agentEvents": [agent_event], "done": done_payload}
+    return {
+        "agentText": "\n".join(lines),
+        "agentEvents": [agent_event],
+        "done": {**done_payload, "minorDecision": minor_decision},
+    }
 
 
 # --------------------------------------------------------------------------
@@ -4036,7 +4144,11 @@ class Handler(BaseHTTPRequestHandler):
             raw_model_ctx = 0
         discovered_max_context = raw_model_ctx if raw_model_ctx > 0 else (raw_ctx_limit if raw_ctx_limit >= 32_768 else 0)
         direct_tester_key = uuid.uuid4().hex[:12] if agent_role == "tester" else ""
-        qa_state: Optional[Dict[str, Any]] = {"report": {}, "checks": []} if agent_role == "tester" else None
+        qa_state: Optional[Dict[str, Any]] = (
+            {"report": {}, "checks": [], "runKey": direct_tester_key}
+            if agent_role == "tester"
+            else None
+        )
         direct_actions_log: List[Dict[str, Any]] = []
         direct_files_log: List[Dict[str, Any]] = []
 
@@ -4137,6 +4249,7 @@ class Handler(BaseHTTPRequestHandler):
                             params,
                             on_reasoning=_emit_live_reasoning,
                             on_text=_emit_live_text,
+                            on_status=lambda msg_s: self.write(sse({"text": msg_s}, "status")),
                             context_limit=discovered_max_context,
                             state_out=call_state,
                             cancel_check=_is_disconnected,
@@ -4156,13 +4269,12 @@ class Handler(BaseHTTPRequestHandler):
                         strip_images()
                         images = []
                         continue
-                    if (
-                        use_tools
-                        and _parse_context_overflow_error(raw_err) is None
-                        and _parse_max_tokens_limit_error(raw_err) is None
-                        and ("tools" in detail or "400" in detail)
+                    if use_tools and (
+                        _parse_context_overflow_error(raw_err) is not None
+                        or (_parse_max_tokens_limit_error(raw_err) is None and ("tools" in detail or "400" in detail))
                     ):
-                        log("function calling недоступен, включаю JSON-протокол")
+                        log("function calling недоступен или переполнил контекст, включаю JSON-протокол")
+                        self.write(sse({"text": "Переключаюсь на компактный текстовый режим инструментов…"}, "status"))
                         use_tools = False
                         messages[0]["content"] = messages[0].get("content", system) + TEXT_PROTOCOL_NOTE
                         continue

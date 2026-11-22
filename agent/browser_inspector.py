@@ -43,6 +43,8 @@ import urllib.parse
 import urllib.request
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -108,11 +110,59 @@ def normalize_viewport(
     return max(320, min(2560, w)), max(320, min(2000, h))
 
 
+def _safe_is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _safe_is_dir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _safe_glob(root: Path, pattern: str) -> List[Path]:
+    try:
+        return sorted(root.glob(pattern), reverse=True)
+    except OSError:
+        return []
+
+
+def _windows_registry_browsers() -> List[Path]:
+    if platform.system() != "Windows":
+        return []
+    found: List[Path] = []
+    try:
+        import winreg  # type: ignore  # noqa: PLC0415
+
+        for root_hive in (getattr(winreg, "HKEY_CURRENT_USER", None), getattr(winreg, "HKEY_LOCAL_MACHINE", None)):
+            if root_hive is None:
+                continue
+            for exe_name in ("chrome.exe", "msedge.exe", "chromium.exe", "brave.exe"):
+                for sub_key in (
+                    rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}",
+                    rf"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}",
+                ):
+                    try:
+                        with winreg.OpenKey(root_hive, sub_key) as key:
+                            val, _ = winreg.QueryValueEx(key, "")
+                            if val:
+                                found.append(Path(str(val).strip().strip('"')))
+                    except OSError:
+                        continue
+    except Exception:  # noqa: BLE001
+        pass
+    return found
+
+
 def find_browser_executable() -> Optional[str]:
-    """Ищет установленный Chromium / Chrome / Edge (включая кеш Playwright)."""
+    """Ищет установленный Chromium / Chrome / Edge (включая реестр Windows и кеш Playwright)."""
     for env_key in ("AGENT_BROWSER_PATH", "CHROME_PATH", "CHROMIUM_PATH"):
-        raw = str(os.environ.get(env_key) or "").strip()
-        if raw and Path(raw).is_file():
+        raw = str(os.environ.get(env_key) or "").strip().strip('"')
+        if raw and _safe_is_file(Path(raw)):
             return str(Path(raw))
 
     names = [
@@ -127,14 +177,19 @@ def find_browser_executable() -> Optional[str]:
         "chrome",
     ]
     for name in names:
-        found = shutil.which(name)
-        if found:
+        try:
+            found = shutil.which(name)
+        except OSError:
+            found = None
+        if found and _safe_is_file(Path(found)):
             return found
 
     system = platform.system()
     candidates: List[Path] = []
     if system == "Windows":
+        candidates.extend(_windows_registry_browsers())
         for base in (
+            os.environ.get("PROGRAMW6432", ""),
             os.environ.get("PROGRAMFILES", r"C:\Program Files"),
             os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
             os.environ.get("LOCALAPPDATA", ""),
@@ -144,6 +199,7 @@ def find_browser_executable() -> Optional[str]:
             b = Path(base)
             candidates.extend([
                 b / "Google" / "Chrome" / "Application" / "chrome.exe",
+                b / "Google" / "Chrome SxS" / "Application" / "chrome.exe",
                 b / "Microsoft" / "Edge" / "Application" / "msedge.exe",
                 b / "Chromium" / "Application" / "chrome.exe",
                 b / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
@@ -166,20 +222,33 @@ def find_browser_executable() -> Optional[str]:
         ])
 
     for path in candidates:
-        if path.is_file():
+        if _safe_is_file(path):
             return str(path)
 
     # Кеш Playwright (chromium-* / chromium_headless_shell-*)
-    pw_roots = [
-        Path.home() / ".cache" / "ms-playwright",
+    pw_roots: List[Path] = []
+    custom_pw = str(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "").strip()
+    if custom_pw and custom_pw != "0":
+        pw_roots.append(Path(custom_pw))
+    try:
+        pw_roots.append(Path.home() / ".cache" / "ms-playwright")
+    except Exception:  # noqa: BLE001
+        pass
+    pw_roots.extend([
         Path("/root/.cache/ms-playwright"),
-    ]
+        Path("/ms-playwright"),
+    ])
     local_app = os.environ.get("LOCALAPPDATA")
     if local_app:
         pw_roots.append(Path(local_app) / "ms-playwright")
 
+    seen_roots: set[str] = set()
     for pw_root in pw_roots:
-        if not pw_root.is_dir():
+        key_r = str(pw_root)
+        if key_r in seen_roots:
+            continue
+        seen_roots.add(key_r)
+        if not _safe_is_dir(pw_root):
             continue
         for pattern in (
             "chromium-*/chrome-linux/chrome",
@@ -188,22 +257,36 @@ def find_browser_executable() -> Optional[str]:
             "chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell",
             "chromium-*/chrome-win/chrome.exe",
             "chromium-*/chrome-win64/chrome.exe",
+            "chromium_headless_shell-*/chrome-win64/chrome-headless-shell.exe",
             "chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium",
             "chromium-*/chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
         ):
-            matches = sorted(pw_root.glob(pattern), reverse=True)
-            for match in matches:
-                if match.is_file():
+            for match in _safe_glob(pw_root, pattern):
+                if _safe_is_file(match):
                     return str(match)
 
-    # Попытка спросить путь у пакета playwright, если он установлен в Python.
+    # Изолированный короткий probe пакета playwright без конфликта с asyncio-loop текущего потока.
     try:
-        from playwright.sync_api import sync_playwright  # type: ignore  # noqa: PLC0415
-
-        with sync_playwright() as p:
-            exe = p.chromium.executable_path
-            if exe and Path(exe).is_file():
-                return str(exe)
+        probe_kwargs: Dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
+            "text": True,
+            "timeout": 4,
+        }
+        if system == "Windows":
+            probe_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from playwright.sync_api import sync_playwright\nwith sync_playwright() as p: print(p.chromium.executable_path or '')",
+            ],
+            **probe_kwargs,
+        )
+        exe = (probe.stdout or "").strip().splitlines()[-1] if probe.returncode == 0 and (probe.stdout or "").strip() else ""
+        if exe and _safe_is_file(Path(exe)):
+            return exe
     except Exception:  # noqa: BLE001
         pass
 
@@ -257,6 +340,15 @@ class StaticSandboxServer:
         elif resolved.is_dir():
             serve_dir = resolved
             default_file = "/"
+            if not (serve_dir / "index.html").is_file():
+                for candidate_sub in ("dist/index.html", "build/index.html", "public/index.html", "out/index.html"):
+                    if (serve_dir / candidate_sub).is_file():
+                        default_file = "/" + candidate_sub
+                        break
+                else:
+                    html_files = sorted(p.name for p in serve_dir.glob("*.html") if p.is_file())
+                    if len(html_files) == 1:
+                        default_file = "/" + html_files[0]
         else:
             raise BrowserError(f"Проект или файл не найден в Sandbox: {project_rel}")
 
@@ -296,9 +388,15 @@ class _WebSocketClient:
         if parsed.scheme != "ws" or not parsed.hostname or not parsed.port:
             raise BrowserError(f"Некорректный WebSocket-адрес CDP: {ws_url}")
         self._sock = socket.create_connection((parsed.hostname, parsed.port), timeout=timeout)
+        try:
+            self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         self._sock.settimeout(timeout)
         self._write_lock = threading.Lock()
         self._buf = bytearray()
+        self._assembled = bytearray()
+        self._assembling_text = False
         self.closed = False
 
         path = parsed.path or "/"
@@ -340,7 +438,8 @@ class _WebSocketClient:
         # Периодический timeout чтения позволяет reader-потоку проверять закрытие сокета.
         self._sock.settimeout(10.0)
 
-    def _read_exact(self, n: int) -> bytes:
+    def _read_exact(self, n: int, *, continuation: bool = False) -> bytes:
+        deadline = time.monotonic() + (20.0 if continuation else 12.0)
         while len(self._buf) < n:
             if self.closed:
                 raise EOFError("WebSocket closed")
@@ -349,11 +448,10 @@ class _WebSocketClient:
             except TimeoutError:
                 if self.closed:
                     raise EOFError("WebSocket closed") from None
-                # Если уже начали читать фрейм (есть буфер или n > 2) — пробуем дочитать при живом сокете,
-                # а если стоим на границе нового фрейма — сигнализируем вызывающему о паузе чтения.
-                if not self._buf and n <= 2:
-                    raise
-                continue
+                # Если уже начали собирать сообщение или читаем тело фрейма — ждём в пределах общего дедлайна.
+                if (continuation or self._buf or n > 2) and time.monotonic() < deadline:
+                    continue
+                raise
             if not chunk:
                 raise EOFError("WebSocket closed")
             self._buf.extend(chunk)
@@ -384,24 +482,25 @@ class _WebSocketClient:
             self._sock.sendall(bytes(header) + masked)
 
     def recv_text(self) -> Optional[str]:
-        assembled = bytearray()
-        text_started = False
         while True:
-            b1, b2 = self._read_exact(2)
+            in_progress = self._assembling_text or bool(self._assembled)
+            b1, b2 = self._read_exact(2, continuation=in_progress)
             fin = bool(b1 & 0x80)
             opcode = b1 & 0x0F
             masked = bool(b2 & 0x80)
             length = b2 & 0x7F
             if length == 126:
-                (length,) = struct.unpack("!H", self._read_exact(2))
+                (length,) = struct.unpack("!H", self._read_exact(2, continuation=True))
             elif length == 127:
-                (length,) = struct.unpack("!Q", self._read_exact(8))
-            mask = self._read_exact(4) if masked else b""
-            data = self._read_exact(length) if length > 0 else b""
+                (length,) = struct.unpack("!Q", self._read_exact(8, continuation=True))
+            mask = self._read_exact(4, continuation=True) if masked else b""
+            data = self._read_exact(length, continuation=True) if length > 0 else b""
             if masked and data:
                 data = bytes(data[i] ^ mask[i % 4] for i in range(len(data)))
 
             if opcode == 0x8:  # close
+                self._assembled.clear()
+                self._assembling_text = False
                 self.closed = True
                 return None
             if opcode == 0x9:  # ping -> pong
@@ -413,14 +512,20 @@ class _WebSocketClient:
             if opcode == 0xA:  # pong
                 continue
             if opcode in (0x1, 0x2):
-                assembled = bytearray(data)
-                text_started = opcode == 0x1
+                self._assembled = bytearray(data)
+                self._assembling_text = opcode == 0x1
                 if fin:
-                    return assembled.decode("utf-8", errors="replace") if text_started else ""
+                    out = self._assembled.decode("utf-8", errors="replace") if self._assembling_text else ""
+                    self._assembled.clear()
+                    self._assembling_text = False
+                    return out
             elif opcode == 0x0:
-                assembled.extend(data)
+                self._assembled.extend(data)
                 if fin:
-                    return assembled.decode("utf-8", errors="replace") if text_started else ""
+                    out = self._assembled.decode("utf-8", errors="replace") if self._assembling_text else ""
+                    self._assembled.clear()
+                    self._assembling_text = False
+                    return out
 
     def close(self) -> None:
         self.closed = True
@@ -960,103 +1065,137 @@ def _kill_proc_tree(proc: Optional[subprocess.Popen[Any]]) -> None:
 
 
 def _launch_headless_chromium(executable: str, width: int, height: int) -> Tuple[subprocess.Popen[str], Path, int]:
-    user_data = Path(tempfile.mkdtemp(prefix="crm-browser-"))
-    cmd = [
-        executable,
-        "--headless=new",
-        f"--user-data-dir={user_data}",
-        "--remote-debugging-port=0",
-        "--remote-allow-origins=*",
-        f"--window-size={width},{height}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--no-proxy-server",
-        "--no-pings",
-        "--disable-background-networking",
-        "--disable-sync",
-        "--disable-translate",
-        "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider",
-        "--disable-hang-monitor",
-        "--disable-gpu",
-        "--disable-dev-shm-usage",
-        "--disable-background-timer-throttling",
-        "--disable-renderer-backgrounding",
-        "--disable-backgrounding-occluded-windows",
-        "--mute-audio",
-        "about:blank",
-    ]
-    if platform.system() != "Windows" and hasattr(os, "geteuid") and os.geteuid() == 0:
-        cmd.append("--no-sandbox")
+    """Запускает headless Chromium; при залипании/сбое `--headless=new` пробует классический `--headless`."""
+    attempts = (
+        ("--headless=new", 11.0),
+        ("--headless", 8.0),
+    )
+    last_error: Optional[Exception] = None
 
-    popen_kwargs: Dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-    }
-    if platform.system() == "Windows":
-        popen_kwargs["creationflags"] = (
-            getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        )
+    for headless_flag, startup_timeout in attempts:
+        user_data = Path(tempfile.mkdtemp(prefix="crm-browser-"))
+        cmd = [
+            executable,
+            headless_flag,
+            f"--user-data-dir={user_data}",
+            "--remote-debugging-port=0",
+            "--remote-allow-origins=*",
+            f"--window-size={width},{height}",
+            "--enable-logging=stderr",
+            "--log-level=3",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--no-proxy-server",
+            "--no-pings",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-translate",
+            "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider",
+            "--disable-hang-monitor",
+            "--disable-gpu",
+            "--disable-gpu-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--mute-audio",
+            "about:blank",
+        ]
+        if platform.system() != "Windows" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            cmd.append("--no-sandbox")
 
-    proc = subprocess.Popen(cmd, **popen_kwargs)
+        popen_kwargs: Dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if platform.system() == "Windows":
+            popen_kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
 
-    stderr_lines: List[str] = []
-    port_holder: Dict[str, int] = {"port": 0}
+        proc = subprocess.Popen(cmd, **popen_kwargs)
 
-    def read_stderr() -> None:
-        if not proc.stderr:
-            return
-        try:
-            for line in proc.stderr:
-                stderr_lines.append(line.strip())
-                m = re.search(r"DevTools listening on ws://[^:]+:(\d+)/", line)
-                if m and not port_holder["port"]:
-                    port_holder["port"] = int(m.group(1))
-                if len(stderr_lines) > 40:
-                    del stderr_lines[: len(stderr_lines) - 40]
-        except Exception:  # noqa: BLE001
-            pass
+        stderr_lines: List[str] = []
+        port_holder: Dict[str, int] = {"port": 0}
 
-    threading.Thread(target=read_stderr, daemon=True).start()
+        def read_stderr(p: subprocess.Popen[str] = proc, lines: List[str] = stderr_lines, holder: Dict[str, int] = port_holder) -> None:
+            if not p.stderr:
+                return
+            try:
+                for line in p.stderr:
+                    lines.append(line.strip())
+                    m = re.search(r"DevTools listening on ws://[^:]+:(\d+)/", line)
+                    if m and not holder["port"]:
+                        holder["port"] = int(m.group(1))
+                    if len(lines) > 40:
+                        del lines[: len(lines) - 40]
+            except Exception:  # noqa: BLE001
+                pass
 
-    deadline = time.monotonic() + 15.0
-    port_file = user_data / "DevToolsActivePort"
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            err_tail = " | ".join(stderr_lines[-5:])
+        threading.Thread(target=read_stderr, daemon=True).start()
+
+        deadline = time.monotonic() + startup_timeout
+        port_file = user_data / "DevToolsActivePort"
+        crashed = False
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                err_tail = " | ".join(stderr_lines[-5:])
+                _kill_proc_tree(proc)
+                shutil.rmtree(user_data, ignore_errors=True)
+                last_error = BrowserError(f"Браузер сразу завершился (код {proc.returncode}): {err_tail}")
+                crashed = True
+                break
+            if port_holder["port"]:
+                return proc, user_data, port_holder["port"]
+            if port_file.is_file():
+                try:
+                    first_line = port_file.read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
+                    if first_line.isdigit():
+                        return proc, user_data, int(first_line)
+                except (IndexError, OSError):
+                    pass
+            time.sleep(0.1)
+
+        if not crashed:
             _kill_proc_tree(proc)
             shutil.rmtree(user_data, ignore_errors=True)
-            raise BrowserError(f"Браузер сразу завершился (код {proc.returncode}): {err_tail}")
-        if port_holder["port"]:
-            return proc, user_data, port_holder["port"]
-        if port_file.is_file():
-            try:
-                first_line = port_file.read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
-                if first_line.isdigit():
-                    return proc, user_data, int(first_line)
-            except (IndexError, OSError):
-                pass
-        time.sleep(0.1)
+            last_error = BrowserError("Таймаут запуска headless-браузера CDP")
 
-    _kill_proc_tree(proc)
-    shutil.rmtree(user_data, ignore_errors=True)
+    if last_error is not None:
+        raise last_error
     raise BrowserError("Таймаут запуска headless-браузера CDP")
 
 
 def _find_page_ws_url(port: int) -> str:
-    deadline = time.monotonic() + 6.0
+    deadline = time.monotonic() + 7.0
     last_err = ""
+    tried_new_tab = False
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2) as resp:
+            with _LOCAL_OPENER.open(f"http://127.0.0.1:{port}/json/list", timeout=2) as resp:
                 targets = json.loads(resp.read().decode("utf-8"))
             for item in targets:
                 if item.get("type") == "page" and item.get("webSocketDebuggerUrl"):
                     return str(item["webSocketDebuggerUrl"])
+            if not tried_new_tab:
+                tried_new_tab = True
+                for method in ("PUT", "GET"):
+                    try:
+                        req = urllib.request.Request(
+                            f"http://127.0.0.1:{port}/json/new?about:blank",
+                            method=method,
+                        )
+                        with _LOCAL_OPENER.open(req, timeout=2) as new_resp:
+                            created = json.loads(new_resp.read().decode("utf-8"))
+                        if isinstance(created, dict) and created.get("webSocketDebuggerUrl"):
+                            return str(created["webSocketDebuggerUrl"])
+                    except Exception:  # noqa: BLE001
+                        continue
         except Exception as error:  # noqa: BLE001
             last_err = str(error)
         time.sleep(0.1)
@@ -1101,6 +1240,7 @@ class BrowserSession:
         self.static_servers: Dict[str, StaticSandboxServer] = {}
         self.approved_external_origins: set[str] = set()
         self.current_url = ""
+        self._screenshots_disabled = False
 
     @classmethod
     def launch(cls, width: int = 1440, height: int = 900) -> "BrowserSession":
@@ -1155,11 +1295,11 @@ class BrowserSession:
     def navigate(self, url: str, wait_ms: int = 450) -> None:
         cdp = self.ensure_cdp()
         cdp.clear_telemetry()
-        nav_res = cdp.call("Page.navigate", {"url": url}, timeout=12.0)
+        nav_res = cdp.call("Page.navigate", {"url": url}, timeout=10.0)
         if nav_res.get("errorText"):
             raise BrowserError(f"Браузер не смог открыть {url}: {nav_res['errorText']}")
         start = time.monotonic()
-        deadline = start + 10.0
+        deadline = start + 8.0
         interactive_since: Optional[float] = None
         while time.monotonic() < deadline:
             remaining = max(0.5, deadline - time.monotonic())
@@ -1167,15 +1307,29 @@ class BrowserSession:
                 state = cdp.evaluate(
                     "document.readyState",
                     await_promise=False,
-                    timeout=min(2.5, remaining),
+                    timeout=min(2.0, remaining),
                 )
                 if state == "complete":
                     break
                 if state == "interactive":
                     if interactive_since is None:
                         interactive_since = time.monotonic()
-                    # Если DOM уже готов > 2.5с (например, завис внешний шрифт/аналитика), продолжаем.
-                    elif time.monotonic() - interactive_since >= 2.5:
+                    # Если DOM уже готов > 2.0с (например, завис внешний шрифт/аналитика), продолжаем.
+                    elif time.monotonic() - interactive_since >= 2.0:
+                        break
+                elif time.monotonic() - start >= 4.5:
+                    # Если заблокирован внешний скрипт в <head>, но DOM уже присутствует — не ждём полный таймаут.
+                    has_dom = cdp.evaluate(
+                        "Boolean(document.body && document.body.children && document.body.children.length > 0)",
+                        await_promise=False,
+                        timeout=1.5,
+                    )
+                    if has_dom:
+                        with cdp._lock:
+                            cdp.console_messages.append({
+                                "level": "warning",
+                                "text": "Внешний ресурс задерживает readyState=loading (>4.5с); аудит выполнен по текущему DOM.",
+                            })
                         break
             except BrowserError:
                 pass
@@ -1185,16 +1339,19 @@ class BrowserSession:
         self.current_url = url
 
     def capture_screenshot(self) -> str:
+        if self._screenshots_disabled:
+            return ""
         try:
             res = self.ensure_cdp().call(
                 "Page.captureScreenshot",
                 {"format": "jpeg", "quality": 76, "fromSurface": True, "optimizeForSpeed": True},
-                timeout=10.0,
+                timeout=6.0,
             )
             b64 = str(res.get("data") or "")
             return f"data:image/jpeg;base64,{b64}" if b64 else ""
         except BrowserError:
-            # Не обваливаем весь шаг browse_project, если рендер скриншота задержался.
+            # Не тормозим последующие шаги в этой сессии, если captureScreenshot заблокирован/таймаутится.
+            self._screenshots_disabled = True
             return ""
 
     def audit(self) -> Dict[str, Any]:
@@ -1586,8 +1743,10 @@ def execute_browse_action(
             target_desc = f"({tx}, {ty})"
         else:
             loc = cdp.evaluate(_js_locate_element(selector, text_q), await_promise=False) or {}
-            if loc.get("error"):
-                raise BrowserError(str(loc["error"]))
+            if not isinstance(loc, dict) or loc.get("error"):
+                raise BrowserError(str((loc or {}).get("error") if isinstance(loc, dict) else "Элемент не найден"))
+            if "x" not in loc or "y" not in loc:
+                raise BrowserError("Не удалось определить координаты элемента на странице")
             tx, ty = int(loc["x"]), int(loc["y"])
             target_desc = f"<{loc.get('tag')}> «{loc.get('text') or selector or text_q}» в ({tx}, {ty})"
 
@@ -1606,8 +1765,10 @@ def execute_browse_action(
         text_val = str(args.get("text") or "")
         if selector:
             loc = cdp.evaluate(_js_locate_element(selector, ""), await_promise=False) or {}
-            if loc.get("error"):
-                raise BrowserError(str(loc["error"]))
+            if not isinstance(loc, dict) or loc.get("error"):
+                raise BrowserError(str((loc or {}).get("error") if isinstance(loc, dict) else "Элемент не найден"))
+            if "x" not in loc or "y" not in loc:
+                raise BrowserError("Не удалось определить координаты элемента ввода на странице")
             tx, ty = int(loc["x"]), int(loc["y"])
             cdp.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": tx, "y": ty, "button": "none"})
             cdp.call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": tx, "y": ty, "button": "left", "clickCount": 1})
@@ -1676,7 +1837,8 @@ def execute_browse_action(
         script = str(args.get("script") or "").strip()
         if not script:
             raise BrowserError("Для action='evaluate' укажите script")
-        eval_result = cdp.evaluate(script[:8000], await_promise=True)
+        await_promise = bool(args.get("await_promise", True))
+        eval_result = cdp.evaluate(script[:8000], await_promise=await_promise, timeout=8.0)
         action_note = "Выполнен инспектирующий скрипт"
 
     audit_data = session.audit()
