@@ -935,8 +935,13 @@ def log(message: str) -> None:
     try:
         print(text, flush=True)
     except UnicodeEncodeError:
-        enc = getattr(sys.stdout, "encoding", None) or "ascii"
-        print(text.encode(enc, errors="replace").decode(enc, errors="replace"), flush=True)
+        try:
+            enc = getattr(sys.stdout, "encoding", None) or "ascii"
+            print(text.encode(enc, errors="replace").decode(enc, errors="replace"), flush=True)
+        except (OSError, ValueError, UnicodeError):
+            pass
+    except (OSError, ValueError):
+        pass
 
 
 def normalize_trust(raw: Any) -> str:
@@ -3612,7 +3617,10 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        log(fmt % args)
+        try:
+            log(fmt % args)
+        except Exception:  # noqa: BLE001 — сбой stdout/логов не должен ронять HTTP-ответ
+            pass
 
     def _get_write_lock(self) -> threading.Lock:
         lock = getattr(self, "_write_lock", None)
@@ -3636,6 +3644,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_cors_headers()
             self.end_headers()
             self.wfile.write(body)
+            self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
             if _is_client_disconnect(exc):
                 self._client_disconnected = True
@@ -3668,8 +3677,34 @@ class Handler(BaseHTTPRequestHandler):
             raise
 
     def do_GET(self) -> None:  # noqa: N802
+        try:
+            self._handle_get()
+        except Exception as exc:  # noqa: BLE001 — не закрываем сокет с пустым ответом (ERR_EMPTY_RESPONSE)
+            if _is_client_disconnect(exc):
+                self._client_disconnected = True
+                return
+            log(f"сбой GET {self.path}: {exc}")
+            try:
+                self._json(500, {"ok": False, "error": str(exc)})
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _handle_get(self) -> None:
         parsed = urlparse(self.path)
         route = parsed.path
+
+        if route == "/favicon.ico":
+            try:
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
+                if _is_client_disconnect(exc):
+                    self._client_disconnected = True
+                    return
+                raise
+            return
 
         if route in ("/", "/health"):
             self._json(
@@ -3729,6 +3764,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(data)
+                self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
                 if _is_client_disconnect(exc):
                     self._client_disconnected = True
@@ -4604,7 +4640,16 @@ def _report_launcher_usage(
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # На Windows SO_REUSEADDR позволяет второму процессу занять уже слушаемый порт без ошибки.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)  # type: ignore[attr-defined]
+            except OSError:
+                pass
+        super().server_bind()
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         _, exc, _ = sys.exc_info()
@@ -5335,6 +5380,20 @@ def self_test() -> int:
     return 0 if passed == len(checks) else 1
 
 
+def _diagnose_port_conflict(host: str, port: int) -> str:
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    try:
+        req = urllib.request.Request(f"http://{probe_host}:{port}/health", method="GET")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=1.0) as resp:
+            raw = resp.read(2048).decode("utf-8", "replace")
+            if resp.status == 200 and '"tools"' in raw and '"ok"' in raw:
+                return f"на {probe_host}:{port} уже запущен другой экземпляр CRM Agent"
+            return f"на {probe_host}:{port} уже отвечает другой HTTP-сервис (HTTP {resp.status})"
+    except Exception as err:  # noqa: BLE001
+        return f"порт {port} уже занят другим процессом или заблокирован ({err})"
+
+
 def main() -> int:
     configure_stdio()
     parser = argparse.ArgumentParser(description="CRM AI Agent (HTTP+SSE + Sandbox)")
@@ -5346,10 +5405,11 @@ def main() -> int:
     try:
         server = Server((HOST, PORT), Handler)
     except OSError as exc:
+        detail = _diagnose_port_conflict(HOST, PORT)
         log(
-            f"не удалось запустить сервер на http://{HOST}:{PORT}: {exc}. "
-            "Проверьте, не запущен ли уже другой экземпляр агента или не занят ли порт "
-            "(можно задать другой AGENT_PORT, например 8901)."
+            f"не удалось запустить сервер на http://{HOST}:{PORT}: {exc} ({detail}). "
+            "Закройте конфликтующий процесс на порту или задайте другой порт "
+            "(например AGENT_PORT=8901 для агента и AGENT_URL=http://127.0.0.1:8901 в .env)."
         )
         return 1
     log(f"слушаю http://{HOST}:{PORT} · модель: {MODEL or 'из запроса'} · база: {BASE_URL}")
