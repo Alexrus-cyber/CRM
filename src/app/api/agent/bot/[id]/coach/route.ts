@@ -1,8 +1,9 @@
-import { AGENT_URL } from "@/lib/agentConfig";
+import { resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { getAgentTask, getAiUserSettingsSecret, recordAgentUsage, setAgentTaskGuidance, syncOperatorTaskToConversation } from "@/db/repo";
 import { botOwner } from "@/lib/agentBot";
 import { requestAgentStepCoaching } from "@/lib/agentCoach";
 import type { GenParams } from "@/lib/genParams";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 
 /**
  * Пошаговое сопровождение Оператора после каждого действия:
@@ -17,6 +18,22 @@ export const runtime = "nodejs";
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const ownerId = await botOwner(req);
   if (!ownerId) return Response.json({ error: "Неверный токен агента" }, { status: 401 });
+
+  const rl = checkApiRateLimit({
+    scope: "bot_coach",
+    userId: ownerId,
+    ip: extractClientIp(req.headers),
+    maxRequests: 120,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
+
+  let safeAgentUrl: string;
+  try {
+    safeAgentUrl = resolveSafeAgentUrl();
+  } catch (err) {
+    return Response.json({ error: (err as Error).message }, { status: 400 });
+  }
 
   const { id } = await ctx.params;
   const task = await getAgentTask(ownerId, Number(id) || 0);
@@ -73,7 +90,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   const savedSettings = await getAiUserSettingsSecret(ownerId).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
   const advice = await requestAgentStepCoaching({
-    agentUrl: AGENT_URL,
+    agentUrl: safeAgentUrl,
     taskPrompt: task.prompt,
     taskMode: task.taskMode,
     phase,

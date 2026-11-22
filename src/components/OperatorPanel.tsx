@@ -726,13 +726,16 @@ export function OperatorPanel({ unlimited = true }: { unlimited?: boolean } = {}
     setRefreshingCaps(true);
     try {
       const base = providerBaseUrl(provider);
-      const res = await fetch(
-        `/api/ai/models?base=${encodeURIComponent(base)}&model=${encodeURIComponent(resolvedModelName)}`,
-        {
-          headers: apiKey.trim() ? { "x-ai-key": apiKey.trim() } : undefined,
-          cache: "no-store",
-        },
-      );
+      const res = await fetch("/api/ai/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseUrl: base,
+          ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+          ...(resolvedModelName ? { model: resolvedModelName } : {}),
+        }),
+        cache: "no-store",
+      });
       if (!res.ok) return;
       const data = (await res.json().catch(() => ({}))) as {
         capabilitiesByModel?: Record<string, ModelCapabilities>;

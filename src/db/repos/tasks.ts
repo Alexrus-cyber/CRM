@@ -106,8 +106,10 @@ export const TASK_MESSAGE_MAX = 2000;
 
 const TASK_SELECT = sql`t.id, t.title, t.description, t.assignee_id, t.author_id, t.counterparty_id,
   t.deadline, t.deadline_time, t.accepted_at, t.hours, t.status, t.priority, t.completed_at, t.closed_at, t.created_at, t.updated_at,
-  a.name as assignee_name, a.avatar_color as assignee_color, a.avatar_url as assignee_avatar,
-  au.name as author_name, au.avatar_color as author_color, au.avatar_url as author_avatar,
+  case when a.deleted_at is null then a.name else a.name || ' (удалён)' end as assignee_name,
+  a.avatar_color as assignee_color, a.avatar_url as assignee_avatar,
+  case when au.deleted_at is null then au.name else au.name || ' (удалён)' end as author_name,
+  au.avatar_color as author_color, au.avatar_url as author_avatar,
   c.name as counterparty_name, c.inn as counterparty_inn, c.kpp as counterparty_kpp,
   (select count(*) from task_messages tm where tm.task_id = t.id) as messages_count`;
 

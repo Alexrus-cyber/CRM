@@ -41,6 +41,13 @@ export const users = pgTable("users", {
   isBot: boolean("is_bot").notNull().default(false),
   canUseAgent: boolean("can_use_agent").notNull().default(false),
   canUseOperator: boolean("can_use_operator").notNull().default(false),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  mustChangePassword: boolean("must_change_password").notNull().default(false),
+  totpSecretEncrypted: text("totp_secret_encrypted").notNull().default(""),
+  totpEnabled: boolean("totp_enabled").notNull().default(false),
+  pendingEmail: text("pending_email"),
+  pendingEmailTokenHash: text("pending_email_token_hash"),
+  pendingEmailExpiresAt: timestamp("pending_email_expires_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -492,10 +499,17 @@ export const agentConnectionTokens = pgTable(
       .references(() => users.id, { onDelete: "cascade" }),
     name: text("name").notNull().default(""),
     token: text("token").notNull().unique(),
+    tokenHash: text("token_hash").notNull().default(""),
+    tokenHint: text("token_hint").notNull().default(""),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
   },
-  (t) => [index("agent_connection_tokens_conn_idx").on(t.connectionId)],
+  (t) => [
+    index("agent_connection_tokens_conn_idx").on(t.connectionId),
+    index("agent_connection_tokens_hash_idx").on(t.tokenHash),
+  ],
 );
 
 export const agentTokens = pgTable("agent_tokens", {

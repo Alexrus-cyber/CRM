@@ -53,7 +53,7 @@ describe("crypto & secret encryption", () => {
     const plain = "sk-test-1234567890abcdef";
     const encrypted = encryptSecret(plain);
     expect(encrypted).not.toContain(plain);
-    expect(encrypted.startsWith("enc1:")).toBe(true);
+    expect(encrypted.startsWith("enc2:k1:")).toBe(true);
     expect(decryptSecret(encrypted)).toBe(plain);
     expect(maskSecret(plain)).toBe("sk-tes••••cdef");
 

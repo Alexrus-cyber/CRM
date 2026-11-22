@@ -1,5 +1,6 @@
 import { addRagChunks, getRagFolder } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -16,6 +17,15 @@ const MAX_BATCH_ITEMS = 400;
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
+  const rl = checkApiRateLimit({
+    scope: "rag_chunks",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 60,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
 
   const unlimited = me.role === "super_admin";
   let folderId = 0;

@@ -71,6 +71,18 @@ def validate_browser_url(raw_url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise BrowserError("Разрешены только адреса http:// или https://")
+    if parsed.username or parsed.password:
+        raise BrowserError("Учётные данные в URL запрещены")
+    host = (parsed.hostname or "").strip().lower().strip("[]")
+    if host in (
+        "169.254.169.254",
+        "metadata.google.internal",
+        "metadata.goog",
+        "metadata.azure.internal",
+        "metadata.aws.internal",
+        "instance-data",
+    ) or host.startswith("169.254.") or host.startswith("fe80:"):
+        raise BrowserError("Запрещён доступ к служебным metadata-адресам")
     return url
 
 

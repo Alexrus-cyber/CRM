@@ -121,29 +121,46 @@ try {
     process.exit(0);
   }
 
-  const adminEmail = (process.env.CRM_SEED_ADMIN_EMAIL || "admin@crm.local").trim().toLowerCase();
-  const envAdminPass = (process.env.CRM_SEED_ADMIN_PASSWORD || "").trim();
+  const adminEmail = (
+    process.env.CRM_ADMIN_EMAIL ||
+    process.env.CRM_SEED_ADMIN_EMAIL ||
+    "admin@crm.local"
+  ).trim().toLowerCase();
+  const envAdminPass = (process.env.CRM_ADMIN_PASSWORD || process.env.CRM_SEED_ADMIN_PASSWORD || "").trim();
   const adminPassword = envAdminPass || generatePassword();
+  const mustChangePassword = !envAdminPass;
 
   await query(
-    `insert into users (email, password_hash, name, position, role, avatar_color, phone, bio, is_bot, can_use_agent, can_use_operator, created_at, updated_at)
-     values (?, ?, ?, ?, 'super_admin', '#7c5cff', '+7 (900) 100-00-01', ?, false, true, true, ?, ?)
+    `insert into users (email, password_hash, name, position, role, avatar_color, phone, bio, is_bot, can_use_agent, can_use_operator, must_change_password, created_at, updated_at)
+     values (?, ?, ?, ?, 'super_admin', '#7c5cff', '+7 (900) 100-00-01', ?, false, true, true, ?, ?, ?)
      on conflict (email) do update set role = 'super_admin', can_use_agent = true, can_use_operator = true`,
     [
       adminEmail,
       hash(adminPassword),
-      process.env.CRM_SEED_ADMIN_NAME || "Главный администратор",
+      process.env.CRM_ADMIN_NAME || process.env.CRM_SEED_ADMIN_NAME || "Главный администратор",
       "Руководитель",
       "Отвечаю за развитие продукта и команду.",
+      mustChangePassword,
       isoOffset(-30),
       isoOffset(-30),
     ],
   );
 
   if (!envAdminPass) {
-    console.log(`[${label}] создан super_admin: ${adminEmail} / временный пароль: ${adminPassword}`);
+    if (process.stdout.isTTY) {
+      console.log(`[${label}] создан super_admin: ${adminEmail} / временный пароль: ${adminPassword} (потребуется смена при первом входе)`);
+    } else {
+      const credFile = path.join(root, "data", ".seed-credentials.txt");
+      fs.mkdirSync(path.dirname(credFile), { recursive: true });
+      fs.writeFileSync(
+        credFile,
+        `email=${adminEmail}\ntemporary_password=${adminPassword}\n`,
+        { mode: 0o600 },
+      );
+      console.log(`[${label}] создан super_admin: ${adminEmail}. Временный пароль сохранён в ${credFile} (mode 0600); потребуется смена при первом входе.`);
+    }
   } else {
-    console.log(`[${label}] создан super_admin: ${adminEmail} (пароль из CRM_SEED_ADMIN_PASSWORD)`);
+    console.log(`[${label}] создан super_admin: ${adminEmail} (пароль из переменной окружения)`);
   }
 
   if (!seedDemo) {
@@ -279,7 +296,14 @@ try {
   ]);
 
   if (!envDemoPass) {
-    console.log(`[${label}] временный пароль демо-сотрудников: ${demoPassword}`);
+    if (process.stdout.isTTY) {
+      console.log(`[${label}] временный пароль демо-сотрудников: ${demoPassword}`);
+    } else {
+      const demoCredFile = path.join(root, "data", ".seed-demo-credentials.txt");
+      fs.mkdirSync(path.dirname(demoCredFile), { recursive: true });
+      fs.writeFileSync(demoCredFile, `demo_password=${demoPassword}\n`, { mode: 0o600 });
+      console.log(`[${label}] временный пароль демо-сотрудников сохранён в ${demoCredFile} (mode 0600).`);
+    }
   }
   console.log(`[${label}] demo seed complete: ${users.length} users, ${cpIds.length} counterparties, ${T.length} tasks`);
 } finally {

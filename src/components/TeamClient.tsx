@@ -137,7 +137,7 @@ export function TeamList({ users, me, stats }: { users: UserLite[]; me: { id: nu
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Имя и фамилия *" className="sm:col-span-2"><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Иван Петров" autoFocus /></Field>
           <Field label="Email *"><Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="ivan@company.ru" /></Field>
-          <Field label="Временный пароль *"><Input type="text" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="минимум 6 символов" /></Field>
+          <Field label="Временный пароль *"><Input type="text" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="мин. 10 симв., буквы и цифры" /></Field>
           <Field label="Роль">
             <Combobox
               aria-label="Роль"

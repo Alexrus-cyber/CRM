@@ -80,7 +80,6 @@ def operator_args(spec: AgentSpec, settings: LaunchSettings) -> List[str]:
     if model["provider"] == "custom" or (model["base_url"] and model["base_url"] != preset_url):
         _add_flag(args, "--base-url", model["base_url"])
     _add_flag(args, "--model", model["model"])
-    _add_flag(args, "--api-key", model["api_key"])
     if model["temperature"] is not None:
         _add_flag(args, "--temperature", model["temperature"])
     if model["top_p"] is not None:
@@ -93,9 +92,7 @@ def operator_args(spec: AgentSpec, settings: LaunchSettings) -> List[str]:
     mode = str(values.get("mode") or "watch")
     profile_op = settings.crm_profile.get("operator") if isinstance(settings.crm_profile, dict) else None
     crm_server = values.get("crm_server") or (profile_op.get("serverUrl") if isinstance(profile_op, dict) else "")
-    crm_token = values.get("crm_token") or (profile_op.get("token") if isinstance(profile_op, dict) else "")
     _add_flag(args, "--server", crm_server)
-    _add_flag(args, "--token", crm_token)
     if mode == "watch":
         args.append("--watch")
     elif mode == "once":
@@ -142,7 +139,7 @@ def operator_args(spec: AgentSpec, settings: LaunchSettings) -> List[str]:
 
 
 def chat_agent_env(spec: AgentSpec, settings: LaunchSettings) -> Dict[str, str]:
-    """Переменные `agent.py` — он не принимает аргументы командной строки."""
+    """Публичные переменные `agent.py` (ключи и токены уходят через 0600 CRM_SECRETS_FILE)."""
     values = settings.values_for(spec)
     model = model_settings(settings)
     env: Dict[str, str] = {
@@ -150,7 +147,6 @@ def chat_agent_env(spec: AgentSpec, settings: LaunchSettings) -> Dict[str, str]:
         "AGENT_PORT": str(number(values.get("port"), int) or 8899),
         "AGENT_BASE_URL": model["base_url"],
         "AGENT_MODEL": model["model"],
-        "AGENT_API_KEY": model["api_key"],
     }
     steps = number(values.get("max_steps"), int)
     if settings.crm_profile:
@@ -179,7 +175,6 @@ def custom_env(spec: AgentSpec, settings: LaunchSettings) -> Dict[str, str]:
     return {
         "AGENT_BASE_URL": model["base_url"],
         "AGENT_MODEL": model["model"],
-        "AGENT_API_KEY": model["api_key"],
     }
 
 
@@ -218,17 +213,37 @@ def agent_args(spec: AgentSpec, settings: LaunchSettings) -> List[str]:
 
 
 def agent_env(spec: AgentSpec, settings: LaunchSettings) -> Dict[str, str]:
-    """Дополнительные переменные окружения агента (без системных)."""
+    """Дополнительные несекретные переменные окружения агента."""
     env: Dict[str, str] = {}
     if settings.crm_url.strip():
         env["CRM_SERVER_URL"] = crm_client.normalize_server_url(settings.crm_url)
-    if settings.crm_session_token.strip():
-        env["CRM_LAUNCHER_SESSION_TOKEN"] = settings.crm_session_token.strip()
     if spec.id == "chat_agent":
         env.update(chat_agent_env(spec, settings))
     elif spec.id == "custom":
         env.update(custom_env(spec, settings))
     return env
+
+
+def agent_secrets(spec: AgentSpec, settings: LaunchSettings) -> Dict[str, str]:
+    """Секреты запуска (передаются через 0600 CRM_SECRETS_FILE, а не argv/env)."""
+    out: Dict[str, str] = {}
+    if settings.crm_session_token.strip():
+        out["CRM_LAUNCHER_SESSION_TOKEN"] = settings.crm_session_token.strip()
+    model = model_settings(settings)
+    if model["api_key"]:
+        if spec.id == "operator":
+            out["OPERATOR_API_KEY"] = model["api_key"]
+        elif spec.id == "chat_agent":
+            out["AGENT_API_KEY"] = model["api_key"]
+        elif spec.id == "custom" and truthy(settings.values_for(spec).get("pass_model_env", True)):
+            out["AGENT_API_KEY"] = model["api_key"]
+    if spec.id == "operator":
+        values = settings.values_for(spec)
+        profile_op = settings.crm_profile.get("operator") if isinstance(settings.crm_profile, dict) else None
+        crm_token = str(values.get("crm_token") or (profile_op.get("token") if isinstance(profile_op, dict) else "") or "").strip()
+        if crm_token:
+            out["CRM_AGENT_TOKEN"] = crm_token
+    return out
 
 
 def script_path(spec: AgentSpec, settings: LaunchSettings, agents_dir: Path) -> Path | None:

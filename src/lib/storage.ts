@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-export type StorageCategory = "chat" | "agent" | "screens";
+export type StorageCategory = "chat" | "agent" | "screens" | "avatars";
 
 /**
  * Корень файлового хранилища.

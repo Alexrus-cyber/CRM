@@ -131,8 +131,11 @@ def self_test() -> int:
     check("оператор: разовое задание передаётся флагом", "--task" in args and "открой блокнот" in args)
     check("оператор: watch не добавляется в разовом режиме", "--watch" not in args)
     check("оператор: температура передаётся", "--temperature" in args and "0.3" in args)
-    check("оператор: секреты не светятся в описании команды",
-          "sk-secret-key-123456" not in commands.describe_command(args, {})
+    check("оператор: секреты не попадают в argv и описание команды",
+          "--api-key" not in args and "--token" not in args
+          and "sk-secret-key-123456" not in " ".join(args)
+          and "crmop_token_value" not in " ".join(args)
+          and "sk-secret-key-123456" not in commands.describe_command(args, {})
           and "crmop_token_value" not in commands.describe_command(args, {}))
 
     watch = settings_mod.LaunchSettings()
@@ -152,8 +155,12 @@ def self_test() -> int:
           and "--no-self-reflect" in off_args)
 
     env = commands.agent_env(chat_agent, conf)
-    check("агент: адрес, модель и ключ уходят в переменные",
-          env.get("AGENT_BASE_URL", "").endswith("/v1") and env.get("AGENT_MODEL") and env.get("AGENT_API_KEY"))
+    sec = commands.agent_secrets(chat_agent, conf)
+    check("агент: адрес и модель уходят в env, а ключ — в изолированные секреты (P1-20)",
+          env.get("AGENT_BASE_URL", "").endswith("/v1")
+          and bool(env.get("AGENT_MODEL"))
+          and "AGENT_API_KEY" not in env
+          and sec.get("AGENT_API_KEY") == "sk-secret-key-123456")
     check("агент: порт по умолчанию", env.get("AGENT_PORT") == "8899")
     check("агент: уровень доверия уходит в AGENT_TRUST_LEVEL", env.get("AGENT_TRUST_LEVEL") == "verified")
 
@@ -184,16 +191,27 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "settings.json"
         conf.remember_key = False
+        conf.crm_session_token = "sess-secret-token-xyz"
         settings_mod.save(conf, path)
         raw = path.read_text(encoding="utf-8")
-        check("настройки: ключ не пишется без разрешения", "sk-secret-key-123456" not in raw)
+        check("настройки: ключ и сессия CRM не пишутся без разрешения (P1-21)",
+              "sk-secret-key-123456" not in raw and "sess-secret-token-xyz" not in raw)
         restored = settings_mod.load(path)
         check("настройки: значения агента переживают перезапуск",
               restored.values_for(operator).get("task") == "открой блокнот")
         conf.remember_key = True
         settings_mod.save(conf, path)
-        check("настройки: с галочкой ключ сохраняется",
-              settings_mod.load(path).api_key == "sk-secret-key-123456")
+        reloaded = settings_mod.load(path)
+        check("настройки: с галочкой ключ и сессия сохраняются",
+              reloaded.api_key == "sk-secret-key-123456" and reloaded.crm_session_token == "sess-secret-token-xyz")
+
+    os.environ["AWS_SECRET_ACCESS_KEY"] = "leaked-aws-secret"
+    try:
+        filtered_env = bundle.child_env({"AGENT_MODEL": "m"})
+        check("child_env отфильтровывает секреты хоста по allowlist (P1-20)",
+              "AWS_SECRET_ACCESS_KEY" not in filtered_env and filtered_env.get("AGENT_MODEL") == "m")
+    finally:
+        os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
 
     check("секрет в подсказке маскируется", settings_mod.mask_secret("sk-secret-key-123456").startswith("sk-s"))
     check("зависимости оператора перечислены", len(deps.check("operator")) == 3)
@@ -369,8 +387,15 @@ def _spec_checks(check) -> None:
 
 def _crm_auth_checks(check) -> None:
     """Проверки ограничений CRM, автотокена и прав доступа в лаунчере."""
-    check("crm_client: нормализует URL без схемы",
-          crm_client.normalize_server_url("localhost:3000/") == "http://localhost:3000")
+    check("crm_client: нормализует URL без схемы (localhost → http, удалённый → https)",
+          crm_client.normalize_server_url("localhost:3000/") == "http://localhost:3000"
+          and crm_client.normalize_server_url("crm.example.com/") == "https://crm.example.com")
+    http_rejected = False
+    try:
+        crm_client._assert_safe_crm_transport("http://crm.example.com/api/health")
+    except crm_client.CrmClientError:
+        http_rejected = True
+    check("crm_client: запрещает незашифрованный http:// для удалённого CRM (P1-22)", http_rejected)
     check("crm_client: ограничивает max_steps для обычных ролей",
           crm_client.clamp_max_steps(999, 500, False) == 500
           and crm_client.clamp_max_steps(0, 500, False) == 500
@@ -411,8 +436,10 @@ def _crm_auth_checks(check) -> None:
           not crm_client.can_launch_agent("operator", limited.crm_profile)[0]
           and crm_client.can_launch_agent("chat_agent", limited.crm_profile)[0])
     op_args = commands.agent_args(operator, limited)
-    check("crm_client: оператор получает автотокен и потолок шагов из профиля",
-          "--token" in op_args and "crmop_auto_token" in op_args
+    op_sec = commands.agent_secrets(operator, limited)
+    check("crm_client: оператор получает автотокен в изолированный файл секретов и потолок шагов",
+          "--token" not in op_args
+          and op_sec.get("CRM_AGENT_TOKEN") == "crmop_auto_token"
           and "--max-steps" in op_args and op_args[op_args.index("--max-steps") + 1] == "500")
     check("crm_client: reasoning сбрасывается до разрешённого уровня",
           "--reasoning" not in op_args
@@ -566,7 +593,9 @@ def _gui_smoke(check) -> None:
 
             script = Path(tmp) / "my_agent.py"
             script.write_text(
-                "import os, sys\nprint('gui-smoke-ok', ' '.join(sys.argv[1:]))\nprint(os.environ.get('AGENT_MODEL'))\nprint(os.environ.get('CRM_LAUNCHER_SESSION_TOKEN'))\n",
+                "import json, os, pathlib, sys\nprint('gui-smoke-ok', ' '.join(sys.argv[1:]))\nprint(os.environ.get('AGENT_MODEL'))\n"
+                "sf = os.environ.get('CRM_SECRETS_FILE', '')\n"
+                "print(json.loads(pathlib.Path(sf).read_text(encoding='utf-8')).get('CRM_LAUNCHER_SESSION_TOKEN') if sf else '')\n",
                 encoding="utf-8",
             )
             app._show_agent("custom")
@@ -581,7 +610,7 @@ def _gui_smoke(check) -> None:
             app._drain_log()
             check("интерфейс: агент запускается и пишет в журнал",
                   "gui-smoke-ok --check" in app.log.content)
-            check("интерфейс: модель и сессия CRM уходят в переменные окружения",
+            check("интерфейс: модель уходит в env, а сессия CRM — через 0600 файл секретов",
                   "gpt-4o-mini" in app.log.content and "crm_sess_smoke_123" in app.log.content)
             app._on_close()
             check("интерфейс: настройки сохраняются при выходе",

@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
-import { AGENT_URL } from "@/lib/agentConfig";
+import { resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { getGithubConnectionWithSecret } from "@/db/repo";
 import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { GithubApiError, buildGithubRagSnapshot } from "@/lib/github";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 
 export const dynamic = "force-dynamic";
 
@@ -13,6 +14,15 @@ export async function POST(req: Request) {
   if (!hasAgentAccess(me)) {
     return NextResponse.json({ error: "Доступ к Агенту не выдан главным администратором" }, { status: 403 });
   }
+
+  const rl = checkApiRateLimit({
+    scope: "github_sync",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 20,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
 
   const conn = await getGithubConnectionWithSecret(me.id);
   if (!conn) {
@@ -48,7 +58,8 @@ export async function POST(req: Request) {
     let sandboxPath = "";
     let sandboxError = "";
     try {
-      const agentRes = await fetch(`${AGENT_URL}/github/sync`, {
+      const agentUrl = resolveSafeAgentUrl();
+      const agentRes = await fetch(`${agentUrl}/github/sync`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

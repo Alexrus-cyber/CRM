@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Camera, Check, KeyRound, Laptop, LogOut, RotateCcw, Save, Shield, Trash2, X } from "lucide-react";
+import { Camera, Check, ClipboardCopy, KeyRound, Laptop, LogOut, RotateCcw, Save, Shield, ShieldCheck, Trash2, X } from "lucide-react";
 import type { Role } from "@/db/schema";
 import type { UserLite } from "@/lib/data";
 import {
@@ -36,10 +36,14 @@ export function ProfileForm({ user }: { user: UserLite }) {
     avatarColor: user.avatarColor,
     avatarUrl: user.avatarUrl as string | null,
   });
+  const [emailConfirmPassword, setEmailConfirmPassword] = useState("");
+  const [confirmLink, setConfirmLink] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ msg: string; ok: boolean } | null>(null);
   const [pw, setPw] = useState({ current: "", next: "", repeat: "" });
   const [pwNotice, setPwNotice] = useState<{ msg: string; ok: boolean } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  const emailChanged = form.email.trim().toLowerCase() !== user.email.toLowerCase();
 
   const onFile = (file: File | undefined) => {
     if (!file) return;
@@ -62,10 +66,28 @@ export function ProfileForm({ user }: { user: UserLite }) {
 
   const save = () => {
     setNotice(null);
+    setConfirmLink(null);
     start(async () => {
-      const res = await updateProfileAction(form);
-      setNotice(res.ok ? { msg: "Профиль сохранён", ok: true } : { msg: res.error, ok: false });
-      if (res.ok) router.refresh();
+      const res = await updateProfileAction({
+        ...form,
+        ...(emailChanged ? { currentPassword: emailConfirmPassword } : {}),
+      });
+      if (!res.ok) {
+        setNotice({ msg: res.error, ok: false });
+        return;
+      }
+      const extra = res as { pendingEmail?: string; confirmPath?: string };
+      if (extra.pendingEmail) {
+        setEmailConfirmPassword("");
+        setConfirmLink(extra.confirmPath ?? null);
+        setNotice({
+          msg: `Профиль сохранён. Для завершения смены email на ${extra.pendingEmail} перейдите по ссылке подтверждения.`,
+          ok: true,
+        });
+      } else {
+        setNotice({ msg: "Профиль сохранён", ok: true });
+      }
+      router.refresh();
     });
   };
 
@@ -74,8 +96,15 @@ export function ProfileForm({ user }: { user: UserLite }) {
     if (pw.next !== pw.repeat) return setPwNotice({ msg: "Пароли не совпадают", ok: false });
     start(async () => {
       const res = await changePasswordAction(pw.current, pw.next);
-      setPwNotice(res.ok ? { msg: "Пароль изменён", ok: true } : { msg: res.error, ok: false });
-      if (res.ok) setPw({ current: "", next: "", repeat: "" });
+      setPwNotice(
+        res.ok
+          ? { msg: "Пароль изменён, другие активные сессии завершены", ok: true }
+          : { msg: res.error, ok: false },
+      );
+      if (res.ok) {
+        setPw({ current: "", next: "", repeat: "" });
+        router.refresh();
+      }
     });
   };
 
@@ -113,7 +142,25 @@ export function ProfileForm({ user }: { user: UserLite }) {
         <Card title="Личная информация" subtitle="Эти данные видят коллеги в разделе «Команда»">
           <div className="grid min-w-0 gap-4 sm:grid-cols-2">
             <Field label="Имя и фамилия *"><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field>
-            <Field label="Email *"><Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></Field>
+            <Field label="Email *">
+              <Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+              {user.pendingEmail && (
+                <p className="mt-1 text-[11px] text-amber-500">
+                  Ожидает подтверждения новый email: <span className="font-mono">{user.pendingEmail}</span>
+                </p>
+              )}
+            </Field>
+            {emailChanged && (
+              <Field label="Текущий пароль (для подтверждения смены email) *" className="sm:col-span-2">
+                <Input
+                  type="password"
+                  value={emailConfirmPassword}
+                  onChange={(e) => setEmailConfirmPassword(e.target.value)}
+                  placeholder="Введите текущий пароль"
+                  autoComplete="current-password"
+                />
+              </Field>
+            )}
             <Field label="Телефон"><Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} placeholder="+7 (999) 000-00-00" /></Field>
             <Field label="Должность"><Input value={form.position} onChange={(e) => setForm({ ...form, position: e.target.value })} placeholder="Frontend-разработчик" /></Field>
             <Field label="Права доступа">
@@ -121,27 +168,201 @@ export function ProfileForm({ user }: { user: UserLite }) {
             </Field>
             <Field label="О себе" className="sm:col-span-2"><Textarea value={form.bio} onChange={(e) => setForm({ ...form, bio: e.target.value })} placeholder="Чем занимаетесь, зона ответственности, навыки..." /></Field>
           </div>
+          {confirmLink && (
+            <div className="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-500">
+              Локальное подтверждение email:{" "}
+              <a href={confirmLink} className="font-semibold underline">
+                подтвердить новый адрес
+              </a>
+            </div>
+          )}
           <div className="mt-4 flex items-center justify-between gap-3">
             {notice ? <Notice {...notice} /> : <span />}
-            <Button onClick={save} disabled={pending}><Save size={16} /> {pending ? "Сохраняем..." : "Сохранить профиль"}</Button>
+            <Button onClick={save} disabled={pending || (emailChanged && !emailConfirmPassword)}><Save size={16} /> {pending ? "Сохраняем..." : "Сохранить профиль"}</Button>
           </div>
         </Card>
 
-        <Card title="Смена пароля">
+        <Card title="Смена пароля" subtitle="Минимум 10 символов, обязательно буквы и цифры или спецсимволы">
+          {user.mustChangePassword && (
+            <div className="mb-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-500">
+              Установлен временный или первичный пароль — смените его сейчас для защиты аккаунта.
+            </div>
+          )}
           <div className="grid min-w-0 gap-4 sm:grid-cols-3">
             <Field label="Текущий пароль"><Input type="password" value={pw.current} onChange={(e) => setPw({ ...pw, current: e.target.value })} autoComplete="current-password" /></Field>
-            <Field label="Новый пароль"><Input type="password" value={pw.next} onChange={(e) => setPw({ ...pw, next: e.target.value })} autoComplete="new-password" /></Field>
+            <Field label="Новый пароль"><Input type="password" value={pw.next} onChange={(e) => setPw({ ...pw, next: e.target.value })} autoComplete="new-password" placeholder="мин. 10 символов" /></Field>
             <Field label="Повторите"><Input type="password" value={pw.repeat} onChange={(e) => setPw({ ...pw, repeat: e.target.value })} autoComplete="new-password" /></Field>
           </div>
           <div className="mt-4 flex items-center justify-between gap-3">
             {pwNotice ? <Notice {...pwNotice} /> : <span />}
-            <Button variant="secondary" onClick={changePw} disabled={pending || !pw.current || !pw.next}><KeyRound size={16} /> Сменить пароль</Button>
+            <Button variant="secondary" onClick={changePw} disabled={pending || !pw.current || pw.next.length < 10}><KeyRound size={16} /> Сменить пароль</Button>
           </div>
         </Card>
+
+        <TwoFactorCard initialEnabled={user.totpEnabled} />
 
         <SessionsCard />
       </div>
     </div>
+  );
+}
+
+function TwoFactorCard({ initialEnabled }: { initialEnabled: boolean }) {
+  const router = useRouter();
+  const [enabled, setEnabled] = useState(initialEnabled);
+  const [setupData, setSetupData] = useState<{ secret: string; otpauthUri: string } | null>(null);
+  const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [notice, setNotice] = useState<{ msg: string; ok: boolean } | null>(null);
+
+  const startSetup = async () => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = await fetch("/api/auth/2fa", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "setup" }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { secret?: string; otpauthUri?: string; error?: string };
+      if (!res.ok || !data.secret || !data.otpauthUri) {
+        setNotice({ msg: data.error || "Не удалось подготовить 2FA", ok: false });
+        return;
+      }
+      setSetupData({ secret: data.secret, otpauthUri: data.otpauthUri });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggle2fa = async (action: "enable" | "disable") => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = await fetch("/api/auth/2fa", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, currentPassword: password, code: code.trim() }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; enabled?: boolean; error?: string };
+      if (!res.ok) {
+        setNotice({ msg: data.error || "Ошибка настройки 2FA", ok: false });
+        return;
+      }
+      setEnabled(Boolean(data.enabled));
+      setSetupData(null);
+      setPassword("");
+      setCode("");
+      setNotice({
+        msg: data.enabled ? "Двухфакторная аутентификация включена" : "Двухфакторная аутентификация отключена",
+        ok: true,
+      });
+      router.refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card
+      title="Двухфакторная аутентификация (2FA)"
+      subtitle="Одноразовые 6-значные TOTP-коды в приложении-аутентификаторе"
+    >
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+          <span className="flex items-center gap-2">
+            <ShieldCheck size={15} className={enabled ? "text-emerald-500" : "text-muted"} />
+            Статус:{" "}
+            <b className={enabled ? "text-emerald-500" : "text-muted"}>
+              {enabled ? "включена" : "выключена"}
+            </b>
+          </span>
+          {!enabled && !setupData && (
+            <Button variant="secondary" size="sm" disabled={busy} onClick={() => void startSetup()}>
+              Настроить 2FA
+            </Button>
+          )}
+        </div>
+
+        {!enabled && setupData && (
+          <div className="space-y-3 rounded-xl border border-border bg-card2/50 p-3 text-xs">
+            <p className="text-muted">
+              Добавьте секретный ключ в приложение-аутентификатор (Google Authenticator, 2FAS, KeePassXC и т.п.):
+            </p>
+            <div className="flex items-center gap-2">
+              <code className="min-w-0 flex-1 truncate rounded-lg bg-card px-2 py-1.5 font-mono text-[11px]">
+                {setupData.secret}
+              </code>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(setupData.secret);
+                    setCopied(true);
+                    window.setTimeout(() => setCopied(false), 2000);
+                  } catch {
+                    /* ignore */
+                  }
+                }}
+              >
+                {copied ? <Check size={13} /> : <ClipboardCopy size={13} />}
+              </Button>
+            </div>
+            <p className="truncate font-mono text-[10px] text-muted" title={setupData.otpauthUri}>
+              {setupData.otpauthUri}
+            </p>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Текущий пароль">
+                <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+              </Field>
+              <Field label="Код из приложения (6 цифр)">
+                <Input
+                  value={code}
+                  onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  placeholder="123456"
+                  inputMode="numeric"
+                />
+              </Field>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button size="sm" disabled={busy || !password || code.length !== 6} onClick={() => void toggle2fa("enable")}>
+                Включить 2FA
+              </Button>
+              <Button size="sm" variant="ghost" disabled={busy} onClick={() => setSetupData(null)}>
+                Отмена
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {enabled && (
+          <div className="space-y-3 rounded-xl border border-border bg-card2/40 p-3 text-xs">
+            <p className="text-muted">Для отключения 2FA подтвердите текущий пароль и актуальный код из приложения:</p>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Текущий пароль">
+                <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+              </Field>
+              <Field label="Код 2FA (6 цифр)">
+                <Input
+                  value={code}
+                  onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  placeholder="123456"
+                  inputMode="numeric"
+                />
+              </Field>
+            </div>
+            <Button variant="danger" size="sm" disabled={busy || !password || code.length !== 6} onClick={() => void toggle2fa("disable")}>
+              Отключить 2FA
+            </Button>
+          </div>
+        )}
+
+        {notice && <Notice {...notice} />}
+      </div>
+    </Card>
   );
 }
 
@@ -460,18 +681,18 @@ export function UserAdminControls({
                 type="text"
                 value={pw}
                 onChange={(e) => setPw(e.target.value)}
-                placeholder="Новый пароль (мин. 6 символов)"
+                placeholder="Новый пароль (мин. 10 симв., буквы и цифры)"
                 className="sm:flex-1"
                 autoComplete="new-password"
               />
               <Button
                 variant="secondary"
                 className="w-full shrink-0 sm:w-auto"
-                disabled={pending || pw.length < 6}
+                disabled={pending || pw.length < 10}
                 onClick={() =>
                   start(async () => {
                     const r = await adminResetPasswordAction(target.id, pw);
-                    setNotice(r.ok ? { msg: "Пароль сброшен — сообщите его сотруднику", ok: true } : { msg: r.error, ok: false });
+                    setNotice(r.ok ? { msg: "Пароль сброшен — сообщите его сотруднику (действует до смены)", ok: true } : { msg: r.error, ok: false });
                     if (r.ok) setPw("");
                   })
                 }
@@ -491,7 +712,7 @@ export function UserAdminControls({
             className="w-full sm:w-auto"
             disabled={pending}
             onClick={() => {
-              if (!confirm(`Удалить пользователя ${target.name}? Все его задачи и сообщения будут удалены.`)) return;
+              if (!confirm(`Удалить пользователя ${target.name}? Пользователь будет деактивирован и потеряет доступ.`)) return;
               start(async () => {
                 const r = await deleteUserAction(target.id);
                 if (!r.ok) return setNotice({ msg: r.error, ok: false });

@@ -78,6 +78,20 @@ def redact_secret(text: str, token: str = "") -> str:
     return re.sub(r"(gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})", "***", value)
 
 
+def _validate_gh_identifier(raw: str, label: str) -> str:
+    clean = str(raw or "").strip()
+    if not clean or clean in (".", "..") or clean.startswith("-") or not re.fullmatch(r"[A-Za-z0-9._-]+", clean):
+        raise GithubToolError(f"Некорректное имя {label}: {clean[:60]}")
+    return clean
+
+
+def _validate_gh_branch(raw: str) -> str:
+    clean = str(raw or "").strip()
+    if not clean or clean.startswith("-") or ".." in clean or re.search(r"[\s\x00-\x1f~^:?*\\\[\]]", clean):
+        raise GithubToolError(f"Некорректное имя ветки: {clean[:60]}")
+    return clean
+
+
 def _slug(raw: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw or "").strip()).strip("._")
     return cleaned or "repo"
@@ -155,7 +169,7 @@ def _run_git(
     use_auth: bool = False,
     timeout: int = 45,
 ) -> Tuple[int, str, str]:
-    cmd: List[str] = ["git"]
+    cmd: List[str] = ["git", "-c", "protocol.ext.allow=never", "-c", "core.fsmonitor=false"]
     if use_auth and token:
         basic = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
         cmd.extend(["-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}"])
@@ -213,9 +227,9 @@ def ensure_repo_synced(
     branch_override: str = "",
 ) -> Dict[str, Any]:
     token = str(github_ctx.get("token") or "").strip()
-    owner = str(github_ctx.get("owner") or "").strip()
-    repo = str(github_ctx.get("repo") or "").strip()
-    branch = str(branch_override or github_ctx.get("branch") or "").strip() or "main"
+    owner = _validate_gh_identifier(str(github_ctx.get("owner") or ""), "владельца")
+    repo = _validate_gh_identifier(str(github_ctx.get("repo") or ""), "репозитория")
+    branch = _validate_gh_branch(str(branch_override or github_ctx.get("branch") or "").strip() or "main")
     user_id = int(github_ctx.get("userId") or 0)
     login = str(github_ctx.get("login") or "").strip()
     name = str(github_ctx.get("name") or login).strip()
@@ -621,10 +635,10 @@ def run_github_tool(
         return f"Файл «{rel_path}» удалён локально в ветке {sync_info['branch']}.", events
 
     if name == "github_create_branch":
-        new_branch = str(args.get("branch") or "").strip()
-        if not new_branch or not re.match(r"^[A-Za-z0-9._/-]+$", new_branch):
+        new_branch = _validate_gh_branch(str(args.get("branch") or ""))
+        if not re.match(r"^[A-Za-z0-9._/-]+$", new_branch):
             raise GithubToolError("Укажите корректное имя новой ветки")
-        from_branch = str(args.get("from_branch") or branch).strip() or branch
+        from_branch = _validate_gh_branch(str(args.get("from_branch") or branch).strip() or branch)
         sync_info = ensure_repo_synced(ctx, sandbox_root=sandbox_root, branch_override=from_branch)
         wdir = Path(sync_info["workspaceDir"])
         code, _, err = _run_git(["checkout", "-b", new_branch], cwd=wdir, timeout=15)
@@ -689,7 +703,7 @@ def run_github_tool(
             return f"Пользователь отклонил Commit/Push.{f' Причина: {why}' if why else ''}", events
 
         final_msg = str(decision.get("commitMessage") or message).strip() or message
-        final_branch = str(decision.get("branch") or target_branch).strip() or target_branch
+        final_branch = _validate_gh_branch(str(decision.get("branch") or target_branch).strip() or target_branch)
         if final_branch != cur_branch:
             c_sw, _, e_sw = _run_git(["checkout", "-B", final_branch], cwd=wdir, timeout=15)
             if c_sw != 0:

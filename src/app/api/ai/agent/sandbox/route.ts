@@ -1,4 +1,4 @@
-import { AGENT_URL } from "@/lib/agentConfig";
+import { resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
@@ -23,11 +23,18 @@ export async function GET(req: Request) {
   const denied = await adminCheck();
   if (denied) return denied;
 
+  let agentUrl: string;
+  try {
+    agentUrl = resolveSafeAgentUrl();
+  } catch (err) {
+    return Response.json({ error: (err as Error).message }, { status: 400 });
+  }
+
   const download = new URL(req.url).searchParams.get("download");
   if (download) {
     try {
       const upstream = await fetch(
-        `${AGENT_URL}/sandbox/download?path=${encodeURIComponent(download)}`,
+        `${agentUrl}/sandbox/download?path=${encodeURIComponent(download)}`,
         { cache: "no-store", signal: AbortSignal.timeout(30_000) },
       );
       if (!upstream.ok) {
@@ -46,7 +53,7 @@ export async function GET(req: Request) {
   }
 
   try {
-    const upstream = await fetch(`${AGENT_URL}/sandbox`, {
+    const upstream = await fetch(`${agentUrl}/sandbox`, {
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     });
@@ -102,8 +109,15 @@ export async function POST(req: Request) {
     return Response.json({ error: "Неизвестное действие Sandbox" }, { status: 400 });
   }
 
+  let agentUrl: string;
   try {
-    const upstream = await fetch(`${AGENT_URL}${path}`, {
+    agentUrl = resolveSafeAgentUrl();
+  } catch (err) {
+    return Response.json({ error: (err as Error).message }, { status: 400 });
+  }
+
+  try {
+    const upstream = await fetch(`${agentUrl}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),

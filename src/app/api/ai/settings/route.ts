@@ -1,5 +1,6 @@
 import { getAiUserSettingsPublic, upsertAiUserSettings } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
+import { assertSafeAiUrl } from "@/lib/ssrf";
 import { aiSettingsUpdateSchema, readValidatedJson } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
@@ -23,6 +24,17 @@ export async function PUT(req: Request) {
 
   const parsed = await readValidatedJson(req, aiSettingsUpdateSchema);
   if (!parsed.ok) return parsed.response;
+
+  if (parsed.data.baseUrl) {
+    try {
+      await assertSafeAiUrl(parsed.data.baseUrl);
+    } catch (err) {
+      return Response.json(
+        { error: err instanceof Error ? err.message : "Запрещённый адрес модели" },
+        { status: 400 },
+      );
+    }
+  }
 
   const settings = await upsertAiUserSettings(me.id, parsed.data);
   return Response.json({ settings }, { headers: { "Cache-Control": "no-store" } });

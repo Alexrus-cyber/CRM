@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -18,6 +19,76 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping
 
 from launcher.catalog import PROVIDER_PRESETS, AgentSpec
+
+
+def _dpapi_protect(plaintext: str) -> str | None:
+    if not sys.platform.startswith("win") or not plaintext:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+        raw = plaintext.encode("utf-8")
+        buf = (ctypes.c_byte * len(raw)).from_buffer_copy(raw)
+        in_blob = DATA_BLOB(len(raw), buf)
+        out_blob = DATA_BLOB()
+        if not ctypes.windll.crypt32.CryptProtectData(  # type: ignore[attr-defined]
+            ctypes.byref(in_blob), "NovaCRM", None, None, None, 0x01, ctypes.byref(out_blob)
+        ):
+            return None
+        try:
+            protected = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+            return "dpapi:" + base64.b64encode(protected).decode("ascii")
+        finally:
+            ctypes.windll.kernel32.LocalFree(out_blob.pbData)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
+
+def _dpapi_unprotect(stored: str) -> str:
+    if not stored.startswith("dpapi:"):
+        return stored
+    if not sys.platform.startswith("win"):
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+        raw = base64.b64decode(stored[6:].encode("ascii"))
+        buf = (ctypes.c_byte * len(raw)).from_buffer_copy(raw)
+        in_blob = DATA_BLOB(len(raw), buf)
+        out_blob = DATA_BLOB()
+        if not ctypes.windll.crypt32.CryptUnprotectData(  # type: ignore[attr-defined]
+            ctypes.byref(in_blob), None, None, None, None, 0x01, ctypes.byref(out_blob)
+        ):
+            return ""
+        try:
+            return ctypes.string_at(out_blob.pbData, out_blob.cbData).decode("utf-8", "replace")
+        finally:
+            ctypes.windll.kernel32.LocalFree(out_blob.pbData)  # type: ignore[attr-defined]
+    except Exception:
+        return ""
+
+
+def _protect_secret(value: str) -> str:
+    clean = (value or "").strip()
+    if not clean:
+        return ""
+    dpapi = _dpapi_protect(clean)
+    return dpapi if dpapi else clean
+
+
+def _unprotect_secret(value: str) -> str:
+    clean = str(value or "")
+    if clean.startswith("dpapi:"):
+        return _dpapi_unprotect(clean)
+    return clean
 
 
 def config_dir() -> Path:
@@ -115,6 +186,22 @@ class LaunchSettings:
 
     # ---- сериализация ---------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
+        safe_values: Dict[str, Dict[str, Any]] = {
+            agent_id: dict(fields) for agent_id, fields in self.agent_values.items()
+        }
+        safe_profile = dict(self.crm_profile) if isinstance(self.crm_profile, dict) else {}
+        if not self.remember_key:
+            for fields in safe_values.values():
+                fields.pop("crm_token", None)
+            if isinstance(safe_profile.get("operator"), dict):
+                op_copy = dict(safe_profile["operator"])
+                op_copy.pop("token", None)
+                safe_profile["operator"] = op_copy
+        elif sys.platform.startswith("win"):
+            op_fields = safe_values.get("operator")
+            if isinstance(op_fields, dict) and op_fields.get("crm_token"):
+                op_fields["crm_token"] = _protect_secret(str(op_fields["crm_token"]))
+
         data: Dict[str, Any] = {
             "provider": self.provider,
             "base_url": self.base_url,
@@ -125,15 +212,18 @@ class LaunchSettings:
             "reasoning": self.reasoning,
             "remember_key": bool(self.remember_key),
             "last_agent": self.last_agent,
-            "agent_values": self.agent_values,
+            "agent_values": safe_values,
             "crm_url": self.crm_url,
             "crm_email": self.crm_email,
-            "crm_session_token": self.crm_session_token,
-            "crm_profile": self.crm_profile,
+            "crm_profile": safe_profile,
         }
-        # Ключ не пишем на диск, пока пользователь не попросил.
-        if self.remember_key and self.api_key:
-            data["api_key"] = self.api_key
+        # Ключ и токен сессии CRM не пишутся на диск без явного согласия пользователя (remember_key),
+        # а на Windows дополнительно шифруются через DPAPI.
+        if self.remember_key:
+            if self.api_key:
+                data["api_key"] = _protect_secret(self.api_key)
+            if self.crm_session_token:
+                data["crm_session_token"] = _protect_secret(self.crm_session_token)
         return data
 
     @classmethod
@@ -147,11 +237,11 @@ class LaunchSettings:
         settings.max_tokens = _as_int(raw.get("max_tokens"))
         settings.reasoning = str(raw.get("reasoning") or "default")
         settings.remember_key = bool(raw.get("remember_key"))
-        settings.api_key = str(raw.get("api_key") or "")
+        settings.api_key = _unprotect_secret(str(raw.get("api_key") or ""))
         settings.last_agent = str(raw.get("last_agent") or "operator")
         settings.crm_url = str(raw.get("crm_url") or "http://localhost:3000")
         settings.crm_email = str(raw.get("crm_email") or "")
-        settings.crm_session_token = str(raw.get("crm_session_token") or "")
+        settings.crm_session_token = _unprotect_secret(str(raw.get("crm_session_token") or ""))
         raw_profile = raw.get("crm_profile")
         if isinstance(raw_profile, dict):
             settings.crm_profile = dict(raw_profile)
@@ -159,7 +249,10 @@ class LaunchSettings:
         if isinstance(values, dict):
             for agent_id, fields in values.items():
                 if isinstance(fields, dict):
-                    settings.agent_values[str(agent_id)] = dict(fields)
+                    copied = dict(fields)
+                    if "crm_token" in copied and str(copied["crm_token"]).startswith("dpapi:"):
+                        copied["crm_token"] = _unprotect_secret(str(copied["crm_token"]))
+                    settings.agent_values[str(agent_id)] = copied
         return settings
 
     def describe(self) -> str:

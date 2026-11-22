@@ -1,14 +1,20 @@
 import {
+  getAiQuotaOverride,
+  getAiUsage,
   getChatBot,
   getChatRoomForUser,
+  getUser,
   insertMessage,
   listMessages,
+  recordAiUsage,
   touchChatRoom,
   type ChatBotRow,
 } from "@/db/repo";
-import { aiAuthHeaders, aiEndpoint, normalizeBaseUrl } from "@/lib/ai";
+import { aiAuthHeaders, aiEndpoint, estimateTokens, normalizeBaseUrl } from "@/lib/ai";
+import { aiPolicyFor, formatTokenCount } from "@/lib/aiPolicy";
 import { publishChatMessage } from "@/lib/events";
 import { applyGenParams, normalizeGenParams, type GenParams } from "@/lib/genParams";
+import { safeAiFetch } from "@/lib/ssrf";
 
 export type PublicChatBot = {
   userId: number;
@@ -65,6 +71,14 @@ export function publicChatBot(bot: ChatBotRow, includeSecretConfig: boolean): Pu
   };
 }
 
+/**
+ * Выбор ботов, которым нужно ответить на сообщение:
+ *   - в ЛС (`isDm`) — конкретный бот;
+ *   - при явном `triggerBotId` — только выбранный бот;
+ *   - в группе / общем чате: срабатывают боты с явным `@упоминанием`, плюс не более
+ *     ОДНОГО бота в режиме `always` (чтобы несколько авто-ботов не зациклились и
+ *     не сжигали квоту шквалом параллельных ответов).
+ */
 export function findTriggeredBots(
   bots: ChatBotRow[],
   content: string,
@@ -79,18 +93,20 @@ export function findTriggeredBots(
   }
   const lower = content.toLowerCase();
   const ids: number[] = [];
+  let alwaysAutoCount = 0;
   for (const bot of active) {
-    if (bot.replyMode === "always") {
+    const nameNeedle = `@${bot.name.trim().toLowerCase()}`;
+    const mentioned =
+      (bot.name.trim() && lower.includes(nameNeedle)) ||
+      lower.includes("@бот") ||
+      lower.includes("@модель");
+    if (mentioned) {
       ids.push(bot.userId);
       continue;
     }
-    const nameNeedle = `@${bot.name.trim().toLowerCase()}`;
-    if (
-      (bot.name.trim() && lower.includes(nameNeedle)) ||
-      lower.includes("@бот") ||
-      lower.includes("@модель")
-    ) {
+    if (bot.replyMode === "always" && alwaysAutoCount < 1) {
       ids.push(bot.userId);
+      alwaysAutoCount += 1;
     }
   }
   return ids;
@@ -105,6 +121,20 @@ export async function runChatBotReply(input: {
   const bot = await getChatBot(input.botUserId);
   if (!bot) return { ok: false, error: "Бот не найден" };
   if (!bot.isActive) return { ok: false, error: "Бот сейчас выключен" };
+
+  // Проверяем месячную квоту ИИ запрашивающего сотрудника (P1).
+  const requester = await getUser(input.requesterId);
+  if (requester) {
+    const override = await getAiQuotaOverride(requester.id);
+    const policy = aiPolicyFor(requester.role, override?.monthlyLimit ?? null);
+    const monthUsage = await getAiUsage(requester.id);
+    if (policy.monthlyTokens !== null && monthUsage.month.total >= policy.monthlyTokens) {
+      return {
+        ok: false,
+        error: `Месячный лимит токенов исчерпан (${formatTokenCount(monthUsage.month.total)} из ${formatTokenCount(policy.monthlyTokens)}).`,
+      };
+    }
+  }
 
   const baseUrl = normalizeBaseUrl(bot.baseUrl || process.env.AI_BASE_URL || "");
   const model = (bot.model || process.env.AI_MODEL || "").trim();
@@ -175,14 +205,14 @@ export async function runChatBotReply(input: {
 
   let res: Response;
   try {
-    res = await fetch(aiEndpoint(baseUrl, "/chat/completions"), {
+    res = await safeAiFetch(aiEndpoint(baseUrl, "/chat/completions"), {
       method: "POST",
       headers: { "Content-Type": "application/json", ...aiAuthHeaders(apiKey) },
       body: JSON.stringify(buildBody(true)),
       signal: AbortSignal.timeout(45_000),
     });
     if (!res.ok && (res.status === 400 || res.status === 422)) {
-      res = await fetch(aiEndpoint(baseUrl, "/chat/completions"), {
+      res = await safeAiFetch(aiEndpoint(baseUrl, "/chat/completions"), {
         method: "POST",
         headers: { "Content-Type": "application/json", ...aiAuthHeaders(apiKey) },
         body: JSON.stringify(buildBody(false)),
@@ -205,12 +235,26 @@ export async function runChatBotReply(input: {
   }
 
   const data = (await res.json().catch(() => null)) as
-    | { choices?: Array<{ message?: { content?: unknown } }> }
+    | {
+        choices?: Array<{ message?: { content?: unknown } }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+      }
     | null;
   const reply = String(data?.choices?.[0]?.message?.content ?? "").trim();
   if (!reply) {
     return { ok: false, error: "Модель бота вернула пустой ответ" };
   }
+
+  const promptEst = llmMessages.reduce((s, m) => s + estimateTokens(m.content) + 4, 4);
+  const compEst = estimateTokens(reply);
+  const promptTokens = Number(data?.usage?.prompt_tokens ?? 0) || promptEst;
+  const completionTokens = Number(data?.usage?.completion_tokens ?? 0) || compEst;
+  await recordAiUsage({
+    userId: input.requesterId,
+    chatId: 0,
+    prompt: promptTokens,
+    completion: completionTokens,
+  }).catch(() => undefined);
 
   const recipientId = input.roomId ? null : input.peerId === 0 ? null : input.requesterId;
   const messageId = await insertMessage(bot.userId, recipientId, reply, input.roomId);

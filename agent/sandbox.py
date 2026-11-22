@@ -83,7 +83,7 @@ FORBIDDEN_EXPORT_PREFIXES = (
     "C:\\Program Files",
 )
 
-FORBIDDEN_EXPORT_HOME_DIRS = {".ssh", ".gnupg", ".aws", ".kube"}
+FORBIDDEN_EXPORT_HOME_DIRS = {".ssh", ".gnupg", ".aws", ".kube", ".docker", ".git"}
 
 MAX_OUTPUT_CHARS = 18_000
 MAX_SANDBOX_FILE_BYTES = 2_000_000
@@ -107,6 +107,15 @@ def _is_within_root(root: Path, candidate: Path) -> bool:
         return os.path.commonpath([str(root), str(candidate)]) == str(root)
     except ValueError:
         return False
+
+
+def _is_safe_non_escaping_entry(root_resolved: Path, entry: Path) -> bool:
+    """Отсекает симлинки и любые записи, выходящие за границы корня Sandbox."""
+    if entry.is_symlink():
+        target = entry.resolve(strict=False)
+        if not _is_within_root(root_resolved, target):
+            return False
+    return _is_within_root(root_resolved, entry.resolve(strict=False))
 
 
 def safe_resolve(root: Path, rel_path: str = ".", *, allow_root: bool = False) -> Path:
@@ -220,6 +229,8 @@ def list_tree(root: Path, rel_path: str = ".", *, unlimited: bool = False) -> Di
                 projects.append({"name": child.name, "files": file_count})
 
     for entry in sorted(base.rglob("*"), key=lambda p: str(p).lower()):
+        if not _is_safe_non_escaping_entry(root_resolved, entry):
+            continue
         rel = relative_to_root(root_resolved, entry)
         if rel.startswith(".tmp"):
             continue
@@ -239,15 +250,20 @@ def list_tree(root: Path, rel_path: str = ".", *, unlimited: bool = False) -> Di
 
 
 def zip_path(root: Path, rel_path: str) -> Tuple[bytes, str]:
-    target = safe_resolve(root, rel_path, allow_root=True)
+    root_resolved = root.resolve(strict=False)
+    target = safe_resolve(root_resolved, rel_path, allow_root=True)
     if not target.exists():
         raise SandboxError(f"Не найдено в Sandbox: {rel_path}")
     buffer = io.BytesIO()
     if target.is_file():
         return target.read_bytes(), target.name
-    root_name = target.name if target != root.resolve(strict=False) else "sandbox"
+    root_name = target.name if target != root_resolved else "sandbox"
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for file_path in sorted(target.rglob("*")):
+            if file_path.is_symlink():
+                raise SandboxError(f"Запрещена архивация символьной ссылки: {file_path.name}")
+            if not _is_safe_non_escaping_entry(root_resolved, file_path):
+                raise SandboxError("Обнаружен выход пути за пределы Sandbox")
             if file_path.is_file():
                 rel = file_path.relative_to(target).as_posix()
                 if rel.startswith(".tmp"):
@@ -297,20 +313,24 @@ def export_path(
     if src.is_dir():
         target.mkdir(parents=True, exist_ok=True)
         for item in src.rglob("*"):
+            if item.is_symlink():
+                raise SandboxError(f"Запрещён экспорт символьной ссылки: {item.name}")
+            if not _is_safe_non_escaping_entry(root_resolved, item):
+                raise SandboxError("Обнаружен выход пути за пределы Sandbox")
             if item.is_file():
                 rel = item.relative_to(src)
                 if str(rel).startswith(".tmp"):
                     continue
                 out_file = target / rel
                 out_file.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(item, out_file)
+                shutil.copy2(item, out_file, follow_symlinks=False)
                 copied_files.append(rel.as_posix())
                 total_bytes += item.stat().st_size
         if mode == "move":
             shutil.rmtree(src)
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, target)
+        shutil.copy2(src, target, follow_symlinks=False)
         copied_files.append(src.name)
         total_bytes = target.stat().st_size
         if mode == "move":

@@ -588,10 +588,14 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     try {
       await persistSettings();
       const targetModel = settings.model.trim();
-      const qs = new URLSearchParams({ base: settings.baseUrl });
-      if (targetModel) qs.set("model", targetModel);
-      const res = await fetch(`/api/ai/models?${qs.toString()}`, {
-        headers: settings.apiKey.trim() ? { "x-ai-key": settings.apiKey.trim() } : undefined,
+      const res = await fetch("/api/ai/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseUrl: settings.baseUrl,
+          ...(settings.apiKey.trim() ? { apiKey: settings.apiKey.trim() } : {}),
+          ...(targetModel ? { model: targetModel } : {}),
+        }),
         cache: "no-store",
       });
       if (!res.ok) return;
@@ -1913,12 +1917,13 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         const updated = { ...current, title, messagesCount: current.messagesCount + 1, updatedAt: new Date().toISOString() };
         return [updated, ...prev.filter((item) => item.id !== activeId)];
       });
+      await persistSettings();
       const res = await fetch("/api/ai/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages: history.map((t) => ({ role: t.role, content: t.content })),
-          settings,
+          settings: { baseUrl: settings.baseUrl, model: settings.model },
           params,
           ...(systemPrompt.trim() ? { systemPrompt: systemPrompt.trim() } : {}),
           trustLevel,

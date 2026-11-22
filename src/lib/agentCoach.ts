@@ -1,6 +1,7 @@
 import { aiAuthHeaders, aiEndpoint, normalizeBaseUrl, type ReasoningMode } from "@/lib/ai";
 import { applyGenParams, normalizeGenParams, type GenParams } from "@/lib/genParams";
 import { findTaskMode, type OperatorTaskMode } from "@/lib/operatorModes";
+import { assertSafeAgentUrl, safeAiFetch } from "@/lib/ssrf";
 
 export type CoachInput = {
   agentUrl: string;
@@ -139,7 +140,8 @@ export async function requestAgentStepCoaching(input: CoachInput): Promise<Coach
 
   // 1. Сначала пробуем обратиться напрямую к работающему процессу Агента (`agent/agent.py /coach`).
   try {
-    const res = await fetch(`${input.agentUrl}/coach`, {
+    const safeAgentBase = assertSafeAgentUrl(input.agentUrl).toString().replace(/\/+$/, "");
+    const res = await fetch(`${safeAgentBase}/coach`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -291,7 +293,7 @@ export async function requestAgentStepCoaching(input: CoachInput): Promise<Coach
       };
 
       const callCoachLlm = async (withImage: boolean, withReasoning: boolean) =>
-        fetch(aiEndpoint(baseUrl, "/chat/completions"), {
+        safeAiFetch(aiEndpoint(baseUrl, "/chat/completions"), {
           method: "POST",
           headers: { "Content-Type": "application/json", ...aiAuthHeaders(apiKey) },
           body: JSON.stringify(buildBody(withImage, withReasoning)),

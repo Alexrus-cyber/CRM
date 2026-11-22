@@ -1,7 +1,7 @@
 "use client";
 
 import { useActionState } from "react";
-import { LogIn } from "lucide-react";
+import { LogIn, ShieldCheck } from "lucide-react";
 import { loginAction, type LoginState } from "@/app/actions/auth";
 import { Button, Field, Input } from "@/components/ui";
 
@@ -10,11 +10,36 @@ export function LoginForm() {
   return (
     <form action={action} className="space-y-4">
       <Field label="Email">
-        <Input name="email" type="email" placeholder="you@company.ru" autoComplete="email" required />
+        <Input
+          name="email"
+          type="email"
+          defaultValue={state?.email ?? ""}
+          placeholder="you@company.ru"
+          autoComplete="email"
+          required
+        />
       </Field>
       <Field label="Пароль">
         <Input name="password" type="password" placeholder="••••••••" autoComplete="current-password" required />
       </Field>
+      {state?.requiresTotp && (
+        <Field label="Код двухфакторной аутентификации (2FA)">
+          <div className="relative">
+            <Input
+              name="totpCode"
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]{6}"
+              maxLength={6}
+              placeholder="123456"
+              autoComplete="one-time-code"
+              autoFocus
+              required
+            />
+            <ShieldCheck size={15} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-accent" />
+          </div>
+        </Field>
+      )}
       {state?.error && (
         <p className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-500">{state.error}</p>
       )}

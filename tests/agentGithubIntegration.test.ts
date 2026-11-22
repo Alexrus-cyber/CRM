@@ -46,7 +46,7 @@ describe("GitHub integration (encryption, per-user DB isolation & GitHub-RAG)", 
   it("encrypts GitHub tokens at rest and masks token hint", () => {
     const raw = "ghp_ExampleSecretToken1234567890";
     const encrypted = encryptGithubToken(raw);
-    expect(encrypted).toMatch(/^enc1:/);
+    expect(encrypted).toMatch(/^enc2:k1:/);
     expect(encrypted).not.toContain(raw);
     expect(decryptGithubToken(encrypted)).toBe(raw);
     expect(maskGithubToken(raw)).toBe("ghp_Ex••••7890");

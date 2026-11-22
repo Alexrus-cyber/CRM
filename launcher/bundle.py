@@ -105,20 +105,63 @@ def prepare_temp_dir() -> Tuple[Path, str]:
             return candidate, f"нет доступа ни к {candidate}, ни к {fallback}: {inner}"
 
 
+SAFE_CHILD_ENV_KEYS = (
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "COMMONPROGRAMFILES",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TERM",
+    "COLORTERM",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "USERNAME",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+)
+
+
 def child_env(extra: Mapping[str, str] | None = None, reuse_runtime: bool = True) -> Dict[str, str]:
-    """Окружение дочернего процесса агента.
-
-    Две вещи, без которых однофайловая сборка ломается:
-
-    * `TEMP`/`TMP`/`TMPDIR` — своя writable-папка. Если системный TEMP закрыт
-      политикой, антивирусом или переполнен, bootloader пишет
-      «Could not create temporary directory!» и агент умирает с кодом -1.
-    * `_PYI_APPLICATION_HOME_DIR` и `_PYI_PARENT_PROCESS_LEVEL` — подсказка
-      bootloader'у, что мы запускаем *свою же* программу: тогда дочерний процесс
-      переиспользует уже распакованный runtime и НЕ пытается распаковываться
-      заново (именно эта повторная распаковка и падала).
-    """
-    env: Dict[str, str] = dict(os.environ)
+    """Окружение дочернего процесса агента (строго по allowlist, без утечки секретов хоста)."""
+    env: Dict[str, str] = {}
+    for key in SAFE_CHILD_ENV_KEYS:
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
     env.update({
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUTF8": "1",

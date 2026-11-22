@@ -1,5 +1,6 @@
 import { getCurrentUser } from "@/lib/auth";
 import { createRagFolder, deleteRagFolder, listRagFolders } from "@/db/repo";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -16,6 +17,15 @@ export async function GET() {
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
+  const rl = checkApiRateLimit({
+    scope: "rag_write",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 30,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
 
   let name = "";
   try {

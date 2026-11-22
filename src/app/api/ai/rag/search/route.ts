@@ -1,5 +1,6 @@
 import { getRagFolder, searchRagChunks } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -8,6 +9,15 @@ export const runtime = "nodejs";
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
+  const rl = checkApiRateLimit({
+    scope: "rag_search",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 120,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
 
   let folderId = 0;
   let query = "";

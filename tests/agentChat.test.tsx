@@ -240,7 +240,7 @@ function mockFetch() {
             : [],
         });
       }
-      if (url.startsWith("/api/ai/models") && method === "GET") {
+      if (url.startsWith("/api/ai/models") && (method === "GET" || method === "POST")) {
         return json({
           ok: true,
           models: ["o3-mini", "gpt-4o-mini"],

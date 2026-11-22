@@ -4,7 +4,8 @@ import { ConnectionsCard, type ConnectionSelection } from "@/components/operator
 
 /**
  * Карточка «Подключения и токены»: список подключений и токенов приходит из базы,
- * токен в списке маскирован, «Показать» раскрывает его, «Отозвать» удаляет.
+ * токен в списке маскирован, повторное раскрытие старых токенов недоступно (P0-2),
+ * вместо него используется «Перевыпустить», а «Отозвать» удаляет токен.
  */
 
 type Conn = {
@@ -24,10 +25,14 @@ type Tok = {
   hint: string;
   createdAt: string;
   lastUsedAt: string | null;
+  expiresAt?: string | null;
+  isExpired?: boolean;
+  expiringSoon?: boolean;
 };
 
 const now = "2026-02-01T10:00:00.000Z";
 const fullToken = "crmop_ff95c81e4d497080c15ff802cb7c39d58e0b96ae2d7b3f12";
+const reissuedToken = "crmop_aa11bb22cc33dd44ee55ff6677889900aabbccddeeff1122";
 
 let connections: Conn[];
 let tokens: Tok[];
@@ -74,13 +79,6 @@ function mockServer() {
         }
       }
 
-      if (url.startsWith("/api/agent/tokens/reveal") && method === "POST") {
-        const body = JSON.parse(String(init?.body ?? "{}")) as { id?: number };
-        const token = tokens.find((item) => item.id === body.id);
-        if (!token) return json({ error: "Токен не найден" }, 404);
-        return json({ token: fullToken });
-      }
-
       if (url.startsWith("/api/agent/tokens")) {
         if (method === "GET") {
           const id = Number(new URL(url, "http://local").searchParams.get("connectionId"));
@@ -90,7 +88,24 @@ function mockServer() {
           });
         }
         if (method === "POST") {
-          const body = JSON.parse(String(init?.body ?? "{}")) as { connectionId?: number; name?: string };
+          const body = JSON.parse(String(init?.body ?? "{}")) as {
+            action?: string;
+            id?: number;
+            connectionId?: number;
+            name?: string;
+          };
+          if (body.action === "reissue") {
+            const target = tokens.find((item) => item.id === body.id);
+            if (!target) return json({ error: "Токен не найден" }, 404);
+            const updated: Tok = {
+              ...target,
+              hint: `…${reissuedToken.slice(-6)}`,
+              createdAt: now,
+              lastUsedAt: null,
+            };
+            tokens = tokens.map((item) => (item.id === target.id ? updated : item));
+            return json({ token: reissuedToken, item: updated });
+          }
           const created: Tok = {
             id: tokens.length + 1,
             connectionId: Number(body.connectionId),
@@ -158,7 +173,7 @@ describe("карточка «Подключения и токены»", () => {
     expect(localStorage.getItem("crm.ai.operator.connection.v1")).toBe("1");
   });
 
-  it("токен показан маской, раскрывается по «Показать» и отзывается", async () => {
+  it("токен показан маской, перевыпускается одноразово по «Перевыпустить» и отзывается", async () => {
     connections = [
       {
         id: 1,
@@ -185,25 +200,22 @@ describe("карточка «Подключения и токены»", () => {
     const onChange = vi.fn();
     render(<ConnectionsCard defaultServer="http://localhost:3000" onChange={onChange} />);
 
-    // В списке только хвост токена — целиком он не утекает.
+    // В списке только хвост токена — целиком он не утекает и кнопки «Показать» нет.
     expect(await screen.findByText(`…${fullToken.slice(-6)}`)).toBeTruthy();
     expect(screen.queryByText(fullToken)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Показать/ })).toBeNull();
     await waitFor(() => expect(lastSelection(onChange).tokensCount).toBe(1));
-    // Пока токен не показан, в команду он не попадает.
     expect(lastSelection(onChange).token).toBe("");
 
-    fireEvent.click(screen.getByRole("button", { name: /Показать/ }));
-    expect(await screen.findByText(fullToken)).toBeTruthy();
-    await waitFor(() => expect(lastSelection(onChange).token).toBe(fullToken));
+    fireEvent.click(screen.getByRole("button", { name: /Перевыпустить/ }));
+    await waitFor(() => expect(lastSelection(onChange).token).toBe(reissuedToken));
     expect(lastSelection(onChange).tokenName).toBe("Ноутбук");
-
-    fireEvent.click(screen.getByRole("button", { name: /Скрыть/ }));
-    await waitFor(() => expect(screen.queryByText(fullToken)).toBeNull());
-    await waitFor(() => expect(lastSelection(onChange).token).toBe(""));
+    expect((await screen.findAllByText(reissuedToken)).length).toBeGreaterThanOrEqual(1);
 
     fireEvent.click(screen.getByRole("button", { name: /Отозвать/ }));
     expect(await screen.findByText(/Токенов пока нет/)).toBeTruthy();
     expect(tokens).toHaveLength(0);
     await waitFor(() => expect(lastSelection(onChange).tokensCount).toBe(0));
+    expect(lastSelection(onChange).token).toBe("");
   });
 });

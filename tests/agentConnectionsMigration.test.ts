@@ -74,8 +74,13 @@ describe("миграция старого токена", () => {
     expect(tokens[0].name).toBe("Основной");
     expect(tokens[0].hint).toBe(`…${legacyToken.slice(-6)}`);
 
-    // Бот со старым токеном продолжает находить владельца.
+    // Бот со старым токеном продолжает находить владельца, но сам токен в БД захеширован (sha256:).
     expect(await repo.findAgentTokenOwner(legacyToken)).toBe(userId);
-    expect(await repo.revealAgentToken(userId, tokens[0].id)).toBe(legacyToken);
+    const stored = await db.q1<{ token: string; token_hash: string }>(
+      sql`select token, token_hash from agent_connection_tokens where id = ${tokens[0].id}`,
+    );
+    expect(stored?.token).toMatch(/^sha256:/);
+    expect(stored?.token_hash).toMatch(/^sha256:/);
+    expect(stored?.token).not.toContain(legacyToken);
   });
 });

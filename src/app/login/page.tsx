@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation";
 import { Sparkles } from "lucide-react";
 import { countSuperAdmins } from "@/db/repo";
-import { ensureSuperAdmin, getCurrentUser } from "@/lib/auth";
+import { getCurrentUser } from "@/lib/auth";
 import { LoginForm } from "./LoginForm";
 
 export const dynamic = "force-dynamic";
@@ -12,10 +12,9 @@ export default async function LoginPage() {
 
   let needsBootstrap = false;
   try {
-    await ensureSuperAdmin();
     needsBootstrap = (await countSuperAdmins()) === 0;
   } catch {
-    // DB may not be migrated yet; login action will retry.
+    // DB may not be migrated yet.
   }
 
   return (
@@ -76,8 +75,8 @@ export default async function LoginPage() {
             <div className="mt-6 rounded-xl border border-dashed border-accent/40 bg-accent/5 p-4 text-xs text-muted">
               <p className="font-medium text-text">Первичная настройка</p>
               <p className="mt-1">
-                Главный администратор ещё не создан. Выполните <code className="font-mono text-text">node scripts/seed.mjs</code> или
-                задайте переменные <code className="font-mono text-text">CRM_ADMIN_EMAIL</code> и{" "}
+                Главный администратор ещё не создан. Выполните <code className="font-mono text-text">node scripts/seed.mjs</code> с заданными{" "}
+                <code className="font-mono text-text">CRM_ADMIN_EMAIL</code> и{" "}
                 <code className="font-mono text-text">CRM_ADMIN_PASSWORD</code>.
               </p>
             </div>

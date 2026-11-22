@@ -25,6 +25,8 @@ import {
   estimateTokens,
   type AiParams,
 } from "@/lib/ai";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
+import { assertSafeAiUrl, safeAiFetch } from "@/lib/ssrf";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -118,13 +120,13 @@ function buildUpstreamBody(model: string, messages: AiMessage[], params: AiParam
 
 async function settingsFromRequest(req: Request, userId: number) {
   const saved = await getAiUserSettingsSecret(userId).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
-  const headerBase = req.headers.get("x-ai-base") ?? "";
+  // SSRF-защита (P0-1): baseUrl и apiKey берутся только из серверных настроек пользователя или env,
+  // клиентский заголовок x-ai-base полностью игнорируется.
   const baseUrl =
-    normalizeBaseUrl(headerBase) ??
     normalizeBaseUrl(saved.baseUrl) ??
     normalizeBaseUrl(process.env.AI_BASE_URL ?? "") ??
     AI_DEFAULT_BASE_URL;
-  const apiKey = (req.headers.get("x-ai-key") ?? saved.apiKey ?? process.env.AI_API_KEY ?? "").trim();
+  const apiKey = (saved.apiKey ?? process.env.AI_API_KEY ?? "").trim();
   const model = (req.headers.get("x-ai-model") ?? saved.model ?? process.env.AI_MODEL ?? "").trim();
   return { baseUrl, apiKey, model };
 }
@@ -188,7 +190,24 @@ export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
+  const rl = checkApiRateLimit({
+    scope: "ai_chat",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 60,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
+
   const { baseUrl, apiKey, model } = await settingsFromRequest(req, me.id);
+  try {
+    await assertSafeAiUrl(baseUrl);
+  } catch (err) {
+    return Response.json(
+      { error: err instanceof Error ? err.message : "Запрещённый URL модели" },
+      { status: 400 },
+    );
+  }
   if (!model) {
     return Response.json(
       { error: "Не указана модель. Впишите имя модели в настройках блока «Чат с ИИ»." },
@@ -434,7 +453,7 @@ export async function POST(req: Request) {
 
   let upstream: Response;
   try {
-    upstream = await fetch(aiEndpoint(baseUrl, "/chat/completions"), {
+    upstream = await safeAiFetch(aiEndpoint(baseUrl, "/chat/completions"), {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...aiAuthHeaders(apiKey) },
       body: JSON.stringify(buildUpstreamBody(model, trimmed, params)),

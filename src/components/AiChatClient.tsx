@@ -690,9 +690,14 @@ export function AiChatClient({ userName, unlimited = false }: { userName: string
     setModels([]);
     try {
       await persistSettings();
-      const modelQuery = settings.model.trim() ? `&model=${encodeURIComponent(settings.model.trim())}` : "";
-      const res = await fetch(`/api/ai/models?base=${encodeURIComponent(settings.baseUrl)}${modelQuery}`, {
-        headers: settings.apiKey.trim() ? { "x-ai-key": settings.apiKey } : undefined,
+      const res = await fetch("/api/ai/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseUrl: settings.baseUrl,
+          ...(settings.apiKey.trim() ? { apiKey: settings.apiKey.trim() } : {}),
+          ...(settings.model.trim() ? { model: settings.model.trim() } : {}),
+        }),
         cache: "no-store",
       });
       const data = (await res.json().catch(() => ({}))) as {
@@ -975,13 +980,12 @@ export function AiChatClient({ userName, unlimited = false }: { userName: string
       setBubbles((prev) => prev.map((bubble) => (bubble.id === replyId ? { ...bubble, ...patchData } : bubble)));
 
     try {
+      await persistSettings();
       const res = await fetch("/api/ai/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-ai-base": settings.baseUrl,
-          ...(settings.apiKey.trim() ? { "x-ai-key": settings.apiKey.trim() } : {}),
-          "x-ai-model": settings.model,
+          ...(settings.model.trim() ? { "x-ai-model": settings.model.trim() } : {}),
         },
         body: JSON.stringify({
           messages: contextRef.current,

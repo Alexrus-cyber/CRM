@@ -5,6 +5,7 @@ import {
 } from "@/db/repo";
 import { getCurrentUser } from "@/lib/auth";
 import { runChatBotReply } from "@/lib/chatBot";
+import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -16,6 +17,15 @@ export const runtime = "nodejs";
 export async function POST(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
+  const rl = checkApiRateLimit({
+    scope: "chat_bot_reply",
+    userId: me.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 30,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
 
   const body = (await req.json().catch(() => null)) as
     | { botUserId?: number; peer?: number; room?: number }
@@ -53,7 +63,8 @@ export async function POST(req: Request) {
   });
 
   if (!result.ok) {
-    return Response.json({ ok: false, error: result.error }, { status: 502 });
+    const status = result.error.includes("лимит") ? 403 : 502;
+    return Response.json({ ok: false, error: result.error }, { status });
   }
 
   return Response.json({ ok: true, id: result.messageId });
