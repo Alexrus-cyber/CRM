@@ -2225,14 +2225,14 @@ def copy_to_clipboard(text: str) -> bool:
     system = platform.system()
     try:
         if system == "Windows":
-            subprocess.run(["clip"], input=text.encode("utf-16-le"), check=True, timeout=5)
+            subprocess.run(["clip"], input=text.encode("utf-16-le"), check=True, timeout=15)
             return True
         if system == "Darwin" and shutil.which("pbcopy"):
-            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=15)
             return True
         for tool in (["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
             if shutil.which(tool[0]):
-                subprocess.run(tool, input=text.encode("utf-8"), check=True, timeout=5)
+                subprocess.run(tool, input=text.encode("utf-8"), check=True, timeout=15)
                 return True
     except Exception:  # noqa: BLE001
         return False
@@ -2249,11 +2249,11 @@ def read_from_clipboard() -> str:
     system = platform.system()
     try:
         if system == "Darwin" and shutil.which("pbpaste"):
-            out = subprocess.run(["pbpaste"], stdout=subprocess.PIPE, check=True, timeout=5)
+            out = subprocess.run(["pbpaste"], stdout=subprocess.PIPE, check=True, timeout=15)
             return out.stdout.decode("utf-8", "replace")
         for tool in (["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard", "--output"]):
             if shutil.which(tool[0]):
-                out = subprocess.run(tool, stdout=subprocess.PIPE, check=True, timeout=5)
+                out = subprocess.run(tool, stdout=subprocess.PIPE, check=True, timeout=15)
                 return out.stdout.decode("utf-8", "replace")
     except Exception:  # noqa: BLE001
         pass

@@ -90,7 +90,11 @@ export async function verifyPasswordAsync(password: string, stored: string): Pro
 
 export async function verifyUserTotp(userId: number, code: string): Promise<boolean> {
   const { enabled, secret } = await getUserTotpSecret(userId);
-  if (!enabled || !secret) return true;
+  if (!enabled) return true;
+  if (!secret) {
+    console.error(`[auth] 2FA enabled for user ${userId}, but TOTP secret could not be decrypted (fail-closed)`);
+    return false;
+  }
   return verifyTotpCode(secret, code);
 }
 

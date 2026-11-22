@@ -102,16 +102,39 @@ export async function GET(req: Request) {
     sheet: "Закрытые задачи",
   });
   const buf = await generated.toBuffer();
-
-  await markTasksExported(user.id, selected.map((t) => t.id));
+  const payload = new Uint8Array(buf);
+  const selectedIds = selected.map((t) => t.id);
 
   const suffix = [from, to].filter(Boolean).join("_");
   const stamp = dateToStr(new Date());
   const filename = `closed-tasks_${suffix ? suffix + "_" : ""}${stamp}.xlsx`;
-  return new Response(new Uint8Array(buf), {
+
+  // Помечаем задачи как выгруженные только после фактической выдачи байтов в поток ответа
+  // (если клиент оборвал соединение до передачи, cancel() не вызовет отметку).
+  let offset = 0;
+  let marked = false;
+  const CHUNK_SIZE = 64 * 1024;
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (offset < payload.byteLength) {
+        const end = Math.min(offset + CHUNK_SIZE, payload.byteLength);
+        controller.enqueue(payload.subarray(offset, end));
+        offset = end;
+        return;
+      }
+      if (!marked && selectedIds.length > 0) {
+        marked = true;
+        await markTasksExported(user.id, selectedIds);
+      }
+      controller.close();
+    },
+  });
+
+  return new Response(body, {
     headers: {
       "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       "Content-Disposition": `attachment; filename="${filename}"`,
+      "Content-Length": String(payload.byteLength),
       "X-Exported-Count": String(selected.length),
       "X-Skipped-Count": String(closed.length - fresh.length),
       "X-Export-Mode": includeAll ? "all" : "new",

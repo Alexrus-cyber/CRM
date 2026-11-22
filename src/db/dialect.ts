@@ -125,7 +125,7 @@ async function buildSqlite(): Promise<Executor> {
   globalForDb.__crmSqlite = database;
   const dialect = new SQLiteSyncDialect();
 
-  const attempt = <R>(fn: () => R): R => {
+  const attempt = async <R>(fn: () => R): Promise<R> => {
     let lastError: unknown;
     for (let i = 0; i < 4; i += 1) {
       try {
@@ -134,10 +134,7 @@ async function buildSqlite(): Promise<Executor> {
         lastError = error;
         const code = (error as { code?: string }).code ?? "";
         if (!code.startsWith("SQLITE_BUSY") && !code.startsWith("SQLITE_LOCKED")) break;
-        const until = Date.now() + 50 * (i + 1);
-        while (Date.now() < until) {
-          /* brief synchronous retry for WAL contention */
-        }
+        await new Promise((resolve) => setTimeout(resolve, 40 * (i + 1)));
       }
     }
     throw lastError;
@@ -151,10 +148,10 @@ async function buildSqlite(): Promise<Executor> {
       const args = sqliteParams(params);
       const statement = database.prepare(text);
       if (!statement.reader) {
-        attempt(() => statement.run(...args));
+        await attempt(() => statement.run(...args));
         return [];
       }
-      return attempt(() => statement.all(...args)) as T[];
+      return (await attempt(() => statement.all(...args))) as T[];
     },
     async exec(statement: string) {
       database.exec(statement);
@@ -163,10 +160,10 @@ async function buildSqlite(): Promise<Executor> {
       const args = sqliteParams(params);
       const statement = database.prepare(sqlText);
       if (!statement.reader) {
-        attempt(() => statement.run(...args));
+        await attempt(() => statement.run(...args));
         return [];
       }
-      return attempt(() => statement.all(...args)) as Record<string, unknown>[];
+      return (await attempt(() => statement.all(...args))) as Record<string, unknown>[];
     },
     async ping() {
       database.prepare("select 1").get();
@@ -211,19 +208,19 @@ async function init(): Promise<Executor> {
  * Однократное наполнение `messages.content_lower` и `message_attachments.name_lower`
  * для записей, созданных до появления поиска.
  */
-async function backfillMessageSearch(executor: Executor): Promise<void> {
+export async function backfillMessageSearch(executor: Executor): Promise<void> {
   for (let batch = 0; batch < 20; batch += 1) {
     const rows = await executor.all<{ id: number; content: string }>(sql`
       select id, content from messages
       where (content_lower is null or content_lower = '') and content <> ''
       limit 200`);
-    if (rows.length) {
-      for (const row of rows) {
-        await executor.all(sql`update messages set content_lower = ${String(row.content).toLowerCase()} where id = ${row.id}`);
-      }
-      continue;
-    }
-    break;
+    if (rows.length === 0) break;
+    const whenClauses = rows.map((row) => sql`when ${Number(row.id)} then ${String(row.content).toLowerCase()}`);
+    const ids = rows.map((row) => sql`${Number(row.id)}`);
+    await executor.all(sql`
+      update messages
+      set content_lower = case id ${sql.join(whenClauses, sql` `)} end
+      where id in (${sql.join(ids, sql`, `)})`);
   }
 
   for (let batch = 0; batch < 20; batch += 1) {
@@ -232,9 +229,12 @@ async function backfillMessageSearch(executor: Executor): Promise<void> {
       where (name_lower is null or name_lower = '') and name <> ''
       limit 200`);
     if (rows.length === 0) return;
-    for (const row of rows) {
-      await executor.all(sql`update message_attachments set name_lower = ${String(row.name).toLowerCase()} where id = ${row.id}`);
-    }
+    const whenClauses = rows.map((row) => sql`when ${Number(row.id)} then ${String(row.name).toLowerCase()}`);
+    const ids = rows.map((row) => sql`${Number(row.id)}`);
+    await executor.all(sql`
+      update message_attachments
+      set name_lower = case id ${sql.join(whenClauses, sql` `)} end
+      where id in (${sql.join(ids, sql`, `)})`);
   }
 }
 

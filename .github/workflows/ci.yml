@@ -61,3 +61,38 @@ jobs:
 
       - name: Run launcher self-test
         run: python3 -m launcher --self-test
+
+  postgres-smoke:
+    name: PostgreSQL Migrations & DB Smoke
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: crm_test
+          POSTGRES_USER: crm
+          POSTGRES_PASSWORD: crm_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Vitest DB & security tests against PostgreSQL
+        env:
+          DB_DIALECT: postgres
+          DATABASE_URL: postgres://crm:crm_test_password@localhost:5432/crm_test
+          CRM_SECRET: ci-postgres-ephemeral-secret-32-chars-min
+        run: npx vitest run tests/agentTester.test.ts tests/teamRoomsBotsAndAccess.test.ts tests/securityP0P1.test.ts

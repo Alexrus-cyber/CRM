@@ -84,6 +84,7 @@ export function proxy(req: NextRequest) {
 
   const requestHeaders = new Headers(req.headers);
   requestHeaders.set("x-nonce", nonce);
+  requestHeaders.set("Content-Security-Policy", csp);
   return attachCsp(NextResponse.next({ request: { headers: requestHeaders } }));
 }
 

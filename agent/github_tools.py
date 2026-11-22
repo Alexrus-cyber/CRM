@@ -16,6 +16,8 @@ GitHub-интеграция и GitHub-RAG инструменты для ИИ-а�
 from __future__ import annotations
 
 import base64
+import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -92,6 +94,13 @@ def _validate_gh_branch(raw: str) -> str:
     return clean
 
 
+def _validate_gh_rev(raw: str) -> str:
+    clean = str(raw or "").strip()
+    if not clean or clean.startswith("-") or ".." in clean or not re.fullmatch(r"[A-Za-z0-9._/@~^{}-]{1,120}", clean):
+        raise GithubToolError(f"Некорректная git-ссылка: {clean[:60]}")
+    return clean
+
+
 def _slug(raw: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw or "").strip()).strip("._")
     return cleaned or "repo"
@@ -117,7 +126,15 @@ def _safe_repo_file(repo_dir: Path, rel_path: str) -> Path:
     if any(p in ("..", ".git") for p in parts):
         raise GithubToolError("Доступ к служебному каталогу .git или выход за пределы репозитория запрещён")
     root = repo_dir.resolve()
-    target = (root / Path(*parts)).resolve()
+    cur = root
+    for part in parts:
+        cur = cur / part
+        if cur.is_symlink():
+            try:
+                cur.resolve(strict=False).relative_to(root)
+            except ValueError as err:
+                raise GithubToolError("Запрещена символьная ссылка за пределы репозитория") from err
+    target = cur.resolve(strict=False)
     try:
         target.relative_to(root)
     except ValueError as err:
@@ -133,7 +150,10 @@ def _gh_api(
     body: Optional[Dict[str, Any]] = None,
     timeout: int = 20,
 ) -> Any:
-    url = path if path.startswith("http") else f"{GITHUB_API}{path}"
+    url = path if path.startswith("http") else f"{GITHUB_API}{path if path.startswith('/') else '/' + path}"
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() != "api.github.com":
+        raise GithubToolError("Разрешены только HTTPS-запросы к api.github.com")
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Accept", "application/vnd.github+json")
@@ -459,43 +479,248 @@ def run_github_tool(
         query = str(args.get("query") or "").strip()
         if not query:
             raise GithubToolError("Укажите query для поиска по коду")
-        glob_filter = str(args.get("glob") or "").strip().lower()
-        max_hits = max(1, min(100, int(args.get("max_hits") or 40)))
-        try:
+        glob_filter = str(args.get("path_glob") or args.get("glob") or "").strip()
+        exclude_glob = str(args.get("exclude_glob") or "").strip()
+        use_regex = bool(args.get("regex", True))
+        case_sensitive = bool(args.get("case_sensitive", False))
+        whole_word = bool(args.get("whole_word", False))
+        context_lines = max(0, min(5, int(args.get("context_lines") or 0)))
+        files_only = bool(args.get("files_only", False))
+        count_only = bool(args.get("count_only", False))
+        force_remote = bool(args.get("remote", False))
+        max_hits = max(1, min(150, int(args.get("max_hits") or 40)))
+
+        def _match_pat(rel_p: str, pat: str) -> bool:
+            p = pat.strip().replace("\\", "/").lstrip("/")
+            if not p:
+                return True
+            if p.startswith(".") and "/" not in p and "*" not in p:
+                return rel_p.lower().endswith(p.lower())
+            if "*" not in p and "?" not in p:
+                return p.lower() in rel_p.lower()
+            return fnmatch.fnmatch(rel_p.lower(), p.lower()) or fnmatch.fnmatch(Path(rel_p).name.lower(), p.lower())
+
+        if not force_remote:
+            try:
+                sync_info = ensure_repo_synced(ctx, sandbox_root=sandbox_root, branch_override=branch)
+                wdir = Path(sync_info["workspaceDir"])
+                flags = 0 if case_sensitive else re.IGNORECASE
+                pat_str = query if use_regex else re.escape(query)
+                if whole_word:
+                    pat_str = rf"\b(?:{pat_str})\b"
+                try:
+                    rx = re.compile(pat_str, flags)
+                except re.error:
+                    rx = re.compile(re.escape(query), flags)
+                hits: List[str] = []
+                file_counts: Dict[str, int] = {}
+                for rel in _iter_repo_files(wdir):
+                    if glob_filter and not _match_pat(rel, glob_filter):
+                        continue
+                    if exclude_glob and _match_pat(rel, exclude_glob):
+                        continue
+                    if Path(rel).suffix.lower() in SKIP_EXTS:
+                        continue
+                    fp = wdir / rel
+                    try:
+                        if fp.stat().st_size > 600_000:
+                            continue
+                        lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+                    except OSError:
+                        continue
+                    fcnt = 0
+                    for idx, line in enumerate(lines):
+                        if rx.search(line):
+                            fcnt += 1
+                            if not files_only and not count_only and len(hits) < max_hits:
+                                if context_lines == 0:
+                                    hits.append(f"{rel}:{idx + 1}: {line.strip()[:220]}")
+                                else:
+                                    lo = max(0, idx - context_lines)
+                                    hi = min(len(lines), idx + context_lines + 1)
+                                    block = [f"--- {rel}:{idx + 1} ---"]
+                                    for j in range(lo, hi):
+                                        mark = ">" if j == idx else " "
+                                        block.append(f"{mark} {j + 1}: {lines[j][:220]}")
+                                    hits.append("\n".join(block))
+                    if fcnt:
+                        file_counts[rel] = fcnt
+                    if not files_only and not count_only and len(hits) >= max_hits:
+                        break
+                if files_only or count_only:
+                    flines = [f"{p} ({c})" for p, c in list(file_counts.items())[:max_hits]]
+                    return (
+                        f"Файлы с «{query}» ({len(file_counts)}):\n" + ("\n".join(flines) if flines else "(ничего не найдено)")
+                    ), events
+                return (
+                    f"Совпадений по «{query}»: {sum(file_counts.values())} (в {len(file_counts)} файлах)\n"
+                    + ("\n".join(hits) if hits else "(ничего не найдено)")
+                ), events
+            except GithubToolError:
+                pass
+
+        q_encoded = urllib.parse.quote(f"{query} repo:{owner}/{repo}")
+        res = _gh_api(f"/search/code?q={q_encoded}&per_page={min(30, max_hits)}", token)
+        items = res.get("items") if isinstance(res, dict) else []
+        lines = [f"{it.get('path')} (score: {it.get('score', '')})" for it in (items or [])]
+        return f"Поиск GitHub API по «{query}»:\n" + ("\n".join(lines) if lines else "(ничего не найдено)"), events
+
+    if name == "github_read_files":
+        raw_items = args.get("files") or args.get("paths")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise GithubToolError("Передайте непустой массив files (до 12 путей или объектов {path, offset, limit})")
+        def_offset = max(1, int(args.get("offset") or 1))
+        def_limit = max(1, min(400, int(args.get("limit") or 160)))
+        wdir = repo_dir
+        if not (wdir / ".git").exists():
             sync_info = ensure_repo_synced(ctx, sandbox_root=sandbox_root, branch_override=branch)
             wdir = Path(sync_info["workspaceDir"])
+        budget = 60_000
+        used = 0
+        sections: List[str] = [f"Пакетное чтение {owner}/{repo}@{branch}:"]
+        for item in raw_items[:12]:
+            if isinstance(item, str):
+                rel_p, off, lim = item.strip().lstrip("/"), def_offset, def_limit
+            elif isinstance(item, dict):
+                rel_p = str(item.get("path") or "").strip().lstrip("/")
+                off = max(1, int(item.get("offset") or def_offset))
+                lim = max(1, min(400, int(item.get("limit") or def_limit)))
+            else:
+                continue
+            if not rel_p:
+                continue
+            fp = _safe_repo_file(wdir, rel_p)
             try:
-                rx = re.compile(query, re.IGNORECASE)
-            except re.error:
-                rx = re.compile(re.escape(query), re.IGNORECASE)
-            hits: List[str] = []
-            for rel in _iter_repo_files(wdir):
-                if glob_filter and glob_filter not in rel.lower():
+                if not fp.is_file():
+                    sections.append(f"\n=== {rel_p} ===\n(файл не найден)")
                     continue
-                if Path(rel).suffix.lower() in SKIP_EXTS:
+                if fp.suffix.lower() in SKIP_EXTS:
+                    sections.append(f"\n=== {rel_p} ===\n(бинарный файл, {fp.stat().st_size} байт)")
                     continue
-                fp = wdir / rel
-                try:
-                    if fp.stat().st_size > 400_000:
-                        continue
-                    for idx, line in enumerate(fp.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
-                        if rx.search(line):
-                            hits.append(f"{rel}:{idx}: {line.strip()[:200]}")
-                            if len(hits) >= max_hits:
-                                break
-                except OSError:
-                    continue
-                if len(hits) >= max_hits:
+                all_lns = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+                st_idx = off - 1
+                sl = all_lns[st_idx : st_idx + lim]
+                body_txt = "\n".join(f"{st_idx + i + 1}: {ln}" for i, ln in enumerate(sl))
+                if used + len(body_txt) > budget:
+                    body_txt = body_txt[: max(500, budget - used)] + "\n... [обрезано по общему бюджету]"
+                used += len(body_txt)
+                sections.append(f"\n=== {rel_p} (строки {off}–{st_idx + len(sl)} из {len(all_lns)}) ===\n{body_txt}")
+                if used >= budget:
                     break
-            return (
-                f"Совпадений по «{query}»: {len(hits)}\n" + ("\n".join(hits) if hits else "(ничего не найдено)")
-            ), events
-        except GithubToolError:
-            q_encoded = urllib.parse.quote(f"{query} repo:{owner}/{repo}")
-            res = _gh_api(f"/search/code?q={q_encoded}&per_page={min(30, max_hits)}", token)
-            items = res.get("items") if isinstance(res, dict) else []
-            lines = [f"{it.get('path')} (score: {it.get('score', '')})" for it in (items or [])]
-            return f"Поиск GitHub по «{query}»:\n" + ("\n".join(lines) if lines else "(ничего не найдено)"), events
+            except OSError as err:
+                sections.append(f"\n=== {rel_p} ===\n(ошибка чтения: {err})")
+        return "\n".join(sections), events
+
+    if name == "github_file_stat":
+        raw_paths = args.get("paths") or ([args.get("path")] if args.get("path") else [])
+        if not isinstance(raw_paths, list) or not raw_paths:
+            raise GithubToolError("Укажите path или массив paths")
+        sync_info = ensure_repo_synced(ctx, sandbox_root=sandbox_root, branch_override=branch)
+        wdir = Path(sync_info["workspaceDir"])
+        lines = [f"Метаданные файлов {owner}/{repo}@{sync_info['branch']}:"]
+        for raw_p in raw_paths[:30]:
+            rel_p = str(raw_p or "").strip().lstrip("/")
+            if not rel_p:
+                continue
+            fp = _safe_repo_file(wdir, rel_p)
+            if not fp.exists():
+                lines.append(f"- {rel_p}: не найден")
+                continue
+            if fp.is_dir():
+                lines.append(f"- {rel_p}/: каталог")
+                continue
+            raw_bytes = fp.read_bytes()
+            sha = hashlib.sha256(raw_bytes).hexdigest()[:12]
+            lcnt = 0 if fp.suffix.lower() in SKIP_EXTS else len(raw_bytes.decode("utf-8", "replace").splitlines())
+            _, glog, _ = _run_git(["log", "-1", "--format=%h %cs %an | %s", "--", rel_p], cwd=wdir, timeout=10)
+            g_str = f" | git: {glog.strip()[:90]}" if glog.strip() else ""
+            lines.append(f"- {rel_p}: {len(raw_bytes)} байт, {lcnt} строк, sha256={sha}{g_str}")
+        return "\n".join(lines), events
+
+    if name == "github_changed_since":
+        sync_info = ensure_repo_synced(ctx, sandbox_root=sandbox_root, branch_override=branch)
+        wdir = Path(sync_info["workspaceDir"])
+        base_ref = _validate_gh_rev(str(args.get("base") or "HEAD~5").strip())
+        head_ref = _validate_gh_rev(str(args.get("head") or "HEAD").strip())
+        code, st_out, err = _run_git(["diff", "--name-status", f"{base_ref}..{head_ref}"], cwd=wdir, timeout=15)
+        if code != 0:
+            raise GithubToolError(err or f"Не удалось сравнить {base_ref}..{head_ref}")
+        _, stat_out, _ = _run_git(["diff", "--stat", f"{base_ref}..{head_ref}"], cwd=wdir, timeout=15)
+        return (
+            f"Изменения {base_ref}..{head_ref} в {owner}/{repo}:\n"
+            f"{st_out.strip() or '(нет изменений)'}\n\n{stat_out.strip()}"
+        ).strip(), events
+
+    if name == "github_ci_status":
+        ref = str(args.get("ref") or "").strip()
+        pull_number = int(args.get("pull_number") or 0)
+        if pull_number > 0 and not ref:
+            pr_data = _gh_api(f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}/pulls/{pull_number}", token)
+            ref = str(((pr_data.get("head") or {}).get("sha")) or branch)
+        target_ref = ref or branch
+        checks = _gh_api(
+            f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}/commits/{urllib.parse.quote(target_ref)}/check-runs?per_page=30",
+            token,
+        )
+        runs = _gh_api(
+            f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}/actions/runs?branch={urllib.parse.quote(branch)}&per_page=10",
+            token,
+        )
+        lines = [f"Статус CI для {owner}/{repo} (ref={target_ref}):"]
+        check_runs = checks.get("check_runs") if isinstance(checks, dict) else []
+        if check_runs:
+            lines.append("\nCheck runs:")
+            for cr in check_runs[:25]:
+                lines.append(
+                    f"  - {cr.get('name')}: status={cr.get('status')}, conclusion={cr.get('conclusion') or 'pending'} "
+                    f"({cr.get('html_url') or ''})"
+                )
+        wf_runs = runs.get("workflow_runs") if isinstance(runs, dict) else []
+        if wf_runs:
+            lines.append("\nWorkflow runs:")
+            for wr in wf_runs[:10]:
+                lines.append(
+                    f"  - #{wr.get('run_number')} {wr.get('name')}: status={wr.get('status')}, "
+                    f"conclusion={wr.get('conclusion') or 'pending'} ({wr.get('html_url') or ''})"
+                )
+        if not check_runs and not wf_runs:
+            lines.append("(запусков CI / check-runs не найдено)")
+        return "\n".join(lines), events
+
+    if name == "github_get_pr_diff":
+        pull_number = int(args.get("pull_number") or 0)
+        if pull_number <= 0:
+            raise GithubToolError("Укажите корректный номер PR (pull_number)")
+        pr = _gh_api(f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}/pulls/{pull_number}", token)
+        files = _gh_api(
+            f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}/pulls/{pull_number}/files?per_page=50",
+            token,
+        )
+        comments = _gh_api(
+            f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}/pulls/{pull_number}/comments?per_page=30",
+            token,
+        )
+        lines = [
+            f"PR #{pull_number} [{pr.get('state')}]: {pr.get('title')}",
+            f"Ветка: {(pr.get('head') or {}).get('ref')} -> {(pr.get('base') or {}).get('ref')} | {pr.get('html_url')}",
+            f"Статистика: +{pr.get('additions', 0)} / -{pr.get('deletions', 0)}, файлов: {pr.get('changed_files', 0)}",
+            "\nФайлы и патчи:",
+        ]
+        if isinstance(files, list):
+            total_patch_chars = 0
+            for f in files[:40]:
+                patch = str(f.get("patch") or "")
+                lines.append(f"\n--- {f.get('filename')} [{f.get('status')}] (+{f.get('additions')}/-{f.get('deletions')}) ---")
+                if patch and total_patch_chars < 14_000:
+                    slice_p = patch[:2500]
+                    lines.append(slice_p)
+                    total_patch_chars += len(slice_p)
+        if isinstance(comments, list) and comments:
+            lines.append("\nReview-комментарии:")
+            for cm in comments[:20]:
+                who = (cm.get("user") or {}).get("login", "")
+                lines.append(f"  - @{who} ({cm.get('path')}:{cm.get('line') or cm.get('original_line') or '?'}): {str(cm.get('body') or '')[:220]}")
+        return "\n".join(lines), events
 
     if name == "github_status":
         sync_info = ensure_repo_synced(ctx, sandbox_root=sandbox_root, branch_override=branch)
@@ -958,14 +1183,69 @@ GITHUB_READ_TOOLS: List[Dict[str, Any]] = [
         ["path"],
     ),
     _fn(
+        "github_read_files",
+        "Прочитать до 12 файлов из GitHub-репозитория одним пакетным вызовом (экономит шаги).",
+        {
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Массив путей файлов (или объектов {path, offset, limit})",
+            },
+            "offset": {"type": "integer", "description": "Начальная строка (по умолчанию 1)"},
+            "limit": {"type": "integer", "description": "Строк на файл (по умолчанию 160)"},
+        },
+        ["files"],
+    ),
+    _fn(
+        "github_file_stat",
+        "Получить размер, число строк, SHA-256 и последний коммит git для указанных файлов репозитория.",
+        {
+            "paths": {"type": "array", "items": {"type": "string"}, "description": "Список путей файлов"},
+            "path": {"type": "string", "description": "Один путь файла"},
+        },
+    ),
+    _fn(
         "github_search_code",
-        "Поиск текста или регулярного выражения по исходному коду привязанного GitHub-репозитория.",
+        "Мощный поиск по коду привязанного GitHub-репозитория (regex, whole_word, case_sensitive, context_lines, path_glob, exclude_glob, files_only/count_only).",
         {
             "query": {"type": "string", "description": "Строка или regex для поиска"},
-            "glob": {"type": "string", "description": "Фильтр по пути/расширению, например '.tsx' или 'src/api'"},
+            "glob": {"type": "string", "description": "Фильтр по пути/расширению, например '*.tsx' или 'src/api'"},
+            "path_glob": {"type": "string", "description": "Синоним glob (шаблон пути)"},
+            "exclude_glob": {"type": "string", "description": "Исключить файлы по шаблону"},
+            "regex": {"type": "boolean", "description": "Трактовать как regex (по умолчанию true)"},
+            "case_sensitive": {"type": "boolean", "description": "Учитывать регистр"},
+            "whole_word": {"type": "boolean", "description": "Только целые слова"},
+            "context_lines": {"type": "integer", "description": "Сколько строк контекста до/после (0–5)"},
+            "files_only": {"type": "boolean", "description": "Только список файлов и количество совпадений"},
+            "count_only": {"type": "boolean", "description": "Только сводка счётчиков по файлам"},
+            "remote": {"type": "boolean", "description": "Искать через удалённый GitHub Code Search API"},
             "max_hits": {"type": "integer", "description": "Максимум совпадений (по умолчанию 40)"},
         },
         ["query"],
+    ),
+    _fn(
+        "github_changed_since",
+        "Список изменённых файлов и diff-статистика между двумя коммитами или ветками (base..head).",
+        {
+            "base": {"type": "string", "description": "Базовый ref (напр. HEAD~5 или origin/main)"},
+            "head": {"type": "string", "description": "Целевой ref (по умолчанию HEAD)"},
+        },
+    ),
+    _fn(
+        "github_ci_status",
+        "Проверить статус CI (Check Runs и GitHub Actions workflows) для ветки, коммита или PR.",
+        {
+            "ref": {"type": "string", "description": "SHA или ветка (по умолчанию текущая ветка)"},
+            "pull_number": {"type": "integer", "description": "Номер PR для проверки его head SHA"},
+        },
+    ),
+    _fn(
+        "github_get_pr_diff",
+        "Получить детальный diff файлов, статистику и review-комментарии конкретного Pull Request.",
+        {
+            "pull_number": {"type": "integer", "description": "Номер Pull Request"},
+        },
+        ["pull_number"],
     ),
     _fn(
         "github_status",

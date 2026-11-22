@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import browser_inspector
+import code_tools
 import sandbox as sandbox_mod
 
 QA_TOOLS: List[Dict[str, Any]] = [
@@ -106,10 +107,94 @@ QA_TOOLS: List[Dict[str, Any]] = [
                         "items": {"type": "string"},
                         "description": "Список маршрутов для проверки (по умолчанию ['/'])",
                     },
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+                        "description": "HTTP-метод запроса (по умолчанию GET)",
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Дополнительные HTTP-заголовки (опционально)",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Тело запроса (JSON/текст для POST/PUT/PATCH)",
+                    },
                     "timeout": {
                         "type": "integer",
                         "description": "Таймаут одного HTTP-запроса в секундах (по умолчанию 10)",
                     },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "qa_security_audit",
+            "description": (
+                "Комплексный QA-аудит безопасности проекта (Sandbox или GitHub-клон): утечки секретов и ключей, "
+                "SAST-паттерны (eval/exec/shell=True/sql.raw/XSS), проверка API-эндпоинтов без auth/rate-limit и "
+                "проверка заголовков CSP/proxy."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sandbox_project": {
+                        "type": "string",
+                        "description": "Папка проекта в Sandbox (если не проверяется GitHub-клон)",
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["auto", "sandbox", "github"],
+                        "description": "Источник кода (по умолчанию auto)",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Подпапка для проверки",
+                    },
+                    "include_tests": {
+                        "type": "boolean",
+                        "description": "Включать ли тестовые файлы",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "qa_auth_matrix_audit",
+            "description": (
+                "Построить и проверить матрицу авторизации и прав по всем API-эндпоинтам (методы, auth, "
+                "role-check, rate-limit, Zod-валидация) и выявить маршруты без защиты."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sandbox_project": {"type": "string"},
+                    "target": {"type": "string", "enum": ["auto", "sandbox", "github"]},
+                    "only_flagged": {
+                        "type": "boolean",
+                        "description": "Показать только маршруты с предупреждениями",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "qa_schema_audit",
+            "description": (
+                "QA-аудит схемы БД и SQL-миграций (src/db/schema.ts vs drizzle/*.sql): поиск несоответствий "
+                "таблиц/колонок и проблем переносимости SQLite/PostgreSQL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sandbox_project": {"type": "string"},
+                    "target": {"type": "string", "enum": ["auto", "sandbox", "github"]},
                 },
             },
         },
@@ -480,6 +565,9 @@ def run_qa_http_audit(
     base_url: str = "",
     sandbox_project: str = "",
     routes: Optional[List[str]] = None,
+    method: str = "GET",
+    headers: Optional[Dict[str, Any]] = None,
+    body: Optional[str] = None,
     timeout: int = 10,
 ) -> Dict[str, Any]:
     clean_url = str(base_url or "").strip()
@@ -501,10 +589,29 @@ def run_qa_http_audit(
     check_routes = [str(r or "/") for r in (routes or ["/"])][:20]
     if not check_routes:
         check_routes = ["/"]
+    req_method = str(method or "GET").strip().upper()
+    if req_method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"):
+        req_method = "GET"
+    req_data = body.encode("utf-8") if body is not None and req_method in ("POST", "PUT", "PATCH", "DELETE") else None
+    req_headers: Dict[str, str] = {}
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            ks = str(k or "").strip()
+            if ks and "\n" not in ks and "\r" not in ks:
+                req_headers[ks] = str(v or "")[:1000]
+    if req_data is not None and "Content-Type" not in req_headers:
+        req_headers["Content-Type"] = "application/json; charset=utf-8"
 
     req_timeout = max(2, min(30, int(timeout or 10)))
     results: List[Dict[str, Any]] = []
-    error_markers = ("traceback (most recent call last)", "internal server error", "application error:", "syntaxerror:")
+    error_markers = (
+        "traceback (most recent call last)",
+        "internal server error",
+        "application error:",
+        "syntaxerror:",
+        "sqlite_error",
+        "postgres error",
+    )
 
     try:
         for route in check_routes:
@@ -516,22 +623,29 @@ def run_qa_http_audit(
                 continue
             started = time.monotonic()
             try:
-                req = urllib.request.Request(full_url, method="GET")
+                req = urllib.request.Request(full_url, data=req_data, headers=req_headers, method=req_method)
                 with urllib.request.urlopen(req, timeout=req_timeout) as resp:
-                    body = resp.read(64_000).decode("utf-8", "replace")
+                    resp_body = resp.read(64_000).decode("utf-8", "replace")
                     elapsed_ms = int((time.monotonic() - started) * 1000)
                     ctype = str(resp.headers.get("Content-Type") or "")
-                    low = body.lower()
+                    low = resp_body.lower()
                     hit_err = next((m for m in error_markers if m in low), "")
+                    sec_headers = {
+                        "csp": bool(resp.headers.get("Content-Security-Policy")),
+                        "xContentTypeOptions": str(resp.headers.get("X-Content-Type-Options") or ""),
+                        "xFrameOptions": str(resp.headers.get("X-Frame-Options") or ""),
+                    }
                     ok = 200 <= resp.status < 400 and not hit_err
                     results.append(
                         {
                             "route": rel_route,
                             "url": full_url,
+                            "method": req_method,
                             "status": resp.status,
                             "ms": elapsed_ms,
                             "contentType": ctype,
-                            "bytes": len(body),
+                            "bytes": len(resp_body),
+                            "securityHeaders": sec_headers,
                             "errorMarker": hit_err,
                             "ok": ok,
                         }
@@ -542,6 +656,7 @@ def run_qa_http_audit(
                     {
                         "route": rel_route,
                         "url": full_url,
+                        "method": req_method,
                         "status": err.code,
                         "ms": elapsed_ms,
                         "ok": False,
@@ -554,6 +669,7 @@ def run_qa_http_audit(
                     {
                         "route": rel_route,
                         "url": full_url,
+                        "method": req_method,
                         "status": 0,
                         "ms": elapsed_ms,
                         "ok": False,
@@ -678,6 +794,7 @@ def run_qa_tool(
     trust_level: str = "verified",
     approval_fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     browser_manager: Optional[browser_inspector.BrowserSessionManager] = None,
+    github_ctx: Optional[Dict[str, Any]] = None,
     report_sink: Optional[Dict[str, Any]] = None,
     checks_sink: Optional[List[Dict[str, Any]]] = None,
     unlimited: bool = False,
@@ -816,6 +933,9 @@ def run_qa_tool(
             base_url=str(args.get("base_url") or ""),
             sandbox_project=str(args.get("sandbox_project") or ""),
             routes=args.get("routes") if isinstance(args.get("routes"), list) else None,
+            method=str(args.get("method") or "GET"),
+            headers=args.get("headers") if isinstance(args.get("headers"), dict) else None,
+            body=str(args.get("body")) if args.get("body") is not None else None,
             timeout=int(args.get("timeout") or 10),
         )
         ok_cnt = res["passedCount"]
@@ -835,10 +955,97 @@ def run_qa_tool(
         )
         lines = [chk_detail]
         for row in res["results"]:
+            sh = row.get("securityHeaders") or {}
+            hdr_note = "" if not sh else f" [csp={sh.get('csp')}, xcto={sh.get('xContentTypeOptions') or '-'}]"
             lines.append(
-                f"- {row['route']}: статус={row.get('status')} ({row.get('ms')} мс) "
+                f"- {row.get('method', 'GET')} {row['route']}: статус={row.get('status')} ({row.get('ms')} мс){hdr_note} "
                 + ("OK" if row.get("ok") else f"ОШИБКА: {row.get('error') or row.get('errorMarker')}")
             )
+        return "\n".join(lines), events
+
+    if name == "qa_security_audit":
+        try:
+            root, scope_label = code_tools._resolve_target_root(args, sandbox_root=sandbox_root, github_ctx=github_ctx)
+        except code_tools.CodeToolError as err:
+            raise QaToolError(str(err)) from err
+        sec = code_tools.scan_security_findings(
+            root,
+            subdir=str(args.get("path") or ""),
+            include_tests=bool(args.get("include_tests", False)),
+        )
+        ep_items = code_tools.collect_endpoint_inventory(root)
+        no_auth = [e for e in ep_items if "NO_AUTH" in e["flags"]]
+        no_rl = [e for e in ep_items if "NO_RATE_LIMIT" in e["flags"]]
+        check_role = [e for e in ep_items if "CHECK_ROLE" in e["flags"]]
+        proxy_warnings: List[str] = []
+        proxy_fp = root / "src" / "proxy.ts"
+        if proxy_fp.is_file():
+            ptxt = proxy_fp.read_text(encoding="utf-8", errors="replace")
+            if "strict-dynamic" in ptxt and "requestHeaders.set(\"Content-Security-Policy\"" not in ptxt and "requestHeaders.set('Content-Security-Policy'" not in ptxt:
+                proxy_warnings.append("src/proxy.ts: 'strict-dynamic' с nonce без передачи Content-Security-Policy в requestHeaders")
+
+        crit_cnt = len(sec["secrets"]) + len([s for s in sec["sast"] if s["severity"] in ("critical", "high")]) + len(no_auth) + len(proxy_warnings)
+        warn_cnt = len([s for s in sec["sast"] if s["severity"] == "medium"]) + len(no_rl) + len(check_role)
+        chk_status = "fail" if crit_cnt > 0 else ("warn" if warn_cnt > 0 else "pass")
+        chk_detail = f"Файлов={sec['filesScanned']}, секреты={len(sec['secrets'])}, SAST={len(sec['sast'])}, NO_AUTH={len(no_auth)}, NO_RL={len(no_rl)}"
+        if checks_sink is not None:
+            checks_sink.append({"name": f"Аудит безопасности ({scope_label})", "tool": "qa_security_audit", "status": chk_status, "details": chk_detail})
+        events.append({"type": "qa_check", "tool": "qa_security_audit", "label": chk_detail, "status": chk_status})
+
+        lines = [f"QA Security Audit ({scope_label}): {chk_detail}"]
+        if proxy_warnings:
+            lines.append("\nCSP / Proxy предупреждения:")
+            lines.extend(f"  ! {w}" for w in proxy_warnings)
+        if sec["secrets"]:
+            lines.append("\nСекреты/ключи:")
+            lines.extend(f"  - [{s['kind']}] {s['file']}:{s['line']}" for s in sec["secrets"][:25])
+        if sec["sast"]:
+            lines.append("\nSAST-находки:")
+            lines.extend(f"  - [{s['severity']}] {s['kind']} @ {s['file']}:{s['line']}" for s in sec["sast"][:35])
+        if no_auth or check_role or no_rl:
+            lines.append("\nЭндпоинты с пробелами защиты:")
+            for e in (no_auth + check_role + no_rl)[:30]:
+                lines.append(f"  - {','.join(e['methods'])} {e['route']} [{', '.join(e['flags'])}]")
+        return "\n".join(lines), events
+
+    if name == "qa_auth_matrix_audit":
+        try:
+            root, scope_label = code_tools._resolve_target_root(args, sandbox_root=sandbox_root, github_ctx=github_ctx)
+        except code_tools.CodeToolError as err:
+            raise QaToolError(str(err)) from err
+        items = code_tools.collect_endpoint_inventory(root)
+        only_flagged = bool(args.get("only_flagged", False))
+        shown = [e for e in items if e["flags"]] if only_flagged else items
+        flagged_cnt = sum(1 for e in items if e["flags"])
+        has_no_auth = any("NO_AUTH" in e["flags"] for e in items)
+        chk_status = "fail" if has_no_auth else ("warn" if flagged_cnt else "pass")
+        chk_detail = f"Эндпоинтов={len(items)}, с флагами={flagged_cnt}"
+        if checks_sink is not None:
+            checks_sink.append({"name": f"Матрица авторизации API ({scope_label})", "tool": "qa_auth_matrix_audit", "status": chk_status, "details": chk_detail})
+        events.append({"type": "qa_check", "tool": "qa_auth_matrix_audit", "label": chk_detail, "status": chk_status})
+        out = [f"Auth Matrix ({scope_label}): {chk_detail}"]
+        for e in shown[:100]:
+            fl = f" [! {', '.join(e['flags'])}]" if e["flags"] else ""
+            out.append(f"- {','.join(e['methods'])} {e['route']} | auth={e['auth']} role={e['roleCheck']} rl={e['rateLimit']} val={e['validation']}{fl}")
+        return "\n".join(out), events
+
+    if name == "qa_schema_audit":
+        try:
+            root, scope_label = code_tools._resolve_target_root(args, sandbox_root=sandbox_root, github_ctx=github_ctx)
+        except code_tools.CodeToolError as err:
+            raise QaToolError(str(err)) from err
+        info = code_tools.inspect_schema_and_migrations(root)
+        warns = info["warnings"]
+        chk_status = "fail" if warns else "pass"
+        chk_detail = f"Таблиц schema={len(info['schemaTables'])}, миграций={len(info['migrationFiles'])}, расхождений={len(warns)}"
+        if checks_sink is not None:
+            checks_sink.append({"name": f"Аудит схемы БД ({scope_label})", "tool": "qa_schema_audit", "status": chk_status, "details": chk_detail})
+        events.append({"type": "qa_check", "tool": "qa_schema_audit", "label": chk_detail, "status": chk_status})
+        lines = [f"Schema Audit ({scope_label}): {chk_detail}"]
+        if warns:
+            lines.extend(f"  ! {w}" for w in warns)
+        else:
+            lines.append("Расхождений между schema.ts и drizzle/*.sql не обнаружено.")
         return "\n".join(lines), events
 
     if name == "qa_browser_audit":

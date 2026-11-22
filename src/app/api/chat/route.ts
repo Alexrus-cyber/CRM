@@ -25,7 +25,9 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const MAX_TEXT = 4000;
+const HARD_MAX_TEXT = 32_000;
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const HARD_MAX_FILE_BYTES = 25 * 1024 * 1024;
 
 /** Имя файла без путей и управляющих символов. */
 function sanitizeFileName(name: string): string {
@@ -118,8 +120,10 @@ export async function POST(req: Request) {
   }
 
   const unlimited = me.role === "super_admin";
+  const maxTextChars = unlimited ? HARD_MAX_TEXT : MAX_TEXT;
+  const maxFileBytes = unlimited ? HARD_MAX_FILE_BYTES : MAX_FILE_BYTES;
   if (!content && !file) return Response.json({ error: "Пустое сообщение" }, { status: 400 });
-  if (!unlimited && content.length > MAX_TEXT) {
+  if (content.length > maxTextChars) {
     return Response.json({ error: "Слишком длинное сообщение" }, { status: 400 });
   }
 
@@ -139,8 +143,22 @@ export async function POST(req: Request) {
     }
   }
 
-  if (!unlimited && file && file.size > MAX_FILE_BYTES) {
-    return Response.json({ error: "Файл больше 5 МБ" }, { status: 413 });
+  if (file && file.size > maxFileBytes) {
+    return Response.json(
+      { error: unlimited ? "Файл превышает максимальный размер 25 МБ" : "Файл больше 5 МБ" },
+      { status: 413 },
+    );
+  }
+
+  let fileBuffer: Buffer | null = null;
+  if (file) {
+    fileBuffer = Buffer.from(await file.arrayBuffer());
+    if (fileBuffer.byteLength > maxFileBytes) {
+      return Response.json(
+        { error: unlimited ? "Файл превышает максимальный размер 25 МБ" : "Файл больше 5 МБ" },
+        { status: 413 },
+      );
+    }
   }
 
   const recipientId = room > 0 ? null : peer === 0 ? null : peer;
@@ -149,13 +167,12 @@ export async function POST(req: Request) {
     await touchChatRoom(room);
   }
 
-  if (file) {
-    const buffer = Buffer.from(await file.arrayBuffer());
+  if (file && fileBuffer) {
     await insertMessageAttachment(id, {
       name: sanitizeFileName(file.name),
       mime: file.type || "application/octet-stream",
-      size: file.size,
-      data: buffer.toString("base64"),
+      size: fileBuffer.byteLength,
+      data: fileBuffer.toString("base64"),
     });
   }
 

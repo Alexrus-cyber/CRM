@@ -27,12 +27,15 @@ import {
 } from "@/lib/ai";
 import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 import { assertSafeAiUrl, safeAiFetch } from "@/lib/ssrf";
+import { readJsonWithByteLimit } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 /** Потолок на тело запроса: история + картинки в data-URL (сжимаем в браузере). */
 const MAX_BODY_BYTES = 48 * 1024 * 1024;
+/** Жёсткий серверный потолок даже для super_admin (защита от OOM DoS). */
+const HARD_MAX_BODY_BYTES = 64 * 1024 * 1024;
 /** Сколько символов RAG-контекста максимум подмешиваем в обычном режиме (≈4–5k токенов). */
 const MAX_RAG_CONTEXT_CHARS = 12_000;
 /** Сколько токенов оставляем модели на ответ в режиме «вся база». */
@@ -342,20 +345,19 @@ export async function POST(req: Request) {
   let chatId = 0;
   let attachmentsJson = "[]";
   const unlimited = me.role === "super_admin";
+  const parsedBody = await readJsonWithByteLimit<{
+    messages?: AiMessage[];
+    params?: unknown;
+    ragContext?: unknown;
+    ragFolderId?: unknown;
+    ragQuery?: unknown;
+    chatId?: unknown;
+    attachments?: unknown;
+  }>(req, unlimited ? HARD_MAX_BODY_BYTES : MAX_BODY_BYTES);
+  if (!parsedBody.ok) return parsedBody.response;
+
   try {
-    const raw = await req.text();
-    if (!unlimited && raw.length > MAX_BODY_BYTES) {
-      return Response.json({ error: "Слишком большой запрос: уменьшите вложение" }, { status: 413 });
-    }
-    const body = JSON.parse(raw) as {
-      messages?: AiMessage[];
-      params?: unknown;
-      ragContext?: unknown;
-      ragFolderId?: unknown;
-      ragQuery?: unknown;
-      chatId?: unknown;
-      attachments?: unknown;
-    };
+    const body = parsedBody.data ?? {};
     params = normalizeParams(body.params, { unlimited });
     ragContext =
       typeof body.ragContext === "string"

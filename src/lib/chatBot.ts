@@ -65,7 +65,7 @@ export function publicChatBot(bot: ChatBotRow, includeSecretConfig: boolean): Pu
     provider: bot.provider,
     baseUrl: bot.baseUrl,
     hasApiKey: Boolean(bot.apiKey),
-    apiKeyHint: bot.apiKey ? `…${bot.apiKey.slice(-4)}` : "",
+    apiKeyHint: bot.apiKey ? (bot.apiKey.length >= 10 ? `…${bot.apiKey.slice(-4)}` : "••••") : "",
     systemPrompt: bot.systemPrompt,
     params: normalizeGenParams(safeParseParams(bot.paramsJson), { unlimited: true }),
   };

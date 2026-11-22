@@ -118,9 +118,20 @@ export function extractClientIp(headers: Headers): string {
 }
 
 function keysFor(ip: string, email: string): string[] {
-  const normIp = (ip || "local").trim().toLowerCase();
+  const normIp = (ip || "direct").trim().toLowerCase();
   const normEmail = (email || "").trim().toLowerCase();
-  return normEmail ? [`ip:${normIp}`, `acct:${normIp}:${normEmail}`, `mail:${normEmail}`] : [`ip:${normIp}`];
+  // При работе без доверенного reverse-proxy (`CRM_TRUST_PROXY !== "1"`) все пользователи
+  // приходят под маркером "direct" — нельзя шарить общий IP-бакет, иначе 15 ошибок входа
+  // одного сотрудника заблокируют вход для всей организации.
+  const includeSharedIpBucket = normIp !== "direct" && normIp !== "local";
+  if (!normEmail) {
+    return includeSharedIpBucket ? [`ip:${normIp}`] : [`ip:${normIp}`];
+  }
+  const keys = [`acct:${normIp}:${normEmail}`, `mail:${normEmail}`];
+  if (includeSharedIpBucket) {
+    keys.unshift(`ip:${normIp}`);
+  }
+  return keys;
 }
 
 export function checkLoginRateLimit(

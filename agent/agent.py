@@ -48,6 +48,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import browser_inspector  # noqa: E402
+import code_tools  # noqa: E402
 import github_tools  # noqa: E402
 import qa_tools  # noqa: E402
 import sandbox as sandbox_mod  # noqa: E402
@@ -91,8 +92,9 @@ def _load_secrets_file() -> None:
 
 
 _load_secrets_file()
-MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "500"))
-MAX_STEPS_LIMIT = 500
+MAX_STEPS = max(1, int(os.environ.get("AGENT_MAX_STEPS", "500")))
+MAX_STEPS_LIMIT = MAX_STEPS
+MAX_RUN_TOKENS = max(0, int(os.environ.get("AGENT_MAX_RUN_TOKENS", "2500000") or 0))
 TIMEOUT = int(os.environ.get("AGENT_TIMEOUT", "180"))
 APPROVAL_TIMEOUT = int(os.environ.get("AGENT_APPROVAL_TIMEOUT", "600"))
 
@@ -231,15 +233,23 @@ SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CR
    - call_operator — вызвать Оператора для выполнения действий на экране/ПК или помощи
      пользователю (ВСЕГДА спрашивает разрешение пользователя на сайте перед запуском!).
 8. Работа с подключённым GitHub-репозиторием (GitHub-RAG и разработка кода):
-   - github_repo_info, github_list_files, github_read_file, github_search_code, github_status,
-     github_diff, github_list_prs — полный анализ кода, архитектуры и PR в выбранном репозитории;
+   - github_repo_info, github_list_files, github_read_file, github_read_files, github_file_stat,
+     github_search_code, github_status, github_diff, github_changed_since, github_list_prs,
+     github_get_pr_diff, github_ci_status — полный анализ кода, PR, CI и архитектуры в выбранном репозитории;
    - github_write_file, github_edit_file, github_delete_file, github_create_branch — создание и
      исправление файлов и веток в изолированной копии репозитория в Sandbox;
    - github_commit, github_create_pr, github_merge_pr — Commit/Push, Pull Request и Merge
      строго от имени пользователя, привязавшего свой GitHub-аккаунт (ВСЕГДА сначала запрашивают
      явное разрешение пользователя на сайте через approval_required — НИКОГДА не делай git commit /
      git push / PR / merge обходным путём через run_command!).
-9. Под-агент Тестировщик (`call_tester`, `confirm_minor_fixes`, `list_tester_reports`):
+9. Профессиональный анализ, верификация кода и безопасность (Sandbox и GitHub-клон):
+   - code_search, code_read_files, code_file_stats, code_symbols, code_refs, code_deps,
+     git_history, schema_inspect, endpoint_inventory, security_scan, agent_plan — глубокий
+     анализ структуры, графа вызовов/зависимостей, git blame/history, схемы БД, матрицы API и
+     утечек/SAST;
+   - run_typecheck, run_lint_file, run_tests_subset — безопасный точечный запуск tsc/mypy,
+     ESLint/Ruff и Vitest/Pytest только по нужным файлам.
+10. Под-агент Тестировщик (`call_tester`, `confirm_minor_fixes`, `list_tester_reports`):
    - Когда приложение, сайт или значимый блок кода в Sandbox готовы — ОБЯЗАТЕЛЬНО сформируй
      чёткое `summary` (что сделано, ключевые файлы/маршруты, на что обратить внимание) и вызови
      `call_tester(summary=..., sandbox_project=...)`.
@@ -283,13 +293,18 @@ TESTER_SYSTEM_PROMPT = """Ты — независимый QA-инженер (п�
 1. У тебя есть ВСЕ обычные инструменты Агента: работа с Sandbox (`sandbox_list`, `sandbox_read_file`,
    `sandbox_write_file`, `run_command`, `create_file`, `open_website`), браузерный осмотр
    (`browse_project`), работа с GitHub (если подключён), а также Оператор при необходимости.
-2. У тебя есть РАСШИРЕННЫЕ QA-инструменты тестирования:
+2. У тебя есть РАСШИРЕННЫЕ QA-инструменты тестирования и анализа кода:
    - `qa_static_review` — статический анализ проекта в Sandbox (синтаксис Python AST / JSON,
      битые локальные ссылки в HTML, незакрытые теги, XSS, hardcoded localhost, пустые файлы, TODO);
    - `qa_run_tests` — автоопределение и запуск тестов, типов, линтера или проверки компиляции в Sandbox;
-   - `qa_http_audit` — проверка HTTP-маршрутов и ответов (коды ответа, Content-Type, ошибки, задержки);
+   - `qa_http_audit` — проверка HTTP-маршрутов и ответов (коды ответа, методы, security headers, утечки ошибок);
    - `qa_browser_audit` — кросс-вьюпортная проверка веб-проекта (desktop 1440x900 и mobile 375x812):
      ошибки JS-консоли, сетевые сбои, переполнение экрана, сломанные картинки, застрявшие анимации + скриншоты;
+   - `qa_security_audit`, `qa_auth_matrix_audit`, `qa_schema_audit` — проверка секретов, SAST-уязвимостей,
+     матрицы auth/role/rateLimit на API-эндпоинтах и соответствия схемы БД/миграций;
+   - `code_search`, `code_read_files`, `code_symbols`, `code_refs`, `code_deps`, `git_history`,
+     `run_typecheck`, `run_lint_file`, `run_tests_subset`, `agent_plan` — быстрая точечная диагностика
+     кода и тестов без лишних шагов;
    - `qa_submit_report` — ОБЯЗАТЕЛЬНЫЙ финальный инструмент! Передаёт структурированный отчёт
      в базу данных для Агента и пользователя.
 
@@ -778,7 +793,16 @@ TESTER_ORCHESTRATION_TOOLS = [
     },
 ]
 
-TOOLS = BASE_TOOLS + SANDBOX_TOOLS + BROWSER_TOOLS + OPERATOR_TOOLS + TESTER_ORCHESTRATION_TOOLS + qa_tools.QA_TOOLS
+TOOLS = (
+    BASE_TOOLS
+    + SANDBOX_TOOLS
+    + BROWSER_TOOLS
+    + OPERATOR_TOOLS
+    + TESTER_ORCHESTRATION_TOOLS
+    + qa_tools.QA_TOOLS
+    + code_tools.CODE_READ_TOOLS
+    + code_tools.CODE_EXEC_TOOLS
+)
 
 
 class AgentError(Exception):
@@ -822,10 +846,12 @@ def tools_for_trust(
 ) -> List[Dict[str, Any]]:
     gh_read = list(github_tools.GITHUB_READ_TOOLS) if has_github else []
     gh_write = list(github_tools.GITHUB_WRITE_TOOLS) if (has_github and trust_level != "none") else []
+    code_read = list(code_tools.CODE_READ_TOOLS)
+    code_exec = list(code_tools.CODE_EXEC_TOOLS) if trust_level != "none" else []
     if role == "tester":
         if trust_level == "none":
             submit_only = [t for t in qa_tools.QA_TOOLS if t["function"]["name"] == "qa_submit_report"]
-            return list(BASE_TOOLS) + gh_read + submit_only
+            return list(BASE_TOOLS) + gh_read + code_read + submit_only
         return (
             list(BASE_TOOLS)
             + list(SANDBOX_TOOLS)
@@ -833,6 +859,8 @@ def tools_for_trust(
             + list(OPERATOR_TOOLS)
             + gh_read
             + gh_write
+            + code_read
+            + code_exec
             + list(qa_tools.QA_TOOLS)
         )
     if trust_level == "none":
@@ -841,7 +869,7 @@ def tools_for_trust(
             for t in TESTER_ORCHESTRATION_TOOLS
             if t["function"]["name"] in ("confirm_minor_fixes", "list_tester_reports")
         ]
-        return list(BASE_TOOLS) + gh_read + safe_orch
+        return list(BASE_TOOLS) + gh_read + code_read + safe_orch
     return (
         list(BASE_TOOLS)
         + list(SANDBOX_TOOLS)
@@ -849,6 +877,8 @@ def tools_for_trust(
         + list(OPERATOR_TOOLS)
         + gh_read
         + gh_write
+        + code_read
+        + code_exec
         + list(TESTER_ORCHESTRATION_TOOLS)
     )
 
@@ -891,11 +921,25 @@ def run_tool(
     unlimited: bool = False,
     tester_ctx: Optional[Dict[str, Any]] = None,
     qa_state: Optional[Dict[str, Any]] = None,
+    run_state: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Выполнить инструмент с учётом Sandbox и уровня доверия."""
     args = args or {}
     events: List[Dict[str, Any]] = []
     trust = normalize_trust(trust_level)
+
+    if name in code_tools.ALL_CODE_TOOL_NAMES:
+        try:
+            return code_tools.run_code_tool(
+                name,
+                args,
+                sandbox_root=sandbox_root,
+                github_ctx=github_ctx,
+                trust_level=trust,
+                run_state=run_state,
+            )
+        except code_tools.CodeToolError as error:
+            raise AgentError(str(error)) from error
 
     if name in qa_tools.QA_TOOL_NAMES:
         try:
@@ -908,6 +952,7 @@ def run_tool(
                 trust_level=trust,
                 approval_fn=approval_fn,
                 browser_manager=browser_manager,
+                github_ctx=github_ctx,
                 report_sink=report_sink,
                 checks_sink=checks_sink,
                 unlimited=unlimited,
@@ -2629,6 +2674,7 @@ def run_tester_session(
     ]
 
     qa_state: Dict[str, Any] = {"report": {}, "checks": []}
+    tester_run_state: Dict[str, Any] = {}
     tester_tools = tools_for_trust(trust_level, has_github=has_github_repo, role="tester")
     local_browser_mgr = browser_manager or browser_inspector.BrowserSessionManager(sandbox_root=sandbox_root)
     owns_browser_mgr = browser_manager is None
@@ -2640,12 +2686,16 @@ def run_tester_session(
     tester_usage_prompt = 0
     tester_usage_completion = 0
     tester_usage_total = 0
+    tester_token_cap = 0 if unlimited else MAX_RUN_TOKENS
     tester_actions: List[Dict[str, Any]] = []
     tester_files: List[Dict[str, Any]] = []
     run_error = ""
 
     try:
         while steps < steps_cap:
+            if tester_token_cap > 0 and tester_usage_total >= tester_token_cap:
+                run_error = f"Достигнут предохранитель расхода токенов Тестировщика ({tester_token_cap})."
+                break
             steps += 1
             _emit(
                 "tester_status",
@@ -2768,6 +2818,7 @@ def run_tester_session(
                             unlimited=unlimited,
                             tester_ctx=tester_ctx,
                             qa_state=qa_state,
+                            run_state=tester_run_state,
                         )
                     except AgentError as error:
                         t_res, t_events = f"Ошибка QA-инструмента {t_name}: {error}", []
@@ -3341,6 +3392,7 @@ class Handler(BaseHTTPRequestHandler):
                     "browserAvailable": bool(browser_inspector.find_browser_executable()),
                     "tools": [tool["function"]["name"] for tool in TOOLS],
                     "maxSteps": MAX_STEPS,
+                    "maxRunTokens": MAX_RUN_TOKENS,
                 },
             )
             return
@@ -3831,9 +3883,22 @@ class Handler(BaseHTTPRequestHandler):
         usage_prompt = 0
         usage_completion = 0
         usage_total = 0
+        run_state: Dict[str, Any] = {}
+        try:
+            raw_token_cap = int(body.get("maxRunTokens") or 0)
+        except (TypeError, ValueError):
+            raw_token_cap = 0
+        run_token_cap = 0 if unlimited_role else (raw_token_cap if raw_token_cap > 0 else MAX_RUN_TOKENS)
 
         try:
             while steps_limit == 0 or steps < steps_limit:
+                if run_token_cap > 0 and usage_total >= run_token_cap:
+                    final_text = (
+                        f"Остановлено предохранителем расхода токенов за прогон ({usage_total} / {run_token_cap}). "
+                        "Уточните следующий шаг, если нужно продолжить."
+                    )
+                    self.write(sse({"text": "Достигнут лимит токенов на прогон"}, "status"))
+                    break
                 steps += 1
                 self.write(sse({"text": "Думаю…" if steps == 1 else f"Шаг {steps}: уточняю план…"}, "status"))
 
@@ -3956,6 +4021,7 @@ class Handler(BaseHTTPRequestHandler):
                             unlimited=unlimited_role,
                             tester_ctx=tester_ctx,
                             qa_state=qa_state,
+                            run_state=run_state,
                         )
                     except AgentError as error:
                         result_text, events = f"Ошибка инструмента: {error}", []
