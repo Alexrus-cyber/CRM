@@ -36,13 +36,13 @@ import { ROLE_LABELS } from "@/lib/utils";
  * Поддерживает:
  *  - неограниченное RAG-окружение (обычный поиск и режим «Вся база»);
  *  - передачу уровня доверия (`full` | `verified` | `none`);
- *  - длительный SSE-поток (до 15 мин), чтобы пользователь успевал подтвердить
- *    выполнение bash-команд, действий на ПК и перенос файлов из Sandbox на сайте.
+ *  - длительный SSE-поток (до 60 мин с keepalive-событиями), чтобы пользователь успевал
+ *    подтвердить выполнение bash-команд, действий на ПК и перенос файлов из Sandbox на сайте.
  */
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-export async function GET() {
+export async function GET(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: "Unauthorized" }, { status: 401 });
   if (!hasAgentAccess(me)) {
@@ -57,9 +57,11 @@ export async function GET() {
   }
 
   try {
+    const healthTimeout = AbortSignal.timeout(6_000);
+    const healthSignal = typeof AbortSignal.any === "function" ? AbortSignal.any([req.signal, healthTimeout]) : healthTimeout;
     const res = await fetch(`${agentUrl}/health`, {
       cache: "no-store",
-      signal: AbortSignal.timeout(4000),
+      signal: healthSignal,
     });
     if (!res.ok) {
       return Response.json({ available: false, endpoint: agentUrl, hint: AGENT_START_HINT });
@@ -410,12 +412,14 @@ export async function POST(req: Request) {
 
   let upstream: Response;
   try {
+    const runTimeout = AbortSignal.timeout(3_600_000);
+    const runSignal = typeof AbortSignal.any === "function" ? AbortSignal.any([req.signal, runTimeout]) : runTimeout;
     upstream = await fetch(`${agentUrl}/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(fullPayload),
       cache: "no-store",
-      signal: AbortSignal.timeout(900_000),
+      signal: runSignal,
     });
   } catch {
     return Response.json({ error: `Агент не запущен. ${AGENT_START_HINT}`, hint: AGENT_START_HINT }, { status: 503 });

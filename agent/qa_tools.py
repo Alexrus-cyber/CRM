@@ -20,8 +20,10 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import socketserver
+import sys
 import threading
 import time
 import urllib.error
@@ -516,17 +518,22 @@ def _detect_test_commands(project_dir: Path) -> List[Tuple[str, str]]:
                 if val and "no test specified" not in val.lower():
                     cmds.append((label, f"npm run {key}"))
 
+    py_exe = (
+        f'"{sys.executable}"'
+        if (not getattr(sys, "frozen", False) and sys.executable and Path(sys.executable).is_file())
+        else (shutil.which("python") or shutil.which("python3") or ("python" if os.name == "nt" else "python3"))
+    )
     py_files = [p for p in _walk_project_files(project_dir, max_files=200) if p.suffix == ".py"]
     has_test_py = any(p.name.startswith("test_") or p.name.endswith("_test.py") for p in py_files)
     if (project_dir / "pytest.ini").exists() or (project_dir / "pyproject.toml").exists() or has_test_py:
         if has_test_py:
-            cmds.append(("Python unittest/tests", "python3 -m unittest discover -s . -v"))
+            cmds.append(("Python unittest/tests", f"{py_exe} -m unittest discover -s . -v"))
     elif py_files:
         rel_list = " ".join(
             f'"{p.relative_to(project_dir).as_posix()}"'
             for p in py_files[:40]
         )
-        cmds.append(("Python compile check", f"python3 -m py_compile {rel_list}"))
+        cmds.append(("Python compile check", f"{py_exe} -m py_compile {rel_list}"))
 
     js_files = [
         p
@@ -551,6 +558,14 @@ def _serve_static_temp(directory: Path) -> Tuple[socketserver.TCPServer, threadi
     class ReusableServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         daemon_threads = True
         allow_reuse_address = True
+
+        def handle_error(self, request: Any, client_address: Any) -> None:
+            _, exc, _ = sys.exc_info()
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)):
+                return
+            if isinstance(exc, OSError) and getattr(exc, "winerror", None) in (10053, 10054):
+                return
+            super().handle_error(request, client_address)
 
     srv = ReusableServer(("127.0.0.1", 0), QuietHandler)
     port = srv.server_address[1]
@@ -848,7 +863,10 @@ def run_qa_tool(
     if name == "qa_run_tests":
         proj = str(args.get("sandbox_project") or ".").strip() or "."
         custom_cmd = str(args.get("command") or "").strip()
-        timeout_sec = int(args.get("timeout") or 120)
+        try:
+            timeout_sec = max(10, min(600, int(args.get("timeout") or 120)))
+        except (TypeError, ValueError):
+            timeout_sec = 120
         try:
             proj_dir = sandbox_mod.safe_resolve(sandbox_root, proj, allow_root=True)
         except sandbox_mod.SandboxError as err:
@@ -928,6 +946,10 @@ def run_qa_tool(
         return "\n\n".join(outputs), events
 
     if name == "qa_http_audit":
+        try:
+            http_timeout = max(2, min(30, int(args.get("timeout") or 10)))
+        except (TypeError, ValueError):
+            http_timeout = 10
         res = run_qa_http_audit(
             sandbox_root,
             base_url=str(args.get("base_url") or ""),
@@ -936,7 +958,7 @@ def run_qa_tool(
             method=str(args.get("method") or "GET"),
             headers=args.get("headers") if isinstance(args.get("headers"), dict) else None,
             body=str(args.get("body")) if args.get("body") is not None else None,
-            timeout=int(args.get("timeout") or 10),
+            timeout=http_timeout,
         )
         ok_cnt = res["passedCount"]
         fail_cnt = res["failedCount"]
@@ -1049,42 +1071,50 @@ def run_qa_tool(
         return "\n".join(lines), events
 
     if name == "qa_browser_audit":
+        owns_mgr = browser_manager is None
         mgr = browser_manager or browser_inspector.BrowserSessionManager(sandbox_root=sandbox_root)
         proj = str(args.get("sandbox_project") or "").strip()
         url = str(args.get("url") or "").strip()
-        wait_ms = int(args.get("wait_ms") or 450)
+        try:
+            wait_ms = max(0, min(15000, int(args.get("wait_ms") or 450)))
+        except (TypeError, ValueError):
+            wait_ms = 450
         if not proj and not url:
             raise QaToolError("Укажите sandbox_project или url для браузерного QA-аудита")
 
         summary_lines: List[str] = []
         any_errors = False
-        for vp in ("desktop", "mobile"):
-            open_args: Dict[str, Any] = {
-                "action": "open" if vp == "desktop" else "resize",
-                "viewport": vp,
-                "wait_ms": wait_ms,
-                "session_id": "qa_audit",
-                "capture_screenshot": True,
-            }
-            if vp == "desktop":
-                if proj:
-                    open_args["sandbox_project"] = proj
-                if url:
-                    open_args["url"] = url
-            try:
-                txt, evs = browser_inspector.execute_browse_action(
-                    mgr, open_args, trust_level=trust, approval_fn=approval_fn
-                )
-            except (browser_inspector.BrowserError, sandbox_mod.SandboxError) as err:
+        try:
+            for vp in ("desktop", "mobile"):
+                open_args: Dict[str, Any] = {
+                    "action": "open" if vp == "desktop" else "resize",
+                    "viewport": vp,
+                    "wait_ms": wait_ms,
+                    "session_id": "qa_audit",
+                    "capture_screenshot": True,
+                }
                 if vp == "desktop":
-                    raise QaToolError(str(err)) from err
-                summary_lines.append(f"Mobile ({vp}): {err}")
-                continue
-            for ev in evs:
-                if (ev.get("errorsCount") or 0) > 0 or (ev.get("issuesCount") or 0) > 0:
-                    any_errors = True
-            events.extend(evs)
-            summary_lines.append(f"=== Viewport: {vp} ===\n{txt}")
+                    if proj:
+                        open_args["sandbox_project"] = proj
+                    if url:
+                        open_args["url"] = url
+                try:
+                    txt, evs = browser_inspector.execute_browse_action(
+                        mgr, open_args, trust_level=trust, approval_fn=approval_fn
+                    )
+                except (browser_inspector.BrowserError, sandbox_mod.SandboxError) as err:
+                    if vp == "desktop":
+                        raise QaToolError(str(err)) from err
+                    summary_lines.append(f"Mobile ({vp}): {err}")
+                    continue
+                for ev in evs:
+                    if (ev.get("errorsCount") or 0) > 0 or (ev.get("issuesCount") or 0) > 0:
+                        any_errors = True
+                events.extend(evs)
+                summary_lines.append(f"=== Viewport: {vp} ===\n{txt}")
+        finally:
+            if owns_mgr:
+                mgr.close_all()
 
         chk_status = "fail" if any_errors else "pass"
         if checks_sink is not None:

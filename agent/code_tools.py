@@ -19,9 +19,11 @@ import fnmatch
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -256,19 +258,22 @@ def _run_argv(
     timeout: int = 120,
 ) -> Tuple[int, str]:
     env = sandbox_mod.sanitized_env(sandbox_root, cwd)
+    kwargs: Dict[str, Any] = {
+        "cwd": str(cwd),
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": max(5, min(300, int(timeout or 120))),
+        "check": False,
+    }
+    if platform.system() == "Windows":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        proc = subprocess.run(
-            argv,
-            cwd=str(cwd),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(5, min(300, int(timeout or 120))),
-            check=False,
-        )
+        proc = subprocess.run(argv, **kwargs)
         return proc.returncode, (proc.stdout or "").strip()
     except FileNotFoundError:
         return 127, f"Команда не найдена: {argv[0]}"
@@ -848,6 +853,17 @@ def run_git_history(
 # ---------------------------------------------------------------------------
 
 def _pick_tool_bin(root: Path, name: str) -> Optional[List[str]]:
+    if platform.system() == "Windows":
+        for ext in (".cmd", ".exe", ".bat", ""):
+            local_bin = root / "node_modules" / ".bin" / f"{name}{ext}"
+            if local_bin.is_file():
+                return ["cmd", "/c", str(local_bin)] if ext in (".cmd", ".bat") else [str(local_bin)]
+        npx = shutil.which("npx")
+        if npx:
+            if npx.lower().endswith((".cmd", ".bat")):
+                return ["cmd", "/c", npx, "--no-install", name]
+            return [npx, "--no-install", name]
+        return None
     local_bin = root / "node_modules" / ".bin" / name
     if local_bin.is_file():
         return [str(local_bin)]
@@ -855,6 +871,13 @@ def _pick_tool_bin(root: Path, name: str) -> Optional[List[str]]:
     if npx:
         return [npx, "--no-install", name]
     return None
+
+
+def _pick_python_bin() -> Optional[List[str]]:
+    if not getattr(sys, "frozen", False) and sys.executable and Path(sys.executable).is_file():
+        return [sys.executable]
+    py = shutil.which("python") or shutil.which("python3")
+    return [py] if py else None
 
 
 def run_typecheck_tool(
@@ -887,9 +910,13 @@ def run_typecheck_tool(
             code, out = _run_argv([mypy, "--ignore-missing-imports", "."], cwd=root_res, sandbox_root=sandbox_root, timeout=timeout)
             outputs.append(f"[Python mypy] exit={code}\n{out[:3000]}")
         else:
-            rel_list = [fp.relative_to(root_res).as_posix() for fp in py_files[:60]]
-            code, out = _run_argv(["python3", "-m", "py_compile", *rel_list], cwd=root_res, sandbox_root=sandbox_root, timeout=60)
-            outputs.append(f"[Python py_compile ({len(rel_list)} файлов)] exit={code}\n{out or 'Синтаксических ошибок нет.'}")
+            py_bin = _pick_python_bin()
+            if py_bin:
+                rel_list = [fp.relative_to(root_res).as_posix() for fp in py_files[:60]]
+                code, out = _run_argv([*py_bin, "-m", "py_compile", *rel_list], cwd=root_res, sandbox_root=sandbox_root, timeout=60)
+                outputs.append(f"[Python py_compile ({len(rel_list)} файлов)] exit={code}\n{out or 'Синтаксических ошибок нет.'}")
+            else:
+                outputs.append("[Python] интерпретатор python не найден в PATH")
 
     if not outputs:
         return f"В проекте ({scope_label}) не обнаружен tsconfig.json или Python-файлы для typecheck."
@@ -935,8 +962,12 @@ def run_lint_file_tool(
             code, out = _run_argv([ruff, "check", *py_targets], cwd=root_res, sandbox_root=sandbox_root, timeout=60)
             parts.append(f"[Ruff {' '.join(py_targets)}] exit={code}\n{out[:4000] or 'Замечаний нет.'}")
         else:
-            code, out = _run_argv(["python3", "-m", "py_compile", *py_targets], cwd=root_res, sandbox_root=sandbox_root, timeout=30)
-            parts.append(f"[py_compile {' '.join(py_targets)}] exit={code}\n{out or 'Синтаксис ок.'}")
+            py_bin = _pick_python_bin()
+            if py_bin:
+                code, out = _run_argv([*py_bin, "-m", "py_compile", *py_targets], cwd=root_res, sandbox_root=sandbox_root, timeout=30)
+                parts.append(f"[py_compile {' '.join(py_targets)}] exit={code}\n{out or 'Синтаксис ок.'}")
+            else:
+                parts.append("[Python] интерпретатор python не найден в PATH")
 
     if not parts:
         return f"Не найдено подходящих JS/TS/Python файлов для линта в {scope_label}."
@@ -983,7 +1014,8 @@ def run_tests_subset_tool(
             return f"[Vitest ({scope_label})] exit={code}\n{out[-6000:]}"
         npm = shutil.which("npm")
         if npm and (root_res / "package.json").is_file():
-            code, out = _run_argv([npm, "test", "--", *safe_rels], cwd=root_res, sandbox_root=sandbox_root, timeout=timeout)
+            npm_cmd = ["cmd", "/c", npm] if (platform.system() == "Windows" and npm.lower().endswith((".cmd", ".bat"))) else [npm]
+            code, out = _run_argv([*npm_cmd, "test", "--", *safe_rels], cwd=root_res, sandbox_root=sandbox_root, timeout=timeout)
             return f"[npm test ({scope_label})] exit={code}\n{out[-6000:]}"
         raise CodeToolError("Не найден vitest/npm для запуска JS/TS-тестов")
 
@@ -995,11 +1027,14 @@ def run_tests_subset_tool(
                 argv.extend(["-k", name_filter])
             code, out = _run_argv(argv, cwd=root_res, sandbox_root=sandbox_root, timeout=timeout)
             return f"[Pytest ({scope_label})] exit={code}\n{out[-6000:]}"
+        py_bin = _pick_python_bin()
+        if not py_bin:
+            raise CodeToolError("Интерпретатор python не найден для запуска тестов")
         if safe_rels:
-            argv = ["python3", "-m", "unittest", *safe_rels]
+            argv = [*py_bin, "-m", "unittest", *safe_rels]
         else:
             test_dir = "agent/tests" if (root_res / "agent" / "tests").is_dir() else "."
-            argv = ["python3", "-m", "unittest", "discover", "-s", test_dir, "-v"]
+            argv = [*py_bin, "-m", "unittest", "discover", "-s", test_dir, "-v"]
         code, out = _run_argv(argv, cwd=root_res, sandbox_root=sandbox_root, timeout=timeout)
         return f"[Python unittest ({scope_label})] exit={code}\n{out[-6000:]}"
 

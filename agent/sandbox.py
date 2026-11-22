@@ -237,13 +237,14 @@ def list_tree(root: Path, rel_path: str = ".", *, unlimited: bool = False) -> Di
     base_rel_parts = set(relative_to_root(root_resolved, base).split("/")) if base != root_resolved else set()
     skip_heavy = not bool(base_rel_parts & TREE_SKIP_DIRS)
 
-    def _walk_entries(start_dir: Path) -> List[Path]:
+    def _walk_entries(start_dir: Path, max_collect: Optional[int] = None) -> Tuple[List[Path], bool]:
         collected: List[Path] = []
+        hit_limit = False
         for current, dirs, files in os.walk(start_dir, followlinks=False):
             cur_path = Path(current)
             filtered_dirs: List[str] = []
             for d in sorted(dirs, key=str.lower):
-                if d.startswith(".tmp"):
+                if d.startswith(".tmp") or (base == root_resolved and not unlimited and cur_path == root_resolved and d == "_github"):
                     continue
                 cand = cur_path / d
                 if not _is_safe_non_escaping_entry(root_resolved, cand):
@@ -261,26 +262,37 @@ def list_tree(root: Path, rel_path: str = ".", *, unlimited: bool = False) -> Di
                     continue
                 if _is_safe_non_escaping_entry(root_resolved, entry):
                     collected.append(entry)
+                    if max_collect is not None and len(collected) >= max_collect:
+                        hit_limit = True
+                        break
+            if hit_limit:
+                break
         collected.sort(key=lambda p: str(p).lower())
-        return collected
+        return collected, hit_limit
 
     items: List[Dict[str, Any]] = []
     projects: List[Dict[str, Any]] = []
 
     if base == root_resolved:
         for child in sorted(root_resolved.iterdir(), key=lambda p: p.name.lower()):
-            if child.name.startswith("."):
+            if child.name.startswith(".") or child.name == "_github":
                 continue
             if child.is_dir():
                 file_count = 0
                 for _, dnames, fnames in os.walk(child, followlinks=False):
                     dnames[:] = [d for d in dnames if not d.startswith(".tmp") and d not in TREE_SKIP_DIRS]
                     file_count += len(fnames)
+                    if not unlimited and file_count >= 2000:
+                        break
                 projects.append({"name": child.name, "files": file_count})
 
-    entries = [base] if base.is_file() else _walk_entries(base)
+    if base.is_file():
+        entries, walk_truncated = [base], False
+    else:
+        entries, walk_truncated = _walk_entries(base, max_collect=None if unlimited else (MAX_LIST_ITEMS + 1))
+
     total_items = 0
-    truncated = False
+    truncated = walk_truncated
     for entry in entries:
         rel = relative_to_root(root_resolved, entry)
         if rel.startswith(".tmp"):
@@ -289,10 +301,14 @@ def list_tree(root: Path, rel_path: str = ".", *, unlimited: bool = False) -> Di
         if not unlimited and len(items) >= MAX_LIST_ITEMS:
             truncated = True
             continue
+        try:
+            st_size = entry.stat().st_size if entry.is_file() else 0
+        except OSError:
+            st_size = 0
         items.append({
             "path": rel,
             "type": "dir" if entry.is_dir() else "file",
-            "size": entry.stat().st_size if entry.is_file() else 0,
+            "size": st_size,
         })
 
     return {
@@ -460,9 +476,17 @@ class ProcessManager:
             if platform.system() != "Windows":
                 pgid = os.getpgid(proc.pid)
                 os.killpg(pgid, signal.SIGTERM)
+                proc.wait(timeout=3)
             else:
-                proc.terminate()
-            proc.wait(timeout=3)
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=4,
+                    check=False,
+                )
         except Exception:  # noqa: BLE001
             try:
                 if platform.system() != "Windows":
@@ -499,6 +523,7 @@ class ProcessManager:
         kwargs: Dict[str, Any] = {
             "cwd": str(cwd),
             "env": env,
+            "stdin": subprocess.DEVNULL,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.STDOUT,
             "text": True,
@@ -508,7 +533,10 @@ class ProcessManager:
         if platform.system() != "Windows":
             kwargs["start_new_session"] = True
         else:
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
 
         proc = subprocess.Popen(_shell_argv(command), **kwargs)
         lines: List[str] = []
@@ -620,18 +648,22 @@ def run_command(
     raw_timeout = int(timeout or 60)
     safe_timeout = max(1, raw_timeout if unlimited else min(300, raw_timeout))
 
+    run_kwargs: Dict[str, Any] = {
+        "cwd": str(cwd),
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": safe_timeout,
+    }
+    if platform.system() == "Windows":
+        run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
     try:
-        completed = subprocess.run(
-            _shell_argv(command),
-            cwd=str(cwd),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=safe_timeout,
-        )
+        completed = subprocess.run(_shell_argv(command), **run_kwargs)
     except subprocess.TimeoutExpired as error:
         partial = (error.stdout or "") if isinstance(error.stdout, str) else ""
         raise SandboxError(
@@ -656,17 +688,20 @@ def run_pc_command(command: str, timeout: int = 60, *, unlimited: bool = False) 
         raise SandboxError("Пустая команда")
     raw_timeout = int(timeout or 60)
     safe_timeout = max(1, raw_timeout if unlimited else min(180, raw_timeout))
+    pc_kwargs: Dict[str, Any] = {
+        "cwd": str(Path.home()),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": safe_timeout,
+    }
+    if platform.system() == "Windows":
+        pc_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        completed = subprocess.run(
-            _shell_argv(text),
-            cwd=str(Path.home()),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=safe_timeout,
-        )
+        completed = subprocess.run(_shell_argv(text), **pc_kwargs)
     except subprocess.TimeoutExpired as error:
         raise SandboxError(f"Команда на ПК превысила таймаут {safe_timeout} с") from error
     raw_output = (completed.stdout or "").strip()

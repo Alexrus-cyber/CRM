@@ -25,7 +25,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import errno
 import hmac
+import http.client
 import ipaddress
 import json
 import mimetypes
@@ -33,6 +36,7 @@ import os
 import re
 import secrets
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -808,6 +812,66 @@ TOOLS = (
 class AgentError(Exception):
     """Ошибка, которую можно показать пользователю как есть."""
 
+    def __init__(self, message: str = "", *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+_CLIENT_DISCONNECT_ERRNOS = frozenset(
+    x
+    for x in (
+        getattr(errno, "EPIPE", 32),
+        getattr(errno, "ECONNRESET", 104),
+        getattr(errno, "ECONNABORTED", 103),
+        getattr(errno, "ESHUTDOWN", 108),
+        10053,  # WSAECONNABORTED (Windows)
+        10054,  # WSAECONNRESET (Windows)
+    )
+    if isinstance(x, int)
+)
+
+
+def _is_client_disconnect(exc: BaseException) -> bool:
+    """True, если клиент закрыл HTTP/SSE-соединение (включая WinError 10053/10054)."""
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    if isinstance(exc, OSError):
+        winerr = getattr(exc, "winerror", None)
+        if isinstance(winerr, int) and winerr in (10053, 10054):
+            return True
+        err_no = getattr(exc, "errno", None)
+        if isinstance(err_no, int) and err_no in _CLIENT_DISCONNECT_ERRNOS:
+            return True
+    return False
+
+
+def _safe_int(value: Any, default: int, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    try:
+        res = int(value) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        res = default
+    if minimum is not None:
+        res = max(minimum, res)
+    if maximum is not None:
+        res = min(maximum, res)
+    return res
+
+
+def _tool_call_signature(calls: List[Dict[str, Any]]) -> str:
+    """Нормализованная сигнатура набора вызовов инструментов для детекции зацикливания."""
+    items: List[Tuple[str, str]] = []
+    for c in calls:
+        fn = c.get("function") or {}
+        t_name = str(fn.get("name") or "")
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            parsed = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            norm_args = json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            norm_args = str(raw_args)
+        items.append((t_name, norm_args))
+    return json.dumps(items, ensure_ascii=False)
+
 
 def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
@@ -1391,7 +1455,7 @@ def run_tool(
         rel_cwd = str(args.get("cwd") or ".").strip() or "."
         background = bool(args.get("background"))
         description = str(args.get("description") or "").strip()
-        timeout_sec = int(args.get("timeout") or 60)
+        timeout_sec = _safe_int(args.get("timeout"), 60, minimum=1, maximum=1800)
 
         # Проверяем границы Sandbox ДО запроса подтверждения.
         try:
@@ -2208,6 +2272,7 @@ def call_model(
     on_text: Optional[Callable[[str], None]] = None,
     context_limit: int = 0,
     state_out: Optional[Dict[str, Any]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     streaming = on_reasoning is not None or on_text is not None
     work_messages = _clone_messages(messages)
@@ -2258,7 +2323,7 @@ def call_model(
                     try:
                         return json.loads(raw)
                     except json.JSONDecodeError as error:
-                        raise AgentError("Сервер модели вернул не JSON") from error
+                        raise AgentError("Сервер модели вернул не JSON", retryable=True) from error
 
                 # Читаем поток построчно; если сервер проигнорировал stream=True и прислал JSON,
                 # подхватываем первую строку и собираем как обычный ответ.
@@ -2274,6 +2339,8 @@ def call_model(
                 stream_usage: Optional[Dict[str, Any]] = None
 
                 for raw_bytes in response:
+                    if cancel_check and cancel_check():
+                        raise BrokenPipeError("Клиент закрыл соединение")
                     line = raw_bytes.decode("utf-8", "replace").rstrip("\r\n")
                     stripped = line.strip()
                     if not stripped:
@@ -2289,7 +2356,7 @@ def call_model(
                             try:
                                 parsed_json = json.loads("\n".join(raw_lines))
                             except json.JSONDecodeError as error:
-                                raise AgentError("Сервер модели вернул не JSON") from error
+                                raise AgentError("Сервер модели вернул не JSON", retryable=True) from error
                             msg = (parsed_json.get("choices") or [{}])[0].get("message") or {}
                             r_full = str(msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
                             c_full = str(msg.get("content") or "")
@@ -2391,24 +2458,38 @@ def call_model(
                 if stream_usage:
                     result_obj["usage"] = stream_usage
                 return result_obj
+        except BrokenPipeError:
+            raise
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")[:800]
-            raise AgentError(f"Модель вернула ошибку {error.code}: {detail}") from error
+            retryable = error.code in (408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
+            raise AgentError(f"Модель вернула ошибку {error.code}: {detail}", retryable=retryable) from error
         except urllib.error.URLError as error:
             raise AgentError(
-                f"Не удалось связаться с моделью по адресу {chat_url(base_url)}: {error.reason}"
+                f"Не удалось связаться с моделью по адресу {chat_url(base_url)}: {error.reason}",
+                retryable=True,
+            ) from error
+        except (http.client.HTTPException, TimeoutError, ConnectionError, ssl.SSLError, OSError) as error:
+            raise AgentError(
+                f"Сбой соединения при чтении ответа модели: {error}",
+                retryable=True,
             ) from error
 
     cur_payload = dict(payload)
     overflow_retries = 0
     max_tok_retries = 0
+    transient_retries = 0
     tried_no_stream_opts = False
     tried_high = False
     tried_stripped_tuning = False
 
-    for _attempt in range(7):
+    for _attempt in range(10):
+        if cancel_check and cancel_check():
+            raise BrokenPipeError("Клиент закрыл соединение")
         try:
             return _consume_stream(cur_payload)
+        except BrokenPipeError:
+            raise
         except AgentError as error:
             raw_err = str(error)
             detail = raw_err.lower()
@@ -2514,6 +2595,17 @@ def call_model(
                         cur_payload.pop(k, None)
                     log("модель не принимает параметры reasoning/thinking — повторяю без них")
                     continue
+
+            if error.retryable and transient_retries < 3:
+                transient_retries += 1
+                if cur_payload.get("stream") and transient_retries >= 2:
+                    cur_payload["stream"] = False
+                    cur_payload.pop("stream_options", None)
+                    log(f"сбой потока модели (повтор #{transient_retries}/3): переключаюсь на non-stream JSON")
+                else:
+                    log(f"временный сбой модели (повтор #{transient_retries}/3): {raw_err[:200]}")
+                time.sleep(min(4.0, 1.2 * transient_retries))
+                continue
             raise
     raise AgentError("Превышено число повторных попыток вызова модели")
 
@@ -2690,6 +2782,10 @@ def run_tester_session(
     tester_actions: List[Dict[str, Any]] = []
     tester_files: List[Dict[str, Any]] = []
     run_error = ""
+    last_tool_sig = ""
+    repeat_sig_count = 0
+    force_no_tools_next = False
+    cancel_check = ctx.get("cancel_check")
 
     try:
         while steps < steps_cap:
@@ -2712,6 +2808,8 @@ def run_tester_session(
                 if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
                     _emit("tester_text", {"runKey": run_key, "text": cleaned})
 
+            use_tools_for_step = use_tools and not force_no_tools_next
+            force_no_tools_next = False
             call_state: Dict[str, Any] = {}
             try:
                 data = call_model(
@@ -2719,13 +2817,17 @@ def run_tester_session(
                     api_key,
                     model,
                     tester_messages,
-                    tester_tools if use_tools else None,
+                    tester_tools if use_tools_for_step else None,
                     params,
                     on_reasoning=_on_t_reason,
                     on_text=_on_t_text,
                     context_limit=discovered_max_context,
                     state_out=call_state,
+                    cancel_check=cancel_check if callable(cancel_check) else None,
                 )
+            except BrokenPipeError:
+                run_error = "Клиент закрыл соединение"
+                break
             except AgentError as error:
                 if call_state.get("max_context"):
                     discovered_max_context = int(call_state["max_context"])
@@ -2770,7 +2872,7 @@ def run_tester_session(
                 _emit("tester_reasoning", {"runKey": run_key, "text": tester_thinking})
 
             tool_calls = msg.get("tool_calls") or []
-            if not tool_calls:
+            if not tool_calls and use_tools_for_step:
                 parsed = parse_text_tool_call(content)
                 if parsed:
                     tool_calls = [
@@ -2822,6 +2924,11 @@ def run_tester_session(
                         )
                     except AgentError as error:
                         t_res, t_events = f"Ошибка QA-инструмента {t_name}: {error}", []
+                    except BrokenPipeError:
+                        raise
+                    except Exception as error:  # noqa: BLE001
+                        log(f"сбой QA-инструмента {t_name}: {traceback.format_exc()}")
+                        t_res, t_events = f"Внутренний сбой QA-инструмента {t_name}: {error}", []
 
                 for ev in t_events:
                     img = ev.pop("_image", None)
@@ -2855,6 +2962,26 @@ def run_tester_session(
                 if isinstance(t_res, str) and len(t_res) > 40_000:
                     t_res = _shrink_text_head_tail(t_res, 40_000)
                 call_results.append({"role": "tool", "tool_call_id": cid, "content": t_res})
+
+            cur_sig = _tool_call_signature(assistant_calls)
+            if cur_sig and cur_sig == last_tool_sig:
+                repeat_sig_count += 1
+            else:
+                last_tool_sig = cur_sig
+                repeat_sig_count = 1
+            if repeat_sig_count >= 4 and call_results:
+                call_results[-1]["content"] = (
+                    str(call_results[-1].get("content") or "")
+                    + "\n\n[СИСТЕМА: Вы повторили один и тот же QA-вызов 4 раза подряд. "
+                    "На следующем шаге вызов инструментов отключён — дайте итоговый QA-отчёт текстом.]"
+                )
+                force_no_tools_next = True
+            elif repeat_sig_count >= 2 and call_results:
+                call_results[-1]["content"] = (
+                    str(call_results[-1].get("content") or "")
+                    + f"\n\n[ПОДСКАЗКА: такой же вызов уже выполнен {repeat_sig_count} раз(а) подряд. "
+                    "Используй полученные данные, измени параметры или вызови qa_submit_report.]"
+                )
 
             img_slice = captured_imgs[:3]
             if img_slice:
@@ -3342,6 +3469,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         log(fmt % args)
 
+    def _get_write_lock(self) -> threading.Lock:
+        lock = getattr(self, "_write_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._write_lock = lock
+        return lock
+
     def _send_cors_headers(self) -> None:
         allowed = _allowed_cors_origin(self.headers.get("Origin"))
         if allowed:
@@ -3350,12 +3484,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, status: int, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self._send_cors_headers()
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
+            if _is_client_disconnect(exc):
+                self._client_disconnected = True
+                return
+            raise
 
     def _read_json(self) -> Optional[Dict[str, Any]]:
         try:
@@ -3365,16 +3505,22 @@ class Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length) if length > 0 else b"{}"
             data = json.loads(raw or b"{}")
             return data if isinstance(data, dict) else None
-        except (ValueError, json.JSONDecodeError):
+        except (ValueError, json.JSONDecodeError, OSError):
             return None
 
     def do_OPTIONS(self) -> None:  # noqa: N802
-        self.send_response(204)
-        self._send_cors_headers()
-        self.send_header("Access-Control-Allow-Headers", "content-type, authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        try:
+            self.send_response(204)
+            self._send_cors_headers()
+            self.send_header("Access-Control-Allow-Headers", "content-type, authorization")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
+            if _is_client_disconnect(exc):
+                self._client_disconnected = True
+                return
+            raise
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -3398,7 +3544,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "/sandbox":
-            tree = sandbox_mod.list_tree(SANDBOX_ROOT, ".", unlimited=True)
+            params = urllib.parse.parse_qs(parsed.query)
+            rel_path = (params.get("path") or ["."])[0]
+            try:
+                tree = sandbox_mod.list_tree(SANDBOX_ROOT, rel_path, unlimited=False)
+            except sandbox_mod.SandboxError as error:
+                self._json(400, {"error": str(error)})
+                return
             self._json(
                 200,
                 {
@@ -3421,16 +3573,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             mime = guess_mime(file_name, None)
             ascii_name = file_name.encode("ascii", "replace").decode("ascii").replace('"', "_")
-            self.send_response(200)
-            self.send_header("Content-Type", mime)
-            self.send_header(
-                "Content-Disposition",
-                f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{urllib.parse.quote(file_name)}',
-            )
-            self.send_header("Content-Length", str(len(data)))
-            self._send_cors_headers()
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{urllib.parse.quote(file_name)}',
+                )
+                self.send_header("Content-Length", str(len(data)))
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
+                if _is_client_disconnect(exc):
+                    self._client_disconnected = True
+                    return
+                raise
             return
 
         self._json(404, {"error": "Не найдено"})
@@ -3570,30 +3728,74 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "Некорректный JSON"})
             return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-store, no-transform")
-        self.send_header("Connection", "close")
-        self.send_header("X-Accel-Buffering", "no")
-        self._send_cors_headers()
-        self.end_headers()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-transform")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self._send_cors_headers()
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
+            if _is_client_disconnect(exc):
+                self._client_disconnected = True
+                return
+            raise
 
         try:
             self.run_agent(body)
         except AgentError as error:
-            self.write(sse({"error": str(error)}, "error"))
+            self._safe_write(sse({"error": str(error)}, "error"))
         except BrokenPipeError:
             log("клиент отключился")
-        except Exception:  # noqa: BLE001
-            log(traceback.format_exc())
-            self.write(sse({"error": "Внутренняя ошибка агента"}, "error"))
+        except Exception as exc:  # noqa: BLE001
+            if _is_client_disconnect(exc):
+                log("клиент отключился")
+            else:
+                log(traceback.format_exc())
+                self._safe_write(sse({"error": "Внутренняя ошибка агента"}, "error"))
 
     def write(self, chunk: bytes) -> None:
+        with self._get_write_lock():
+            if getattr(self, "_client_disconnected", False):
+                raise BrokenPipeError from None
+            try:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError) as exc:
+                if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)) or _is_client_disconnect(exc):
+                    self._client_disconnected = True
+                    raise BrokenPipeError from None
+                raise
+
+    def _safe_write(self, chunk: bytes) -> None:
         try:
-            self.wfile.write(chunk)
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            raise BrokenPipeError from None
+            self.write(chunk)
+        except BrokenPipeError:
+            pass
+
+    @contextlib.contextmanager
+    def _sse_keepalive(self, interval: float = 8.0):
+        stop_ev = threading.Event()
+
+        def _beat() -> None:
+            while not stop_ev.wait(interval):
+                if getattr(self, "_client_disconnected", False):
+                    break
+                try:
+                    self.write(b": keepalive\n\n")
+                except BrokenPipeError:
+                    break
+                except Exception:  # noqa: BLE001
+                    break
+
+        th = threading.Thread(target=_beat, daemon=True)
+        th.start()
+        try:
+            yield
+        finally:
+            stop_ev.set()
+            th.join(timeout=0.5)
 
     def await_website_approval(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         approval_id = str(payload.get("approvalId") or uuid.uuid4().hex)
@@ -3841,6 +4043,9 @@ class Handler(BaseHTTPRequestHandler):
         def _emit_sse(ev_name: str, ev_payload: Dict[str, Any]) -> None:
             self.write(sse(ev_payload, ev_name))
 
+        def _is_disconnected() -> bool:
+            return bool(getattr(self, "_client_disconnected", False))
+
         tester_ctx: Dict[str, Any] = {
             "base_url": base_url,
             "api_key": api_key,
@@ -3849,6 +4054,7 @@ class Handler(BaseHTTPRequestHandler):
             "discovered_max_context": discovered_max_context,
             "emit_sse": _emit_sse,
             "recent_reports": recent_reports,
+            "cancel_check": _is_disconnected,
         }
 
         if agent_role == "tester":
@@ -3884,6 +4090,9 @@ class Handler(BaseHTTPRequestHandler):
         usage_completion = 0
         usage_total = 0
         run_state: Dict[str, Any] = {}
+        last_tool_sig = ""
+        repeat_sig_count = 0
+        force_no_tools_next = False
         try:
             raw_token_cap = int(body.get("maxRunTokens") or 0)
         except (TypeError, ValueError):
@@ -3892,6 +4101,8 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             while steps_limit == 0 or steps < steps_limit:
+                if _is_disconnected():
+                    raise BrokenPipeError from None
                 if run_token_cap > 0 and usage_total >= run_token_cap:
                     final_text = (
                         f"Остановлено предохранителем расхода токенов за прогон ({usage_total} / {run_token_cap}). "
@@ -3912,20 +4123,26 @@ class Handler(BaseHTTPRequestHandler):
                     if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
                         self.write(sse({"text": cleaned}, "text"))
 
+                use_tools_for_step = use_tools and not force_no_tools_next
+                force_no_tools_next = False
                 call_state: Dict[str, Any] = {}
                 try:
-                    data = call_model(
-                        base_url,
-                        api_key,
-                        model,
-                        messages,
-                        active_tools if use_tools else None,
-                        params,
-                        on_reasoning=_emit_live_reasoning,
-                        on_text=_emit_live_text,
-                        context_limit=discovered_max_context,
-                        state_out=call_state,
-                    )
+                    with self._sse_keepalive():
+                        data = call_model(
+                            base_url,
+                            api_key,
+                            model,
+                            messages,
+                            active_tools if use_tools_for_step else None,
+                            params,
+                            on_reasoning=_emit_live_reasoning,
+                            on_text=_emit_live_text,
+                            context_limit=discovered_max_context,
+                            state_out=call_state,
+                            cancel_check=_is_disconnected,
+                        )
+                except BrokenPipeError:
+                    raise
                 except AgentError as error:
                     if call_state.get("max_context"):
                         discovered_max_context = int(call_state["max_context"])
@@ -3975,7 +4192,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.write(sse({"text": thinking}, "reasoning"))
                 tool_calls = message.get("tool_calls") or []
 
-                if not tool_calls:
+                if not tool_calls and use_tools_for_step:
                     parsed = parse_text_tool_call(content)
                     if parsed:
                         tool_calls = [
@@ -4010,21 +4227,27 @@ class Handler(BaseHTTPRequestHandler):
                     self.write(sse({"text": f"Вызываю инструмент: {name}…"}, "status"))
                     try:
                         tester_ctx["discovered_max_context"] = discovered_max_context
-                        result_text, events = run_tool(
-                            name,
-                            args if isinstance(args, dict) else {},
-                            trust_level=trust_level,
-                            approval_fn=self.await_website_approval,
-                            sandbox_root=SANDBOX_ROOT,
-                            browser_manager=browser_mgr,
-                            github_ctx=github_ctx,
-                            unlimited=unlimited_role,
-                            tester_ctx=tester_ctx,
-                            qa_state=qa_state,
-                            run_state=run_state,
-                        )
+                        with self._sse_keepalive():
+                            result_text, events = run_tool(
+                                name,
+                                args if isinstance(args, dict) else {},
+                                trust_level=trust_level,
+                                approval_fn=self.await_website_approval,
+                                sandbox_root=SANDBOX_ROOT,
+                                browser_manager=browser_mgr,
+                                github_ctx=github_ctx,
+                                unlimited=unlimited_role,
+                                tester_ctx=tester_ctx,
+                                qa_state=qa_state,
+                                run_state=run_state,
+                            )
                     except AgentError as error:
                         result_text, events = f"Ошибка инструмента: {error}", []
+                    except BrokenPipeError:
+                        raise
+                    except Exception as error:  # noqa: BLE001
+                        log(f"сбой инструмента {name}: {traceback.format_exc()}")
+                        result_text, events = f"Внутренний сбой инструмента {name}: {error}", []
 
                     for event in events:
                         img = event.pop("_image", None)
@@ -4072,6 +4295,27 @@ class Handler(BaseHTTPRequestHandler):
                             marker=f"\n...[вывод инструмента сокращён с {len(result_text)} симв. для защиты контекста модели]...\n",
                         )
                     call_results.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
+
+                cur_sig = _tool_call_signature(assistant_calls)
+                if cur_sig and cur_sig == last_tool_sig:
+                    repeat_sig_count += 1
+                else:
+                    last_tool_sig = cur_sig
+                    repeat_sig_count = 1
+                if repeat_sig_count >= 4 and call_results:
+                    call_results[-1]["content"] = (
+                        str(call_results[-1].get("content") or "")
+                        + "\n\n[СИСТЕМА: Вы повторили один и тот же вызов инструментов 4 раза подряд. "
+                        "На следующем шаге вызов инструментов отключён — дайте итоговый ответ пользователю "
+                        "на основе уже полученных данных или опишите, что мешает продолжить.]"
+                    )
+                    force_no_tools_next = True
+                elif repeat_sig_count >= 2 and call_results:
+                    call_results[-1]["content"] = (
+                        str(call_results[-1].get("content") or "")
+                        + f"\n\n[ПОДСКАЗКА: такой же вызов уже выполнен {repeat_sig_count} раз(а) подряд. "
+                        "Не повторяй одинаковое действие — используй уже полученный результат, измени параметры или переходи к следующему шагу.]"
+                    )
 
                 image_note = (
                     "Скриншоты интерактивного осмотра проекта в браузере (для проверки вёрстки и анимаций):"
@@ -4212,6 +4456,12 @@ def _report_launcher_usage(
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        _, exc, _ = sys.exc_info()
+        if exc is not None and _is_client_disconnect(exc):
+            return
+        super().handle_error(request, client_address)
 
 
 def self_test() -> int:
