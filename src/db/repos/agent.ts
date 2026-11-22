@@ -108,7 +108,48 @@ export type AgentTokenRow = {
   expiringSoon?: boolean;
 };
 
-export type AgentConversationKind = "plan" | "agent";
+export type AgentConversationKind = "plan" | "agent" | "tester";
+
+export type TesterIssue = {
+  title: string;
+  description: string;
+  file?: string;
+  line?: number;
+  fixHint?: string;
+  severity: "critical" | "minor";
+};
+
+export type TesterCheck = {
+  name: string;
+  tool?: string;
+  status: "pass" | "fail" | "warn";
+  details: string;
+};
+
+export type TesterRunStatus = "running" | "passed" | "minor_issues" | "critical_issues" | "error";
+
+export type TesterMinorDecision = "not_needed" | "pending" | "approved" | "rejected";
+
+export type AgentTesterRunRow = {
+  id: number;
+  userId: number;
+  agentConversationId: number | null;
+  testerConversationId: number;
+  sandboxProject: string;
+  summary: string;
+  status: TesterRunStatus;
+  reportSummary: string;
+  criticalIssues: TesterIssue[];
+  minorIssues: TesterIssue[];
+  checksRun: TesterCheck[];
+  minorDecision: TesterMinorDecision;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  model: string;
+  createdAt: string;
+  updatedAt: string;
+};
 
 export type AgentConversationRow = {
   id: number;
@@ -1122,10 +1163,13 @@ function parseStoredArray(value: unknown): unknown[] {
 }
 
 function mapAgentConversation(row: Raw): AgentConversationRow {
+  const rawKind = String(row.kind ?? "agent");
+  const kind: AgentConversationKind =
+    rawKind === "plan" ? "plan" : rawKind === "tester" ? "tester" : "agent";
   return {
     id: toNum(row.id),
     userId: toNum(row.user_id),
-    kind: row.kind === "plan" ? "plan" : "agent",
+    kind,
     title: String(row.title ?? "Новый чат"),
     systemPrompt: String(row.system_prompt ?? ""),
     messagesCount: toNum(row.messages_count),
@@ -1157,7 +1201,7 @@ export async function getAgentConversation(userId: number, id: number): Promise<
 export async function createAgentConversation(
   userId: number,
   kind: AgentConversationKind,
-  title = kind === "plan" ? "Новый план" : "Новый чат",
+  title = kind === "plan" ? "Новый план" : kind === "tester" ? "Тестирование" : "Новый чат",
   systemPrompt = "",
 ): Promise<AgentConversationRow> {
   const now = nowIso();
@@ -1194,6 +1238,7 @@ export async function updateAgentConversation(
 export async function deleteAgentConversation(userId: number, id: number): Promise<boolean> {
   const current = await getAgentConversation(userId, id);
   if (!current) return false;
+  await q(sql`delete from agent_tester_runs where tester_conversation_id = ${id} and user_id = ${userId}`);
   await q(sql`delete from agent_conversation_messages where conversation_id = ${id}`);
   await q(sql`delete from agent_conversations where id = ${id} and user_id = ${userId}`);
   return true;
@@ -1239,7 +1284,7 @@ export async function insertAgentConversationMessage(input: {
   const title = input.content.replace(/\s+/g, " ").trim().slice(0, 80);
   await q(sql`update agent_conversations set
       title = case
-        when ${input.role} = 'user' and title in ('Новый план', 'Новый чат') and ${title} <> '' then ${title}
+        when ${input.role} = 'user' and title in ('Новый план', 'Новый чат', 'Тестирование') and ${title} <> '' then ${title}
         else title
       end,
       updated_at = ${createdAt}
@@ -1786,4 +1831,375 @@ export async function deleteGithubConnection(userId: number): Promise<boolean> {
   if (!existing) return false;
   await q(sql`delete from github_connections where user_id = ${userId}`);
   return true;
+}
+
+/* ----------------------- Под-агент Тестировщик ------------------------ */
+
+function normalizeTesterStatus(raw: unknown): TesterRunStatus {
+  const v = String(raw ?? "").trim();
+  if (v === "passed" || v === "minor_issues" || v === "critical_issues" || v === "error") {
+    return v;
+  }
+  return "running";
+}
+
+function normalizeMinorDecision(raw: unknown): TesterMinorDecision {
+  const v = String(raw ?? "").trim();
+  if (v === "pending" || v === "approved" || v === "rejected") {
+    return v;
+  }
+  return "not_needed";
+}
+
+function normalizeTesterIssues(raw: unknown, fallbackSeverity: "critical" | "minor"): TesterIssue[] {
+  const list = Array.isArray(raw) ? raw : typeof raw === "string" ? parseStoredArray(raw) : [];
+  const out: TesterIssue[] = [];
+  for (const item of list.slice(0, 100)) {
+    if (typeof item === "string") {
+      const clean = item.trim().slice(0, 2_000);
+      if (clean) {
+        out.push({ title: clean.slice(0, 180), description: clean, severity: fallbackSeverity });
+      }
+      continue;
+    }
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const obj = item as Record<string, unknown>;
+    const title = String(obj.title ?? obj.name ?? obj.description ?? "").trim().slice(0, 240);
+    const description = String(obj.description ?? obj.details ?? title).trim().slice(0, 4_000);
+    if (!title && !description) continue;
+    const sev = obj.severity === "critical" || obj.severity === "minor" ? obj.severity : fallbackSeverity;
+    const file = typeof obj.file === "string" && obj.file.trim() ? obj.file.trim().slice(0, 300) : undefined;
+    const lineNum = Number(obj.line);
+    const line = Number.isFinite(lineNum) && lineNum > 0 ? Math.floor(lineNum) : undefined;
+    const fixHint =
+      typeof (obj.fixHint ?? obj.fix_hint) === "string" && String(obj.fixHint ?? obj.fix_hint).trim()
+        ? String(obj.fixHint ?? obj.fix_hint).trim().slice(0, 1_500)
+        : undefined;
+    out.push({
+      title: title || description.slice(0, 180),
+      description: description || title,
+      severity: sev,
+      ...(file ? { file } : {}),
+      ...(line ? { line } : {}),
+      ...(fixHint ? { fixHint } : {}),
+    });
+  }
+  return out;
+}
+
+function normalizeTesterChecks(raw: unknown): TesterCheck[] {
+  const list = Array.isArray(raw) ? raw : typeof raw === "string" ? parseStoredArray(raw) : [];
+  const out: TesterCheck[] = [];
+  for (const item of list.slice(0, 100)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const obj = item as Record<string, unknown>;
+    const name = String(obj.name ?? obj.check ?? "Проверка").trim().slice(0, 240);
+    const details = String(obj.details ?? obj.output ?? "").trim().slice(0, 2_000);
+    const rawStatus = String(obj.status ?? "pass").toLowerCase();
+    const status: TesterCheck["status"] =
+      rawStatus === "fail" ? "fail" : rawStatus === "warn" ? "warn" : "pass";
+    const tool = typeof obj.tool === "string" && obj.tool.trim() ? obj.tool.trim().slice(0, 120) : undefined;
+    out.push({ name, status, details, ...(tool ? { tool } : {}) });
+  }
+  return out;
+}
+
+function mapTesterRun(row: Raw): AgentTesterRunRow {
+  const agentConvNum = toNum(row.agent_conversation_id);
+  return {
+    id: toNum(row.id),
+    userId: toNum(row.user_id),
+    agentConversationId: agentConvNum > 0 ? agentConvNum : null,
+    testerConversationId: toNum(row.tester_conversation_id),
+    sandboxProject: String(row.sandbox_project ?? ""),
+    summary: String(row.summary ?? ""),
+    status: normalizeTesterStatus(row.status),
+    reportSummary: String(row.report_summary ?? ""),
+    criticalIssues: normalizeTesterIssues(row.critical_issues, "critical"),
+    minorIssues: normalizeTesterIssues(row.minor_issues, "minor"),
+    checksRun: normalizeTesterChecks(row.checks_run),
+    minorDecision: normalizeMinorDecision(row.minor_decision),
+    promptTokens: toNum(row.prompt_tokens),
+    completionTokens: toNum(row.completion_tokens),
+    totalTokens: toNum(row.total_tokens),
+    model: String(row.model ?? ""),
+    createdAt: toIso(row.created_at) ?? nowIso(),
+    updatedAt: toIso(row.updated_at) ?? nowIso(),
+  };
+}
+
+export function formatTesterReportMessage(input: {
+  sandboxProject?: string;
+  status: TesterRunStatus;
+  reportSummary: string;
+  criticalIssues: TesterIssue[];
+  minorIssues: TesterIssue[];
+  checksRun: TesterCheck[];
+  fullResponse?: string;
+}): string {
+  const lines: string[] = [];
+  const statusLabel =
+    input.status === "passed"
+      ? "Проверка пройдена без замечаний"
+      : input.status === "critical_issues"
+        ? "Найдены критические ошибки (требуется исправление Агентом)"
+        : input.status === "minor_issues"
+          ? "Критических ошибок нет, найдены некритические/мелкие замечания"
+          : input.status === "error"
+            ? "Тестирование завершилось с ошибкой"
+            : "Выполняется тестирование";
+  lines.push(`Статус проверки: ${statusLabel}`);
+  if (input.sandboxProject) {
+    lines.push(`Проект в Sandbox: ${input.sandboxProject}`);
+  }
+  if (input.reportSummary.trim()) {
+    lines.push("", input.reportSummary.trim());
+  }
+  if (input.criticalIssues.length > 0) {
+    lines.push("", `Критические ошибки (${input.criticalIssues.length}):`);
+    for (const issue of input.criticalIssues) {
+      const loc = issue.file ? ` [${issue.file}${issue.line ? `:${issue.line}` : ""}]` : "";
+      lines.push(`- ${issue.title}${loc}: ${issue.description}`);
+    }
+  }
+  if (input.minorIssues.length > 0) {
+    lines.push("", `Мелкие / некритические замечания (${input.minorIssues.length}):`);
+    for (const issue of input.minorIssues) {
+      const loc = issue.file ? ` [${issue.file}${issue.line ? `:${issue.line}` : ""}]` : "";
+      lines.push(`- ${issue.title}${loc}: ${issue.description}`);
+    }
+  }
+  if (input.checksRun.length > 0) {
+    lines.push("", `Выполненные проверки (${input.checksRun.length}):`);
+    for (const chk of input.checksRun) {
+      const badge = chk.status === "pass" ? "OK" : chk.status === "fail" ? "FAIL" : "WARN";
+      lines.push(`- [${badge}] ${chk.name}: ${chk.details}`);
+    }
+  }
+  const full = String(input.fullResponse ?? "").trim();
+  if (full && !lines.join("\n").includes(full.slice(0, 80))) {
+    lines.push("", "Подробный комментарий тестировщика:", full);
+  }
+  return lines.join("\n").slice(0, 48_000);
+}
+
+export async function createTesterRunWithConversation(input: {
+  userId: number;
+  agentConversationId?: number | null;
+  testerConversationId?: number | null;
+  title?: string;
+  sandboxProject?: string;
+  summary: string;
+  model?: string;
+  skipInitialMessage?: boolean;
+}): Promise<{ run: AgentTesterRunRow; conversation: AgentConversationRow }> {
+  const cleanProject = String(input.sandboxProject ?? "").trim().slice(0, 300);
+  const cleanSummary = String(input.summary ?? "").trim().slice(0, 48_000);
+  const agentConvId =
+    typeof input.agentConversationId === "number" && input.agentConversationId > 0
+      ? Math.floor(input.agentConversationId)
+      : null;
+
+  let conversation: AgentConversationRow | null = null;
+  if (typeof input.testerConversationId === "number" && input.testerConversationId > 0) {
+    const existing = await getAgentConversation(input.userId, Math.floor(input.testerConversationId));
+    if (existing && existing.kind === "tester") {
+      conversation = existing;
+    }
+  }
+  if (!conversation) {
+    const rawTitle = String(input.title ?? "").trim();
+    const convTitle =
+      rawTitle ||
+      (cleanProject && cleanProject !== "."
+        ? `Тест: ${cleanProject}`
+        : cleanSummary.replace(/\s+/g, " ").trim().slice(0, 60) || "Тестирование проекта");
+    conversation = await createAgentConversation(
+      input.userId,
+      "tester",
+      convTitle.slice(0, 120),
+      agentConvId ? `agent_chat:${agentConvId}` : "",
+    );
+  }
+
+  const promptContent = cleanProject
+    ? `Проект Sandbox: ${cleanProject}\n\nSummary от Агента:\n${cleanSummary}`
+    : cleanSummary;
+  if (!input.skipInitialMessage && promptContent.trim()) {
+    await insertAgentConversationMessage({
+      userId: input.userId,
+      conversationId: conversation.id,
+      role: "user",
+      content: promptContent.slice(0, 48_000),
+    });
+  }
+
+  const now = nowIso();
+  const row = await q1<{ id: number }>(sql`insert into agent_tester_runs
+      (user_id, agent_conversation_id, tester_conversation_id, sandbox_project, summary, status, model, created_at, updated_at)
+    values (
+      ${input.userId}, ${agentConvId}, ${conversation.id}, ${cleanProject},
+      ${cleanSummary}, 'running', ${String(input.model ?? "").slice(0, 160)}, ${now}, ${now}
+    ) returning id`);
+
+  const run = await getTesterRun(input.userId, toNum(row?.id));
+  if (!run) throw new Error("Не удалось создать прогон Тестировщика");
+  const refreshedConv = (await getAgentConversation(input.userId, conversation.id)) ?? conversation;
+  return { run, conversation: refreshedConv };
+}
+
+export async function completeTesterRun(
+  userId: number,
+  runId: number,
+  input: {
+    status: TesterRunStatus;
+    reportSummary?: string;
+    criticalIssues?: unknown;
+    minorIssues?: unknown;
+    checksRun?: unknown;
+    minorDecision?: TesterMinorDecision;
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+    model?: string;
+    fullResponse?: string;
+    reasoning?: string;
+    actions?: unknown[];
+    files?: unknown[];
+    error?: string;
+    skipUsageRecord?: boolean;
+  },
+): Promise<AgentTesterRunRow | null> {
+  const existing = await getTesterRun(userId, runId);
+  if (!existing) return null;
+
+  const critical = normalizeTesterIssues(input.criticalIssues, "critical");
+  const minor = normalizeTesterIssues(input.minorIssues, "minor");
+  const checks = normalizeTesterChecks(input.checksRun);
+  let status = normalizeTesterStatus(input.status);
+  if (status === "running") {
+    status = critical.length > 0 ? "critical_issues" : minor.length > 0 ? "minor_issues" : "passed";
+  }
+  const minorDecision: TesterMinorDecision =
+    input.minorDecision !== undefined
+      ? normalizeMinorDecision(input.minorDecision)
+      : minor.length > 0
+        ? "pending"
+        : "not_needed";
+  const promptTokens = Math.max(0, Math.round(Number(input.promptTokens ?? 0) || 0));
+  const completionTokens = Math.max(0, Math.round(Number(input.completionTokens ?? 0) || 0));
+  const totalTokens = Math.max(
+    promptTokens + completionTokens,
+    Math.round(Number(input.totalTokens ?? 0) || 0),
+  );
+  const reportSummary = String(input.reportSummary ?? input.fullResponse ?? "").trim().slice(0, 16_000);
+  const model = String(input.model ?? existing.model ?? "").slice(0, 160);
+  const now = nowIso();
+
+  await q(sql`update agent_tester_runs set
+      status = ${status},
+      report_summary = ${reportSummary},
+      critical_issues = ${JSON.stringify(critical)},
+      minor_issues = ${JSON.stringify(minor)},
+      checks_run = ${JSON.stringify(checks)},
+      minor_decision = ${minorDecision},
+      prompt_tokens = ${promptTokens},
+      completion_tokens = ${completionTokens},
+      total_tokens = ${totalTokens},
+      model = ${model},
+      updated_at = ${now}
+    where id = ${runId} and user_id = ${userId}`);
+
+  const assistantText = formatTesterReportMessage({
+    sandboxProject: existing.sandboxProject,
+    status,
+    reportSummary,
+    criticalIssues: critical,
+    minorIssues: minor,
+    checksRun: checks,
+    fullResponse: input.fullResponse,
+  });
+  const storedFiles = Array.isArray(input.files)
+    ? input.files
+        .filter((f): f is Record<string, unknown> => Boolean(f && typeof f === "object"))
+        .map((f) => ({
+          name: String(f.name ?? "файл").slice(0, 240),
+          mime: String(f.mime ?? "application/octet-stream").slice(0, 160),
+          size: Math.max(0, Math.round(Number(f.size ?? 0) || 0)),
+        }))
+    : [];
+  const storedActions = Array.isArray(input.actions) ? input.actions.slice(0, 60) : [];
+
+  await insertAgentConversationMessage({
+    userId,
+    conversationId: existing.testerConversationId,
+    role: "assistant",
+    content: assistantText,
+    reasoning: String(input.reasoning ?? "").slice(0, 48_000),
+    actions: JSON.stringify(storedActions),
+    files: JSON.stringify(storedFiles),
+    error: String(input.error ?? "").slice(0, 2_000),
+  });
+
+  if (!input.skipUsageRecord && (totalTokens > 0 || promptTokens > 0 || completionTokens > 0)) {
+    await recordAgentUsage({
+      userId,
+      kind: "agent",
+      refId: existing.testerConversationId,
+      model,
+      prompt: promptTokens,
+      completion: completionTokens,
+      total: totalTokens,
+    }).catch(() => undefined);
+  }
+
+  return getTesterRun(userId, runId);
+}
+
+export async function updateTesterMinorDecision(
+  userId: number,
+  runId: number,
+  decision: "approved" | "rejected" | "pending",
+  note?: string,
+): Promise<AgentTesterRunRow | null> {
+  const existing = await getTesterRun(userId, runId);
+  if (!existing) return null;
+  const now = nowIso();
+  await q(sql`update agent_tester_runs set minor_decision = ${decision}, updated_at = ${now}
+    where id = ${runId} and user_id = ${userId}`);
+  if (decision === "approved" || decision === "rejected") {
+    const label =
+      decision === "approved"
+        ? "Решение пользователя: внесение мелких/некритических изменений ОДОБРЕНО."
+        : "Решение пользователя: мелкие/некритические изменения ОСТАВИТЬ КАК ЕСТЬ (отклонено).";
+    const fullNote = note?.trim() ? `${label}\nКомментарий: ${note.trim()}` : label;
+    await insertAgentConversationMessage({
+      userId,
+      conversationId: existing.testerConversationId,
+      role: "user",
+      content: fullNote.slice(0, 4_000),
+    });
+  }
+  return getTesterRun(userId, runId);
+}
+
+export async function getTesterRun(userId: number, id: number): Promise<AgentTesterRunRow | null> {
+  const row = await q1(sql`select * from agent_tester_runs where id = ${id} and user_id = ${userId} limit 1`);
+  return row ? mapTesterRun(row) : null;
+}
+
+export async function getTesterRunByConversationId(
+  userId: number,
+  testerConversationId: number,
+): Promise<AgentTesterRunRow | null> {
+  const row = await q1(sql`select * from agent_tester_runs
+    where tester_conversation_id = ${testerConversationId} and user_id = ${userId}
+    order by id desc limit 1`);
+  return row ? mapTesterRun(row) : null;
+}
+
+export async function listTesterRuns(userId: number, limit = 50): Promise<AgentTesterRunRow[]> {
+  const cap = Math.max(1, Math.min(200, Math.floor(limit)));
+  const rows = await q(sql`select * from agent_tester_runs where user_id = ${userId} order by id desc limit ${cap}`);
+  return rows.map(mapTesterRun);
 }

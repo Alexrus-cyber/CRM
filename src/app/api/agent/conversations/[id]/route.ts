@@ -33,7 +33,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   if (!id) return Response.json({ error: "Некорректный чат" }, { status: 400 });
   const conversation = await getAgentConversation(auth.user.id, id);
   if (!conversation) return Response.json({ error: "Чат не найден" }, { status: 404 });
-  if (conversation.kind === "agent" ? !hasAgentAccess(auth.user) : !hasOperatorAccess(auth.user)) {
+  if (conversation.kind === "plan" ? !hasOperatorAccess(auth.user) : !hasAgentAccess(auth.user)) {
     return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
   }
 
@@ -51,7 +51,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
   if (!id) return Response.json({ error: "Некорректный чат" }, { status: 400 });
   const current = await getAgentConversation(auth.user.id, id);
   if (!current) return Response.json({ error: "Чат не найден" }, { status: 404 });
-  if (current.kind === "agent" ? !hasAgentAccess(auth.user) : !hasOperatorAccess(auth.user)) {
+  if (current.kind === "plan" ? !hasOperatorAccess(auth.user) : !hasAgentAccess(auth.user)) {
     return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
   }
 

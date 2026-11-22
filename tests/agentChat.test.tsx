@@ -16,7 +16,7 @@ type Sent = {
 
 type StoredConversation = {
   id: number;
-  kind: "agent";
+  kind: "agent" | "tester";
   title: string;
   messagesCount: number;
   updatedAt: string;
@@ -43,6 +43,8 @@ let nextConvId = 1;
 let nextMsgId = 1;
 let sseReply = "";
 let sseResponder: ((url: string, init?: RequestInit) => Promise<Response> | Response) | null = null;
+let testerRunsMock: Array<Record<string, unknown>> = [];
+const testerDecisionsSent: Array<{ runId: number; decision: string }> = [];
 
 const operatorCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
 let operatorPollCount = 0;
@@ -334,14 +336,34 @@ function mockFetch() {
         });
       }
 
+      if (url === "/api/agent/tester" && method === "GET") {
+        return json({
+          runs: testerRunsMock,
+          conversations: conversations.filter((c) => c.kind === "tester"),
+        });
+      }
+      const testerIdMatch = url.match(/^\/api\/agent\/tester\/(\d+)$/);
+      if (testerIdMatch && method === "POST") {
+        const runId = Number(testerIdMatch[1]);
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        const decision = String(body.decision ?? "approved");
+        testerDecisionsSent.push({ runId, decision });
+        testerRunsMock = testerRunsMock.map((r) =>
+          Number(r.id) === runId ? { ...r, minorDecision: decision } : r,
+        );
+        const updated = testerRunsMock.find((r) => Number(r.id) === runId);
+        return json({ ok: true, run: updated });
+      }
       if (url.startsWith("/api/agent/conversations?kind=agent") && method === "GET") {
-        return json({ conversations });
+        return json({ conversations: conversations.filter((c) => c.kind === "agent") });
       }
       if (url === "/api/agent/conversations" && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        const kind = body.kind === "tester" ? "tester" : "agent";
         const created: StoredConversation = {
           id: nextConvId++,
-          kind: "agent",
-          title: "Новый чат",
+          kind,
+          title: String(body.title ?? "Новый чат"),
           messagesCount: 0,
           updatedAt: "2026-11-17T10:00:00.000Z",
         };
@@ -408,6 +430,8 @@ describe("вкладка «Агент»", () => {
     nextMsgId = 1;
     sseReply = "";
     sseResponder = null;
+    testerRunsMock = [];
+    testerDecisionsSent.length = 0;
     mockFetch();
   });
 
@@ -871,6 +895,7 @@ describe("вкладка «Агент»", () => {
       "Модель и генерация",
       "Доверие и RAG",
       "Sandbox и Оператор",
+      "Тестировщик",
       "Чат",
     ]);
     expect(tabs[tabs.length - 1]?.textContent).toBe("Чат");
@@ -948,5 +973,202 @@ describe("вкладка «Агент»", () => {
     await waitFor(() => expect(ensureChatRequested).toBe(1));
     expect(await screen.findByText("Шаг #1: навожу на дверь")).toBeTruthy();
     enableLiveOperatorMock = false;
+  });
+
+  it("синхронизирует модель с подвкладкой «Тестировщик», отображает отдельный QA-чат, отчёт и одобрение мелких правок", async () => {
+    testerRunsMock = [
+      {
+        id: 11,
+        userId: 1,
+        agentConversationId: 1,
+        testerConversationId: 50,
+        sandboxProject: "landing-site",
+        title: "QA: landing-site",
+        summary: "Найдена 1 мелкая проблема верстки",
+        status: "minor_issues",
+        criticalIssues: [],
+        minorIssues: [
+          {
+            title: "Отступ на мобильном экране",
+            description: "Увеличить padding-x до 16px",
+            file: "src/index.css",
+            severity: "minor",
+          },
+        ],
+        checksRun: [{ name: "qa_static_review", status: "pass", details: "OK" }],
+        minorDecision: "pending",
+        model: "gpt-4o-mini",
+        promptTokens: 120,
+        completionTokens: 80,
+        totalTokens: 200,
+        createdAt: "2026-11-17T10:05:00.000Z",
+        finishedAt: "2026-11-17T10:05:10.000Z",
+      },
+    ];
+    conversations = [
+      { id: 1, kind: "agent", title: "Основной чат", messagesCount: 0, updatedAt: "2026-11-17T10:00:00.000Z" },
+      { id: 50, kind: "tester", title: "QA: landing-site", messagesCount: 2, updatedAt: "2026-11-17T10:05:10.000Z" },
+    ];
+    messagesByConv[50] = [
+      { id: 501, role: "user", content: "Проверь landing-site" },
+      { id: 502, role: "assistant", content: "Итог: minor_issues" },
+    ];
+
+    render(<AgentChat userName="Тест" />);
+    // Меняем модель на вкладке Агента — она должна синхронизироваться в индикаторе Тестировщика
+    fireEvent.click(screen.getByRole("tab", { name: /Модель и генерация/i }));
+    const modelInput = screen.getByLabelText("Модель");
+    fireEvent.change(modelInput, { target: { value: "qwen2.5-coder:32b" } });
+
+    fireEvent.click(screen.getByRole("tab", { name: /Тестировщик/i }));
+    expect(await screen.findByText(/Модель синхронизирована с Агентом: qwen2\.5-coder:32b/i)).toBeTruthy();
+    expect(screen.getByText(/Токены QA-чата: 200/)).toBeTruthy();
+    expect(screen.getByText("Отступ на мобильном экране")).toBeTruthy();
+
+    // Подтверждаем мелкие исправления прямо из панели Тестировщика
+    fireEvent.click(screen.getByRole("button", { name: /Внести изменения/i }));
+    await waitFor(() =>
+      expect(testerDecisionsSent).toEqual([{ runId: 11, decision: "approved" }]),
+    );
+  });
+
+  it("обрабатывает SSE-события tester_run / approval_required (tester_minor_fixes) / tester_done в основном чате Агента", async () => {
+    conversations = [
+      { id: 1, kind: "agent", title: "Основной чат", messagesCount: 0, updatedAt: "2026-11-17T10:00:00.000Z" },
+    ];
+    const testerRunObj = {
+      id: 22,
+      userId: 1,
+      agentConversationId: 1,
+      testerConversationId: 60,
+      sandboxProject: "crm-widget",
+      title: "QA: crm-widget",
+      summary: "Обнаружена 1 мелкая ошибка отступа",
+      status: "minor_issues",
+      criticalIssues: [],
+      minorIssues: [{ title: "Шрифт заголовка", description: "Слишком тонкий", file: "index.html", severity: "minor" }],
+      checksRun: [{ name: "qa_static_review", status: "pass", details: "OK" }],
+      minorDecision: "pending",
+      model: "o3-mini",
+      promptTokens: 50,
+      completionTokens: 40,
+      totalTokens: 90,
+      createdAt: "2026-11-17T10:06:00.000Z",
+      finishedAt: "2026-11-17T10:06:05.000Z",
+    };
+
+    const encoder = new TextEncoder();
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_run\ndata: ${JSON.stringify({ runKey: "r1", runId: 22, testerConversationId: 60, conversation: { id: 60, kind: "tester", title: "QA: crm-widget", messagesCount: 1, updatedAt: "2026-11-17T10:06:00.000Z" }, run: { ...testerRunObj, status: "running", minorIssues: [], totalTokens: 0 } })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: approval_required\ndata: ${JSON.stringify({ approvalId: "apr-minor-1", kind: "tester_minor_fixes", title: "Мелкие замечания по crm-widget", description: "Решить судьбу мелких правок", sandboxProject: "crm-widget", testerRunId: 22, testerConversationId: 60, minorIssues: testerRunObj.minorIssues })}\n\n`,
+            ),
+          );
+          while (approvalsSent.length === 0) {
+            await new Promise((r) => setTimeout(r, 10));
+          }
+          controller.enqueue(
+            encoder.encode(
+              `event: action\ndata: ${JSON.stringify({ type: "tester_report", label: "Отчёт Тестировщика: crm-widget", sandboxProject: "crm-widget", testerConversationId: 60, status: "minor_issues", reportSummary: "Обнаружена 1 мелкая ошибка отступа", criticalCount: 0, minorCount: 1, totalTokens: 90 })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_done\ndata: ${JSON.stringify({ runKey: "r1", runId: 22, testerConversationId: 60, run: testerRunObj })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode('event: text\ndata: {"text":"Тестировщик завершил проверку crm-widget."}\n\n'),
+          );
+          controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Протестируй crm-widget" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    // Появляется карточка подтверждения мелких замечаний
+    expect(await screen.findByText("Мелкие замечания по crm-widget")).toBeTruthy();
+    expect(screen.getByText("Шрифт заголовка")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /Внести мелкие изменения/i }));
+
+    await waitFor(() => expect(approvalsSent.length).toBe(1));
+    expect(approvalsSent[0]).toMatchObject({ approvalId: "apr-minor-1", approved: true });
+    await waitFor(() =>
+      expect(testerDecisionsSent).toContainEqual({ runId: 22, decision: "approved" }),
+    );
+    expect(await screen.findByText(/Отчёт Тестировщика · crm-widget/i)).toBeTruthy();
+  });
+
+  it("позволяет запустить Тестировщика напрямую из отдельной вкладки с общими настройками модели", async () => {
+    sseResponder = () => {
+      // Имитируем серверную запись отчёта в QA-чат №1 (который создаст клиент при первом запуске)
+      const convId = nextConvId - 1;
+      messagesByConv[convId] = [
+        ...(messagesByConv[convId] ?? []),
+        { id: nextMsgId++, role: "assistant", content: "Проверка завершена успешно, багов не найдено." },
+      ];
+      testerRunsMock = [
+        {
+          id: 33,
+          userId: 1,
+          agentConversationId: null,
+          testerConversationId: convId,
+          sandboxProject: "landing-site",
+          summary: "Проверь сайт",
+          status: "passed",
+          reportSummary: "OK",
+          criticalIssues: [],
+          minorIssues: [],
+          checksRun: [],
+          minorDecision: "not_needed",
+          promptTokens: 40,
+          completionTokens: 20,
+          totalTokens: 60,
+          model: "o3-mini",
+          createdAt: "2026-11-17T10:10:00.000Z",
+          updatedAt: "2026-11-17T10:10:05.000Z",
+        },
+      ];
+      const body = [
+        `event: tester_run\ndata: ${JSON.stringify({ runKey: "direct", runId: 33, testerConversationId: convId })}\n\n`,
+        'event: text\ndata: {"text":"Проверка завершена успешно, багов не найдено."}\n\n',
+        `event: tester_done\ndata: ${JSON.stringify({ runKey: "direct", runId: 33, testerConversationId: convId, run: testerRunsMock[0] })}\n\n`,
+        "event: done\ndata: {}\n\n",
+      ].join("");
+      return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    fireEvent.click(screen.getByRole("tab", { name: /Модель и генерация/i }));
+    fireEvent.change(screen.getByLabelText("Модель"), { target: { value: "o3-mini" } });
+
+    fireEvent.click(screen.getByRole("tab", { name: /Тестировщик/i }));
+    const projectSelect = (await screen.findByLabelText(/Проект Sandbox/i)) as HTMLSelectElement;
+    fireEvent.change(projectSelect, { target: { value: "landing-site" } });
+
+    const testerInput = screen.getByLabelText("Задача для Тестировщика");
+    fireEvent.change(testerInput, { target: { value: "Проверь адаптивность и ссылки" } });
+    fireEvent.click(screen.getByRole("button", { name: /Проверить проект/i }));
+
+    await waitFor(() => expect(sent.length).toBe(1));
+    expect(sent[0]).toMatchObject({
+      agentRole: "tester",
+      sandboxProject: "landing-site",
+      settings: { model: "o3-mini" },
+    });
+    expect(await screen.findByText(/Проверка завершена успешно, багов не найдено\./i)).toBeTruthy();
   });
 });

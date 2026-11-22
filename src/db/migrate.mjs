@@ -41,6 +41,7 @@ export const SCHEMA_TABLES = [
   "ai_rag_chunks",
   "ai_rag_terms",
   "agent_usage_events",
+  "agent_tester_runs",
   "github_connections",
 ];
 

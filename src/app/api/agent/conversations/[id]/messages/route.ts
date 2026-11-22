@@ -83,7 +83,7 @@ export async function POST(
   }
   const conversation = await getAgentConversation(auth.user.id, id);
   if (!conversation) return Response.json({ error: "Чат не найден" }, { status: 404 });
-  if (conversation.kind === "agent" ? !hasAgentAccess(auth.user) : !hasOperatorAccess(auth.user)) {
+  if (conversation.kind === "plan" ? !hasOperatorAccess(auth.user) : !hasAgentAccess(auth.user)) {
     return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
   }
 
