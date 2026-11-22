@@ -20,6 +20,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import platform
 import re
 import subprocess
 import urllib.error
@@ -189,7 +190,7 @@ def _run_git(
     use_auth: bool = False,
     timeout: int = 45,
 ) -> Tuple[int, str, str]:
-    cmd: List[str] = ["git", "-c", "protocol.ext.allow=never", "-c", "core.fsmonitor=false"]
+    cmd: List[str] = ["git", "-c", "protocol.ext.allow=never", "-c", "core.fsmonitor=false", "-c", "credential.helper="]
     if use_auth and token:
         basic = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
         cmd.extend(["-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}"])
@@ -201,6 +202,7 @@ def _run_git(
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
     }
     if author_name:
         env["GIT_AUTHOR_NAME"] = author_name
@@ -209,16 +211,22 @@ def _run_git(
         env["GIT_AUTHOR_EMAIL"] = author_email
         env["GIT_COMMITTER_EMAIL"] = author_email
 
+    git_kwargs: Dict[str, Any] = {
+        "cwd": str(cwd),
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": timeout,
+        "check": False,
+    }
+    if platform.system() == "Windows":
+        git_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        proc = subprocess.run(cmd, **git_kwargs)
     except FileNotFoundError as err:
         raise GithubToolError("Команда git не установлена в системе") from err
     except subprocess.TimeoutExpired as err:

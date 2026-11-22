@@ -690,14 +690,70 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     }
   }, []);
 
-  const refreshSandbox = useCallback(async () => {
-    try {
-      const res = await fetch("/api/ai/agent/sandbox", { cache: "no-store" });
-      if (!res.ok) return;
-      const data: unknown = await res.json();
-      setSandbox(normalizeSandboxState(data));
-    } catch {
-      /* фоновая проверка — тихо игнорируем */
+  const sandboxInFlightRef = useRef<Promise<void> | null>(null);
+  const sandboxQueuedRef = useRef(false);
+  const lastSandboxAtRef = useRef(0);
+  const sandboxTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (sandboxTimerRef.current) {
+        clearTimeout(sandboxTimerRef.current);
+        sandboxTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const refreshSandbox = useCallback(async (force = false): Promise<void> => {
+    const runFetch = async () => {
+      if (sandboxInFlightRef.current) {
+        sandboxQueuedRef.current = true;
+        return sandboxInFlightRef.current;
+      }
+      const task = (async () => {
+        do {
+          sandboxQueuedRef.current = false;
+          lastSandboxAtRef.current = Date.now();
+          try {
+            const res = await fetch("/api/ai/agent/sandbox", { cache: "no-store" });
+            if (res.ok) {
+              const data: unknown = await res.json();
+              setSandbox(normalizeSandboxState(data));
+            }
+          } catch {
+            /* фоновая проверка — тихо игнорируем */
+          }
+        } while (sandboxQueuedRef.current);
+      })();
+      sandboxInFlightRef.current = task;
+      try {
+        await task;
+      } finally {
+        sandboxInFlightRef.current = null;
+      }
+    };
+
+    if (force) {
+      if (sandboxTimerRef.current) {
+        clearTimeout(sandboxTimerRef.current);
+        sandboxTimerRef.current = null;
+      }
+      await runFetch();
+      return;
+    }
+
+    const elapsed = Date.now() - lastSandboxAtRef.current;
+    if (elapsed >= 2500 && !sandboxInFlightRef.current) {
+      await runFetch();
+      return;
+    }
+
+    if (!sandboxTimerRef.current) {
+      const waitMs = Math.max(250, 2500 - elapsed);
+      sandboxTimerRef.current = setTimeout(() => {
+        sandboxTimerRef.current = null;
+        void runFetch();
+      }, waitMs);
     }
   }, []);
 
@@ -1853,7 +1909,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       setNotice(
         `${exportMode === "move" ? "Перенесено" : "Скопировано"} ${data.filesCount ?? 0} файлов в ${data.destination ?? exportDest}`,
       );
-      await refreshSandbox();
+      await refreshSandbox(true);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Ошибка экспорта из Sandbox");
     } finally {
@@ -1869,7 +1925,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "stop_process", pid }),
       });
-      await refreshSandbox();
+      await refreshSandbox(true);
     } finally {
       setSandboxBusy(false);
     }
@@ -2690,7 +2746,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 setOpDraftSteps(action.maxSteps ?? 30);
                 setOpDraftNotes(action.notes ?? "");
               }
-              void refreshSandbox();
+              void refreshSandbox(false);
             }
             scrollDown();
           } else if (event === "done") {
@@ -2698,7 +2754,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             setPendingApproval(null);
             setScreenCapture(null);
             setLiveTester(null);
-            void refreshSandbox();
+            void refreshSandbox(true);
           }
         }
       }
@@ -2890,7 +2946,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           type="button"
           onClick={() => {
             void loadHealth().then(setHealth);
-            void refreshSandbox();
+            void refreshSandbox(true);
             void refreshOperatorOverview();
           }}
           className="rounded-lg border border-border bg-card px-2 py-1 font-medium text-muted transition hover:text-text"
@@ -3424,7 +3480,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               </a>
               <button
                 type="button"
-                onClick={() => void refreshSandbox()}
+                onClick={() => void refreshSandbox(true)}
                 className="rounded-lg border border-border bg-card2 px-2 py-1 text-[10px] text-muted hover:text-text"
               >
                 Обновить

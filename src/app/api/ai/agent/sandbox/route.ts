@@ -53,9 +53,11 @@ export async function GET(req: Request) {
   }
 
   try {
+    const sbTimeout = AbortSignal.timeout(12_000);
+    const sbSignal = typeof AbortSignal.any === "function" ? AbortSignal.any([req.signal, sbTimeout]) : sbTimeout;
     const upstream = await fetch(`${agentUrl}/sandbox`, {
       cache: "no-store",
-      signal: AbortSignal.timeout(5_000),
+      signal: sbSignal,
     });
     const data = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
     return Response.json(data, { status: upstream.status, headers: { "Cache-Control": "no-store" } });

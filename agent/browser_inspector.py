@@ -34,6 +34,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -218,9 +219,31 @@ class _SandboxRequestHandler(SimpleHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         return
 
+    def setup(self) -> None:
+        super().setup()
+        try:
+            self.connection.settimeout(10.0)
+        except OSError:
+            pass
+
     def end_headers(self) -> None:
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
+
+
+class _StaticThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    block_on_close = False
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc = sys.exc_info()[1] if "sys" in globals() else None
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)):
+            return
+        winerr = getattr(exc, "winerror", None)
+        if winerr in (10053, 10054):
+            return
+        super().handle_error(request, client_address)
 
 
 class StaticSandboxServer:
@@ -243,7 +266,7 @@ class StaticSandboxServer:
         mimetypes.add_type("image/svg+xml", ".svg")
 
         handler = partial(_SandboxRequestHandler, directory=str(serve_dir))
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.httpd = _StaticThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = int(self.httpd.server_address[1])
         self.url = f"http://127.0.0.1:{self.port}{default_file}"
         self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -252,6 +275,9 @@ class StaticSandboxServer:
     def close(self) -> None:
         try:
             self.httpd.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             self.httpd.server_close()
         except Exception:  # noqa: BLE001
             pass
@@ -311,11 +337,23 @@ class _WebSocketClient:
         leftover = bytes(raw_hdr[sep + 4 :])
         if leftover:
             self._buf.extend(leftover)
-        self._sock.settimeout(None)
+        # Периодический timeout чтения позволяет reader-потоку проверять закрытие сокета.
+        self._sock.settimeout(10.0)
 
     def _read_exact(self, n: int) -> bytes:
         while len(self._buf) < n:
-            chunk = self._sock.recv(max(4096, n - len(self._buf)))
+            if self.closed:
+                raise EOFError("WebSocket closed")
+            try:
+                chunk = self._sock.recv(max(4096, n - len(self._buf)))
+            except TimeoutError:
+                if self.closed:
+                    raise EOFError("WebSocket closed") from None
+                # Если уже начали читать фрейм (есть буфер или n > 2) — пробуем дочитать при живом сокете,
+                # а если стоим на границе нового фрейма — сигнализируем вызывающему о паузе чтения.
+                if not self._buf and n <= 2:
+                    raise
+                continue
             if not chunk:
                 raise EOFError("WebSocket closed")
             self._buf.extend(chunk)
@@ -415,6 +453,8 @@ class CDPClient:
         while not self._ws.closed:
             try:
                 raw = self._ws.recv_text()
+            except TimeoutError:
+                continue
             except Exception:  # noqa: BLE001
                 break
             if raw is None:
@@ -439,11 +479,34 @@ class CDPClient:
             params = msg.get("params") or {}
             self._handle_event(method, params)
 
+        self._ws.closed = True
         with self._lock:
             for slot in self._pending.values():
                 slot["event"].set()
 
+    def _dismiss_dialog_async(self) -> None:
+        def _run() -> None:
+            try:
+                self.call("Page.handleJavaScriptDialog", {"accept": True}, timeout=3.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _handle_event(self, method: str, params: Dict[str, Any]) -> None:
+        if method == "Page.javascriptDialogOpening":
+            dialog_type = str(params.get("type") or "alert")
+            dialog_msg = str(params.get("message") or "").strip()[:200]
+            with self._lock:
+                self.console_messages.append({
+                    "level": "warning",
+                    "text": f"[JS {dialog_type}] {dialog_msg or '(диалог автоматически закрыт)'}",
+                })
+                if len(self.console_messages) > 40:
+                    del self.console_messages[: len(self.console_messages) - 40]
+            self._dismiss_dialog_async()
+            return
+
         if method == "Runtime.consoleAPICalled":
             level = str(params.get("type") or "log")
             if level in ("error", "warning", "assert"):
@@ -631,9 +694,12 @@ AUDIT_JS = r"""
     });
   }
 
+  const SKIP_TAGS = new Set(["HTML", "HEAD", "META", "LINK", "STYLE", "SCRIPT", "TITLE", "NOSCRIPT", "TEMPLATE", "BR"]);
   const all = Array.from(document.querySelectorAll("*")).slice(0, 1200);
   for (const el of all) {
-    const st = getComputedStyle(el);
+    if (!el || SKIP_TAGS.has(el.tagName)) continue;
+    let st;
+    try { st = getComputedStyle(el); } catch { continue; }
     if (st.display === "none") continue;
     const rect = el.getBoundingClientRect();
     const sel = makeSelector(el);
@@ -858,6 +924,41 @@ def _js_locate_element(selector: str = "", text: str = "") -> str:
 # --------------------------------------------------------------------------
 
 
+def _kill_proc_tree(proc: Optional[subprocess.Popen[Any]]) -> None:
+    if not proc:
+        return
+    try:
+        if proc.poll() is None:
+            if platform.system() == "Windows":
+                # Убиваем всё дерево процессов Chrome/Edge (renderer/gpu/network),
+                # чтобы освободить временный user_data_dir и сокеты сразу.
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        timeout=4,
+                        check=False,
+                    )
+                except Exception:  # noqa: BLE001
+                    proc.kill()
+            else:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if proc.stderr:
+            proc.stderr.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _launch_headless_chromium(executable: str, width: int, height: int) -> Tuple[subprocess.Popen[str], Path, int]:
     user_data = Path(tempfile.mkdtemp(prefix="crm-browser-"))
     cmd = [
@@ -869,6 +970,13 @@ def _launch_headless_chromium(executable: str, width: int, height: int) -> Tuple
         f"--window-size={width},{height}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--no-proxy-server",
+        "--no-pings",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--disable-translate",
+        "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider",
+        "--disable-hang-monitor",
         "--disable-gpu",
         "--disable-dev-shm-usage",
         "--disable-background-timer-throttling",
@@ -880,14 +988,21 @@ def _launch_headless_chromium(executable: str, width: int, height: int) -> Tuple
     if platform.system() != "Windows" and hasattr(os, "geteuid") and os.geteuid() == 0:
         cmd.append("--no-sandbox")
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    popen_kwargs: Dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if platform.system() == "Windows":
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
 
     stderr_lines: List[str] = []
     port_holder: Dict[str, int] = {"port": 0}
@@ -895,21 +1010,25 @@ def _launch_headless_chromium(executable: str, width: int, height: int) -> Tuple
     def read_stderr() -> None:
         if not proc.stderr:
             return
-        for line in proc.stderr:
-            stderr_lines.append(line.strip())
-            m = re.search(r"DevTools listening on ws://[^:]+:(\d+)/", line)
-            if m and not port_holder["port"]:
-                port_holder["port"] = int(m.group(1))
-            if len(stderr_lines) > 40:
-                del stderr_lines[: len(stderr_lines) - 40]
+        try:
+            for line in proc.stderr:
+                stderr_lines.append(line.strip())
+                m = re.search(r"DevTools listening on ws://[^:]+:(\d+)/", line)
+                if m and not port_holder["port"]:
+                    port_holder["port"] = int(m.group(1))
+                if len(stderr_lines) > 40:
+                    del stderr_lines[: len(stderr_lines) - 40]
+        except Exception:  # noqa: BLE001
+            pass
 
     threading.Thread(target=read_stderr, daemon=True).start()
 
-    deadline = time.monotonic() + 12.0
+    deadline = time.monotonic() + 15.0
     port_file = user_data / "DevToolsActivePort"
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             err_tail = " | ".join(stderr_lines[-5:])
+            _kill_proc_tree(proc)
             shutil.rmtree(user_data, ignore_errors=True)
             raise BrowserError(f"Браузер сразу завершился (код {proc.returncode}): {err_tail}")
         if port_holder["port"]:
@@ -923,7 +1042,7 @@ def _launch_headless_chromium(executable: str, width: int, height: int) -> Tuple
                 pass
         time.sleep(0.1)
 
-    proc.terminate()
+    _kill_proc_tree(proc)
     shutil.rmtree(user_data, ignore_errors=True)
     raise BrowserError("Таймаут запуска headless-браузера CDP")
 
@@ -996,22 +1115,32 @@ class BrowserSession:
         try:
             ws_url = _find_page_ws_url(port)
             cdp = CDPClient(ws_url)
-            cdp.call("Page.enable")
-            cdp.call("Runtime.enable")
-            cdp.call("Network.enable")
+            cdp.call("Page.enable", timeout=10.0)
+            cdp.call("Runtime.enable", timeout=10.0)
+            cdp.call("Network.enable", timeout=10.0)
             cdp.call(
                 "Emulation.setDeviceMetricsOverride",
                 {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": width <= 500},
+                timeout=10.0,
             )
         except Exception:
-            proc.terminate()
+            _kill_proc_tree(proc)
             shutil.rmtree(user_data, ignore_errors=True)
             raise
         return cls(cdp=cdp, proc=proc, user_data_dir=user_data, width=width, height=height)
 
+    def is_alive(self) -> bool:
+        if self.cdp is None or self.cdp._ws.closed:
+            return False
+        if self.proc is not None and self.proc.poll() is not None:
+            return False
+        return True
+
     def ensure_cdp(self) -> CDPClient:
-        if not self.cdp:
-            raise BrowserError("Браузерная сессия не запущена")
+        if not self.cdp or self.cdp._ws.closed:
+            raise BrowserError("Браузерная сессия не запущена или соединение оборвалось")
+        if self.proc is not None and self.proc.poll() is not None:
+            raise BrowserError("Процесс браузера завершился неожиданно")
         return self.cdp
 
     def set_viewport(self, width: int, height: int) -> None:
@@ -1020,37 +1149,67 @@ class BrowserSession:
         self.ensure_cdp().call(
             "Emulation.setDeviceMetricsOverride",
             {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": width <= 500},
+            timeout=10.0,
         )
 
     def navigate(self, url: str, wait_ms: int = 450) -> None:
         cdp = self.ensure_cdp()
         cdp.clear_telemetry()
-        cdp.call("Page.navigate", {"url": url})
-        deadline = time.monotonic() + 12.0
+        nav_res = cdp.call("Page.navigate", {"url": url}, timeout=12.0)
+        if nav_res.get("errorText"):
+            raise BrowserError(f"Браузер не смог открыть {url}: {nav_res['errorText']}")
+        start = time.monotonic()
+        deadline = start + 10.0
+        interactive_since: Optional[float] = None
         while time.monotonic() < deadline:
+            remaining = max(0.5, deadline - time.monotonic())
             try:
-                state = cdp.evaluate("document.readyState", await_promise=False)
-                if state in ("interactive", "complete"):
-                    if state == "complete":
+                state = cdp.evaluate(
+                    "document.readyState",
+                    await_promise=False,
+                    timeout=min(2.5, remaining),
+                )
+                if state == "complete":
+                    break
+                if state == "interactive":
+                    if interactive_since is None:
+                        interactive_since = time.monotonic()
+                    # Если DOM уже готов > 2.5с (например, завис внешний шрифт/аналитика), продолжаем.
+                    elif time.monotonic() - interactive_since >= 2.5:
                         break
             except BrowserError:
                 pass
-            time.sleep(0.12)
+            time.sleep(0.15)
         if wait_ms > 0:
             time.sleep(min(wait_ms, 5000) / 1000.0)
         self.current_url = url
 
     def capture_screenshot(self) -> str:
-        res = self.ensure_cdp().call(
-            "Page.captureScreenshot",
-            {"format": "jpeg", "quality": 78, "fromSurface": True},
-        )
-        b64 = str(res.get("data") or "")
-        return f"data:image/jpeg;base64,{b64}" if b64 else ""
+        try:
+            res = self.ensure_cdp().call(
+                "Page.captureScreenshot",
+                {"format": "jpeg", "quality": 76, "fromSurface": True, "optimizeForSpeed": True},
+                timeout=10.0,
+            )
+            b64 = str(res.get("data") or "")
+            return f"data:image/jpeg;base64,{b64}" if b64 else ""
+        except BrowserError:
+            # Не обваливаем весь шаг browse_project, если рендер скриншота задержался.
+            return ""
 
     def audit(self) -> Dict[str, Any]:
         cdp = self.ensure_cdp()
-        dom_audit = cdp.evaluate(AUDIT_JS, await_promise=False) or {}
+        dom_audit: Dict[str, Any] = {}
+        for attempt in range(2):
+            try:
+                dom_audit = cdp.evaluate(AUDIT_JS, await_promise=False, timeout=12.0) or {}
+                break
+            except BrowserError as err:
+                msg = str(err).lower()
+                if attempt == 0 and ("context" in msg or "destroyed" in msg or "navigation" in msg):
+                    time.sleep(0.35)
+                    continue
+                raise
         telemetry = cdp.snapshot_telemetry()
         return {
             "dom": dom_audit,
@@ -1058,25 +1217,18 @@ class BrowserSession:
         }
 
     def close(self) -> None:
-        for srv in self.static_servers.values():
-            srv.close()
-        self.static_servers.clear()
         if self.cdp:
             try:
                 self.cdp.close()
             except Exception:  # noqa: BLE001
                 pass
             self.cdp = None
-        if self.proc:
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=3)
-            except Exception:  # noqa: BLE001
-                try:
-                    self.proc.kill()
-                except Exception:  # noqa: BLE001
-                    pass
-            self.proc = None
+        # Сначала завершаем дерево процессов браузера, чтобы отпустить HTTP keep-alive и lock-файлы.
+        _kill_proc_tree(self.proc)
+        self.proc = None
+        for srv in self.static_servers.values():
+            srv.close()
+        self.static_servers.clear()
         if self.user_data_dir and self.user_data_dir.exists():
             shutil.rmtree(self.user_data_dir, ignore_errors=True)
             self.user_data_dir = None
@@ -1091,11 +1243,20 @@ class BrowserSessionManager:
         self._sessions: Dict[str, BrowserSession] = {}
 
     def get_or_create(self, session_id: str, width: int, height: int) -> BrowserSession:
+        stale: Optional[BrowserSession] = None
+        preserved_origins: set[str] = set()
         with self._lock:
             session = self._sessions.get(session_id)
             if session is not None:
-                return session
+                if session.is_alive():
+                    return session
+                stale = self._sessions.pop(session_id, None)
+                preserved_origins = set(session.approved_external_origins)
+        if stale is not None:
+            stale.close()
         created = BrowserSession.launch(width=width, height=height)
+        if preserved_origins:
+            created.approved_external_origins.update(preserved_origins)
         with self._lock:
             self._sessions[session_id] = created
         return created
@@ -1396,8 +1557,15 @@ def execute_browse_action(
             raise BrowserError("Сначала откройте проект: browse_project(action='open', url='...' или sandbox_project='...')")
 
     cdp = session.ensure_cdp()
+    known_actions = ("resize", "click", "hover", "type", "press", "scroll", "wait", "inspect_animations", "evaluate")
+    if raw_action not in known_actions:
+        raise BrowserError(
+            f"Неизвестное действие '{raw_action}'. Доступно: open, click, hover, type, press, scroll, resize, wait, inspect_animations, evaluate, close"
+        )
+
     action_note = ""
-    before_audit = session.audit()
+    delta_actions = ("click", "hover", "scroll", "wait", "inspect_animations", "resize")
+    before_audit = session.audit() if raw_action in delta_actions else {}
     delta: Optional[Dict[str, Any]] = None
     extra_shots: List[str] = []
     eval_result: Any = None
@@ -1411,7 +1579,10 @@ def execute_browse_action(
         selector = str(args.get("selector") or "").strip()
         text_q = str(args.get("text") or "").strip()
         if args.get("x") is not None and args.get("y") is not None:
-            tx, ty = int(args["x"]), int(args["y"])
+            try:
+                tx, ty = int(args["x"]), int(args["y"])
+            except (TypeError, ValueError) as err:
+                raise BrowserError("Координаты x и y должны быть числами") from err
             target_desc = f"({tx}, {ty})"
         else:
             loc = cdp.evaluate(_js_locate_element(selector, text_q), await_promise=False) or {}
@@ -1470,7 +1641,10 @@ def execute_browse_action(
                 raise BrowserError(str(loc["error"]))
             action_note = f"Прокрутка к {selector}"
         elif args.get("scroll_y") is not None:
-            sy = int(args["scroll_y"])
+            try:
+                sy = int(args["scroll_y"])
+            except (TypeError, ValueError) as err:
+                raise BrowserError("scroll_y должен быть числом") from err
             cdp.evaluate(f"window.scrollTo({{ top: {sy}, behavior: 'smooth' }})", await_promise=False)
             action_note = f"Прокрутка к y={sy}px"
         else:
@@ -1504,11 +1678,6 @@ def execute_browse_action(
             raise BrowserError("Для action='evaluate' укажите script")
         eval_result = cdp.evaluate(script[:8000], await_promise=True)
         action_note = "Выполнен инспектирующий скрипт"
-
-    else:
-        raise BrowserError(
-            f"Неизвестное действие '{raw_action}'. Доступно: open, click, hover, type, press, scroll, resize, wait, inspect_animations, evaluate, close"
-        )
 
     audit_data = session.audit()
     if raw_action in ("click", "hover", "scroll", "wait", "inspect_animations", "resize"):
