@@ -88,6 +88,23 @@ FORBIDDEN_EXPORT_HOME_DIRS = {".ssh", ".gnupg", ".aws", ".kube", ".docker", ".gi
 MAX_OUTPUT_CHARS = 18_000
 MAX_SANDBOX_FILE_BYTES = 2_000_000
 MAX_LIST_ITEMS = 500
+TREE_SKIP_DIRS = frozenset({
+    ".git",
+    "node_modules",
+    ".next",
+    ".nuxt",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".cache",
+    ".turbo",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+    "coverage",
+})
 
 
 class SandboxError(RuntimeError):
@@ -215,7 +232,37 @@ def list_tree(root: Path, rel_path: str = ".", *, unlimited: bool = False) -> Di
     root_resolved = root.resolve(strict=False)
     base = safe_resolve(root_resolved, rel_path, allow_root=True)
     if not base.exists():
-        return {"root": str(root_resolved), "items": [], "projects": []}
+        return {"root": str(root_resolved), "items": [], "projects": [], "totalItems": 0, "truncated": False}
+
+    base_rel_parts = set(relative_to_root(root_resolved, base).split("/")) if base != root_resolved else set()
+    skip_heavy = not bool(base_rel_parts & TREE_SKIP_DIRS)
+
+    def _walk_entries(start_dir: Path) -> List[Path]:
+        collected: List[Path] = []
+        for current, dirs, files in os.walk(start_dir, followlinks=False):
+            cur_path = Path(current)
+            filtered_dirs: List[str] = []
+            for d in sorted(dirs, key=str.lower):
+                if d.startswith(".tmp"):
+                    continue
+                cand = cur_path / d
+                if not _is_safe_non_escaping_entry(root_resolved, cand):
+                    continue
+                if skip_heavy and d in TREE_SKIP_DIRS:
+                    collected.append(cand)
+                    continue
+                filtered_dirs.append(d)
+            dirs[:] = filtered_dirs
+            for name in sorted(filtered_dirs + files, key=str.lower):
+                if name.startswith(".tmp"):
+                    continue
+                entry = cur_path / name
+                if entry in collected:
+                    continue
+                if _is_safe_non_escaping_entry(root_resolved, entry):
+                    collected.append(entry)
+        collected.sort(key=lambda p: str(p).lower())
+        return collected
 
     items: List[Dict[str, Any]] = []
     projects: List[Dict[str, Any]] = []
@@ -225,17 +272,23 @@ def list_tree(root: Path, rel_path: str = ".", *, unlimited: bool = False) -> Di
             if child.name.startswith("."):
                 continue
             if child.is_dir():
-                file_count = sum(1 for p in child.rglob("*") if p.is_file())
+                file_count = 0
+                for _, dnames, fnames in os.walk(child, followlinks=False):
+                    dnames[:] = [d for d in dnames if not d.startswith(".tmp") and d not in TREE_SKIP_DIRS]
+                    file_count += len(fnames)
                 projects.append({"name": child.name, "files": file_count})
 
-    for entry in sorted(base.rglob("*"), key=lambda p: str(p).lower()):
-        if not _is_safe_non_escaping_entry(root_resolved, entry):
-            continue
+    entries = [base] if base.is_file() else _walk_entries(base)
+    total_items = 0
+    truncated = False
+    for entry in entries:
         rel = relative_to_root(root_resolved, entry)
         if rel.startswith(".tmp"):
             continue
+        total_items += 1
         if not unlimited and len(items) >= MAX_LIST_ITEMS:
-            break
+            truncated = True
+            continue
         items.append({
             "path": rel,
             "type": "dir" if entry.is_dir() else "file",
@@ -246,6 +299,8 @@ def list_tree(root: Path, rel_path: str = ".", *, unlimited: bool = False) -> Di
         "root": str(root_resolved),
         "items": items,
         "projects": projects,
+        "totalItems": total_items,
+        "truncated": truncated,
     }
 
 

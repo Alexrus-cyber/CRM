@@ -101,6 +101,7 @@ export async function POST(req: Request) {
         ragFull?: boolean;
         ragChunks?: number;
         contextLimit?: number;
+        modelContextLength?: number | null;
         githubEnabled?: boolean;
         githubOwner?: string;
         githubRepo?: string;
@@ -136,79 +137,16 @@ export async function POST(req: Request) {
     };
   });
 
-  // RAG-окружение без искусственных ограничений: вся база или топ-N фрагментов.
-  const ragFolderId = Number(body?.ragFolderId ?? 0) || 0;
-  const ragFull = Boolean(body?.ragFull);
-  const rawRagChunks = Number(body?.ragChunks ?? 8);
-  const ragChunks = unlimitedSteps
-    ? Math.max(0, Number.isFinite(rawRagChunks) ? Math.floor(rawRagChunks) : 8)
-    : Math.max(0, Math.min(500, Number.isFinite(rawRagChunks) ? Math.floor(rawRagChunks) : 8));
-  const contextLimit = Math.max(0, Number(body?.contextLimit ?? 0) || 0);
-
-  let ragContext = "";
-  let ragMeta: { folderName: string; hits: number; totalChunks: number; ragFull: boolean; truncated: boolean } | null =
-    null;
-
-  if (ragFolderId > 0 && (ragFull || ragChunks > 0)) {
-    const folder = await getRagFolder(me.id, ragFolderId);
-    if (folder) {
-      const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
-      if (ragFull) {
-        const chunks = await listRagChunks(ragFolderId, unlimitedSteps ? 500_000 : 50_000);
-        if (chunks.length > 0) {
-          const relevant = lastUser ? await searchRagChunks(ragFolderId, lastUser, chunks.length) : [];
-          const seen = new Set<number>();
-          const ordered: Array<{ id: number; path: string; text: string; score: number }> = [];
-          for (const hit of relevant) {
-            if (seen.has(hit.id)) continue;
-            seen.add(hit.id);
-            ordered.push(hit);
-          }
-          for (const chunk of chunks) {
-            if (seen.has(chunk.id)) continue;
-            seen.add(chunk.id);
-            ordered.push({ ...chunk, score: 0 });
-          }
-          const usedTokens = messages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
-          const budgetChars =
-            contextLimit > 0
-              ? ragBudgetChars(contextLimit, usedTokens, 1024, unlimitedSteps)
-              : unlimitedSteps
-                ? Number.MAX_SAFE_INTEGER
-                : RAG_FULL_MAX_CHARS;
-          const packed = formatFullRagContext(ordered, budgetChars);
-          if (packed.used > 0) {
-            ragContext = packed.text;
-            ragMeta = {
-              folderName: folder.name,
-              hits: packed.used,
-              totalChunks: ordered.length,
-              ragFull: true,
-              truncated: packed.truncated,
-            };
-          }
-        }
-      } else if (lastUser.trim()) {
-        const hits = await searchRagChunks(ragFolderId, lastUser, ragChunks);
-        if (hits.length > 0) {
-          const maxChars =
-            contextLimit > 0
-              ? ragBudgetChars(contextLimit, 0, 1024, unlimitedSteps)
-              : unlimitedSteps
-                ? Number.MAX_SAFE_INTEGER
-                : RAG_FULL_MAX_CHARS;
-          ragContext = formatRagContext(hits, maxChars);
-          ragMeta = {
-            folderName: folder.name,
-            hits: hits.length,
-            totalChunks: folder.chunksCount,
-            ragFull: false,
-            truncated: false,
-          };
-        }
-      }
-    }
-  }
+  const params = normalizeGenParams(body?.params, { unlimited: unlimitedSteps });
+  const maxSteps = resolveStepsForRole(me.role, body?.maxSteps, unlimitedSteps ? 0 : AGENT_MAX_STEPS);
+  const trustLevel = normalizeTrustLevel(body?.trustLevel);
+  const runId = typeof body?.runId === "string" && body.runId.trim() ? body.runId.trim().slice(0, 80) : undefined;
+  const systemPrompt =
+    typeof body?.systemPrompt === "string"
+      ? unlimitedSteps
+        ? body.systemPrompt.trim()
+        : body.systemPrompt.trim().slice(0, 12_000)
+      : "";
 
   // Персональный GitHub-контекст и RAG по выбранному репозиторию текущего пользователя CRM.
   const ghConn = await getGithubConnectionWithSecret(me.id).catch(() => null);
@@ -258,16 +196,96 @@ export async function POST(req: Request) {
     }
   }
 
-  const params = normalizeGenParams(body?.params, { unlimited: unlimitedSteps });
-  const maxSteps = resolveStepsForRole(me.role, body?.maxSteps, unlimitedSteps ? 0 : AGENT_MAX_STEPS);
-  const trustLevel = normalizeTrustLevel(body?.trustLevel);
-  const runId = typeof body?.runId === "string" && body.runId.trim() ? body.runId.trim().slice(0, 80) : undefined;
-  const systemPrompt =
-    typeof body?.systemPrompt === "string"
-      ? unlimitedSteps
-        ? body.systemPrompt.trim()
-        : body.systemPrompt.trim().slice(0, 12_000)
-      : "";
+  // RAG-окружение с учётом реального бюджета: история + системный промпт + инструменты + max_tokens.
+  const ragFolderId = Number(body?.ragFolderId ?? 0) || 0;
+  const ragFull = Boolean(body?.ragFull);
+  const rawRagChunks = Number(body?.ragChunks ?? 8);
+  const ragChunks = unlimitedSteps
+    ? Math.max(0, Number.isFinite(rawRagChunks) ? Math.floor(rawRagChunks) : 8)
+    : Math.max(0, Math.min(500, Number.isFinite(rawRagChunks) ? Math.floor(rawRagChunks) : 8));
+  const contextLimit = Math.max(0, Math.floor(Number(body?.contextLimit ?? 0) || 0));
+  const modelContextLength = Math.max(0, Math.floor(Number(body?.modelContextLength ?? 0) || 0));
+  const effectiveContextLimit =
+    contextLimit > 0
+      ? modelContextLength > 0
+        ? Math.min(contextLimit, modelContextLength)
+        : contextLimit
+      : modelContextLength;
+
+  let ragContext = "";
+  let ragMeta: { folderName: string; hits: number; totalChunks: number; ragFull: boolean; truncated: boolean } | null =
+    null;
+
+  if (ragFolderId > 0 && (ragFull || ragChunks > 0)) {
+    const folder = await getRagFolder(me.id, ragFolderId);
+    if (folder) {
+      const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+      const historyTokens = messages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
+      const overheadTokens =
+        6_000 +
+        estimateTokens(systemPrompt) +
+        estimateTokens(githubRagContext) +
+        attachments.reduce((sum, a) => sum + estimateTokens(a.text) + (a.image ? 1500 : 0), 0);
+      const requestedCompletion = params.maxTokens ?? 4_096;
+      const completionReserve =
+        effectiveContextLimit > 0
+          ? Math.min(requestedCompletion, Math.max(1_024, Math.floor(effectiveContextLimit * 0.75)))
+          : Math.min(requestedCompletion, 32_768);
+      const safetyTokens =
+        effectiveContextLimit > 0 ? Math.max(2_048, Math.floor(effectiveContextLimit * 0.08)) : 2_048;
+      const ragReserveTokens = overheadTokens + completionReserve + safetyTokens;
+
+      if (ragFull) {
+        const chunks = await listRagChunks(ragFolderId, unlimitedSteps ? 500_000 : 50_000);
+        if (chunks.length > 0) {
+          const relevant = lastUser ? await searchRagChunks(ragFolderId, lastUser, chunks.length) : [];
+          const seen = new Set<number>();
+          const ordered: Array<{ id: number; path: string; text: string; score: number }> = [];
+          for (const hit of relevant) {
+            if (seen.has(hit.id)) continue;
+            seen.add(hit.id);
+            ordered.push(hit);
+          }
+          for (const chunk of chunks) {
+            if (seen.has(chunk.id)) continue;
+            seen.add(chunk.id);
+            ordered.push({ ...chunk, score: 0 });
+          }
+          const budgetChars =
+            effectiveContextLimit > 0
+              ? ragBudgetChars(effectiveContextLimit, historyTokens, ragReserveTokens, unlimitedSteps)
+              : RAG_FULL_MAX_CHARS;
+          const packed = formatFullRagContext(ordered, budgetChars);
+          if (packed.used > 0) {
+            ragContext = packed.text;
+            ragMeta = {
+              folderName: folder.name,
+              hits: packed.used,
+              totalChunks: ordered.length,
+              ragFull: true,
+              truncated: packed.truncated,
+            };
+          }
+        }
+      } else if (lastUser.trim()) {
+        const hits = await searchRagChunks(ragFolderId, lastUser, ragChunks);
+        if (hits.length > 0) {
+          const maxChars =
+            effectiveContextLimit > 0
+              ? ragBudgetChars(effectiveContextLimit, historyTokens, ragReserveTokens, unlimitedSteps)
+              : Math.min(RAG_FULL_MAX_CHARS, Math.max(24_000, ragChunks * 2_400));
+          ragContext = formatRagContext(hits, maxChars);
+          ragMeta = {
+            folderName: folder.name,
+            hits: hits.length,
+            totalChunks: folder.chunksCount,
+            ragFull: false,
+            truncated: false,
+          };
+        }
+      }
+    }
+  }
 
   const savedSettings = await getAiUserSettingsSecret(me.id).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
   const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl || savedSettings.baseUrl || "") ?? undefined;
@@ -297,6 +315,8 @@ export async function POST(req: Request) {
     maxSteps,
     unlimited: unlimitedSteps,
     trustLevel,
+    ...(contextLimit > 0 ? { contextLimit } : {}),
+    ...(modelContextLength > 0 ? { modelContextLength } : {}),
     ...(runId ? { runId } : {}),
     settings: {
       baseUrl,
@@ -407,12 +427,18 @@ export async function POST(req: Request) {
         return `event: ${ev}\ndata: ${JSON.stringify(parsed)}\n\n`;
       } else if (ev === "done" && parsed.usage && typeof parsed.usage === "object") {
         const u = parsed.usage as Record<string, unknown>;
-        reportedPrompt = Math.max(reportedPrompt, Math.round(Number(u.prompt_tokens ?? u.promptTokens ?? 0) || 0));
+        reportedPrompt = Math.max(
+          reportedPrompt,
+          Math.round(Number(u.prompt_tokens ?? u.promptTokens ?? u.prompt ?? 0) || 0),
+        );
         reportedCompletion = Math.max(
           reportedCompletion,
-          Math.round(Number(u.completion_tokens ?? u.completionTokens ?? 0) || 0),
+          Math.round(Number(u.completion_tokens ?? u.completionTokens ?? u.completion ?? 0) || 0),
         );
-        reportedTotal = Math.max(reportedTotal, Math.round(Number(u.total_tokens ?? u.totalTokens ?? 0) || 0));
+        reportedTotal = Math.max(
+          reportedTotal,
+          Math.round(Number(u.total_tokens ?? u.totalTokens ?? u.total ?? 0) || 0),
+        );
       }
     } catch {
       /* ignore malformed SSE frame */

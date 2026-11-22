@@ -1932,6 +1932,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           ragFull: ragPrefs.ragFull,
           ragChunks: ragPrefs.ragChunks,
           contextLimit,
+          ...(modelCapabilities?.contextLength ? { modelContextLength: modelCapabilities.contextLength } : {}),
           ...(ghAccount && ghAccount.enabled && ghAccount.selectedOwner && ghAccount.selectedRepo
             ? {
                 githubEnabled: true,

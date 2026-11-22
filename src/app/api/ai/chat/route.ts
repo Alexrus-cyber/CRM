@@ -13,7 +13,7 @@ import {
   searchRagChunks,
   type AiChatRow,
 } from "@/db/repo";
-import { formatFullRagContext, formatRagContext, ragBudgetChars, type FullRagContext } from "@/lib/rag";
+import { RAG_FULL_MAX_CHARS, formatFullRagContext, formatRagContext, ragBudgetChars, type FullRagContext } from "@/lib/rag";
 import { aiPolicyFor, formatTokenCount, reasoningAllowed, type AiRolePolicy } from "@/lib/aiPolicy";
 import {
   AI_DEFAULT_BASE_URL,
@@ -162,6 +162,125 @@ function readDelta(chunk: UpstreamChunk): string {
 function readReasoning(chunk: UpstreamChunk): string {
   const choice = chunk.choices?.[0];
   return choice?.delta?.reasoning_content ?? choice?.delta?.reasoning ?? choice?.message?.reasoning_content ?? "";
+}
+
+function adaptBodyOnContextOverflow(
+  body: Record<string, unknown>,
+  rawError: string,
+): Record<string, unknown> | null {
+  const lower = rawError.toLowerCase();
+  const maxTokOnly =
+    /(?:max_tokens|max_output_tokens|completion\s*tokens)/i.test(lower) &&
+    /(?:at\s+most|must\s+be\s*<=|too\s+large|exceed|range|limit)/i.test(lower);
+  const isOverflow =
+    /maximum\s+context\s+length|context[_ ]length[_ ]exceeded|context\s+(?:window|limit|size)|available\s+context\s+size|prompt\s+is\s+too\s+long|too\s+many\s+tokens|reduce\s+the\s+length|in\s+the\s+messages.*in\s+the\s+completion/i.test(
+      lower,
+    );
+  if (!isOverflow && !maxTokOnly) return null;
+
+  const next: Record<string, unknown> = { ...body };
+  const msgs = Array.isArray(body.messages) ? [...(body.messages as AiMessage[])] : [];
+  next.messages = msgs;
+
+  const firstInt = (patterns: RegExp[]): number | null => {
+    for (const pat of patterns) {
+      const m = rawError.match(pat);
+      if (m?.[1]) {
+        const parsed = Number(m[1].replace(/,/g, ""));
+        if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+      }
+    }
+    return null;
+  };
+
+  if (maxTokOnly && !isOverflow) {
+    const cap =
+      firstInt([
+        /supports\s+at\s+most\s+(\d[\d,]*)/i,
+        /(?:max_tokens|max_output_tokens)\s*(?:must\s+be\s*<=?|cannot\s+exceed|limit\s*(?:is|:)?)\s*(\d[\d,]*)/i,
+        /range\s*\[\s*\d+\s*,\s*(\d[\d,]*)\s*\]/i,
+      ]) ?? (typeof next.max_tokens === "number" ? Math.max(1024, Math.floor(next.max_tokens / 2)) : 8192);
+    if (typeof next.max_tokens === "number" && next.max_tokens > cap) {
+      const clamped = Math.max(256, cap);
+      next.max_tokens = clamped;
+      if (typeof next.thinking_budget === "number" && next.thinking_budget >= clamped) {
+        next.thinking_budget = Math.max(256, Math.floor(clamped / 2));
+      }
+      return next;
+    }
+    return null;
+  }
+
+  const maxCtx = firstInt([
+    /maximum\s+context\s+length\s+is\s+(\d[\d,]*)/i,
+    /context\s+(?:length|limit|window|size)\s*(?:is|of|:)?\s*(\d[\d,]*)/i,
+    /available\s+context\s+size\s*\((\d[\d,]*)\s*tokens?\)/i,
+  ]);
+  const msgTokens = firstInt([
+    /(\d[\d,]*)\s*in\s+the\s+messages/i,
+    /messages\s+resulted\s+in\s+(\d[\d,]*)\s*tokens?/i,
+    /prompt\s+is\s+too\s+long:\s*(\d[\d,]*)\s*tokens?/i,
+  ]);
+
+  let changed = false;
+  if (maxCtx && msgTokens) {
+    const margin = Math.max(256, Math.min(2048, Math.floor(maxCtx / 64)));
+    const avail = maxCtx - msgTokens - margin;
+    if (avail >= 1024 && typeof next.max_tokens === "number" && next.max_tokens > avail) {
+      next.max_tokens = avail;
+      if (typeof next.thinking_budget === "number" && next.thinking_budget >= avail) {
+        next.thinking_budget = Math.max(256, Math.floor(avail / 2));
+      }
+      return next;
+    }
+  }
+
+  if (typeof next.max_tokens === "number" && next.max_tokens > 4096) {
+    const clamped = Math.max(2048, Math.floor(next.max_tokens / 3));
+    next.max_tokens = clamped;
+    if (typeof next.thinking_budget === "number" && next.thinking_budget >= clamped) {
+      next.thinking_budget = Math.max(256, Math.floor(clamped / 2));
+    }
+    changed = true;
+  }
+
+  const estNow = estimatePromptTokens(msgs);
+  const targetTokens = maxCtx
+    ? Math.max(512, maxCtx - (typeof next.max_tokens === "number" ? next.max_tokens : 4096) - 1024)
+    : Math.max(512, Math.floor(estNow * 0.65));
+
+  const targetEst =
+    msgTokens && msgTokens > estNow && estNow > 0
+      ? Math.max(512, Math.floor(targetTokens * (estNow / msgTokens) * 0.9))
+      : targetTokens;
+
+  while (estimatePromptTokens(msgs) > targetEst) {
+    const nonSysIdx = msgs.findIndex((m) => m.role !== "system");
+    const nonSysCount = msgs.filter((m) => m.role !== "system").length;
+    if (nonSysIdx >= 0 && nonSysCount > 1) {
+      msgs.splice(nonSysIdx, 1);
+      changed = true;
+      continue;
+    }
+    const ragIdx = msgs.findIndex(
+      (m) => m.role === "system" && typeof m.content === "string" && m.content.includes("(RAG)"),
+    );
+    if (ragIdx >= 0) {
+      const content = String(msgs[ragIdx].content);
+      const shrinkTo = Math.max(500, Math.floor(content.length * 0.6));
+      if (shrinkTo < content.length) {
+        msgs[ragIdx] = {
+          role: "system",
+          content: `${content.slice(0, shrinkTo)}\n...[RAG сокращён под лимит контекста модели]`,
+        };
+        changed = true;
+        continue;
+      }
+    }
+    break;
+  }
+
+  return changed ? next : null;
 }
 
 function describeUpstreamError(status: number, body: string): string {
@@ -357,12 +476,20 @@ export async function POST(req: Request) {
             ordered.push({ ...chunk, score: 0 });
           }
 
-          // Сколько уже занято: история без системного промпта + сам промпт.
+          // Сколько уже занято: история без системного промпта + сам промпт + запас на ответ.
           const usedTokens =
             estimatePromptTokens(messages.filter((message) => message.role !== "system")) +
             (params.system.trim() ? estimateTokens(params.system) : 0);
-          const reserve = params.maxTokens ?? RAG_FULL_RESERVE_TOKENS;
-          const budgetChars = ragBudgetChars(params.contextLimit, usedTokens, reserve, unlimited);
+          const completionReserve =
+            params.contextLimit > 0
+              ? Math.min(params.maxTokens ?? RAG_FULL_RESERVE_TOKENS, Math.max(1_024, Math.floor(params.contextLimit * 0.75)))
+              : Math.min(params.maxTokens ?? RAG_FULL_RESERVE_TOKENS, 32_768);
+          const safetyTokens =
+            params.contextLimit > 0 ? Math.max(1_024, Math.floor(params.contextLimit * 0.08)) : 1_024;
+          const budgetChars =
+            params.contextLimit > 0
+              ? ragBudgetChars(params.contextLimit, usedTokens, completionReserve + safetyTokens, unlimited)
+              : RAG_FULL_MAX_CHARS;
           const packed = formatFullRagContext(ordered, budgetChars);
           if (packed.used > 0) {
             ragContext = packed.text;
@@ -373,7 +500,10 @@ export async function POST(req: Request) {
       } else if (query) {
         const hits = await searchRagChunks(ragFolderId, query, params.ragChunks);
         if (hits.length > 0) {
-          ragContext = formatRagContext(hits, unlimited ? Number.MAX_SAFE_INTEGER : MAX_RAG_CONTEXT_CHARS);
+          const maxChars = unlimited
+            ? Math.min(RAG_FULL_MAX_CHARS, Math.max(24_000, params.ragChunks * 2_400))
+            : MAX_RAG_CONTEXT_CHARS;
+          ragContext = formatRagContext(hits, maxChars);
           ragHits = hits.length;
         }
       }
@@ -394,7 +524,7 @@ export async function POST(req: Request) {
     return Response.json({ error: "Пустой запрос" }, { status: 400 });
   }
   const trimmed = unlimited ? messages : messages.slice(-AI_MAX_CONTEXT_MESSAGES);
-  const estimatedPrompt = estimatePromptTokens(trimmed);
+  let estimatedPrompt = estimatePromptTokens(trimmed);
 
   /**
    * Фиксирует ход в базе: сообщения, расход токенов, счётчик чата.
@@ -451,30 +581,45 @@ export async function POST(req: Request) {
   const timeout = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS);
   const signal = typeof AbortSignal.any === "function" ? AbortSignal.any([req.signal, timeout]) : timeout;
 
-  let upstream: Response;
-  try {
-    upstream = await safeAiFetch(aiEndpoint(baseUrl, "/chat/completions"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...aiAuthHeaders(apiKey) },
-      body: JSON.stringify(buildUpstreamBody(model, trimmed, params)),
-      signal,
-      cache: "no-store",
-    });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    return Response.json(
-      {
-        error:
-          `Не удалось подключиться к ${baseUrl}. Проверьте, что локальный сервер запущен ` +
-          `и адрес совпадает с baseURL (${reason}).`,
-      },
-      { status: 502 },
-    );
+  let currentBody = buildUpstreamBody(model, trimmed, params);
+  let upstream: Response | null = null;
+  let lastErrorBody = "";
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      upstream = await safeAiFetch(aiEndpoint(baseUrl, "/chat/completions"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...aiAuthHeaders(apiKey) },
+        body: JSON.stringify(currentBody),
+        signal,
+        cache: "no-store",
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return Response.json(
+        {
+          error:
+            `Не удалось подключиться к ${baseUrl}. Проверьте, что локальный сервер запущен ` +
+            `и адрес совпадает с baseURL (${reason}).`,
+        },
+        { status: 502 },
+      );
+    }
+    if (upstream.ok) break;
+    lastErrorBody = await upstream.text().catch(() => "");
+    if (upstream.status !== 400 || attempt >= 2) break;
+    const adapted = adaptBodyOnContextOverflow(currentBody, lastErrorBody);
+    if (!adapted) break;
+    currentBody = adapted;
+    if (Array.isArray(currentBody.messages)) {
+      estimatedPrompt = estimatePromptTokens(currentBody.messages as AiMessage[]);
+    }
   }
 
-  if (!upstream.ok) {
-    const body = await upstream.text().catch(() => "");
-    return Response.json({ error: describeUpstreamError(upstream.status, body) }, { status: 502 });
+  if (!upstream || !upstream.ok) {
+    return Response.json(
+      { error: describeUpstreamError(upstream?.status ?? 502, lastErrorBody) },
+      { status: 502 },
+    );
   }
 
   const contentType = upstream.headers.get("content-type") ?? "";
