@@ -305,6 +305,7 @@ QA_TOOL_NAMES = {t["function"]["name"] for t in QA_TOOLS}
 
 SKIP_REVIEW_DIRS = sandbox_mod.TREE_SKIP_DIRS | {"__pycache__", ".venv", "venv"}
 STATIC_EXTENSIONS_MAX_BYTES = 512_000
+_LOCAL_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class QaToolError(Exception):
@@ -639,7 +640,14 @@ def run_qa_http_audit(
             started = time.monotonic()
             try:
                 req = urllib.request.Request(full_url, data=req_data, headers=req_headers, method=req_method)
-                with urllib.request.urlopen(req, timeout=req_timeout) as resp:
+                parsed_full = urlparse(full_url)
+                host_low = (parsed_full.hostname or "").strip().lower().strip("[]")
+                open_fn = (
+                    _LOCAL_HTTP_OPENER.open
+                    if host_low in ("127.0.0.1", "localhost", "::1")
+                    else urllib.request.urlopen
+                )
+                with open_fn(req, timeout=req_timeout) as resp:
                     resp_body = resp.read(64_000).decode("utf-8", "replace")
                     elapsed_ms = int((time.monotonic() - started) * 1000)
                     ctype = str(resp.headers.get("Content-Type") or "")
@@ -813,6 +821,7 @@ def run_qa_tool(
     report_sink: Optional[Dict[str, Any]] = None,
     checks_sink: Optional[List[Dict[str, Any]]] = None,
     unlimited: bool = False,
+    tester_run_key: str = "",
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Выполняет один QA-инструмент Тестировщика."""
     args = args or {}
@@ -890,18 +899,43 @@ def run_qa_tool(
             esc = sandbox_mod.inspect_command_escape(cmd, sandbox_root, cwd_rel)
             if esc:
                 raise QaToolError(esc)
-            if trust == "verified":
-                if approval_fn is None:
-                    raise QaToolError("Требуется подтверждение пользователя для запуска тестовой команды")
-                decision = approval_fn(
-                    {
-                        "kind": "bash_command",
-                        "title": f"Разрешить Тестировщику запустить: {label}?",
-                        "description": f"Запуск QA-проверки внутри Sandbox/{cwd_rel}",
-                        "command": cmd,
-                        "cwd": cwd_rel,
-                    }
-                )
+
+        batch_approved = False
+        if trust == "verified":
+            if approval_fn is None:
+                raise QaToolError("Требуется подтверждение пользователя для запуска тестовой команды")
+            if len(cmds_to_run) > 1:
+                labels_str = ", ".join(lbl for lbl, _ in cmds_to_run)
+                combined_cmd = " && ".join(cmd for _, cmd in cmds_to_run)
+                req_payload: Dict[str, Any] = {
+                    "kind": "bash_command",
+                    "title": f"Разрешить Тестировщику выполнить {len(cmds_to_run)} проверок ({labels_str})?",
+                    "description": f"Пакетный запуск QA-проверок внутри Sandbox/{cwd_rel}",
+                    "command": combined_cmd[:2000],
+                    "cwd": cwd_rel,
+                }
+                if tester_run_key:
+                    req_payload["testerRunKey"] = tester_run_key
+                decision = approval_fn(req_payload)
+                if not decision.get("approved"):
+                    msg = f"Пользователь отклонил пакетный запуск QA-проверок ({labels_str})."
+                    if checks_sink is not None:
+                        checks_sink.append({"name": labels_str, "tool": "qa_run_tests", "status": "warn", "details": msg})
+                    return msg, events
+                batch_approved = True
+
+        for label, cmd in cmds_to_run:
+            if trust == "verified" and not batch_approved:
+                req_payload = {
+                    "kind": "bash_command",
+                    "title": f"Разрешить Тестировщику запустить: {label}?",
+                    "description": f"Запуск QA-проверки внутри Sandbox/{cwd_rel}",
+                    "command": cmd,
+                    "cwd": cwd_rel,
+                }
+                if tester_run_key:
+                    req_payload["testerRunKey"] = tester_run_key
+                decision = approval_fn(req_payload)
                 if not decision.get("approved"):
                     msg = f"Пользователь отклонил запуск QA-команды «{cmd}»."
                     outputs.append(msg)
@@ -1084,6 +1118,7 @@ def run_qa_tool(
 
         summary_lines: List[str] = []
         any_errors = False
+        no_browser_reason = ""
         try:
             for vp in ("desktop", "mobile"):
                 open_args: Dict[str, Any] = {
@@ -1103,9 +1138,13 @@ def run_qa_tool(
                         mgr, open_args, trust_level=trust, approval_fn=approval_fn
                     )
                 except (browser_inspector.BrowserError, sandbox_mod.SandboxError) as err:
+                    msg = str(err)
                     if vp == "desktop":
-                        raise QaToolError(str(err)) from err
-                    summary_lines.append(f"Mobile ({vp}): {err}")
+                        if "не найден браузер" in msg.lower():
+                            no_browser_reason = msg
+                            break
+                        raise QaToolError(msg) from err
+                    summary_lines.append(f"Mobile ({vp}): {msg}")
                     continue
                 for ev in evs:
                     if (ev.get("errorsCount") or 0) > 0 or (ev.get("issuesCount") or 0) > 0:
@@ -1115,6 +1154,55 @@ def run_qa_tool(
         finally:
             if owns_mgr:
                 mgr.close_all()
+
+        if no_browser_reason:
+            # Fallback: без установленного Chromium проверяем проект через HTTP + статический анализ, не ломая QA-цикл.
+            fallback_parts: List[str] = [f"Локальный headless-браузер недоступен ({no_browser_reason}). Выполнен fallback HTTP + статический аудит:"]
+            fb_fail = False
+            try:
+                http_res = run_qa_http_audit(
+                    sandbox_root,
+                    base_url=url,
+                    sandbox_project=proj,
+                    routes=["/"],
+                    timeout=8,
+                )
+                fb_fail = fb_fail or (http_res["failedCount"] > 0)
+                fallback_parts.append(
+                    f"HTTP-аудит {http_res['baseUrl']}: OK={http_res['passedCount']}, ошибок={http_res['failedCount']}"
+                )
+            except QaToolError as herr:
+                fb_fail = True
+                fallback_parts.append(f"HTTP-аудит не удался: {herr}")
+            if proj:
+                try:
+                    st_res = run_qa_static_review(sandbox_root, proj)
+                    if st_res["criticalIssues"]:
+                        fb_fail = True
+                    fallback_parts.append(
+                        f"Статика {proj}: файлов={st_res['filesChecked']}, крит.={len(st_res['criticalIssues'])}, мелк.={len(st_res['minorIssues'])}"
+                    )
+                except QaToolError as serr:
+                    fallback_parts.append(f"Статика {proj}: {serr}")
+            fb_status = "fail" if fb_fail else "warn"
+            if checks_sink is not None:
+                checks_sink.append(
+                    {
+                        "name": "Браузерный аудит (fallback HTTP/статика)",
+                        "tool": "qa_browser_audit",
+                        "status": fb_status,
+                        "details": "; ".join(fallback_parts)[:400],
+                    }
+                )
+            events.append(
+                {
+                    "type": "qa_check",
+                    "tool": "qa_browser_audit",
+                    "label": "Браузерный аудит (fallback без Chromium)",
+                    "status": fb_status,
+                }
+            )
+            return "\n".join(fallback_parts), events
 
         chk_status = "fail" if any_errors else "pass"
         if checks_sink is not None:

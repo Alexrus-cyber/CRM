@@ -605,6 +605,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const opTaskRef = useRef<OperatorTask | null>(null);
   const dismissedOpTaskIdsRef = useRef<Set<number>>(new Set());
   const runningRef = useRef(false);
+  const chatAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     conversationIdRef.current = conversationId;
@@ -2375,6 +2376,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     } = { content: "", reasoning: "", actions: [], files: [], error: "" };
     let userSaved = false;
     let storedUserForRollover: Turn | null = null;
+    let sawDone = false;
+    const abortCtrl = new AbortController();
+    chatAbortRef.current = abortCtrl;
 
     try {
       setStatus("Сохраняю переписку…");
@@ -2396,6 +2400,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       await persistSettings();
       const res = await fetch("/api/ai/agent", {
         method: "POST",
+        signal: abortCtrl.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           agentConversationId: activeId,
@@ -2443,7 +2448,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
 
         let boundary = buffer.indexOf("\n\n");
         while (boundary !== -1) {
@@ -2451,13 +2456,15 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           buffer = buffer.slice(boundary + 2);
           boundary = buffer.indexOf("\n\n");
 
-          const eventLine = raw.split("\n").find((line) => line.startsWith("event:"));
-          const dataLine = raw.split("\n").find((line) => line.startsWith("data:"));
-          if (!dataLine) continue;
+          const lines = raw.split("\n");
+          const eventLine = lines.find((line) => line.startsWith("event:"));
+          const dataLines = lines.filter((line) => line.startsWith("data:"));
+          if (dataLines.length === 0) continue;
           const event = eventLine ? eventLine.slice(6).trim() : "message";
+          const dataText = dataLines.map((l) => l.slice(5).trimStart()).join("\n");
           let data: Record<string, unknown>;
           try {
-            data = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
+            data = JSON.parse(dataText) as Record<string, unknown>;
           } catch {
             continue;
           }
@@ -2750,6 +2757,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             }
             scrollDown();
           } else if (event === "done") {
+            sawDone = true;
             setStatus(null);
             setPendingApproval(null);
             setScreenCapture(null);
@@ -2758,14 +2766,32 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           }
         }
       }
+      if (
+        !sawDone &&
+        !assistantDraft.error &&
+        !assistantDraft.content.trim() &&
+        assistantDraft.actions.length === 0 &&
+        assistantDraft.files.length === 0
+      ) {
+        assistantDraft.error = "Поток ответа от агента оборвался без завершения";
+        patch((t) => ({ ...t, error: assistantDraft.error }));
+      }
     } catch (caught) {
-      assistantDraft.error = userSaved
-        ? "Соединение с агентом прервалось"
-        : caught instanceof Error
-          ? caught.message
-          : "Не удалось сохранить сообщение";
-      patch((t) => ({ ...t, error: assistantDraft.error }));
+      if (caught instanceof DOMException && caught.name === "AbortError") {
+        if (!assistantDraft.content.trim()) {
+          assistantDraft.content = "Выполнение остановлено пользователем.";
+          patch((t) => ({ ...t, content: assistantDraft.content }));
+        }
+      } else {
+        assistantDraft.error = userSaved
+          ? "Соединение с агентом прервалось"
+          : caught instanceof Error
+            ? caught.message
+            : "Не удалось сохранить сообщение";
+        patch((t) => ({ ...t, error: assistantDraft.error }));
+      }
     } finally {
+      chatAbortRef.current = null;
       let updatedTurns = history;
       if (userSaved) {
         try {
@@ -2807,6 +2833,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       setRunning(false);
       setPendingApproval(null);
       setScreenCapture(null);
+      setLiveTester(null);
       setStatus(null);
       scrollDown();
 
@@ -4098,6 +4125,41 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                     <LiveReasoningBox text={turn.reasoning} streaming={isStreamingTurn} />
                   )}
 
+                  {isStreamingTurn && liveTester && (
+                    <div className="space-y-1.5 rounded-xl border border-violet-500/40 bg-violet-500/10 p-2.5 text-[11px]">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="flex items-center gap-1.5 font-semibold text-violet-300">
+                          <Loader2 size={12} className="animate-spin" />
+                          Тестировщик · {liveTester.sandboxProject || "."}
+                        </span>
+                        {isTabs && (
+                          <button
+                            type="button"
+                            onClick={() => setActiveTab("tester")}
+                            className="rounded-md border border-violet-500/40 bg-card px-2 py-0.5 text-[10px] font-medium text-violet-300 hover:bg-violet-500/20"
+                          >
+                            Открыть Тестировщик
+                          </button>
+                        )}
+                      </div>
+                      <p className="text-[10px] text-muted">{liveTester.statusText}</p>
+                      {liveTester.actions.length > 0 && (
+                        <ul className="space-y-0.5 text-[10px] text-text/90">
+                          {liveTester.actions.slice(-5).map((act, aIdx) => (
+                            <li key={`lt-act-${aIdx}`} className="truncate">
+                              • {act.label || act.command || act.url || act.type}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {liveTester.reasoning && (
+                        <p className="line-clamp-3 whitespace-pre-wrap rounded-lg border border-border/60 bg-card/60 px-2 py-1 text-[10px] text-muted">
+                          {liveTester.reasoning}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
                   {turn.attached && turn.attached.length > 0 && (
                     <div className="flex flex-wrap gap-1">
                       {turn.attached.map((file, index) => (
@@ -4599,15 +4661,27 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               {opFormulating ? <Loader2 size={13} className="animate-spin" /> : <MonitorCog size={13} />}
               Оператор
             </button>
-            <button
-              type="button"
-              onClick={() => void send()}
-              disabled={running || historyLoading || conversationId === null || (!text.trim() && attachments.length === 0)}
-              className="flex h-10 shrink-0 items-center gap-1.5 rounded-xl bg-accent px-3 text-xs font-medium text-white transition disabled:opacity-40"
-            >
-              {running ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-              Запустить
-            </button>
+            {running ? (
+              <button
+                type="button"
+                onClick={() => chatAbortRef.current?.abort()}
+                className="flex h-10 shrink-0 items-center gap-1.5 rounded-xl border border-red-500/40 bg-red-500/15 px-3 text-xs font-medium text-red-400 transition hover:bg-red-500/25"
+                title="Остановить текущий запуск агента"
+              >
+                <Square size={13} />
+                Остановить
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void send()}
+                disabled={historyLoading || conversationId === null || (!text.trim() && attachments.length === 0)}
+                className="flex h-10 shrink-0 items-center gap-1.5 rounded-xl bg-accent px-3 text-xs font-medium text-white transition disabled:opacity-40"
+              >
+                <Send size={14} />
+                Запустить
+              </button>
+            )}
           </div>
           <p className="mt-1.5 text-[10px] text-muted">
             Скрепка — файлы для анализа ({unlimited ? "без лимита" : "до 5 по 10 МБ"}) или сохранённые .md-переписки. В истории остаются имена файлов,

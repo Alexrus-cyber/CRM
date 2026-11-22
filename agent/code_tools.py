@@ -84,6 +84,15 @@ class CodeToolError(RuntimeError):
     """Ошибка выполнения инструмента анализа или верификации кода."""
 
 
+def _safe_int(value: Any, default: int) -> int:
+    if value is None or value == "" or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _fn(name: str, description: str, properties: Dict[str, Any], required: Optional[List[str]] = None) -> Dict[str, Any]:
     return {
         "type": "function",
@@ -258,28 +267,19 @@ def _run_argv(
     timeout: int = 120,
 ) -> Tuple[int, str]:
     env = sandbox_mod.sanitized_env(sandbox_root, cwd)
-    kwargs: Dict[str, Any] = {
-        "cwd": str(cwd),
-        "env": env,
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.STDOUT,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-        "timeout": max(5, min(300, int(timeout or 120))),
-        "check": False,
-    }
-    if platform.system() == "Windows":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    safe_timeout = max(5, min(300, _safe_int(timeout, 120)))
     try:
-        proc = subprocess.run(argv, **kwargs)
-        return proc.returncode, (proc.stdout or "").strip()
+        code, out, timed_out = sandbox_mod.run_subprocess_with_tree_timeout(
+            argv,
+            cwd=cwd,
+            env=env,
+            timeout=safe_timeout,
+        )
+        if timed_out:
+            return 124, f"Таймаут ({safe_timeout} с).\n{out[:3000]}"
+        return code, out
     except FileNotFoundError:
         return 127, f"Команда не найдена: {argv[0]}"
-    except subprocess.TimeoutExpired as err:
-        partial = (err.stdout or "") if isinstance(err.stdout, str) else ""
-        return 124, f"Таймаут ({timeout} с).\n{partial[:3000]}"
 
 
 # ---------------------------------------------------------------------------
@@ -299,12 +299,12 @@ def run_code_search(
     use_regex = bool(args.get("regex", True))
     case_sensitive = bool(args.get("case_sensitive", False))
     whole_word = bool(args.get("whole_word", False))
-    context_lines = max(0, min(5, int(args.get("context_lines") or 0)))
+    context_lines = max(0, min(5, _safe_int(args.get("context_lines"), 0)))
     path_glob = str(args.get("path_glob") or args.get("glob") or "").strip()
     exclude_glob = str(args.get("exclude_glob") or "").strip()
     files_only = bool(args.get("files_only", False))
     count_only = bool(args.get("count_only", False))
-    max_hits = max(1, min(150, int(args.get("max_hits") or 50)))
+    max_hits = max(1, min(150, _safe_int(args.get("max_hits"), 50)))
     subdir = str(args.get("path") or "").strip()
 
     flags = 0 if case_sensitive else re.IGNORECASE
@@ -374,8 +374,8 @@ def run_code_read_files(
     if not isinstance(raw_items, list) or not raw_items:
         raise CodeToolError("Передайте непустой массив files (до 12 путей или объектов {path, offset, limit})")
     root, scope_label = _resolve_target_root(args, sandbox_root=sandbox_root, github_ctx=github_ctx)
-    default_offset = max(1, int(args.get("offset") or 1))
-    default_limit = max(1, min(400, int(args.get("limit") or 160)))
+    default_offset = max(1, _safe_int(args.get("offset"), 1))
+    default_limit = max(1, min(400, _safe_int(args.get("limit"), 160)))
     total_char_budget = 60_000
     used_chars = 0
     sections: List[str] = [f"Пакетное чтение ({scope_label}):"]
@@ -386,8 +386,8 @@ def run_code_read_files(
             offset, limit = default_offset, default_limit
         elif isinstance(item, dict):
             rel = str(item.get("path") or "").strip()
-            offset = max(1, int(item.get("offset") or default_offset))
-            limit = max(1, min(400, int(item.get("limit") or default_limit)))
+            offset = max(1, _safe_int(item.get("offset"), default_offset))
+            limit = max(1, min(400, _safe_int(item.get("limit"), default_limit)))
         else:
             continue
         if not rel:
@@ -534,7 +534,7 @@ def run_code_symbols(
     rel_target = str(args.get("path") or ".").strip()
     kind_filter = str(args.get("kind") or "").strip().lower()
     name_filter = str(args.get("query") or "").strip().lower()
-    max_items = max(10, min(300, int(args.get("max_items") or 120)))
+    max_items = max(10, min(300, _safe_int(args.get("max_items"), 120)))
     root, scope_label = _resolve_target_root(args, sandbox_root=sandbox_root, github_ctx=github_ctx)
 
     target = _safe_file(root, rel_target, allow_dir=True)
@@ -588,7 +588,7 @@ def run_code_refs(
     if not symbol:
         raise CodeToolError("Укажите symbol (имя функции/класса/типа/переменной)")
     path_glob = str(args.get("path_glob") or "").strip()
-    max_hits = max(10, min(150, int(args.get("max_hits") or 60)))
+    max_hits = max(10, min(150, _safe_int(args.get("max_hits"), 60)))
     root, scope_label = _resolve_target_root(args, sandbox_root=sandbox_root, github_ctx=github_ctx)
 
     word_rx = re.compile(rf"\b{re.escape(symbol)}\b")
@@ -805,8 +805,8 @@ def run_git_history(
         fp = _safe_file(root_res, rel)
         if not fp.is_file():
             raise CodeToolError(f"Файл не найден: {rel}")
-        start_line = max(1, int(args.get("start_line") or 1))
-        end_line = max(start_line, min(start_line + 120, int(args.get("end_line") or (start_line + 60))))
+        start_line = max(1, _safe_int(args.get("start_line"), 1))
+        end_line = max(start_line, min(start_line + 120, _safe_int(args.get("end_line"), start_line + 60)))
         rel_posix = fp.relative_to(root_res).as_posix()
         code, out = _run_argv(
             ["git", "blame", "-L", f"{start_line},{end_line}", "--date=short", "--", rel_posix],
@@ -823,7 +823,7 @@ def run_git_history(
         grep_msg = str(args.get("grep") or "").strip()
         author = str(args.get("author") or "").strip()
         rel_path = str(args.get("path") or "").strip()
-        max_commits = max(1, min(50, int(args.get("max_commits") or 20)))
+        max_commits = max(1, min(50, _safe_int(args.get("max_commits"), 20)))
         argv = ["git", "log", f"-n{max_commits}", "--date=short", "--format=%h %ad %an | %s"]
         if query:
             if query.startswith("-"):
@@ -888,7 +888,7 @@ def run_typecheck_tool(
 ) -> str:
     root, scope_label = _resolve_target_root(args, sandbox_root=sandbox_root, github_ctx=github_ctx)
     root_res = root.resolve()
-    timeout = max(10, min(300, int(args.get("timeout") or 120)))
+    timeout = max(10, min(300, _safe_int(args.get("timeout"), 120)))
     outputs: List[str] = []
 
     if (root_res / "tsconfig.json").is_file():
@@ -985,7 +985,7 @@ def run_tests_subset_tool(
     if name_filter.startswith("-"):
         raise CodeToolError("Фильтр тестов не может начинаться с '-'")
     runner = str(args.get("runner") or "auto").strip().lower()
-    timeout = max(10, min(300, int(args.get("timeout") or 120)))
+    timeout = max(10, min(300, _safe_int(args.get("timeout"), 120)))
     root, scope_label = _resolve_target_root(args, sandbox_root=sandbox_root, github_ctx=github_ctx)
     root_res = root.resolve()
 
@@ -1030,11 +1030,21 @@ def run_tests_subset_tool(
         py_bin = _pick_python_bin()
         if not py_bin:
             raise CodeToolError("Интерпретатор python не найден для запуска тестов")
-        if safe_rels:
-            argv = [*py_bin, "-m", "unittest", *safe_rels]
+        file_rels = [r for r in safe_rels if (root_res / r).is_file()]
+        dir_rels = [r for r in safe_rels if (root_res / r).is_dir()]
+        if file_rels and not dir_rels:
+            argv = [*py_bin, "-m", "unittest", *file_rels]
+        elif dir_rels and not file_rels:
+            argv = [*py_bin, "-m", "unittest", "discover", "-s", dir_rels[0], "-v"]
+        elif safe_rels:
+            argv = [*py_bin, "-m", "unittest", *file_rels]
+            if not file_rels:
+                argv = [*py_bin, "-m", "unittest", "discover", "-s", ".", "-v"]
         else:
             test_dir = "agent/tests" if (root_res / "agent" / "tests").is_dir() else "."
             argv = [*py_bin, "-m", "unittest", "discover", "-s", test_dir, "-v"]
+        if name_filter:
+            argv.extend(["-k", name_filter])
         code, out = _run_argv(argv, cwd=root_res, sandbox_root=sandbox_root, timeout=timeout)
         return f"[Python unittest ({scope_label})] exit={code}\n{out[-6000:]}"
 
@@ -1255,7 +1265,7 @@ def collect_endpoint_inventory(root: Path) -> List[Dict[str, Any]]:
     api_dir = root_res / "src" / "app" / "api"
     search_root = api_dir if api_dir.is_dir() else root_res
 
-    for fp in sorted(search_root.rglob("route.*")):
+    for fp in sorted(_iter_files(search_root, path_glob="route.*", max_files=600)):
         if fp.suffix.lower() not in (".ts", ".tsx", ".js", ".mjs"):
             continue
         rel = fp.relative_to(root_res).as_posix()
@@ -1340,7 +1350,7 @@ def run_agent_plan_tool(args: Dict[str, Any], run_state: Optional[Dict[str, Any]
                     "note": str(st.get("note") or "").strip(),
                 })
     elif action == "update_step":
-        step_id = int(args.get("step_id") or 0)
+        step_id = _safe_int(args.get("step_id"), 0)
         status = str(args.get("status") or "done").strip()
         note = str(args.get("note") or "").strip()
         for item in plan:
@@ -1354,7 +1364,7 @@ def run_agent_plan_tool(args: Dict[str, Any], run_state: Optional[Dict[str, Any]
             "id": len(ledger) + 1,
             "severity": str(args.get("severity") or "info").strip(),
             "file": str(args.get("file") or "").strip(),
-            "line": int(args.get("line") or 0),
+            "line": _safe_int(args.get("line"), 0),
             "summary": str(args.get("summary") or "").strip(),
             "verified": bool(args.get("verified", True)),
         })

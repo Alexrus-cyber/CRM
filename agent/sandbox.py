@@ -42,6 +42,15 @@ SAFE_ENV_KEYS = (
     "SYSTEMROOT",
     "COMSPEC",
     "WINDIR",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "COMMONPROGRAMFILES",
+    "ProgramData",
+    "SystemDrive",
+    "PROCESSOR_ARCHITECTURE",
+    "OS",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
@@ -50,6 +59,7 @@ SAFE_ENV_KEYS = (
     "USERPROFILE",
     "NODE_ENV",
     "PYTHONIOENCODING",
+    "PYTHONUTF8",
 )
 
 # Очевидные попытки побега из Sandbox или разрушения системы.
@@ -449,6 +459,9 @@ def sanitized_env(root: Path, cwd: Path) -> Dict[str, str]:
     env["TMP"] = str(tmp_dir)
     env["PWD"] = str(cwd)
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+    env["no_proxy"] = "127.0.0.1,localhost,::1"
     env["CRM_SANDBOX"] = "1"
     env["CRM_SANDBOX_ROOT"] = str(root_resolved)
     return env
@@ -463,6 +476,78 @@ def _shell_argv(command: str) -> List[str]:
     return ["/bin/sh", "-c", command]
 
 
+def _terminate_proc_tree(proc: subprocess.Popen[Any]) -> None:
+    try:
+        if platform.system() != "Windows":
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            proc.wait(timeout=3)
+        else:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=4,
+                check=False,
+            )
+    except Exception:  # noqa: BLE001
+        try:
+            if platform.system() != "Windows":
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def run_subprocess_with_tree_timeout(
+    argv: List[str],
+    *,
+    cwd: Path,
+    env: Optional[Dict[str, str]] = None,
+    timeout: int = 60,
+) -> Tuple[int, str, bool]:
+    """Запускает argv в отдельной группе процессов и при таймауте убивает всё дерево процессов."""
+    run_kwargs: Dict[str, Any] = {
+        "cwd": str(cwd),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if env is not None:
+        run_kwargs["env"] = env
+    if platform.system() != "Windows":
+        run_kwargs["start_new_session"] = True
+    else:
+        run_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+
+    proc = subprocess.Popen(argv, **run_kwargs)
+    try:
+        stdout_text, _ = proc.communicate(timeout=max(1, int(timeout)))
+        return int(proc.returncode or 0), (stdout_text or "").strip(), False
+    except subprocess.TimeoutExpired:
+        _terminate_proc_tree(proc)
+        try:
+            stdout_text, _ = proc.communicate(timeout=2)
+        except Exception:  # noqa: BLE001
+            stdout_text = ""
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except OSError:
+            pass
+        return 124, (stdout_text or "").strip(), True
+
+
 class ProcessManager:
     """Управляет фоновыми процессами (локальными серверами проектов) внутри Sandbox."""
 
@@ -472,30 +557,7 @@ class ProcessManager:
         atexit.register(self.stop_all)
 
     def _terminate_proc(self, proc: subprocess.Popen[str]) -> None:
-        try:
-            if platform.system() != "Windows":
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
-                proc.wait(timeout=3)
-            else:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    timeout=4,
-                    check=False,
-                )
-        except Exception:  # noqa: BLE001
-            try:
-                if platform.system() != "Windows":
-                    pgid = os.getpgid(proc.pid)
-                    os.killpg(pgid, signal.SIGKILL)
-                else:
-                    proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
+        _terminate_proc_tree(proc)
 
     def stop(self, pid: int) -> bool:
         with self._lock:
@@ -553,14 +615,19 @@ class ProcessManager:
         thread = threading.Thread(target=reader, daemon=True)
         thread.start()
 
-        # Ждём чуть-чуть: ловим мгновенный краш или URL поднявшегося сервера.
-        deadline = time.monotonic() + 1.8
+        # Ждём до 2.6 с: ловим мгновенный краш или URL поднявшегося сервера (выходим сразу как URL обнаружен).
+        deadline = time.monotonic() + 2.6
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 break
+            with self._lock:
+                cur_out = "\n".join(lines).strip()
+            if _detect_local_url("", cur_out):
+                break
             time.sleep(0.15)
 
-        output = "\n".join(lines).strip()[:MAX_OUTPUT_CHARS]
+        with self._lock:
+            output = "\n".join(lines).strip()[:MAX_OUTPUT_CHARS]
         url = _detect_local_url(command, output)
 
         if proc.poll() is not None:
@@ -648,35 +715,27 @@ def run_command(
     raw_timeout = int(timeout or 60)
     safe_timeout = max(1, raw_timeout if unlimited else min(300, raw_timeout))
 
-    run_kwargs: Dict[str, Any] = {
-        "cwd": str(cwd),
-        "env": env,
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.STDOUT,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-        "timeout": safe_timeout,
-    }
-    if platform.system() == "Windows":
-        run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
     try:
-        completed = subprocess.run(_shell_argv(command), **run_kwargs)
-    except subprocess.TimeoutExpired as error:
-        partial = (error.stdout or "") if isinstance(error.stdout, str) else ""
-        raise SandboxError(
-            f"Команда превысила таймаут {safe_timeout} с. Если это сервер — запустите с background=true.\n{partial[:2000]}"
-        ) from error
+        exit_code, raw_output, timed_out = run_subprocess_with_tree_timeout(
+            _shell_argv(command),
+            cwd=cwd,
+            env=env,
+            timeout=safe_timeout,
+        )
+    except FileNotFoundError as error:
+        raise SandboxError(f"Команда оболочки не найдена: {error}") from error
 
-    raw_output = (completed.stdout or "").strip()
+    if timed_out:
+        raise SandboxError(
+            f"Команда превысила таймаут {safe_timeout} с. Если это сервер — запустите с background=true.\n{raw_output[:2000]}"
+        )
+
     output = raw_output if unlimited else raw_output[:MAX_OUTPUT_CHARS]
     return {
         "background": False,
-        "exitCode": completed.returncode,
+        "exitCode": exit_code,
         "cwd": relative_to_root(root, cwd) if cwd != root.resolve(strict=False) else ".",
-        "output": output or f"(вывод пуст, код возврата {completed.returncode})",
+        "output": output or f"(вывод пуст, код возврата {exit_code})",
         "url": _detect_local_url(command, output),
     }
 
@@ -688,25 +747,19 @@ def run_pc_command(command: str, timeout: int = 60, *, unlimited: bool = False) 
         raise SandboxError("Пустая команда")
     raw_timeout = int(timeout or 60)
     safe_timeout = max(1, raw_timeout if unlimited else min(180, raw_timeout))
-    pc_kwargs: Dict[str, Any] = {
-        "cwd": str(Path.home()),
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.STDOUT,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-        "timeout": safe_timeout,
-    }
-    if platform.system() == "Windows":
-        pc_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        completed = subprocess.run(_shell_argv(text), **pc_kwargs)
-    except subprocess.TimeoutExpired as error:
-        raise SandboxError(f"Команда на ПК превысила таймаут {safe_timeout} с") from error
-    raw_output = (completed.stdout or "").strip()
+        exit_code, raw_output, timed_out = run_subprocess_with_tree_timeout(
+            _shell_argv(text),
+            cwd=Path.home(),
+            env=None,
+            timeout=safe_timeout,
+        )
+    except FileNotFoundError as error:
+        raise SandboxError(f"Команда оболочки не найдена: {error}") from error
+    if timed_out:
+        raise SandboxError(f"Команда на ПК превысила таймаут {safe_timeout} с.\n{raw_output[:2000]}")
     output = raw_output if unlimited else raw_output[:MAX_OUTPUT_CHARS]
     return {
-        "exitCode": completed.returncode,
-        "output": output or f"(вывод пуст, код возврата {completed.returncode})",
+        "exitCode": exit_code,
+        "output": output or f"(вывод пуст, код возврата {exit_code})",
     }

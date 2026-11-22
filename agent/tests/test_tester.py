@@ -237,8 +237,13 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
             self.assertTrue(any(ev == "tester_start" for ev, _ in events))
             done_ev = next(data for ev, data in events if ev == "tester_done")
             self.assertEqual(done_ev["usage"]["total"], 255)
-            self.assertEqual(done_ev["minorDecision"], "approved")
+            # tester_done уходит ДО approval_fn с minorDecision="pending" (чтобы прогон закрылся в БД),
+            # а решение человека приходит следующим событием tester_decision.
+            self.assertEqual(done_ev["minorDecision"], "pending")
+            dec_ev = next(data for ev, data in events if ev == "tester_decision")
+            self.assertEqual(dec_ev["decision"], "approved")
             self.assertEqual(len(tester_ctx["recent_reports"]), 1)
+            self.assertEqual(tester_ctx["recent_reports"][0]["minorDecision"], "approved")
             self.assertEqual(result_events[0]["type"], "tester_report")
             self.assertEqual(approval_requests[0]["kind"], "tester_minor_fixes")
 
