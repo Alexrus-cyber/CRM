@@ -1044,8 +1044,16 @@ def run_tool(
             tree = sandbox_mod.list_tree(sandbox_root, str(args.get("path") or "."), unlimited=unlimited)
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
-        list_slice = tree["items"] if unlimited else tree["items"][:120]
+        max_show = 1_500 if unlimited else 120
+        list_slice = tree["items"][:max_show]
         lines = [f"- [{item['type']}] {item['path']} ({item['size']} Б)" for item in list_slice]
+        extra_count = max(0, len(tree["items"]) - len(list_slice))
+        if extra_count > 0 or tree.get("truncated"):
+            lines.append(
+                f"... (показано {len(list_slice)} элементов"
+                + (f", ещё {extra_count}" if extra_count > 0 else "")
+                + "; укажите подпапку в path для детализации)"
+            )
         return (
             f"Содержимое Sandbox ({tree['root']}):\n" + ("\n".join(lines) if lines else "(пусто)"),
             events,
@@ -1451,6 +1459,424 @@ def _messages_char_len(messages: Any) -> int:
     return total
 
 
+def _estimate_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+    cyr = sum(1 for ch in text if "\u0400" <= ch <= "\u04ff")
+    rest = len(text) - cyr
+    return max(1, int((cyr / 2.2) + (rest / 3.2) + 0.999))
+
+
+def _estimate_message_tokens(msg: Dict[str, Any]) -> int:
+    tokens = 8
+    c = msg.get("content")
+    if isinstance(c, str):
+        tokens += _estimate_text_tokens(c)
+    elif isinstance(c, list):
+        for part in c:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                tokens += _estimate_text_tokens(str(part.get("text") or ""))
+            elif part.get("type") == "image_url":
+                tokens += 1500
+    tcs = msg.get("tool_calls")
+    if tcs:
+        try:
+            tokens += _estimate_text_tokens(json.dumps(tcs, ensure_ascii=False))
+        except (TypeError, ValueError):
+            tokens += 100
+    rc = msg.get("reasoning_content")
+    if isinstance(rc, str) and rc:
+        tokens += _estimate_text_tokens(rc)
+    return tokens
+
+
+def _estimate_payload_tokens(
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    total = 32 + sum(_estimate_message_tokens(m) for m in messages if isinstance(m, dict))
+    if tools:
+        try:
+            total += _estimate_text_tokens(json.dumps(tools, ensure_ascii=False))
+        except (TypeError, ValueError):
+            total += len(tools) * 180
+    return total
+
+
+def _clone_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cloned: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        item = dict(msg)
+        c = item.get("content")
+        if isinstance(c, list):
+            item["content"] = [dict(part) if isinstance(part, dict) else part for part in c]
+        tcs = item.get("tool_calls")
+        if isinstance(tcs, list):
+            item["tool_calls"] = [dict(tc) if isinstance(tc, dict) else tc for tc in tcs]
+        cloned.append(item)
+    return cloned
+
+
+def _shrink_text_head_tail(
+    text: str,
+    max_chars: int,
+    marker: str = "\n...[сокращено для экономии контекста]...\n",
+) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= len(marker) + 40:
+        return text[:max_chars]
+    avail = max_chars - len(marker)
+    head = int(avail * 0.65)
+    tail = avail - head
+    return text[:head] + marker + (text[-tail:] if tail > 0 else "")
+
+
+def _parse_context_overflow_error(detail: str) -> Optional[Dict[str, Optional[int]]]:
+    text = str(detail or "")
+    lower = text.lower()
+    is_overflow = bool(
+        re.search(
+            r"maximum\s+context\s+length|context[_ ]length[_ ]exceeded|context\s+(?:window|limit|size)"
+            r"|available\s+context\s+size|prompt\s+is\s+too\s+long|input\s+(?:is\s+too\s+long|length.*exceed)"
+            r"|too\s+many\s+tokens|reduce\s+the\s+length|in\s+the\s+messages.*in\s+the\s+completion"
+            r"|exceeds?\s+(?:the\s+)?(?:model'?s?\s+)?(?:maximum\s+)?context|n_ctx|max_context_len|превыш\w*\s+контекст",
+            lower,
+        )
+    )
+    if not is_overflow:
+        return None
+
+    def _first_int(patterns: Tuple[str, ...]) -> Optional[int]:
+        for pat in patterns:
+            m = re.search(pat, text, flags=re.IGNORECASE)
+            if m:
+                try:
+                    val = int(m.group(1).replace(",", "").replace(" ", ""))
+                    if val > 0:
+                        return val
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    max_ctx = _first_int(
+        (
+            r"maximum\s+context\s+length\s+is\s+(\d[\d,]*)",
+            r"context\s+(?:length|limit|window|size)\s*(?:is|of|:)?\s*(\d[\d,]*)",
+            r"available\s+context\s+size\s*\((\d[\d,]*)\s*tokens?\)",
+            r">\s*(\d[\d,]*)\s*maximum",
+            r"limit\s*(?:is|of)?\s*(\d[\d,]*)\s*tokens?",
+        )
+    )
+    msg_toks = _first_int(
+        (
+            r"(\d[\d,]*)\s*in\s+the\s+messages",
+            r"messages\s+resulted\s+in\s+(\d[\d,]*)\s*tokens?",
+            r"prompt\s+is\s+too\s+long:\s*(\d[\d,]*)\s*tokens?",
+            r"input\s+tokens?\s*(?:is|of|:)?\s*(\d[\d,]*)",
+        )
+    )
+    comp_toks = _first_int((r"(\d[\d,]*)\s*in\s+the\s+completion",))
+    req_toks = _first_int(
+        (
+            r"requested\s+(\d[\d,]*)\s*tokens?",
+            r"request\s*\((\d[\d,]*)\s*tokens?\)",
+        )
+    )
+    return {
+        "max_context": max_ctx,
+        "msg_tokens": msg_toks,
+        "completion_tokens": comp_toks,
+        "requested_tokens": req_toks,
+    }
+
+
+def _parse_max_tokens_limit_error(detail: str) -> Optional[int]:
+    text = str(detail or "")
+    lower = text.lower()
+    if not ("max_tokens" in lower or "max_output_tokens" in lower or "completion tokens" in lower):
+        return None
+    if not any(w in lower for w in ("too large", "exceed", "at most", "must be <=", "maximum", "range", "limit")):
+        return None
+    for pat in (
+        r"supports\s+at\s+most\s+(\d[\d,]*)\s*(?:completion\s*)?tokens?",
+        r"(?:max_tokens|max_output_tokens)\s*(?:must\s+be\s*<=?|cannot\s+exceed|limit\s*(?:is|:)?)\s*(\d[\d,]*)",
+        r"range\s*\[\s*\d+\s*,\s*(\d[\d,]*)\s*\]",
+        r"at\s+most\s+(\d[\d,]*)\s*(?:completion\s*)?tokens?",
+    ):
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                val = int(m.group(1).replace(",", ""))
+                if val > 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
+    return -1
+
+
+def _strip_old_images(messages: List[Dict[str, Any]], keep_last_n: int = 1) -> List[Dict[str, Any]]:
+    image_indices = [
+        idx
+        for idx, msg in enumerate(messages)
+        if isinstance(msg.get("content"), list)
+        and any(isinstance(p, dict) and p.get("type") == "image_url" for p in msg["content"])
+    ]
+    if keep_last_n <= 0:
+        to_strip = set(image_indices)
+    elif len(image_indices) > keep_last_n:
+        to_strip = set(image_indices[:-keep_last_n])
+    else:
+        to_strip = set()
+
+    if not to_strip:
+        return messages
+
+    for idx in to_strip:
+        parts = messages[idx].get("content")
+        if not isinstance(parts, list):
+            continue
+        texts: List[str] = []
+        had_img = False
+        for p in parts:
+            if isinstance(p, dict) and p.get("type") == "text":
+                t = str(p.get("text") or "").strip()
+                if t:
+                    texts.append(t)
+            elif isinstance(p, dict) and p.get("type") == "image_url":
+                had_img = True
+        if had_img:
+            texts.append("[предыдущее изображение скрыто для экономии контекста]")
+        messages[idx]["content"] = "\n".join(texts) if texts else "[изображение скрыто]"
+    return messages
+
+
+def _compact_system_prompt(sys_text: str, target_chars: int) -> str:
+    if len(sys_text) <= target_chars:
+        return sys_text
+    markers = (
+        "\n\nДокументация / база знаний (RAG):\n",
+        "\n\nGitHub-репозиторий и кодовая база (GitHub-RAG):\n",
+    )
+    split_positions = [sys_text.find(m) for m in markers if sys_text.find(m) != -1]
+    if not split_positions:
+        return _shrink_text_head_tail(sys_text, target_chars)
+
+    first_split = min(split_positions)
+    core = sys_text[:first_split]
+    if len(core) >= target_chars:
+        return _shrink_text_head_tail(core, target_chars)
+
+    tail_budget = target_chars - len(core)
+    rag_tail = sys_text[first_split:]
+    if len(rag_tail) <= tail_budget:
+        return sys_text
+    note = "\n...[RAG/контекст репозитория частично сокращён под лимит контекста модели]"
+    keep = max(0, tail_budget - len(note))
+    if keep < 200:
+        return core + note
+    return core + rag_tail[:keep] + note
+
+
+def _compact_messages_for_budget(
+    messages: List[Dict[str, Any]],
+    target_msg_tokens: int,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    work = _clone_messages(messages)
+    if not work:
+        return work
+
+    def _over() -> bool:
+        return _estimate_payload_tokens(work, tools) > target_msg_tokens
+
+    if not _over():
+        return work
+
+    # 1. Сначала убираем старые картинки (оставляем только 1 последнюю, затем при необходимости 0).
+    _strip_old_images(work, keep_last_n=1)
+    if not _over():
+        return work
+    _strip_old_images(work, keep_last_n=0)
+    if not _over():
+        return work
+
+    # 2. Сокращаем громоздкие результаты инструментов (сначала старые шаги, затем при необходимости свежие).
+    tool_indices = [
+        idx
+        for idx, m in enumerate(work)
+        if m.get("role") == "tool"
+        or (m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"].startswith("Результаты инструментов:\n"))
+    ]
+    if tool_indices:
+        for cap in (4000, 1200):
+            for idx in tool_indices[:-3] if len(tool_indices) > 3 else tool_indices:
+                c = work[idx].get("content")
+                if isinstance(c, str) and len(c) > cap:
+                    work[idx]["content"] = _shrink_text_head_tail(c, cap)
+                if not _over():
+                    return work
+        for cap in (16000, 4000, 1500):
+            for idx in tool_indices:
+                c = work[idx].get("content")
+                if isinstance(c, str) and len(c) > cap:
+                    work[idx]["content"] = _shrink_text_head_tail(c, cap)
+                if not _over():
+                    return work
+
+    # 3. Если system-промпт раздут базой знаний (RAG / GitHub-RAG), подрезаем хвост RAG.
+    if work[0].get("role") == "system" and isinstance(work[0].get("content"), str):
+        sys_tokens = _estimate_message_tokens(work[0])
+        non_sys_tokens = _estimate_payload_tokens(work[1:], tools)
+        allowed_sys_tokens = max(1200, target_msg_tokens - non_sys_tokens)
+        if sys_tokens > allowed_sys_tokens or sys_tokens > int(target_msg_tokens * 0.55):
+            desired_sys_tokens = min(allowed_sys_tokens, max(1200, int(target_msg_tokens * 0.45)))
+            work[0]["content"] = _compact_system_prompt(work[0]["content"], int(desired_sys_tokens * 2.5))
+            if not _over():
+                return work
+
+    # 4. Удаляем самые ранние атомарные блоки переписки (сохраняя pairing assistant+tool и последний запрос user).
+    if len(work) > 2:
+        has_sys = work[0].get("role") == "system"
+        sys_msg = work[0] if has_sys else None
+        tail = work[1:] if has_sys else work[:]
+
+        blocks: List[List[Dict[str, Any]]] = []
+        i = 0
+        while i < len(tail):
+            cur = tail[i]
+            if cur.get("role") == "assistant" and cur.get("tool_calls"):
+                grp = [cur]
+                j = i + 1
+                while j < len(tail) and tail[j].get("role") == "tool":
+                    grp.append(tail[j])
+                    j += 1
+                blocks.append(grp)
+                i = j
+            else:
+                blocks.append([cur])
+                i += 1
+
+        last_user_block = max(
+            (idx for idx, blk in enumerate(blocks) if blk[0].get("role") == "user" and not str(blk[0].get("content") or "").startswith("Результаты инструментов:")),
+            default=max(0, len(blocks) - 1),
+        )
+        dropped = 0
+        while _over() and len(blocks) > 1 and last_user_block > 0:
+            blocks.pop(0)
+            last_user_block -= 1
+            dropped += 1
+            rebuilt = ([sys_msg] if sys_msg else []) + [m for blk in blocks for m in blk]
+            work = rebuilt
+
+        if dropped > 0 and sys_msg and isinstance(work[0].get("content"), str):
+            note = f"\n\n[Примечание: {dropped} ранних сообщений истории скрыты, чтобы уложиться в контекст модели]"
+            if note not in work[0]["content"]:
+                work[0]["content"] = work[0]["content"] + note
+
+        if not _over():
+            return work
+
+    # 5. Крайняя мера: укорачиваем system (RAG/вложения) и длинный текст последнего сообщения.
+    if work[0].get("role") == "system" and isinstance(work[0].get("content"), str):
+        non_sys = _estimate_payload_tokens(work[1:], tools)
+        sys_tok_budget = max(500, target_msg_tokens - non_sys)
+        work[0]["content"] = _compact_system_prompt(work[0]["content"], int(sys_tok_budget * 2.3))
+    if _over():
+        for idx in range(len(work) - 1, 0, -1):
+            c = work[idx].get("content")
+            if isinstance(c, str) and len(c) > 2000:
+                excess_tokens = _estimate_payload_tokens(work, tools) - target_msg_tokens
+                keep_chars = max(800, len(c) - int(excess_tokens * 2.6))
+                work[idx]["content"] = _shrink_text_head_tail(c, keep_chars)
+            if not _over():
+                break
+    return work
+
+
+def _clamp_generation_limits(payload: Dict[str, Any], max_allowed_completion: int) -> bool:
+    changed = False
+    safe_cap = max(256, int(max_allowed_completion))
+    cur_max = payload.get("max_tokens")
+    if isinstance(cur_max, (int, float)) and int(cur_max) > safe_cap:
+        payload["max_tokens"] = safe_cap
+        changed = True
+    tb = payload.get("thinking_budget")
+    if isinstance(tb, (int, float)):
+        eff_max = int(payload.get("max_tokens") or safe_cap)
+        if int(tb) >= eff_max:
+            if eff_max <= 512:
+                payload.pop("thinking_budget", None)
+            else:
+                payload["thinking_budget"] = max(256, eff_max // 2)
+            changed = True
+    return changed
+
+
+def _fit_request_to_context(
+    messages: List[Dict[str, Any]],
+    payload: Dict[str, Any],
+    tools: Optional[List[Dict[str, Any]]],
+    max_context: int,
+    reported_msg_tokens: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    info: Dict[str, Any] = {"compacted": False, "clamped_max_tokens": None}
+    if max_context <= 0:
+        return messages, payload, info
+
+    work_payload = dict(payload)
+    work_messages = _clone_messages(messages)
+    margin = max(256, min(2048, max_context // 64))
+    est_tokens = _estimate_payload_tokens(work_messages, tools)
+    effective_prompt = max(reported_msg_tokens or 0, est_tokens)
+    cur_max_tokens = work_payload.get("max_tokens")
+    desired_completion = int(cur_max_tokens) if isinstance(cur_max_tokens, (int, float)) else 0
+
+    # Случай 1: сами сообщения помещаются с достаточным запасом на ответ — достаточно поджать max_tokens.
+    if effective_prompt + margin < max_context:
+        available_completion = max_context - effective_prompt - margin
+        min_needed = min(desired_completion, 2048) if desired_completion > 0 else 1024
+        if available_completion >= max(1024, min_needed):
+            if desired_completion > available_completion:
+                _clamp_generation_limits(work_payload, available_completion)
+                info["clamped_max_tokens"] = work_payload.get("max_tokens")
+            return work_messages, work_payload, info
+
+    # Случай 2: сообщения + минимальный буфер ответа превышают max_context — сжимаем messages.
+    min_completion = min(desired_completion, max(1024, min(8192, max_context // 6))) if desired_completion > 0 else max(1024, min(4096, max_context // 6))
+    target_msg_tokens = max(256, max_context - min_completion - margin)
+
+    if reported_msg_tokens and reported_msg_tokens > est_tokens and est_tokens > 0:
+        scale = (est_tokens / float(reported_msg_tokens)) * 0.90
+        target_est = max(256, int(target_msg_tokens * scale))
+    else:
+        target_est = target_msg_tokens
+
+    compacted = _compact_messages_for_budget(work_messages, target_est, tools)
+    new_est = _estimate_payload_tokens(compacted, tools)
+    info["compacted"] = compacted != work_messages or new_est < est_tokens
+    work_messages = compacted
+    work_payload["messages"] = work_messages
+
+    approx_after = (
+        int(reported_msg_tokens * (new_est / float(max(1, est_tokens))))
+        if (reported_msg_tokens and est_tokens > 0)
+        else new_est
+    )
+    remaining = max(512, max_context - max(new_est, approx_after) - margin)
+    if desired_completion > remaining or desired_completion == 0:
+        if desired_completion > 0:
+            _clamp_generation_limits(work_payload, remaining)
+            info["clamped_max_tokens"] = work_payload.get("max_tokens")
+    return work_messages, work_payload, info
+
+
 def call_model(
     base_url: str,
     api_key: str,
@@ -1460,11 +1886,14 @@ def call_model(
     params: Optional[Dict[str, Any]] = None,
     on_reasoning: Optional[Callable[[str], None]] = None,
     on_text: Optional[Callable[[str], None]] = None,
+    context_limit: int = 0,
+    state_out: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     streaming = on_reasoning is not None or on_text is not None
+    work_messages = _clone_messages(messages)
     payload: Dict[str, Any] = {
         "model": model or MODEL,
-        "messages": messages,
+        "messages": work_messages,
         "temperature": 0.3,
         "stream": streaming,
     }
@@ -1476,6 +1905,18 @@ def call_model(
         payload["tool_choice"] = "auto"
     if not payload["model"]:
         raise AgentError("Не указана модель: выберите её в интерфейсе или задайте AGENT_MODEL")
+
+    if context_limit > 0:
+        fitted_msgs, fitted_payload, fit_info = _fit_request_to_context(
+            work_messages, payload, tools, context_limit
+        )
+        work_messages = fitted_msgs
+        payload = fitted_payload
+        if state_out is not None:
+            if fit_info.get("compacted"):
+                state_out["compacted_messages"] = work_messages
+            if fit_info.get("clamped_max_tokens") is not None:
+                state_out["clamped_max_tokens"] = fit_info["clamped_max_tokens"]
 
     def _consume_stream(body_payload: Dict[str, Any]) -> Dict[str, Any]:
         assert_safe_ai_url(base_url)
@@ -1631,54 +2072,130 @@ def call_model(
                     result_obj["usage"] = stream_usage
                 return result_obj
         except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", "replace")[:400]
+            detail = error.read().decode("utf-8", "replace")[:800]
             raise AgentError(f"Модель вернула ошибку {error.code}: {detail}") from error
         except urllib.error.URLError as error:
             raise AgentError(
                 f"Не удалось связаться с моделью по адресу {chat_url(base_url)}: {error.reason}"
             ) from error
 
-    try:
-        return _consume_stream(payload)
-    except AgentError as error:
-        detail = str(error).lower()
-        if "stream_options" in payload and ("400" in detail or "422" in detail) and "stream_options" in detail:
-            no_stream_opts = {k: v for k, v in payload.items() if k != "stream_options"}
-            try:
-                return _consume_stream(no_stream_opts)
-            except AgentError as inner_so_err:
-                error = inner_so_err
-                detail = str(inner_so_err).lower()
-        has_tuning = any(
-            k in payload for k in ("reasoning_effort", "thinking_budget", "chat_template_kwargs")
-        )
-        if has_tuning and ("400" in detail or "422" in detail) and any(
-            w in detail for w in ("reasoning", "thinking", "chat_template", "unknown", "unsupported", "extra", "invalid")
-        ):
-            if payload.get("reasoning_effort") == "max":
-                fallback_high = dict(payload)
-                fallback_high["reasoning_effort"] = "high"
-                log("модель не принимает reasoning_effort=max — пробую high")
-                try:
-                    return _consume_stream(fallback_high)
-                except AgentError as inner_err:
-                    detail = str(inner_err).lower()
-                    if not (
-                        ("400" in detail or "422" in detail)
-                        and any(
-                            w in detail
-                            for w in ("reasoning", "thinking", "chat_template", "unknown", "unsupported", "extra", "invalid")
+    cur_payload = dict(payload)
+    overflow_retries = 0
+    max_tok_retries = 0
+    tried_no_stream_opts = False
+    tried_high = False
+    tried_stripped_tuning = False
+
+    for _attempt in range(7):
+        try:
+            return _consume_stream(cur_payload)
+        except AgentError as error:
+            raw_err = str(error)
+            detail = raw_err.lower()
+
+            overflow = _parse_context_overflow_error(raw_err)
+            if overflow is not None and overflow_retries < 3:
+                overflow_retries += 1
+                known_ctx = overflow.get("max_context") or (context_limit if context_limit > 0 else None)
+                reported_msgs = overflow.get("msg_tokens")
+                if state_out is not None and known_ctx:
+                    state_out["max_context"] = known_ctx
+                if known_ctx:
+                    effective_ctx = int(known_ctx * (0.85 ** (overflow_retries - 1))) if overflow_retries > 1 else int(known_ctx)
+                    fitted_msgs, fitted_payload, fit_info = _fit_request_to_context(
+                        work_messages,
+                        cur_payload,
+                        cur_payload.get("tools"),
+                        max(512, effective_ctx),
+                        reported_msg_tokens=reported_msgs if overflow_retries == 1 else None,
+                    )
+                    changed = (
+                        fitted_msgs != work_messages
+                        or fitted_payload.get("max_tokens") != cur_payload.get("max_tokens")
+                        or fitted_payload.get("thinking_budget") != cur_payload.get("thinking_budget")
+                    )
+                    if not changed:
+                        # Принудительно сжимаем чуть сильнее, если сервер всё ещё отклонил запрос.
+                        cur_est = _estimate_payload_tokens(work_messages, cur_payload.get("tools"))
+                        fitted_msgs = _compact_messages_for_budget(
+                            work_messages, max(256, int(cur_est * 0.65)), cur_payload.get("tools")
                         )
-                    ):
-                        raise
-            stripped = {
-                k: v
-                for k, v in payload.items()
-                if k not in ("reasoning_effort", "thinking_budget", "chat_template_kwargs")
-            }
-            log("модель не принимает параметры reasoning/thinking — повторяю без них")
-            return _consume_stream(stripped)
-        raise
+                        fitted_payload = dict(cur_payload)
+                        fitted_payload["messages"] = fitted_msgs
+                        if isinstance(fitted_payload.get("max_tokens"), (int, float)) and int(fitted_payload["max_tokens"]) > 4096:
+                            _clamp_generation_limits(fitted_payload, max(2048, int(fitted_payload["max_tokens"]) // 2))
+                    work_messages = fitted_msgs
+                    cur_payload = fitted_payload
+                    if state_out is not None:
+                        state_out["compacted_messages"] = work_messages
+                        if cur_payload.get("max_tokens") is not None:
+                            state_out["clamped_max_tokens"] = cur_payload.get("max_tokens")
+                    log(
+                        f"контекст модели ({known_ctx}): адаптировал запрос "
+                        f"(max_tokens={cur_payload.get('max_tokens')}, est_prompt≈{_estimate_payload_tokens(work_messages, cur_payload.get('tools'))})"
+                    )
+                    continue
+                else:
+                    changed = False
+                    cur_max_tok = cur_payload.get("max_tokens")
+                    if isinstance(cur_max_tok, (int, float)) and int(cur_max_tok) > 4096:
+                        _clamp_generation_limits(cur_payload, max(2048, int(cur_max_tok) // 3))
+                        changed = True
+                    cur_est = _estimate_payload_tokens(work_messages, cur_payload.get("tools"))
+                    compacted = _compact_messages_for_budget(
+                        work_messages, max(256, int(cur_est * 0.65)), cur_payload.get("tools")
+                    )
+                    if compacted != work_messages:
+                        work_messages = compacted
+                        cur_payload["messages"] = work_messages
+                        changed = True
+                    if changed:
+                        if state_out is not None:
+                            state_out["compacted_messages"] = work_messages
+                            if cur_payload.get("max_tokens") is not None:
+                                state_out["clamped_max_tokens"] = cur_payload.get("max_tokens")
+                        log(
+                            f"переполнение контекста: сжал запрос и max_tokens={cur_payload.get('max_tokens')}"
+                        )
+                        continue
+
+            max_tok_cap = _parse_max_tokens_limit_error(raw_err)
+            if max_tok_cap is not None and max_tok_retries < 2:
+                max_tok_retries += 1
+                cur_max_tok = cur_payload.get("max_tokens")
+                new_cap = max_tok_cap if max_tok_cap > 0 else (
+                    max(2048, int(cur_max_tok) // 2) if isinstance(cur_max_tok, (int, float)) else 8192
+                )
+                if _clamp_generation_limits(cur_payload, new_cap):
+                    if state_out is not None:
+                        state_out["clamped_max_tokens"] = cur_payload.get("max_tokens")
+                    log(f"модель ограничивает max_tokens: уменьшил до {cur_payload.get('max_tokens')}")
+                    continue
+
+            if not tried_no_stream_opts and "stream_options" in cur_payload and ("400" in detail or "422" in detail) and "stream_options" in detail:
+                tried_no_stream_opts = True
+                cur_payload.pop("stream_options", None)
+                continue
+
+            has_tuning = any(
+                k in cur_payload for k in ("reasoning_effort", "thinking_budget", "chat_template_kwargs")
+            )
+            if has_tuning and ("400" in detail or "422" in detail) and any(
+                w in detail for w in ("reasoning", "thinking", "chat_template", "unknown", "unsupported", "extra", "invalid")
+            ):
+                if cur_payload.get("reasoning_effort") == "max" and not tried_high:
+                    tried_high = True
+                    cur_payload["reasoning_effort"] = "high"
+                    log("модель не принимает reasoning_effort=max — пробую high")
+                    continue
+                if not tried_stripped_tuning:
+                    tried_stripped_tuning = True
+                    for k in ("reasoning_effort", "thinking_budget", "chat_template_kwargs"):
+                        cur_payload.pop(k, None)
+                    log("модель не принимает параметры reasoning/thinking — повторяю без них")
+                    continue
+            raise
+    raise AgentError("Превышено число повторных попыток вызова модели")
 
 
 def parse_text_tool_call(text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -2494,6 +3011,15 @@ class Handler(BaseHTTPRequestHandler):
 
         active_tools = tools_for_trust(trust_level, has_github=has_github_repo)
         browser_mgr = browser_inspector.BrowserSessionManager(sandbox_root=SANDBOX_ROOT)
+        try:
+            raw_ctx_limit = max(0, int(body.get("contextLimit") or 0))
+        except (TypeError, ValueError):
+            raw_ctx_limit = 0
+        try:
+            raw_model_ctx = max(0, int(body.get("modelContextLength") or 0))
+        except (TypeError, ValueError):
+            raw_model_ctx = 0
+        discovered_max_context = raw_model_ctx if raw_model_ctx > 0 else (raw_ctx_limit if raw_ctx_limit >= 32_768 else 0)
         use_tools = True
         steps = 0
         files = 0
@@ -2519,6 +3045,7 @@ class Handler(BaseHTTPRequestHandler):
                     if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
                         self.write(sse({"text": cleaned}, "text"))
 
+                call_state: Dict[str, Any] = {}
                 try:
                     data = call_model(
                         base_url,
@@ -2529,21 +3056,38 @@ class Handler(BaseHTTPRequestHandler):
                         params,
                         on_reasoning=_emit_live_reasoning,
                         on_text=_emit_live_text,
+                        context_limit=discovered_max_context,
+                        state_out=call_state,
                     )
                 except AgentError as error:
-                    detail = str(error).lower()
+                    if call_state.get("max_context"):
+                        discovered_max_context = int(call_state["max_context"])
+                    if call_state.get("compacted_messages"):
+                        messages[:] = call_state["compacted_messages"]
+                    raw_err = str(error)
+                    detail = raw_err.lower()
                     if has_multimodal_images() and ("image" in detail or "vision" in detail or "modality" in detail):
                         log("модель не принимает картинки — читаю только текст вложений")
                         self.write(sse({"text": "Модель не принимает картинки — читаю текстовое описание"}, "status"))
                         strip_images()
                         images = []
                         continue
-                    if use_tools and ("tools" in detail or "400" in detail):
+                    if (
+                        use_tools
+                        and _parse_context_overflow_error(raw_err) is None
+                        and _parse_max_tokens_limit_error(raw_err) is None
+                        and ("tools" in detail or "400" in detail)
+                    ):
                         log("function calling недоступен, включаю JSON-протокол")
                         use_tools = False
-                        messages[0]["content"] = system + TEXT_PROTOCOL_NOTE
+                        messages[0]["content"] = messages[0].get("content", system) + TEXT_PROTOCOL_NOTE
                         continue
                     raise
+
+                if call_state.get("max_context"):
+                    discovered_max_context = int(call_state["max_context"])
+                if call_state.get("compacted_messages"):
+                    messages[:] = call_state["compacted_messages"]
 
                 choices = data.get("choices") or []
                 if not choices:
@@ -2635,6 +3179,17 @@ class Handler(BaseHTTPRequestHandler):
                             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
                         }
                     )
+                    per_tool_char_cap = (
+                        min(240_000, max(16_000, int(discovered_max_context * 1.5)))
+                        if discovered_max_context > 0
+                        else 240_000
+                    )
+                    if isinstance(result_text, str) and len(result_text) > per_tool_char_cap:
+                        result_text = _shrink_text_head_tail(
+                            result_text,
+                            per_tool_char_cap,
+                            marker=f"\n...[вывод инструмента сокращён с {len(result_text)} симв. для защиты контекста модели]...\n",
+                        )
                     call_results.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
 
                 image_note = (
@@ -2642,7 +3197,10 @@ class Handler(BaseHTTPRequestHandler):
                     if has_browser_images
                     else "Снимок экрана ПК, переданный Оператором после разрешения пользователя:"
                 )
-                screen_slice = captured_screen_images if unlimited_role else captured_screen_images[:3]
+                screen_slice = captured_screen_images[:6] if unlimited_role else captured_screen_images[:3]
+                if screen_slice:
+                    # Не накапливаем десятки устаревших скриншотов в истории шагов — оставляем свежие.
+                    _strip_old_images(messages, keep_last_n=0)
                 if use_tools:
                     messages.append({"role": "assistant", "content": content, "tool_calls": assistant_calls})
                     messages.extend(call_results)
