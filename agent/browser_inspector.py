@@ -2966,6 +2966,9 @@ def execute_browse_action(
                 action_note=f"Открыта страница {target_url}{sandbox_note}",
             )
             emit_status(f"Осмотр «open» завершён за {time.monotonic() - started_at:.2f} с ({meta.get('summary') or 'ок'})")
+            if bool(args.get("close_after")):
+                manager.close_session(session_id)
+                emit_status(f"Сессия «{session_id}» закрыта после шага «open»")
             events.append({
                 "type": "browser_inspect",
                 "action": "open",
@@ -3141,6 +3144,9 @@ def execute_browse_action(
             action_note=action_note,
         )
         emit_status(f"Осмотр «{raw_action}» завершён за {time.monotonic() - started_at:.2f} с ({meta.get('summary') or 'ок'})")
+        if bool(args.get("close_after")):
+            manager.close_session(session_id)
+            emit_status(f"Сессия «{session_id}» закрыта после шага «{raw_action}»")
         preview = extra_shots[-1] if extra_shots else ""
         events.append({
             "type": "browser_inspect",

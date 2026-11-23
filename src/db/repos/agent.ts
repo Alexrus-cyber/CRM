@@ -2128,7 +2128,16 @@ export async function completeTesterRun(
           size: Math.max(0, Math.round(Number(f.size ?? 0) || 0)),
         }))
     : [];
-  const storedActions = Array.isArray(input.actions) ? input.actions.slice(0, 60) : [];
+  const storedActions = Array.isArray(input.actions)
+    ? input.actions.slice(0, 60).map((act) => {
+        if (act && typeof act === "object" && !Array.isArray(act) && "preview" in act) {
+          const rest = { ...(act as Record<string, unknown>) };
+          delete rest.preview;
+          return rest;
+        }
+        return act;
+      })
+    : [];
 
   await insertAgentConversationMessage({
     userId,

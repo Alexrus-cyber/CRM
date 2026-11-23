@@ -88,6 +88,7 @@ import { ApprovalToast } from "./ApprovalToast";
 import { GithubIcon, GithubIntegrationPanel, type GithubAccountPublic } from "./agent/GithubIntegrationPanel";
 import {
   TesterPanel,
+  formatLiveTesterAction,
   type LiveTesterState,
   type TesterChatMessage,
   type TesterConversationItem,
@@ -696,6 +697,10 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       return next.length > 60 ? next.slice(-60) : next;
     });
     return entry;
+  }, []);
+  const clearLiveBrowserLog = useCallback(() => {
+    browserRunStartRef.current = 0;
+    setLiveBrowserLog([]);
   }, []);
   const conversationIdRef = useRef<number | null>(null);
   const selectedTesterConvIdRef = useRef<number | null>(null);
@@ -2262,142 +2267,186 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       let assistantText = "";
       let assistantReason = "";
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let boundary = buffer.indexOf("\n\n");
-        while (boundary !== -1) {
-          const raw = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
-          boundary = buffer.indexOf("\n\n");
-          const eventLine = raw.split("\n").find((l) => l.startsWith("event:"));
-          const dataLine = raw.split("\n").find((l) => l.startsWith("data:"));
-          if (!dataLine) continue;
-          const ev = eventLine ? eventLine.slice(6).trim() : "message";
-          let data: Record<string, unknown>;
-          try {
-            data = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
-          } catch {
-            continue;
-          }
+      const processFrame = (raw: string) => {
+        const lines = raw.split("\n");
+        const eventLine = lines.find((l) => l.startsWith("event:"));
+        const dataLines = lines.filter((l) => l.startsWith("data:"));
+        if (dataLines.length === 0) return;
+        const ev = eventLine ? eventLine.slice(6).trim() : "message";
+        const dataText = dataLines.map((l) => l.slice(5).trimStart()).join("\n");
+        let data: Record<string, unknown>;
+        try {
+          data = JSON.parse(dataText) as Record<string, unknown>;
+        } catch {
+          return;
+        }
 
-          if (ev === "tester_run") {
-            const createdConv =
-              data.conversation && typeof data.conversation === "object"
-                ? (data.conversation as TesterConversationItem)
-                : null;
-            const createdRun =
-              data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
-            if (createdConv) {
-              setTesterConversations((prev) => [
-                createdConv,
-                ...prev.filter((c) => c.id !== createdConv.id),
-              ]);
-            }
-            if (createdRun) {
-              setTesterRuns((prev) => [createdRun, ...prev.filter((r) => r.id !== createdRun.id)]);
-            }
-            setLiveTester({
-              runKey: String(data.runKey ?? "direct"),
-              runId: typeof data.runId === "number" ? data.runId : createdRun?.id,
-              testerConversationId:
-                typeof data.testerConversationId === "number"
-                  ? data.testerConversationId
-                  : createdConv?.id ?? targetConvId ?? undefined,
-              sandboxProject: String(createdRun?.sandboxProject ?? testerDirectProject ?? "."),
-              summary: promptText,
-              model: String(createdRun?.model ?? settings.model ?? ""),
-              statusText: "Тестировщик начал проверку…",
-              reasoning: "",
-              content: "",
-              browserLog: [],
-              actions: [],
-            });
-          } else if (ev === "status") {
-            const st = String(data.text ?? "");
-            const isBrowserStep =
-              data.source === "browser_inspector" ||
-              data.tool === "browse_project" ||
-              data.tool === "qa_browser_audit";
+        if (ev === "tester_run") {
+          const createdConv =
+            data.conversation && typeof data.conversation === "object"
+              ? (data.conversation as TesterConversationItem)
+              : null;
+          const createdRun =
+            data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
+          if (createdConv) {
+            setTesterConversations((prev) => [
+              createdConv,
+              ...prev.filter((c) => c.id !== createdConv.id),
+            ]);
+          }
+          if (createdRun) {
+            setTesterRuns((prev) => [createdRun, ...prev.filter((r) => r.id !== createdRun.id)]);
+          }
+          clearLiveBrowserLog();
+          setLiveTester({
+            runKey: String(data.runKey ?? "direct"),
+            runId: typeof data.runId === "number" ? data.runId : createdRun?.id,
+            testerConversationId:
+              typeof data.testerConversationId === "number"
+                ? data.testerConversationId
+                : createdConv?.id ?? targetConvId ?? undefined,
+            sandboxProject: String(createdRun?.sandboxProject ?? testerDirectProject ?? "."),
+            summary: promptText,
+            model: String(createdRun?.model ?? settings.model ?? ""),
+            statusText: "Тестировщик начал проверку…",
+            reasoning: "",
+            content: "",
+            browserLog: [],
+            actions: [],
+          });
+        } else if (ev === "status") {
+          const st = String(data.text ?? "");
+          const isBrowserStep =
+            data.source === "browser_inspector" ||
+            data.tool === "browse_project" ||
+            data.tool === "qa_browser_audit";
+          if (isBrowserStep && data.done === true) {
+            clearLiveBrowserLog();
+            setLiveTester((prev) => (prev ? { ...prev, statusText: st, browserLog: [] } : prev));
+          } else if (isBrowserStep && st) {
             const isBrowserStart =
               st.startsWith("Вызываю инструмент: browse_project") ||
               st.startsWith("Вызываю инструмент: qa_browser_audit") ||
               st.startsWith("Тестировщик: browse_project") ||
               st.startsWith("Тестировщик: qa_browser_audit");
-            const logLine = isBrowserStep && st ? pushLiveBrowserLog(st, isBrowserStart) : "";
+            const logLine = pushLiveBrowserLog(st, isBrowserStart);
             setLiveTester((prev) =>
               prev
                 ? {
                     ...prev,
                     statusText: st,
-                    ...(logLine
-                      ? {
-                          browserLog: (isBrowserStart ? [] : prev.browserLog ?? []).concat(logLine).slice(-60),
-                        }
-                      : {}),
+                    browserLog: (isBrowserStart ? [] : prev.browserLog ?? []).concat(logLine).slice(-60),
                   }
                 : prev,
             );
-          } else if (ev === "reasoning") {
-            assistantReason = String(data.text ?? "");
-            setSelectedTesterMessages((prev) =>
-              prev.map((m) => (m.id === draftId ? { ...m, reasoning: assistantReason } : m)),
-            );
-          } else if (ev === "text") {
-            assistantText = String(data.text ?? "");
-            setSelectedTesterMessages((prev) =>
-              prev.map((m) => (m.id === draftId ? { ...m, content: assistantText } : m)),
-            );
-          } else if (ev === "action") {
+          } else {
+            if (st) clearLiveBrowserLog();
             setLiveTester((prev) =>
               prev
                 ? {
                     ...prev,
-                    actions: [
-                      ...prev.actions,
-                      {
-                        type: String(data.type ?? "qa_check"),
-                        label: data.label ? String(data.label) : undefined,
-                        command: data.command ? String(data.command) : undefined,
-                      },
-                    ],
+                    statusText: st,
+                    ...(st ? { browserLog: [] } : {}),
                   }
                 : prev,
             );
-          } else if (ev === "approval_required") {
-            setPendingApproval({
-              approvalId: String(data.approvalId ?? ""),
-              kind: String(data.kind ?? "command"),
-              title: String(data.title ?? "Требуется подтверждение"),
-              description: String(data.description ?? data.reason ?? ""),
-              command: data.command ? String(data.command) : undefined,
-              cwd: data.cwd ? String(data.cwd) : undefined,
-              sandboxProject: data.sandboxProject ? String(data.sandboxProject) : undefined,
-              testerRunKey: data.testerRunKey ? String(data.testerRunKey) : undefined,
-              testerRunId: typeof data.testerRunId === "number" ? data.testerRunId : undefined,
-              testerConversationId:
-                typeof data.testerConversationId === "number" ? data.testerConversationId : undefined,
-              minorIssues: Array.isArray(data.minorIssues)
-                ? (data.minorIssues as TesterIssueItem[])
-                : undefined,
-            });
-            setLiveTester((prev) =>
-              prev ? { ...prev, statusText: "Тестировщик ждёт вашего подтверждения на сайте…" } : prev,
-            );
-          } else if (ev === "tester_done") {
-            const savedRun =
-              data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
-            if (savedRun) {
-              persistedByServer = true;
-              setTesterRuns((prev) => [savedRun, ...prev.filter((r) => r.id !== savedRun.id)]);
-            }
-          } else if (ev === "done") {
-            setPendingApproval(null);
-          } else if (ev === "error") {
-            const errTxt = String(data.error ?? "Ошибка тестировщика");
-            setTesterError(errTxt);
           }
+        } else if (ev === "reasoning") {
+          assistantReason = String(data.text ?? "");
+          setSelectedTesterMessages((prev) =>
+            prev.map((m) => (m.id === draftId ? { ...m, reasoning: assistantReason } : m)),
+          );
+        } else if (ev === "text") {
+          clearLiveBrowserLog();
+          assistantText = String(data.text ?? "");
+          setSelectedTesterMessages((prev) =>
+            prev.map((m) => (m.id === draftId ? { ...m, content: assistantText } : m)),
+          );
+        } else if (ev === "action") {
+          const actType = String(data.type ?? "qa_check");
+          if (actType === "browser_inspect") {
+            clearLiveBrowserLog();
+          }
+          setLiveTester((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  ...(actType === "browser_inspect" ? { browserLog: [] } : {}),
+                  actions: [
+                    ...prev.actions,
+                    {
+                      type: actType,
+                      label: data.label ? String(data.label) : undefined,
+                      command: data.command ? String(data.command) : undefined,
+                      url: data.url ? String(data.url) : undefined,
+                      action: data.action ? String(data.action) : undefined,
+                      viewport: data.viewport ? String(data.viewport) : undefined,
+                      summary: data.summary ? String(data.summary) : undefined,
+                      error: data.error ? String(data.error) : undefined,
+                      errorsCount: typeof data.errorsCount === "number" ? data.errorsCount : undefined,
+                      issuesCount: typeof data.issuesCount === "number" ? data.issuesCount : undefined,
+                      animationsCount: typeof data.animationsCount === "number" ? data.animationsCount : undefined,
+                    },
+                  ],
+                }
+              : prev,
+          );
+        } else if (ev === "approval_required") {
+          setPendingApproval({
+            approvalId: String(data.approvalId ?? ""),
+            kind: String(data.kind ?? "command"),
+            title: String(data.title ?? "Требуется подтверждение"),
+            description: String(data.description ?? data.reason ?? ""),
+            command: data.command ? String(data.command) : undefined,
+            cwd: data.cwd ? String(data.cwd) : undefined,
+            sandboxProject: data.sandboxProject ? String(data.sandboxProject) : undefined,
+            testerRunKey: data.testerRunKey ? String(data.testerRunKey) : undefined,
+            testerRunId: typeof data.testerRunId === "number" ? data.testerRunId : undefined,
+            testerConversationId:
+              typeof data.testerConversationId === "number" ? data.testerConversationId : undefined,
+            minorIssues: Array.isArray(data.minorIssues)
+              ? (data.minorIssues as TesterIssueItem[])
+              : undefined,
+          });
+          setLiveTester((prev) =>
+            prev ? { ...prev, statusText: "Тестировщик ждёт вашего подтверждения на сайте…" } : prev,
+          );
+        } else if (ev === "tester_done") {
+          clearLiveBrowserLog();
+          const savedRun =
+            data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
+          if (savedRun) {
+            persistedByServer = true;
+            setTesterRuns((prev) => [savedRun, ...prev.filter((r) => r.id !== savedRun.id)]);
+          }
+        } else if (ev === "done") {
+          clearLiveBrowserLog();
+          setPendingApproval(null);
+        } else if (ev === "error") {
+          clearLiveBrowserLog();
+          const errTxt = String(data.error ?? "Ошибка тестировщика");
+          setTesterError(errTxt);
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          buffer += decoder.decode().replace(/\r\n/g, "\n");
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary !== -1) {
+          const raw = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          boundary = buffer.indexOf("\n\n");
+          if (raw.trim()) processFrame(raw);
+        }
+      }
+      if (buffer.trim()) {
+        for (const leftover of buffer.split("\n\n")) {
+          if (leftover.trim()) processFrame(leftover);
         }
       }
 
@@ -2416,6 +2465,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     } catch (caught) {
       setTesterError(caught instanceof Error ? caught.message : "Не удалось запустить Тестировщика");
     } finally {
+      clearLiveBrowserLog();
       setLiveTester(null);
       setTesterDirectRunning(false);
     }
@@ -2620,11 +2670,15 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               data.source === "browser_inspector" ||
               data.tool === "browse_project" ||
               data.tool === "qa_browser_audit";
-            if (isBrowserStep && st) {
+            if (isBrowserStep && data.done === true) {
+              clearLiveBrowserLog();
+            } else if (isBrowserStep && st) {
               const isBrowserStart =
                 st.startsWith("Вызываю инструмент: browse_project") ||
                 st.startsWith("Вызываю инструмент: qa_browser_audit");
               pushLiveBrowserLog(st, isBrowserStart);
+            } else if (st) {
+              clearLiveBrowserLog();
             }
           } else if (event === "approval_required") {
             const ghPayload =
@@ -2755,23 +2809,35 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               data.source === "browser_inspector" ||
               data.tool === "browse_project" ||
               data.tool === "qa_browser_audit";
-            const isBrowserStart =
-              st.startsWith("Тестировщик: browse_project") ||
-              st.startsWith("Тестировщик: qa_browser_audit");
-            const logLine = isBrowserStep && st ? pushLiveBrowserLog(st, isBrowserStart) : "";
-            setLiveTester((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    statusText: st,
-                    ...(logLine
-                      ? {
-                          browserLog: (isBrowserStart ? [] : prev.browserLog ?? []).concat(logLine).slice(-60),
-                        }
-                      : {}),
-                  }
-                : prev,
-            );
+            if (isBrowserStep && data.done === true) {
+              clearLiveBrowserLog();
+              setLiveTester((prev) => (prev ? { ...prev, statusText: st, browserLog: [] } : prev));
+            } else if (isBrowserStep && st) {
+              const isBrowserStart =
+                st.startsWith("Тестировщик: browse_project") ||
+                st.startsWith("Тестировщик: qa_browser_audit");
+              const logLine = pushLiveBrowserLog(st, isBrowserStart);
+              setLiveTester((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      statusText: st,
+                      browserLog: (isBrowserStart ? [] : prev.browserLog ?? []).concat(logLine).slice(-60),
+                    }
+                  : prev,
+              );
+            } else {
+              if (st) clearLiveBrowserLog();
+              setLiveTester((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      statusText: st,
+                      ...(st ? { browserLog: [] } : {}),
+                    }
+                  : prev,
+              );
+            }
           } else if (event === "tester_reasoning") {
             const r = String(data.text ?? "");
             setLiveTester((prev) => (prev ? { ...prev, reasoning: r } : prev));
@@ -2784,17 +2850,29 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 ? (data.action as Record<string, unknown>)
                 : null;
             if (act) {
+              const actType = String(act.type ?? "qa_check");
+              if (actType === "browser_inspect") {
+                clearLiveBrowserLog();
+              }
               setLiveTester((prev) =>
                 prev
                   ? {
                       ...prev,
+                      ...(actType === "browser_inspect" ? { browserLog: [] } : {}),
                       actions: [
                         ...prev.actions,
                         {
-                          type: String(act.type ?? "qa_check"),
+                          type: actType,
                           label: act.label ? String(act.label) : undefined,
                           command: act.command ? String(act.command) : undefined,
                           url: act.url ? String(act.url) : undefined,
+                          action: act.action ? String(act.action) : undefined,
+                          viewport: act.viewport ? String(act.viewport) : undefined,
+                          summary: act.summary ? String(act.summary) : undefined,
+                          error: act.error ? String(act.error) : undefined,
+                          errorsCount: typeof act.errorsCount === "number" ? act.errorsCount : undefined,
+                          issuesCount: typeof act.issuesCount === "number" ? act.issuesCount : undefined,
+                          animationsCount: typeof act.animationsCount === "number" ? act.animationsCount : undefined,
                         },
                       ],
                     }
@@ -2802,6 +2880,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               );
             }
           } else if (event === "tester_done") {
+            clearLiveBrowserLog();
             const savedRun =
               data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
             if (savedRun) {
@@ -2828,10 +2907,12 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             patch((t) => ({ ...t, reasoning: assistantDraft.reasoning }));
             scrollDown();
           } else if (event === "text") {
+            clearLiveBrowserLog();
             assistantDraft.content = String(data.text ?? "");
             patch((t) => ({ ...t, content: assistantDraft.content }));
             scrollDown();
           } else if (event === "error") {
+            clearLiveBrowserLog();
             assistantDraft.error = String(data.error ?? "Ошибка агента");
             patch((t) => ({ ...t, error: assistantDraft.error }));
             setStatus(null);
@@ -2935,6 +3016,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               };
               assistantDraft.actions.push(action);
               patch((t) => ({ ...t, actions: [...t.actions, action] }));
+              if (action.type === "browser_inspect") {
+                clearLiveBrowserLog();
+              }
               if (action.type === "operator_task" && action.taskId) {
                 void refreshOpTask(action.taskId);
               }
@@ -4466,7 +4550,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                         <ul className="space-y-0.5 text-[10px] text-text/90">
                           {liveTester.actions.slice(-5).map((act, aIdx) => (
                             <li key={`lt-act-${aIdx}`} className="truncate">
-                              • {act.label || act.command || act.url || act.type}
+                              • {formatLiveTesterAction(act)}
                             </li>
                           ))}
                         </ul>

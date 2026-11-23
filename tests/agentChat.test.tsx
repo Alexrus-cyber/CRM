@@ -1372,5 +1372,165 @@ describe("вкладка «Агент»", () => {
     expect(screen.getByText(/Не удалось запустить Chromium \(код 1\)/i)).toBeTruthy();
     expect(screen.getByText(/Журнал шагов BrowserInspector \(2\)/i)).toBeTruthy();
     expect(screen.getByText(/\[\+0\.25s\] Попытка 1 завершилась с ошибкой/i)).toBeTruthy();
+    // После прихода карточки browser_inspect и завершения шага живая плашка хода должна исчезнуть.
+    expect(screen.queryByText(/Ход BrowserInspector/i)).toBeNull();
+  });
+
+  it("убирает живую плашку BrowserInspector сразу после handoff (done: true) и показывает формат осмотра у Тестировщика", async () => {
+    const encoder = new TextEncoder();
+    const streamCtrl: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
+
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          streamCtrl.current = controller;
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_run\ndata: ${JSON.stringify({
+                runKey: "run-br-1",
+                runId: 77,
+                testerConversationId: 2,
+                sandboxProject: "landing",
+                model: "gpt-test",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_status\ndata: ${JSON.stringify({
+                runKey: "run-br-1",
+                text: "Осмотр «resize» завершён за 0.92 с (анимаций: 20, проблем: 0, ошибок: 0)",
+                source: "browser_inspector",
+                tool: "qa_browser_audit",
+              })}\n\n`,
+            ),
+          );
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Проверь проект тестировщиком" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    expect((await screen.findAllByText(/Ход BrowserInspector/i)).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(/Осмотр «resize» завершён/i).length).toBeGreaterThanOrEqual(2);
+
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: tester_action\ndata: ${JSON.stringify({
+          runKey: "run-br-1",
+          action: {
+            type: "browser_inspect",
+            action: "resize",
+            viewport: "390×844",
+            url: "http://127.0.0.1:4444/",
+            summary: "анимаций: 20, проблем: 0, ошибок: 0",
+          },
+        })}\n\n`,
+      ),
+    );
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: tester_status\ndata: ${JSON.stringify({
+          runKey: "run-br-1",
+          text: "BrowserInspector завершил шаг (qa_browser_audit) — передаю данные Тестировщику…",
+          source: "browser_inspector",
+          tool: "qa_browser_audit",
+          done: true,
+        })}\n\n`,
+      ),
+    );
+
+    expect(
+      (await screen.findAllByText(/Осмотр проекта \(resize · 390×844\): анимаций: 20, проблем: 0, ошибок: 0/i)).length,
+    ).toBeGreaterThanOrEqual(2);
+    await waitFor(() => {
+      expect(screen.queryAllByText(/Ход BrowserInspector/i).length).toBe(0);
+    });
+
+    streamCtrl.current?.enqueue(encoder.encode('event: text\ndata: {"text":"Проверка завершена."}\n\n'));
+    streamCtrl.current?.enqueue(encoder.encode('event: done\ndata: {"steps":1,"files":0,"actions":0}\n\n'));
+    streamCtrl.current?.close();
+    expect(await screen.findByText(/Проверка завершена\./i)).toBeTruthy();
+  });
+
+  it("корректно разбирает CRLF SSE и завершает BrowserInspector при прямом запуске Тестировщика", async () => {
+    const encoder = new TextEncoder();
+    const streamCtrl: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
+
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          streamCtrl.current = controller;
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_run\r\ndata: ${JSON.stringify({
+                runKey: "direct-1",
+                runId: 88,
+                testerConversationId: 2,
+                sandboxProject: "landing",
+                model: "gpt-test",
+              })}\r\n\r\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: status\r\ndata: ${JSON.stringify({
+                text: "Осмотр «resize» завершён за 0.92 с (анимаций: 20, проблем: 0, ошибок: 0)",
+                source: "browser_inspector",
+                tool: "qa_browser_audit",
+              })}\r\n\r\n`,
+            ),
+          );
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    const testerTab = await screen.findByRole("button", { name: /Тестировщик/i });
+    fireEvent.click(testerTab);
+
+    const promptInput = await screen.findByLabelText(/Задача для Тестировщика/i);
+    fireEvent.change(promptInput, { target: { value: "Проверь адаптивность landing" } });
+    fireEvent.click(screen.getByRole("button", { name: /Проверить проект/i }));
+
+    expect(await screen.findByText(/Ход BrowserInspector/i)).toBeTruthy();
+
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: action\r\ndata: ${JSON.stringify({
+          type: "browser_inspect",
+          action: "resize",
+          viewport: "390×844",
+          summary: "анимаций: 20, проблем: 0, ошибок: 0",
+        })}\r\n\r\n`,
+      ),
+    );
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: status\r\ndata: ${JSON.stringify({
+          text: "BrowserInspector завершил шаг — передаю данные Тестировщику…",
+          source: "browser_inspector",
+          tool: "qa_browser_audit",
+          done: true,
+        })}\r\n\r\n`,
+      ),
+    );
+
+    expect(
+      await screen.findByText(/Осмотр проекта \(resize · 390×844\): анимаций: 20, проблем: 0, ошибок: 0/i),
+    ).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.queryByText(/Ход BrowserInspector/i)).toBeNull();
+    });
+
+    streamCtrl.current?.enqueue(encoder.encode('event: text\r\ndata: {"text":"Прямая проверка выполнена."}\r\n\r\n'));
+    streamCtrl.current?.enqueue(encoder.encode('event: done\r\ndata: {"steps":1,"files":0,"actions":1}\r\n\r\n'));
+    streamCtrl.current?.close();
+    expect(await screen.findByText(/Прямая проверка выполнена\./i)).toBeTruthy();
   });
 });

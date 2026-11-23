@@ -595,6 +595,129 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
 
+    def test_tester_isolates_browser_emits_done_handoff_and_handles_image_limit(self) -> None:
+        import browser_inspector
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            sandbox_mod.write_file(root, "app/index.html", "<!doctype html><h1>App</h1>")
+
+            agent_mgr = browser_inspector.BrowserSessionManager(sandbox_root=root)
+            agent_sess = mock.MagicMock()
+            agent_sess.is_alive.return_value = True
+            agent_mgr._sessions["default"] = agent_sess
+
+            events: list[tuple[str, dict]] = []
+            model_calls: list[list[dict]] = []
+
+            def _fake_model(_base, _key, _model, messages, *_a, **_kw):
+                model_calls.append(json.loads(json.dumps(messages)))
+                idx = len(model_calls)
+                if idx == 1:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "tc_qa_br",
+                                            "function": {
+                                                "name": "qa_browser_audit",
+                                                "arguments": '{"sandbox_project":"app"}',
+                                            },
+                                        }
+                                    ],
+                                }
+                            }
+                        ],
+                        "usage": {"total_tokens": 30},
+                    }
+                if idx == 2:
+                    # Имитируем модель, принимающую не более 1 изображения за запрос.
+                    raise agent_mod.AgentError("HTTP 400: At most 1 image may be provided in one request")
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "tc_submit",
+                                        "function": {
+                                            "name": "qa_submit_report",
+                                            "arguments": '{"status":"passed","summary":"Браузерный аудит пройден"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"total_tokens": 45},
+                }
+
+            def _fake_exec(mgr, args, **_kw):
+                self.assertIsNot(mgr, agent_mgr)
+                sid = str(args.get("session_id"))
+                if sid not in mgr._sessions:
+                    s = mock.MagicMock()
+                    s.is_alive.return_value = True
+                    mgr._sessions[sid] = s
+                act = str(args.get("action"))
+                return f"OK {act}", [
+                    {
+                        "type": "browser_inspect",
+                        "action": act,
+                        "viewport": "1440×900" if act == "open" else "390×844",
+                        "summary": "анимаций: 4, проблем: 0, ошибок: 0",
+                        "errorsCount": 0,
+                        "issuesCount": 0,
+                        "_images": ["data:image/jpeg;base64,IMG"],
+                        "preview": "data:image/jpeg;base64,IMG",
+                    }
+                ]
+
+            with (
+                mock.patch.object(agent_mod, "call_model", side_effect=_fake_model),
+                mock.patch.object(browser_inspector, "execute_browse_action", side_effect=_fake_exec),
+            ):
+                txt, _ = agent_mod.run_tool(
+                    "call_tester",
+                    {"sandbox_project": "app", "summary": "Проверь UI"},
+                    trust_level="verified",
+                    sandbox_root=root,
+                    browser_manager=agent_mgr,
+                    tester_ctx={
+                        "emit_sse": lambda ev, data: events.append((ev, data)),
+                        "base_url": "http://127.0.0.1:8888/v1",
+                        "api_key": "",
+                        "model": "vlm",
+                        "params": {},
+                        "recent_reports": [],
+                    },
+                )
+
+            self.assertIn("Браузерный аудит пройден", txt)
+            # Сессия родительского Агента не пострадала.
+            self.assertIn("default", agent_mgr._sessions)
+            agent_sess.close.assert_not_called()
+
+            # На 2-м вызове были 2 картинки (desktop + mobile), после ошибки лимита на 3-м осталась ровно 1.
+            self.assertEqual(agent_mod._count_message_images(model_calls[1]), 2)
+            self.assertEqual(agent_mod._count_message_images(model_calls[2]), 1)
+
+            # Эмитнулся явный tester_status с done=True, а из tester_done.actions удалены base64 preview.
+            self.assertTrue(
+                any(
+                    ev == "tester_status" and d.get("source") == "browser_inspector" and d.get("done") is True
+                    for ev, d in events
+                )
+            )
+            done_ev = next(d for ev, d in events if ev == "tester_done")
+            self.assertTrue(done_ev["actions"])
+            for act in done_ev["actions"]:
+                self.assertNotIn("preview", act)
+
 
 if __name__ == "__main__":
     unittest.main()
