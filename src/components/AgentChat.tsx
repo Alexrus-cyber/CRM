@@ -1780,6 +1780,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       setPendingApproval(null);
       setApprovalDest("");
       setApprovalTaskDraft("");
+      setLiveTester((prev) =>
+        prev ? { ...prev, statusText: "Тестировщик: продолжаю проверку…" } : prev,
+      );
       if (launchedTaskId !== undefined) {
         void refreshOpTask(launchedTaskId);
       }
@@ -2333,6 +2336,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 ? (data.minorIssues as TesterIssueItem[])
                 : undefined,
             });
+            setLiveTester((prev) =>
+              prev ? { ...prev, statusText: "Тестировщик ждёт вашего подтверждения на сайте…" } : prev,
+            );
           } else if (ev === "tester_done") {
             const savedRun =
               data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
@@ -2636,6 +2642,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               const mm = req.github?.mergeMethod;
               setApprovalGhMergeMethod(mm === "squash" || mm === "rebase" ? mm : "merge");
             }
+            setLiveTester((prev) =>
+              prev ? { ...prev, statusText: "Тестировщик ждёт вашего подтверждения на сайте…" } : prev,
+            );
             scrollDown();
           } else if (event === "github") {
             const ghRepoName = `${String(data.owner ?? "")}/${String(data.repo ?? "")}`;

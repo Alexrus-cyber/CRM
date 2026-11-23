@@ -1248,4 +1248,65 @@ describe("вкладка «Агент»", () => {
 
     expect(await screen.findByText(/Поток ответа от агента оборвался без завершения/i)).toBeTruthy();
   });
+
+  it("обновляет статус liveTester, когда Тестировщик ждёт подтверждения на сайте", async () => {
+    const encoder = new TextEncoder();
+    const streamCtrl: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
+
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          streamCtrl.current = controller;
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_run\ndata: ${JSON.stringify({
+                runKey: "rk-apr",
+                runId: 77,
+                testerConversationId: 1,
+                sandboxProject: "qa-proj",
+                summary: "Запуск тестов",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_reasoning\ndata: ${JSON.stringify({
+                runKey: "rk-apr",
+                text: "Рассуждения завершены, запускаю qa_run_tests",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: approval_required\ndata: ${JSON.stringify({
+                approvalId: "apr-qa-1",
+                kind: "bash_command",
+                title: "Разрешить Тестировщику запустить тесты?",
+                command: "npm test",
+                testerRunKey: "rk-apr",
+              })}\n\n`,
+            ),
+          );
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Проверь qa-proj" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    expect(await screen.findByText(/Тестировщик · qa-proj/i)).toBeTruthy();
+    expect((await screen.findAllByText(/Тестировщик ждёт вашего подтверждения на сайте…/i)).length).toBeGreaterThanOrEqual(2);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Разрешить$/i }));
+    await waitFor(() => expect(approvalsSent.length).toBe(1));
+    expect((await screen.findAllByText(/Тестировщик: продолжаю проверку…/i)).length).toBeGreaterThanOrEqual(2);
+
+    streamCtrl.current?.enqueue(encoder.encode('event: text\ndata: {"text":"Проверка завершена."}\n\n'));
+    streamCtrl.current?.enqueue(encoder.encode('event: done\ndata: {"steps":1,"files":0,"actions":0}\n\n'));
+    streamCtrl.current?.close();
+    expect(await screen.findByText(/Проверка завершена\./i)).toBeTruthy();
+  });
 });
