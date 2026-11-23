@@ -1556,6 +1556,65 @@ class WindowsCompatibilityAndSpecTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_tracking_https_handler_works_across_python_versions_without_check_hostname(self) -> None:
+        import urllib.request
+
+        req = urllib.request.Request("https://api.example.com/v1/chat/completions", method="POST")
+
+        # 1) Штатный вызов _TrackingHTTPSHandler.https_open на текущем Python
+        handler = agent_mod._TrackingHTTPSHandler()
+        seen_classes: list[object] = []
+        seen_kwargs: list[dict[str, object]] = []
+
+        def fake_super_do_open(self_h: object, http_class: object, req_arg: object, **kwargs: object) -> str:
+            seen_classes.append(http_class)
+            seen_kwargs.append(dict(kwargs))
+            return "ok"
+
+        with mock.patch.object(urllib.request.AbstractHTTPHandler, "do_open", fake_super_do_open):
+            self.assertEqual(handler.https_open(req), "ok")
+        self.assertIs(seen_classes[-1], agent_mod._TrackingHTTPSConnection)
+
+        # 2) Симуляция Python 3.12 / 3.13+: у HTTPSHandler нет _check_hostname и https_open передаёт только context
+        class Py313TrackingHTTPSHandler(agent_mod._TrackingHTTPSHandler):
+            def __init__(self, context: object = None) -> None:
+                urllib.request.AbstractHTTPHandler.__init__(self, 0)
+                self._context = context
+
+            def https_open(self, r: object) -> object:
+                return self.do_open(http.client.HTTPSConnection, r, context=self._context)
+
+        py313_handler = Py313TrackingHTTPSHandler(context="fake-ctx")
+        self.assertFalse(hasattr(py313_handler, "_check_hostname"))
+        with mock.patch.object(urllib.request.AbstractHTTPHandler, "do_open", fake_super_do_open):
+            self.assertEqual(py313_handler.https_open(req), "ok")
+        self.assertIs(seen_classes[-1], agent_mod._TrackingHTTPSConnection)
+        self.assertEqual(seen_kwargs[-1], {"context": "fake-ctx"})
+
+        # 3) _NO_REDIRECT_OPENER / _NO_REDIRECT_LOCAL_OPENER используют оба tracking-обработчика,
+        # а _TrackingHTTPSConnection.connect() регистрирует conn и sock в _MODEL_CONN_TLS.holder.
+        for opener in (agent_mod._NO_REDIRECT_OPENER, agent_mod._NO_REDIRECT_LOCAL_OPENER):
+            names = {type(h).__name__ for h in opener.handlers}
+            self.assertIn("_TrackingHTTPHandler", names)
+            self.assertIn("_TrackingHTTPSHandler", names)
+
+        holder: dict[str, object] = {}
+        prev_holder = getattr(agent_mod._MODEL_CONN_TLS, "holder", None)
+        agent_mod._MODEL_CONN_TLS.holder = holder
+        try:
+            conn = agent_mod._TrackingHTTPSConnection("example.com", timeout=5)
+            fake_sock = object()
+
+            def fake_super_connect(self_c: agent_mod._TrackingHTTPSConnection) -> None:
+                self_c.sock = fake_sock  # type: ignore[assignment]
+
+            with mock.patch.object(http.client.HTTPSConnection, "connect", fake_super_connect):
+                conn.connect()
+            self.assertIs(holder.get("conn"), conn)
+            self.assertIs(holder.get("sock"), fake_sock)
+        finally:
+            agent_mod._MODEL_CONN_TLS.holder = prev_holder
+
 
 if __name__ == "__main__":
     unittest.main()

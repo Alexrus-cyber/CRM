@@ -178,18 +178,17 @@ class _TrackingHTTPSConnection(http.client.HTTPSConnection):
 
 
 class _TrackingHTTPHandler(urllib.request.HTTPHandler):
-    def http_open(self, req: Any) -> Any:
-        return self.do_open(_TrackingHTTPConnection, req)
+    def do_open(self, http_class: Any, req: Any, **http_conn_args: Any) -> Any:
+        if http_class is http.client.HTTPConnection:
+            http_class = _TrackingHTTPConnection
+        return super().do_open(http_class, req, **http_conn_args)
 
 
 class _TrackingHTTPSHandler(urllib.request.HTTPSHandler):
-    def https_open(self, req: Any) -> Any:
-        return self.do_open(
-            _TrackingHTTPSConnection,
-            req,
-            context=self._context,
-            check_hostname=self._check_hostname,
-        )
+    def do_open(self, http_class: Any, req: Any, **http_conn_args: Any) -> Any:
+        if http_class is http.client.HTTPSConnection:
+            http_class = _TrackingHTTPSConnection
+        return super().do_open(http_class, req, **http_conn_args)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
