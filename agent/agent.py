@@ -2458,134 +2458,188 @@ def call_model(
                 is_sse = False
                 stream_usage: Optional[Dict[str, Any]] = None
                 saw_finish = False
+                saw_finish_reason = ""
+                finish_deadline: Optional[float] = None
+
+                def _usage_has_counts(usage_obj: Any) -> bool:
+                    if not isinstance(usage_obj, dict):
+                        return False
+                    for uk in (
+                        "total_tokens",
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "input_tokens",
+                        "output_tokens",
+                        "total",
+                        "prompt",
+                        "completion",
+                    ):
+                        try:
+                            if int(usage_obj.get(uk) or 0) > 0:
+                                return True
+                        except (TypeError, ValueError):
+                            continue
+                    return False
 
                 def _shrink_response_socket_timeout(seconds: float) -> None:
                     try:
                         fp = getattr(response, "fp", None)
-                        raw_fp = getattr(fp, "raw", None)
+                        raw_fp = getattr(fp, "raw", None) or getattr(response, "raw", None)
                         sock = getattr(raw_fp, "_sock", None)
                         if sock is not None and hasattr(sock, "settimeout"):
                             sock.settimeout(seconds)
                     except Exception:  # noqa: BLE001
                         pass
 
-                for raw_bytes in response:
-                    if cancel_check and cancel_check():
-                        raise BrokenPipeError("Клиент закрыл соединение")
-                    line = raw_bytes.decode("utf-8", "replace").rstrip("\r\n")
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    if not is_sse:
-                        if stripped.startswith("data:") or stripped.startswith("event:") or stripped.startswith(":"):
-                            is_sse = True
-                        elif stripped.startswith("{"):
-                            raw_lines.append(line)
-                            rest = response.read().decode("utf-8", "replace")
-                            if rest:
-                                raw_lines.append(rest)
-                            try:
-                                parsed_json = json.loads("\n".join(raw_lines))
-                            except json.JSONDecodeError as error:
-                                raise AgentError("Сервер модели вернул не JSON", retryable=True) from error
-                            if isinstance(parsed_json, dict) and parsed_json.get("error"):
-                                err_obj = parsed_json["error"]
-                                err_msg = str(err_obj.get("message") if isinstance(err_obj, dict) else err_obj)
-                                raise AgentError(f"Модель вернула ошибку: {err_msg}", retryable=True)
-                            msg = (parsed_json.get("choices") or [{}])[0].get("message") or {}
-                            r_full = str(msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
-                            c_full = str(msg.get("content") or "")
-                            if r_full and on_reasoning:
-                                on_reasoning(r_full)
-                            if c_full and not msg.get("tool_calls") and on_text:
-                                on_text(c_full)
-                            return parsed_json
-                        else:
-                            is_sse = True
+                try:
+                    for raw_bytes in response:
+                        if cancel_check and cancel_check():
+                            raise BrokenPipeError("Клиент закрыл соединение")
+                        if saw_finish and finish_deadline is not None:
+                            rem = finish_deadline - time.monotonic()
+                            if rem <= 0:
+                                break
+                            _shrink_response_socket_timeout(max(0.1, rem))
+                        line = raw_bytes.decode("utf-8", "replace").rstrip("\r\n")
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        if not is_sse:
+                            if stripped.startswith("data:") or stripped.startswith("event:") or stripped.startswith(":"):
+                                is_sse = True
+                            elif stripped.startswith("{"):
+                                raw_lines.append(line)
+                                rest = response.read().decode("utf-8", "replace")
+                                if rest:
+                                    raw_lines.append(rest)
+                                try:
+                                    parsed_json = json.loads("\n".join(raw_lines))
+                                except json.JSONDecodeError as error:
+                                    raise AgentError("Сервер модели вернул не JSON", retryable=True) from error
+                                if isinstance(parsed_json, dict) and parsed_json.get("error"):
+                                    err_obj = parsed_json["error"]
+                                    err_msg = str(err_obj.get("message") if isinstance(err_obj, dict) else err_obj)
+                                    raise AgentError(f"Модель вернула ошибку: {err_msg}", retryable=True)
+                                msg = (parsed_json.get("choices") or [{}])[0].get("message") or {}
+                                r_full = str(msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+                                c_full = str(msg.get("content") or "")
+                                c_clean, c_think = _split_inline_think(c_full)
+                                if c_think and not r_full:
+                                    r_full = c_think
+                                    c_full = c_clean
+                                if r_full and on_reasoning:
+                                    on_reasoning(r_full)
+                                if c_full and not msg.get("tool_calls") and on_text:
+                                    on_text(c_full)
+                                return parsed_json
+                            else:
+                                is_sse = True
 
-                    if not stripped.startswith("data:"):
-                        continue
-                    data_str = stripped[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-
-                    if isinstance(chunk, dict) and chunk.get("error"):
-                        err_obj = chunk["error"]
-                        err_msg = str(err_obj.get("message") if isinstance(err_obj, dict) else err_obj)
-                        err_code = str(err_obj.get("code") or err_obj.get("type") or "") if isinstance(err_obj, dict) else ""
-                        retryable = any(w in (err_msg + " " + err_code).lower() for w in ("rate", "timeout", "overload", "502", "503", "504", "429"))
-                        raise AgentError(f"Модель вернула ошибку в потоке: {err_msg}", retryable=retryable)
-
-                    if isinstance(chunk.get("usage"), dict):
-                        stream_usage = chunk["usage"]
-
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        if saw_finish and stream_usage:
+                        if not stripped.startswith("data:"):
+                            continue
+                        data_str = stripped[5:].strip()
+                        if data_str == "[DONE]":
                             break
-                        continue
-                    choice = choices[0] or {}
-                    finish_reason = choice.get("finish_reason")
-                    delta = choice.get("delta") or {}
-                    msg_fb = choice.get("message") or {}
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
 
-                    r_piece = delta.get("reasoning_content") or delta.get("reasoning") or msg_fb.get("reasoning_content") or ""
-                    if isinstance(r_piece, str) and r_piece:
-                        reasoning_parts.append(r_piece)
-                        now = time.monotonic()
-                        if on_reasoning and (last_reason_emit == 0.0 or now - last_reason_emit >= 0.2):
-                            last_reason_emit = now
-                            on_reasoning("".join(reasoning_parts))
+                        if isinstance(chunk, dict) and chunk.get("error"):
+                            err_obj = chunk["error"]
+                            err_msg = str(err_obj.get("message") if isinstance(err_obj, dict) else err_obj)
+                            err_code = str(err_obj.get("code") or err_obj.get("type") or "") if isinstance(err_obj, dict) else ""
+                            retryable = any(w in (err_msg + " " + err_code).lower() for w in ("rate", "timeout", "overload", "502", "503", "504", "429"))
+                            raise AgentError(f"Модель вернула ошибку в потоке: {err_msg}", retryable=retryable)
 
-                    c_piece = delta.get("content") if delta.get("content") is not None else msg_fb.get("content")
-                    if isinstance(c_piece, str) and c_piece:
-                        c_out, t_out, in_think, tag_buf = _process_stream_think_chunk(c_piece, in_think, tag_buf)
-                        if t_out:
-                            reasoning_parts.append(t_out)
+                        if isinstance(chunk.get("usage"), dict):
+                            stream_usage = chunk["usage"]
+
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            if saw_finish and (
+                                _usage_has_counts(stream_usage)
+                                or (finish_deadline is not None and time.monotonic() >= finish_deadline)
+                            ):
+                                break
+                            continue
+                        choice = choices[0] or {}
+                        finish_reason = choice.get("finish_reason")
+                        delta = choice.get("delta") or {}
+                        msg_fb = choice.get("message") or {}
+
+                        r_piece = (
+                            delta.get("reasoning_content")
+                            or delta.get("reasoning")
+                            or msg_fb.get("reasoning_content")
+                            or msg_fb.get("reasoning")
+                            or ""
+                        )
+                        if isinstance(r_piece, str) and r_piece:
+                            reasoning_parts.append(r_piece)
                             now = time.monotonic()
                             if on_reasoning and (last_reason_emit == 0.0 or now - last_reason_emit >= 0.2):
                                 last_reason_emit = now
                                 on_reasoning("".join(reasoning_parts))
-                        if c_out:
-                            content_parts.append(c_out)
-                            now = time.monotonic()
-                            if on_text and not tool_calls_map and (last_text_emit == 0.0 or now - last_text_emit >= 0.2):
-                                last_text_emit = now
-                                on_text("".join(content_parts))
 
-                    tc_deltas = delta.get("tool_calls") or msg_fb.get("tool_calls") or []
-                    if isinstance(tc_deltas, list):
-                        for pos, tc in enumerate(tc_deltas):
-                            if not isinstance(tc, dict):
-                                continue
-                            idx = tc.get("index")
-                            if not isinstance(idx, int):
-                                idx = pos
-                            entry = tool_calls_map.setdefault(
-                                idx,
-                                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
-                            )
-                            if tc.get("id"):
-                                entry["id"] = str(tc["id"])
-                            if tc.get("type"):
-                                entry["type"] = str(tc["type"])
-                            fn = tc.get("function") or {}
-                            if isinstance(fn, dict):
-                                if fn.get("name"):
-                                    entry["function"]["name"] += str(fn["name"])
-                                if fn.get("arguments"):
-                                    entry["function"]["arguments"] += str(fn["arguments"])
+                        c_piece = delta.get("content") if delta.get("content") is not None else msg_fb.get("content")
+                        if isinstance(c_piece, str) and c_piece:
+                            c_out, t_out, in_think, tag_buf = _process_stream_think_chunk(c_piece, in_think, tag_buf)
+                            if t_out:
+                                reasoning_parts.append(t_out)
+                                now = time.monotonic()
+                                if on_reasoning and (last_reason_emit == 0.0 or now - last_reason_emit >= 0.2):
+                                    last_reason_emit = now
+                                    on_reasoning("".join(reasoning_parts))
+                            if c_out:
+                                content_parts.append(c_out)
+                                now = time.monotonic()
+                                if on_text and not tool_calls_map and (last_text_emit == 0.0 or now - last_text_emit >= 0.2):
+                                    last_text_emit = now
+                                    on_text("".join(content_parts))
 
-                    if finish_reason:
-                        saw_finish = True
-                        if stream_usage:
-                            break
-                        # Если сервер забыл отправить [DONE] или держит keep-alive — ждём хвост не более 2.5с.
-                        _shrink_response_socket_timeout(2.5)
+                        tc_deltas = delta.get("tool_calls") or msg_fb.get("tool_calls") or []
+                        if isinstance(tc_deltas, list):
+                            for pos, tc in enumerate(tc_deltas):
+                                if not isinstance(tc, dict):
+                                    continue
+                                idx = tc.get("index")
+                                if not isinstance(idx, int):
+                                    idx = pos
+                                entry = tool_calls_map.setdefault(
+                                    idx,
+                                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                                )
+                                if tc.get("id"):
+                                    entry["id"] = str(tc["id"])
+                                if tc.get("type"):
+                                    entry["type"] = str(tc["type"])
+                                fn = tc.get("function") or {}
+                                if isinstance(fn, dict):
+                                    if fn.get("name"):
+                                        entry["function"]["name"] += str(fn["name"])
+                                    if fn.get("arguments"):
+                                        entry["function"]["arguments"] += str(fn["arguments"])
+
+                        if finish_reason:
+                            saw_finish = True
+                            saw_finish_reason = str(finish_reason)
+                            if _usage_has_counts(stream_usage):
+                                break
+                            # Если сервер забыл отправить [DONE] или шлёт keep-alive — ждём хвост строго не более 2.0с.
+                            if finish_deadline is None:
+                                finish_deadline = time.monotonic() + 2.0
+                            _shrink_response_socket_timeout(max(0.1, finish_deadline - time.monotonic()))
+                except (http.client.HTTPException, TimeoutError, ConnectionError, ssl.SSLError, OSError) as stream_err:
+                    if not (saw_finish and (content_parts or reasoning_parts or tool_calls_map)):
+                        raise AgentError(
+                            f"Сбой соединения при чтении ответа модели: {stream_err}",
+                            retryable=True,
+                        ) from stream_err
+                    log(
+                        f"ответ модели уже завершён (finish_reason={saw_finish_reason}); "
+                        f"игнорирую обрыв/таймаут хвоста: {stream_err}"
+                    )
 
                 if tag_buf:
                     if in_think:
@@ -2595,6 +2649,10 @@ def call_model(
 
                 final_reasoning = "".join(reasoning_parts)
                 final_content = "".join(content_parts)
+                c_clean, c_think = _split_inline_think(final_content)
+                if c_think:
+                    final_reasoning = ((final_reasoning + "\n\n") if final_reasoning else "") + c_think
+                    final_content = c_clean
                 assembled_tools = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
                 if final_reasoning and on_reasoning:
                     on_reasoning(final_reasoning)
@@ -2606,7 +2664,10 @@ def call_model(
                     **({"reasoning_content": final_reasoning} if final_reasoning else {}),
                     **({"tool_calls": assembled_tools} if assembled_tools else {}),
                 }
-                result_obj: Dict[str, Any] = {"choices": [{"message": msg_obj}]}
+                choice_out: Dict[str, Any] = {"message": msg_obj}
+                if saw_finish_reason:
+                    choice_out["finish_reason"] = saw_finish_reason
+                result_obj: Dict[str, Any] = {"choices": [choice_out]}
                 if stream_usage:
                     result_obj["usage"] = stream_usage
                 return result_obj
@@ -2808,29 +2869,107 @@ def _extract_balanced_json_objects(text: str) -> List[str]:
     return results
 
 
+def _split_inline_think(text: str) -> Tuple[str, str]:
+    """Отделяет `<think>...</think>` (включая сиротский `</think>` при prefill-шаблоне) от основного текста."""
+    src = str(text or "")
+    if not src:
+        return "", ""
+    thoughts: List[str] = []
+
+    def _collect(match: re.Match[str]) -> str:
+        inner = (match.group(1) or "").strip()
+        if inner:
+            thoughts.append(inner)
+        return ""
+
+    cleaned = re.sub(r"<think>([\s\S]*?)</think>", _collect, src, flags=re.IGNORECASE)
+    # Если шаблон модели сам подставил `<think>` в промпт, в ответе приходит только закрывающий `</think>`.
+    orphan_close = list(re.finditer(r"</think>", cleaned, flags=re.IGNORECASE))
+    if orphan_close:
+        last_close = orphan_close[-1]
+        prefix = cleaned[: last_close.start()].strip()
+        if prefix:
+            thoughts.append(prefix)
+        cleaned = cleaned[last_close.end() :]
+    return cleaned.strip(), "\n\n".join(t for t in thoughts if t).strip()
+
+
+def _parse_json_dict_relaxed(raw: Any) -> Optional[Dict[str, Any]]:
+    """Парсит JSON-объект (в том числе с висячими запятыми или обрамляющим текстом)."""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    src = raw.strip()
+    if not src:
+        return None
+    for candidate in (src, *_extract_balanced_json_objects(src)):
+        for text_try in (candidate, re.sub(r",\s*([}\]])", r"\1", candidate)):
+            try:
+                parsed = json.loads(text_try)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return None
+
+
 def parse_text_tool_call(text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
-    src = text or ""
+    src, _ = _split_inline_think(text or "")
+    if not src:
+        src = text or ""
     candidates = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", src)
     # Если внутри JSON-аргументов встречались вложенные тройные кавычки, берём полные сбалансированные {...}.
     for obj_str in _extract_balanced_json_objects(src):
         if ('"tool"' in obj_str or '"name"' in obj_str) and obj_str not in candidates:
             candidates.append(obj_str)
     for raw in candidates:
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
+        data = _parse_json_dict_relaxed(raw)
         if not isinstance(data, dict):
             continue
         tool = data.get("tool") or data.get("name")
         if isinstance(tool, str) and tool.strip():
-            args = data.get("args") or data.get("arguments") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {}
-            return tool.strip(), args if isinstance(args, dict) else {}
+            raw_args = data.get("args")
+            if raw_args is None:
+                raw_args = data.get("arguments")
+            if raw_args is None:
+                raw_args = data.get("parameters")
+            if raw_args is None:
+                flat = {k: v for k, v in data.items() if k not in ("tool", "name", "type")}
+                args: Dict[str, Any] = flat
+            elif isinstance(raw_args, str):
+                args = _parse_json_dict_relaxed(raw_args) or {}
+            elif isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                args = {}
+            return tool.strip(), args
+    return None
+
+
+def _extract_trailing_qa_submit_from_reasoning(reasoning: str) -> Optional[Dict[str, Any]]:
+    """Если модель поместила финальный вызов `qa_submit_report` в хвост рассуждений, извлекает его аргументы."""
+    tail = str(reasoning or "").strip()[-6000:]
+    if not tail or "qa_submit_report" not in tail:
+        return None
+    objs = _extract_balanced_json_objects(tail)
+    for obj_str in reversed(objs):
+        data = _parse_json_dict_relaxed(obj_str)
+        if not isinstance(data, dict):
+            continue
+        tool = str(data.get("tool") or data.get("name") or "").strip()
+        if tool == "qa_submit_report":
+            raw_args = data.get("args")
+            if raw_args is None:
+                raw_args = data.get("arguments")
+            if raw_args is None:
+                raw_args = data.get("parameters")
+            if raw_args is None:
+                return {k: v for k, v in data.items() if k not in ("tool", "name", "type")}
+            if isinstance(raw_args, str):
+                return _parse_json_dict_relaxed(raw_args) or {}
+            if isinstance(raw_args, dict):
+                return raw_args
     return None
 
 
@@ -2988,7 +3127,26 @@ def run_tester_session(
     last_tool_sig = ""
     repeat_sig_count = 0
     force_no_tools_next = False
+    empty_reply_nudges = 0
+    allow_tester_images = True
     cancel_check = ctx.get("cancel_check")
+
+    def _tester_approval_wrapper(req: Dict[str, Any]) -> Dict[str, Any]:
+        if approval_fn is None:
+            return {"approved": False, "note": "Требуется подтверждение на сайте"}
+        _emit(
+            "tester_status",
+            {"runKey": run_key, "text": "Тестировщик ждёт вашего подтверждения на сайте…"},
+        )
+        try:
+            return approval_fn(req)
+        finally:
+            _emit(
+                "tester_status",
+                {"runKey": run_key, "text": "Тестировщик: продолжаю проверку…"},
+            )
+
+    wrapped_tool_approval = _tester_approval_wrapper if approval_fn is not None else None
 
     try:
         while steps < steps_cap:
@@ -3011,7 +3169,8 @@ def run_tester_session(
                 if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
                     _emit("tester_text", {"runKey": run_key, "text": cleaned})
 
-            use_tools_for_step = use_tools and not force_no_tools_next
+            step_forced_no_tools = force_no_tools_next
+            use_tools_for_step = use_tools and not step_forced_no_tools
             force_no_tools_next = False
             call_state: Dict[str, Any] = {}
             try:
@@ -3039,9 +3198,15 @@ def run_tester_session(
                     tester_messages[:] = call_state["compacted_messages"]
                 raw_err = str(error)
                 detail = raw_err.lower()
+                has_imgs = any(isinstance(m.get("content"), list) for m in tester_messages)
+                if has_imgs and ("image" in detail or "vision" in detail or "modality" in detail):
+                    allow_tester_images = False
+                    _strip_old_images(tester_messages, keep_last_n=0)
+                    _emit("tester_status", {"runKey": run_key, "text": "Тестировщик: модель без vision — продолжаю по тексту…"})
+                    continue
                 if use_tools and (
                     _parse_context_overflow_error(raw_err) is not None
-                    or ("tools" in detail or "400" in detail)
+                    or (_parse_max_tokens_limit_error(raw_err) is None and ("tools" in detail or "400" in detail))
                 ):
                     use_tools = False
                     tester_messages[0]["content"] = tester_messages[0].get("content", tester_system) + TEXT_PROTOCOL_NOTE
@@ -3059,8 +3224,12 @@ def run_tester_session(
                 run_error = "Модель Тестировщика вернула пустой ответ"
                 break
             msg = choices[0].get("message") or {}
-            content = str(msg.get("content") or "")
+            raw_content = str(msg.get("content") or "")
             reasoning = str(msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+            clean_content, inline_think = _split_inline_think(raw_content)
+            content = clean_content if (inline_think or "<think>" in raw_content.lower()) else raw_content
+            if inline_think:
+                reasoning = ((reasoning + "\n\n") if reasoning else "") + inline_think
             step_usage = extract_usage(
                 data,
                 _messages_char_len(tester_messages),
@@ -3074,8 +3243,12 @@ def run_tester_session(
                 _emit("tester_reasoning", {"runKey": run_key, "text": tester_thinking})
 
             tool_calls = msg.get("tool_calls") or []
-            if not tool_calls and use_tools_for_step:
+            if not tool_calls and not step_forced_no_tools:
                 parsed = parse_text_tool_call(content)
+                if not parsed and not content.strip() and reasoning:
+                    trailing_args = _extract_trailing_qa_submit_from_reasoning(reasoning)
+                    if trailing_args is not None:
+                        parsed = ("qa_submit_report", trailing_args)
                 if parsed:
                     tool_calls = [
                         {
@@ -3090,6 +3263,26 @@ def run_tester_session(
                     content = ""
 
             if not tool_calls:
+                if (
+                    not content.strip()
+                    and not qa_state.get("report")
+                    and reasoning
+                    and empty_reply_nudges < 1
+                    and steps < steps_cap
+                ):
+                    empty_reply_nudges += 1
+                    _emit("tester_status", {"runKey": run_key, "text": "Тестировщик: фиксирую итоговый отчёт…"})
+                    tester_messages.append({"role": "assistant", "content": "(рассуждения завершены)"})
+                    tester_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Ты завершил рассуждения, но не вызвал `qa_submit_report` и не дал итоговый текст. "
+                                "Немедленно вызови `qa_submit_report(...)` или кратко напиши QA-вердикт (без длинных рассуждений)."
+                            ),
+                        }
+                    )
+                    continue
                 tester_final_text = content.strip()
                 break
 
@@ -3101,10 +3294,10 @@ def run_tester_session(
                 fn = call.get("function") or {}
                 t_name = str(fn.get("name") or "")
                 raw_args = fn.get("arguments") or "{}"
-                try:
-                    t_args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-                except json.JSONDecodeError:
-                    t_args = {}
+                if isinstance(raw_args, dict):
+                    t_args = raw_args
+                else:
+                    t_args = _parse_json_dict_relaxed(str(raw_args)) or {}
 
                 if t_name in ("call_tester", "confirm_minor_fixes"):
                     t_res, t_events = "Инструмент недоступен внутри Тестировщика — используй QA-инструменты и qa_submit_report.", []
@@ -3115,7 +3308,7 @@ def run_tester_session(
                             t_name,
                             t_args if isinstance(t_args, dict) else {},
                             trust_level=trust_level,
-                            approval_fn=approval_fn,
+                            approval_fn=wrapped_tool_approval,
                             sandbox_root=sandbox_root,
                             browser_manager=local_browser_mgr,
                             github_ctx=github_ctx,
@@ -3165,6 +3358,12 @@ def run_tester_session(
                     t_res = _shrink_text_head_tail(t_res, 40_000)
                 call_results.append({"role": "tool", "tool_call_id": cid, "content": t_res})
 
+            if qa_state.get("report"):
+                if not tester_final_text:
+                    tester_final_text = content.strip() or str(qa_state["report"].get("summary") or "").strip()
+                _emit("tester_status", {"runKey": run_key, "text": "Тестировщик: передаю отчёт Агенту…"})
+                break
+
             cur_sig = _tool_call_signature(assistant_calls)
             if cur_sig and cur_sig == last_tool_sig:
                 repeat_sig_count += 1
@@ -3185,7 +3384,7 @@ def run_tester_session(
                     "Используй полученные данные, измени параметры или вызови qa_submit_report.]"
                 )
 
-            img_slice = captured_imgs[:3]
+            img_slice = captured_imgs[:3] if allow_tester_images else []
             if img_slice:
                 _strip_old_images(tester_messages, keep_last_n=0)
             if use_tools:
@@ -3216,19 +3415,31 @@ def run_tester_session(
 
     report = qa_state.get("report") if qa_state.get("report") else None
     if not report:
-        if not tester_final_text and not run_error and steps >= steps_cap:
+        if not tester_final_text and not run_error:
             checks_list = qa_state.get("checks") or []
+            fallback_bits: List[str] = []
+            if steps >= steps_cap:
+                if checks_list:
+                    fallback_bits.append(
+                        f"Достигнут лимит шагов Тестировщика ({steps_cap}) до явного qa_submit_report; итоги выполненных проверок:"
+                    )
+                elif tester_actions:
+                    fallback_bits.append(
+                        f"Достигнут лимит шагов Тестировщика ({steps_cap}). Выполнено действий: {len(tester_actions)}."
+                    )
             if checks_list:
-                summary_lines = [f"Достигнут лимит шагов Тестировщика ({steps_cap}) до явного qa_submit_report; итоги выполненных проверок:"]
                 for chk in checks_list:
-                    summary_lines.append(f"- {chk.get('name')}: {chk.get('status')} — {chk.get('details')}")
-                tester_final_text = "\n".join(summary_lines)
-            elif tester_actions:
-                tester_final_text = f"Достигнут лимит шагов Тестировщика ({steps_cap}). Выполнено действий: {len(tester_actions)}."
+                    fallback_bits.append(f"- {chk.get('name')}: {chk.get('status')} — {chk.get('details')}")
+            if tester_thinking.strip():
+                fallback_bits.append(f"Вывод из рассуждений Тестировщика:\n{tester_thinking.strip()[-1500:]}")
+            if fallback_bits:
+                tester_final_text = "\n".join(fallback_bits)
         report = qa_tools.extract_fallback_qa_report(tester_final_text, qa_state.get("checks"))
         if run_error and not report.get("criticalIssues"):
             report["status"] = "error"
             report["summary"] = run_error
+
+    _emit("tester_status", {"runKey": run_key, "text": "Тестировщик: завершаю и передаю данные Агенту…"})
 
     critical_issues = list(report.get("criticalIssues") or [])
     minor_issues = list(report.get("minorIssues") or [])
@@ -4669,6 +4880,7 @@ class Handler(BaseHTTPRequestHandler):
         last_tool_sig = ""
         repeat_sig_count = 0
         force_no_tools_next = False
+        direct_empty_reply_nudges = 0
         try:
             raw_token_cap = int(body.get("maxRunTokens") or 0)
         except (TypeError, ValueError):
@@ -4699,7 +4911,8 @@ class Handler(BaseHTTPRequestHandler):
                     if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
                         self.write(sse({"text": cleaned}, "text"))
 
-                use_tools_for_step = use_tools and not force_no_tools_next
+                step_forced_no_tools = force_no_tools_next
+                use_tools_for_step = use_tools and not step_forced_no_tools
                 force_no_tools_next = False
                 call_state: Dict[str, Any] = {}
                 try:
@@ -4753,8 +4966,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not choices:
                     raise AgentError("Модель вернула пустой ответ")
                 message = choices[0].get("message") or {}
-                content = str(message.get("content") or "")
+                raw_content = str(message.get("content") or "")
                 reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "").strip()
+                clean_content, inline_think = _split_inline_think(raw_content)
+                content = clean_content if (inline_think or "<think>" in raw_content.lower()) else raw_content
+                if inline_think:
+                    reasoning = ((reasoning + "\n\n") if reasoning else "") + inline_think
                 step_usage = extract_usage(
                     data,
                     _messages_char_len(messages),
@@ -4768,8 +4985,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.write(sse({"text": thinking}, "reasoning"))
                 tool_calls = message.get("tool_calls") or []
 
-                if not tool_calls and use_tools_for_step:
+                if not tool_calls and not step_forced_no_tools:
                     parsed = parse_text_tool_call(content)
+                    if not parsed and agent_role == "tester" and not content.strip() and reasoning:
+                        trailing_args = _extract_trailing_qa_submit_from_reasoning(reasoning)
+                        if trailing_args is not None:
+                            parsed = ("qa_submit_report", trailing_args)
                     if parsed:
                         tool_calls = [
                             {
@@ -4784,7 +5005,30 @@ class Handler(BaseHTTPRequestHandler):
                         content = ""
 
                 if not tool_calls:
-                    final_text = content.strip() or "Готово."
+                    if (
+                        agent_role == "tester"
+                        and not content.strip()
+                        and not (qa_state and qa_state.get("report"))
+                        and reasoning
+                        and direct_empty_reply_nudges < 1
+                        and (steps_limit == 0 or steps < steps_limit)
+                    ):
+                        direct_empty_reply_nudges += 1
+                        self.write(sse({"text": "Тестировщик: фиксирую итоговый отчёт…"}, "status"))
+                        messages.append({"role": "assistant", "content": "(рассуждения завершены)"})
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Ты завершил рассуждения, но не вызвал `qa_submit_report` и не дал итоговый текст. "
+                                    "Немедленно вызови `qa_submit_report(...)` или кратко напиши QA-вердикт (без длинных рассуждений)."
+                                ),
+                            }
+                        )
+                        continue
+                    final_text = content.strip()
+                    if not final_text and agent_role != "tester":
+                        final_text = "Готово."
                     break
 
                 call_results = []
@@ -4795,10 +5039,10 @@ class Handler(BaseHTTPRequestHandler):
                     function = call.get("function") or {}
                     name = str(function.get("name") or "")
                     raw_args = function.get("arguments") or "{}"
-                    try:
-                        args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-                    except json.JSONDecodeError:
-                        args = {}
+                    if isinstance(raw_args, dict):
+                        args = raw_args
+                    else:
+                        args = _parse_json_dict_relaxed(str(raw_args)) or {}
 
                     self.write(sse({"text": f"Вызываю инструмент: {name}…"}, "status"))
                     try:
@@ -4872,6 +5116,15 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     call_results.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
 
+                if agent_role == "tester" and qa_state is not None and qa_state.get("report"):
+                    if not final_text:
+                        final_text = (
+                            content.strip()
+                            or str(qa_state["report"].get("summary") or "").strip()
+                            or "Проверка завершена."
+                        )
+                    break
+
                 cur_sig = _tool_call_signature(assistant_calls)
                 if cur_sig and cur_sig == last_tool_sig:
                     repeat_sig_count += 1
@@ -4936,7 +5189,18 @@ class Handler(BaseHTTPRequestHandler):
             browser_mgr.close_all()
 
         if not final_text:
-            final_text = "Сделал максимум шагов. Уточните задачу, если нужно продолжение."
+            if agent_role == "tester" and qa_state is not None:
+                checks_list = qa_state.get("checks") or []
+                fb_bits: List[str] = []
+                if steps_limit > 0 and steps >= steps_limit:
+                    fb_bits.append(f"Достигнут лимит шагов Тестировщика ({steps_limit}) до явного qa_submit_report.")
+                for chk in checks_list:
+                    fb_bits.append(f"- {chk.get('name')}: {chk.get('status')} — {chk.get('details')}")
+                if thinking.strip():
+                    fb_bits.append(f"Вывод из рассуждений Тестировщика:\n{thinking.strip()[-1500:]}")
+                final_text = "\n".join(fb_bits) if fb_bits else "Проверка завершена."
+            else:
+                final_text = "Сделал максимум шагов. Уточните задачу, если нужно продолжение."
 
         if agent_role == "tester" and qa_state is not None:
             rep = qa_state.get("report") or qa_tools.extract_fallback_qa_report(final_text, qa_state.get("checks"))
