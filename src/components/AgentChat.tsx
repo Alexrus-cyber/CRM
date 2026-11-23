@@ -158,6 +158,8 @@ type AgentAction = {
   issuesCount?: number;
   animationsCount?: number;
   errorsCount?: number;
+  error?: string;
+  trace?: string[];
   preview?: string;
   owner?: string;
   repo?: string;
@@ -669,6 +671,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const [testerDirectPrompt, setTesterDirectPrompt] = useState("");
   const [testerDirectProject, setTesterDirectProject] = useState(".");
   const [liveTester, setLiveTester] = useState<LiveTesterState | null>(null);
+  const [liveBrowserLog, setLiveBrowserLog] = useState<string[]>([]);
   const [testerError, setTesterError] = useState<string | null>(null);
   const [testerDecisionBusy, setTesterDecisionBusy] = useState<number | null>(null);
 
@@ -678,6 +681,22 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const fileRef = useRef<HTMLInputElement>(null);
   const ragDirRef = useRef<HTMLInputElement>(null);
   const counter = useRef(0);
+  const browserRunStartRef = useRef<number>(0);
+  const pushLiveBrowserLog = useCallback((textValue: string, reset = false): string => {
+    const clean = textValue.trim();
+    if (reset || browserRunStartRef.current === 0) {
+      browserRunStartRef.current = Date.now();
+    }
+    const elapsedSec = ((Date.now() - browserRunStartRef.current) / 1000).toFixed(1);
+    const entry = `[+${elapsedSec}s] ${clean}`;
+    setLiveBrowserLog((prev) => {
+      const base = reset ? [] : prev;
+      if (clean && base[base.length - 1] === entry) return base;
+      const next = clean ? [...base, entry] : base;
+      return next.length > 60 ? next.slice(-60) : next;
+    });
+    return entry;
+  }, []);
   const conversationIdRef = useRef<number | null>(null);
   const selectedTesterConvIdRef = useRef<number | null>(null);
   const opTaskRef = useRef<OperatorTask | null>(null);
@@ -1006,6 +1025,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     counter.current = 0;
     setError(null);
     setStatus(null);
+    setLiveBrowserLog([]);
+    browserRunStartRef.current = 0;
   }, []);
 
   const createConversation = useCallback(async (title?: string) => {
@@ -1025,6 +1046,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     setText("");
     setError(null);
     setStatus(null);
+    setLiveBrowserLog([]);
+    browserRunStartRef.current = 0;
     return conversation;
   }, []);
 
@@ -2288,11 +2311,34 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               statusText: "Тестировщик начал проверку…",
               reasoning: "",
               content: "",
+              browserLog: [],
               actions: [],
             });
           } else if (ev === "status") {
             const st = String(data.text ?? "");
-            setLiveTester((prev) => (prev ? { ...prev, statusText: st } : prev));
+            const isBrowserStep =
+              data.source === "browser_inspector" ||
+              data.tool === "browse_project" ||
+              data.tool === "qa_browser_audit";
+            const isBrowserStart =
+              st.startsWith("Вызываю инструмент: browse_project") ||
+              st.startsWith("Вызываю инструмент: qa_browser_audit") ||
+              st.startsWith("Тестировщик: browse_project") ||
+              st.startsWith("Тестировщик: qa_browser_audit");
+            const logLine = isBrowserStep && st ? pushLiveBrowserLog(st, isBrowserStart) : "";
+            setLiveTester((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    statusText: st,
+                    ...(logLine
+                      ? {
+                          browserLog: (isBrowserStart ? [] : prev.browserLog ?? []).concat(logLine).slice(-60),
+                        }
+                      : {}),
+                  }
+                : prev,
+            );
           } else if (ev === "reasoning") {
             assistantReason = String(data.text ?? "");
             setSelectedTesterMessages((prev) =>
@@ -2457,6 +2503,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     ]);
     setRunning(true);
     setStatus("Отправляю агенту…");
+    setLiveBrowserLog([]);
+    browserRunStartRef.current = 0;
     autoScrollPausedRef.current = false;
     scrollDown(true);
 
@@ -2566,7 +2614,18 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           }
 
           if (event === "status") {
-            setStatus(String(data.text ?? ""));
+            const st = String(data.text ?? "");
+            setStatus(st);
+            const isBrowserStep =
+              data.source === "browser_inspector" ||
+              data.tool === "browse_project" ||
+              data.tool === "qa_browser_audit";
+            if (isBrowserStep && st) {
+              const isBrowserStart =
+                st.startsWith("Вызываю инструмент: browse_project") ||
+                st.startsWith("Вызываю инструмент: qa_browser_audit");
+              pushLiveBrowserLog(st, isBrowserStart);
+            }
           } else if (event === "approval_required") {
             const ghPayload =
               data.github && typeof data.github === "object"
@@ -2686,12 +2745,33 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               statusText: "Тестировщик запущен в новом чате…",
               reasoning: "",
               content: "",
+              browserLog: [],
               actions: [],
             });
           } else if (event === "tester_status") {
             const st = String(data.text ?? "");
             setStatus(st);
-            setLiveTester((prev) => (prev ? { ...prev, statusText: st } : prev));
+            const isBrowserStep =
+              data.source === "browser_inspector" ||
+              data.tool === "browse_project" ||
+              data.tool === "qa_browser_audit";
+            const isBrowserStart =
+              st.startsWith("Тестировщик: browse_project") ||
+              st.startsWith("Тестировщик: qa_browser_audit");
+            const logLine = isBrowserStep && st ? pushLiveBrowserLog(st, isBrowserStart) : "";
+            setLiveTester((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    statusText: st,
+                    ...(logLine
+                      ? {
+                          browserLog: (isBrowserStart ? [] : prev.browserLog ?? []).concat(logLine).slice(-60),
+                        }
+                      : {}),
+                  }
+                : prev,
+            );
           } else if (event === "tester_reasoning") {
             const r = String(data.text ?? "");
             setLiveTester((prev) => (prev ? { ...prev, reasoning: r } : prev));
@@ -2825,6 +2905,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 issuesCount: typeof data.issuesCount === "number" ? data.issuesCount : undefined,
                 animationsCount: typeof data.animationsCount === "number" ? data.animationsCount : undefined,
                 errorsCount: typeof data.errorsCount === "number" ? data.errorsCount : undefined,
+                error: data.error ? String(data.error) : undefined,
+                trace: Array.isArray(data.trace) ? data.trace.map(String).slice(-80) : undefined,
                 preview: typeof data.preview === "string" && data.preview.startsWith("data:image/") ? data.preview : undefined,
                 owner: data.owner ? String(data.owner) : undefined,
                 repo: data.repo ? String(data.repo) : undefined,
@@ -2871,6 +2953,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             setPendingApproval(null);
             setScreenCapture(null);
             setLiveTester(null);
+            setLiveBrowserLog([]);
+            browserRunStartRef.current = 0;
             void refreshSandbox(true);
           }
         }
@@ -2943,6 +3027,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       setPendingApproval(null);
       setScreenCapture(null);
       setLiveTester(null);
+      setLiveBrowserLog([]);
+      browserRunStartRef.current = 0;
       setStatus(null);
       scrollDown();
 
@@ -4366,6 +4452,16 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                         )}
                       </div>
                       <p className="text-[10px] text-muted">{liveTester.statusText}</p>
+                      {liveTester.browserLog && liveTester.browserLog.length > 0 && (
+                        <div className="space-y-0.5 rounded-lg border border-cyan-500/30 bg-card/70 px-2 py-1.5">
+                          <p className="text-[10px] font-semibold text-cyan-400">
+                            Ход BrowserInspector ({liveTester.browserLog.length})
+                          </p>
+                          <pre className="max-h-28 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-muted">
+                            {liveTester.browserLog.slice(-14).join("\n")}
+                          </pre>
+                        </div>
+                      )}
                       {liveTester.actions.length > 0 && (
                         <ul className="space-y-0.5 text-[10px] text-text/90">
                           {liveTester.actions.slice(-5).map((act, aIdx) => (
@@ -4525,21 +4621,30 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                       );
                     }
                     if (action.type === "browser_inspect") {
-                      const hasProblems = (action.errorsCount ?? 0) > 0 || (action.issuesCount ?? 0) > 0;
+                      const hasError = Boolean(action.error);
+                      const hasProblems = hasError || (action.errorsCount ?? 0) > 0 || (action.issuesCount ?? 0) > 0;
+                      const traceLines = Array.isArray(action.trace) ? action.trace : [];
                       return (
                         <div
                           key={`browser-inspect-${index}`}
                           className={cn(
                             "space-y-1.5 rounded-xl border px-2.5 py-2 text-[11px]",
-                            hasProblems
-                              ? "border-amber-500/40 bg-amber-500/5"
-                              : "border-emerald-500/35 bg-emerald-500/5",
+                            hasError
+                              ? "border-red-500/40 bg-red-500/10"
+                              : hasProblems
+                                ? "border-amber-500/40 bg-amber-500/5"
+                                : "border-emerald-500/35 bg-emerald-500/5",
                           )}
                         >
                           <div className="flex flex-wrap items-center gap-1.5">
-                            <Compass size={13} className={hasProblems ? "text-amber-500" : "text-emerald-500"} />
+                            {hasError ? (
+                              <TriangleAlert size={13} className="shrink-0 text-red-500" />
+                            ) : (
+                              <Compass size={13} className={hasProblems ? "text-amber-500" : "text-emerald-500"} />
+                            )}
                             <span className="font-medium text-text">
-                              Осмотр проекта{action.action ? ` (${action.action})` : ""}
+                              {hasError ? "Сбой BrowserInspector" : "Осмотр проекта"}
+                              {action.action ? ` (${action.action})` : ""}
                             </span>
                             {action.viewport && (
                               <span className="rounded bg-card px-1.5 py-0.5 text-[10px] text-muted">
@@ -4552,7 +4657,14 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                               </span>
                             )}
                           </div>
-                          {action.summary && <p className="text-[10px] text-muted">{action.summary}</p>}
+                          {action.error && (
+                            <p className="whitespace-pre-wrap break-words rounded-lg border border-red-500/30 bg-card/80 px-2 py-1 text-[10px] text-red-400">
+                              {action.error}
+                            </p>
+                          )}
+                          {action.summary && !action.error && (
+                            <p className="text-[10px] text-muted">{action.summary}</p>
+                          )}
                           {action.preview && (
                             // eslint-disable-next-line @next/next/no-img-element
                             <img
@@ -4560,6 +4672,16 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                               alt={`Скриншот осмотра ${action.url || "проекта"}`}
                               className="max-h-48 w-full rounded-lg border border-border object-cover object-top"
                             />
+                          )}
+                          {traceLines.length > 0 && (
+                            <details open={hasError} className="rounded-lg border border-border/70 bg-card/70 px-2 py-1">
+                              <summary className="cursor-pointer select-none text-[10px] font-medium text-muted hover:text-text">
+                                Журнал шагов BrowserInspector ({traceLines.length})
+                              </summary>
+                              <pre className="mt-1 max-h-44 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-muted">
+                                {traceLines.join("\n")}
+                              </pre>
+                            </details>
                           )}
                         </div>
                       );
@@ -4832,6 +4954,20 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         </div>
 
         <div className="border-t border-border p-3">
+          {running && liveBrowserLog.length > 0 && (
+            <div className="mb-2 space-y-1 rounded-xl border border-cyan-500/35 bg-cyan-500/5 px-2.5 py-2">
+              <div className="flex items-center justify-between gap-2 text-[10px]">
+                <span className="flex items-center gap-1.5 font-semibold text-cyan-400">
+                  <Compass size={11} className="animate-pulse" />
+                  Ход BrowserInspector ({liveBrowserLog.length})
+                </span>
+                <span className="text-muted">шаги в реальном времени</span>
+              </div>
+              <pre className="max-h-28 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-muted">
+                {liveBrowserLog.slice(-16).join("\n")}
+              </pre>
+            </div>
+          )}
           {status && (
             <p className="mb-2 flex items-center gap-1.5 text-[11px] text-muted">
               <Loader2 size={11} className="animate-spin" /> {status}

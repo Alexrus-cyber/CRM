@@ -915,9 +915,16 @@ TOOLS = (
 class AgentError(Exception):
     """Ошибка, которую можно показать пользователю как есть."""
 
-    def __init__(self, message: str = "", *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        retryable: bool = False,
+        trace: Optional[List[str]] = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.trace: List[str] = list(trace or [])
 
 
 _CLIENT_DISCONNECT_ERRNOS = frozenset(
@@ -1136,7 +1143,7 @@ def run_tool(
                 cancel_check=cancel_check,
             )
         except qa_tools.QaToolError as error:
-            raise AgentError(str(error)) from error
+            raise AgentError(str(error), trace=getattr(error, "trace", None)) from error
 
     if name == "list_tester_reports":
         reports = (tester_ctx or {}).get("recent_reports") or []
@@ -1347,7 +1354,7 @@ def run_tool(
                 cancel_check=cancel_check,
             )
         except (browser_inspector.BrowserError, sandbox_mod.SandboxError) as error:
-            raise AgentError(str(error)) from error
+            raise AgentError(str(error), trace=getattr(error, "trace", None)) from error
 
     if name == "inspect_pc_screen":
         reason = str(args.get("reason") or "Агенту нужен снимок экрана ПК для решения задачи").strip()
@@ -3308,7 +3315,37 @@ def run_tester_session(
                 if t_name in ("call_tester", "confirm_minor_fixes"):
                     t_res, t_events = "Инструмент недоступен внутри Тестировщика — используй QA-инструменты и qa_submit_report.", []
                 else:
-                    _emit("tester_status", {"runKey": run_key, "text": f"Тестировщик: {t_name}…"})
+                    is_browser_tool = t_name in ("browse_project", "qa_browser_audit")
+                    tester_browser_trace: List[str] = []
+                    t_started = time.monotonic()
+
+                    def _on_tester_tool_status(msg_s: str) -> None:
+                        if not msg_s:
+                            return
+                        if is_browser_tool:
+                            line = f"[+{time.monotonic() - t_started:.2f}s] {msg_s}"
+                            if not tester_browser_trace or tester_browser_trace[-1] != line:
+                                tester_browser_trace.append(line)
+                            _emit(
+                                "tester_status",
+                                {
+                                    "runKey": run_key,
+                                    "text": msg_s,
+                                    "source": "browser_inspector",
+                                    "tool": t_name,
+                                },
+                            )
+                        else:
+                            _emit("tester_status", {"runKey": run_key, "text": msg_s})
+
+                    _emit(
+                        "tester_status",
+                        {
+                            "runKey": run_key,
+                            "text": f"Тестировщик: {t_name}…",
+                            **({"source": "browser_inspector", "tool": t_name} if is_browser_tool else {}),
+                        },
+                    )
                     try:
                         t_res, t_events = run_tool(
                             t_name,
@@ -3322,19 +3359,69 @@ def run_tester_session(
                             tester_ctx=tester_ctx,
                             qa_state=qa_state,
                             run_state=tester_run_state,
-                            on_status=lambda msg_s: _emit("tester_status", {"runKey": run_key, "text": msg_s}),
+                            on_status=_on_tester_tool_status,
                             cancel_check=cancel_check if callable(cancel_check) else None,
                         )
                     except AgentError as error:
                         if callable(cancel_check) and cancel_check():
                             run_error = "Клиент закрыл соединение"
                             raise BrokenPipeError from error
-                        t_res, t_events = f"Ошибка QA-инструмента {t_name}: {error}", []
+                        if is_browser_tool:
+                            err_trace = list(getattr(error, "trace", None) or []) or list(tester_browser_trace)
+                            err_msg = str(error)
+                            t_events = [
+                                {
+                                    "type": "browser_inspect",
+                                    "action": str((t_args if isinstance(t_args, dict) else {}).get("action") or "open"),
+                                    "url": str(
+                                        (t_args if isinstance(t_args, dict) else {}).get("url")
+                                        or (t_args if isinstance(t_args, dict) else {}).get("sandbox_project")
+                                        or ""
+                                    ),
+                                    "error": err_msg,
+                                    "summary": f"Сбой: {err_msg[:120]}",
+                                    "trace": err_trace,
+                                    "animationsCount": 0,
+                                    "issuesCount": 0,
+                                    "errorsCount": 1,
+                                }
+                            ]
+                            tail = "\n".join(err_trace[-12:]) if err_trace else ""
+                            t_res = f"Ошибка QA-инструмента {t_name}: {err_msg}" + (
+                                f"\n\nЖурнал шагов BrowserInspector:\n{tail}" if tail else ""
+                            )
+                        else:
+                            t_res, t_events = f"Ошибка QA-инструмента {t_name}: {error}", []
                     except BrokenPipeError:
                         raise
                     except Exception as error:  # noqa: BLE001
                         log(f"сбой QA-инструмента {t_name}: {traceback.format_exc()}")
-                        t_res, t_events = f"Внутренний сбой QA-инструмента {t_name}: {error}", []
+                        if is_browser_tool:
+                            err_trace = list(getattr(error, "trace", None) or []) or list(tester_browser_trace)
+                            err_msg = str(error)
+                            t_events = [
+                                {
+                                    "type": "browser_inspect",
+                                    "action": str((t_args if isinstance(t_args, dict) else {}).get("action") or "open"),
+                                    "url": str(
+                                        (t_args if isinstance(t_args, dict) else {}).get("url")
+                                        or (t_args if isinstance(t_args, dict) else {}).get("sandbox_project")
+                                        or ""
+                                    ),
+                                    "error": err_msg,
+                                    "summary": f"Сбой: {err_msg[:120]}",
+                                    "trace": err_trace,
+                                    "animationsCount": 0,
+                                    "issuesCount": 0,
+                                    "errorsCount": 1,
+                                }
+                            ]
+                            tail = "\n".join(err_trace[-12:]) if err_trace else ""
+                            t_res = f"Внутренний сбой QA-инструмента {t_name}: {err_msg}" + (
+                                f"\n\nЖурнал шагов BrowserInspector:\n{tail}" if tail else ""
+                            )
+                        else:
+                            t_res, t_events = f"Внутренний сбой QA-инструмента {t_name}: {error}", []
 
                 for ev in t_events:
                     img = ev.pop("_image", None)
@@ -5056,11 +5143,33 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         args = _parse_json_dict_relaxed(str(raw_args)) or {}
 
-                    self.write(sse({"text": f"Вызываю инструмент: {name}…"}, "status"))
+                    is_browser_tool = name in ("browse_project", "qa_browser_audit")
+                    browser_trace: List[str] = []
+                    tool_started = time.monotonic()
+
+                    self.write(
+                        sse(
+                            {
+                                "text": f"Вызываю инструмент: {name}…",
+                                **({"source": "browser_inspector", "tool": name} if is_browser_tool else {}),
+                            },
+                            "status",
+                        )
+                    )
 
                     def _on_tool_status(msg_text: str) -> None:
-                        if not _is_disconnected() and msg_text:
-                            self._safe_write(sse({"text": msg_text}, "status"))
+                        if not msg_text:
+                            return
+                        if is_browser_tool:
+                            line = f"[+{time.monotonic() - tool_started:.2f}s] {msg_text}"
+                            if not browser_trace or browser_trace[-1] != line:
+                                browser_trace.append(line)
+                        if not _is_disconnected():
+                            payload: Dict[str, Any] = {"text": msg_text}
+                            if is_browser_tool:
+                                payload["source"] = "browser_inspector"
+                                payload["tool"] = name
+                            self._safe_write(sse(payload, "status"))
 
                     try:
                         tester_ctx["discovered_max_context"] = discovered_max_context
@@ -5083,12 +5192,62 @@ class Handler(BaseHTTPRequestHandler):
                     except AgentError as error:
                         if _is_disconnected():
                             raise BrokenPipeError from error
-                        result_text, events = f"Ошибка инструмента: {error}", []
+                        if is_browser_tool:
+                            err_trace = list(getattr(error, "trace", None) or []) or list(browser_trace)
+                            err_msg = str(error)
+                            events = [
+                                {
+                                    "type": "browser_inspect",
+                                    "action": str((args if isinstance(args, dict) else {}).get("action") or "open"),
+                                    "url": str(
+                                        (args if isinstance(args, dict) else {}).get("url")
+                                        or (args if isinstance(args, dict) else {}).get("sandbox_project")
+                                        or ""
+                                    ),
+                                    "error": err_msg,
+                                    "summary": f"Сбой: {err_msg[:120]}",
+                                    "trace": err_trace,
+                                    "animationsCount": 0,
+                                    "issuesCount": 0,
+                                    "errorsCount": 1,
+                                }
+                            ]
+                            tail = "\n".join(err_trace[-12:]) if err_trace else ""
+                            result_text = f"Ошибка инструмента: {err_msg}" + (
+                                f"\n\nЖурнал шагов BrowserInspector:\n{tail}" if tail else ""
+                            )
+                        else:
+                            result_text, events = f"Ошибка инструмента: {error}", []
                     except BrokenPipeError:
                         raise
                     except Exception as error:  # noqa: BLE001
                         log(f"сбой инструмента {name}: {traceback.format_exc()}")
-                        result_text, events = f"Внутренний сбой инструмента {name}: {error}", []
+                        if is_browser_tool:
+                            err_trace = list(getattr(error, "trace", None) or []) or list(browser_trace)
+                            err_msg = str(error)
+                            events = [
+                                {
+                                    "type": "browser_inspect",
+                                    "action": str((args if isinstance(args, dict) else {}).get("action") or "open"),
+                                    "url": str(
+                                        (args if isinstance(args, dict) else {}).get("url")
+                                        or (args if isinstance(args, dict) else {}).get("sandbox_project")
+                                        or ""
+                                    ),
+                                    "error": err_msg,
+                                    "summary": f"Сбой: {err_msg[:120]}",
+                                    "trace": err_trace,
+                                    "animationsCount": 0,
+                                    "issuesCount": 0,
+                                    "errorsCount": 1,
+                                }
+                            ]
+                            tail = "\n".join(err_trace[-12:]) if err_trace else ""
+                            result_text = f"Внутренний сбой инструмента {name}: {err_msg}" + (
+                                f"\n\nЖурнал шагов BrowserInspector:\n{tail}" if tail else ""
+                            )
+                        else:
+                            result_text, events = f"Внутренний сбой инструмента {name}: {error}", []
                     if _is_disconnected():
                         raise BrokenPipeError
 

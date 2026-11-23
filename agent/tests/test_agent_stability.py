@@ -783,6 +783,194 @@ class BrowserInspectorStabilityTests(unittest.TestCase):
         self.assertIn("Запускаю headless-браузер…", joined)
         self.assertIn("Открываю страницу http://127.0.0.1:8123…", joined)
         self.assertIn("Готово, страница проверена.", joined)
+        self.assertIn('"source": "browser_inspector"', joined)
+
+    def test_run_agent_emits_browser_inspect_error_card_with_trace_on_failure(self) -> None:
+        sse_frames: list[str] = []
+
+        class CollectingWriter:
+            def write(self, data: bytes) -> int:
+                sse_frames.append(data.decode("utf-8", errors="replace"))
+                return len(data)
+
+            def flush(self) -> None:
+                pass
+
+        h = agent_mod.Handler.__new__(agent_mod.Handler)
+        h.wfile = CollectingWriter()  # type: ignore[assignment]
+        h._client_disconnected = False
+
+        calls = {"n": 0}
+
+        def fake_call_model(*_args, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_b_err",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "browse_project",
+                                            "arguments": json.dumps({"action": "open", "url": "http://127.0.0.1:8123"}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            return {"choices": [{"message": {"role": "assistant", "content": "Браузер упал при старте."}}]}
+
+        def failing_browse(_mgr, _args, **_kw):
+            raise browser_inspector.BrowserError(
+                "Не удалось запустить Chromium (код 2147483651)",
+                trace=["[+0.01s] Ищу браузер…", "[+0.12s] Попытка 1/3 упала"],
+            )
+
+        with (
+            mock.patch.object(agent_mod, "call_model", side_effect=fake_call_model),
+            mock.patch.object(browser_inspector, "execute_browse_action", side_effect=failing_browse),
+        ):
+            h.run_agent(
+                {
+                    "messages": [{"role": "user", "content": "проверь сайт"}],
+                    "model": "test-model",
+                    "baseUrl": "http://127.0.0.1:8888/v1",
+                    "trustLevel": "verified",
+                }
+            )
+
+        joined = "".join(sse_frames)
+        self.assertIn('"type": "browser_inspect"', joined)
+        self.assertIn("Не удалось запустить Chromium", joined)
+        self.assertIn("[+0.12s] Попытка 1/3 упала", joined)
+
+    def test_launch_windows_retries_swiftshader_then_no_sandbox_and_reads_debug_log(self) -> None:
+        captured_cmds: list[list[str]] = []
+
+        class DeadProc:
+            pid = 222
+            returncode = 1
+            def poll(self): return 1
+            def terminate(self): pass
+            def kill(self): pass
+            def wait(self, timeout=None): return 1
+
+        class AliveProc:
+            pid = 333
+            returncode = None
+            def poll(self): return None
+            def terminate(self): pass
+            def kill(self): pass
+            def wait(self, timeout=None): return 0
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmds.append(list(cmd))
+            attempt = len(captured_cmds)
+            ud = Path(next(a for a in cmd if a.startswith("--user-data-dir=")).split("=", 1)[1])
+            if attempt in (1, 2):
+                (ud / "chrome_debug.log").write_text(f"[ERR] attempt {attempt} gpu crash\n", encoding="utf-8")
+                return DeadProc()
+            (ud / "DevToolsActivePort").write_text("49123\n/devtools/browser/xyz\n", encoding="utf-8")
+            return AliveProc()
+
+        trace_lines: list[str] = []
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(browser_inspector.platform, "system", return_value="Windows"),
+            mock.patch.object(browser_inspector.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            proc, user_data, port = browser_inspector._launch_headless_chromium(
+                "C:\\msedge.exe", 1280, 720, trace=trace_lines, started_at=0.0
+            )
+        import shutil as _sh
+        _sh.rmtree(user_data, ignore_errors=True)
+
+        self.assertEqual(port, 49123)
+        self.assertEqual(len(captured_cmds), 3)
+        self.assertNotIn("--disable-gpu", captured_cmds[0])
+        self.assertIn("--disable-gpu", captured_cmds[1])
+        self.assertIn("--use-angle=swiftshader", captured_cmds[1])
+        self.assertIn("--no-sandbox", captured_cmds[2])
+        self.assertIn("--disable-gpu-sandbox", captured_cmds[2])
+        self.assertTrue(any("Попытка 1 завершилась с ошибкой" in line for line in trace_lines))
+
+        # Если упали все попытки, chrome_debug.log попадает в сообщение BrowserError.
+        def always_dead(cmd, **kwargs):
+            ud = Path(next(a for a in cmd if a.startswith("--user-data-dir=")).split("=", 1)[1])
+            (ud / "chrome_debug.log").write_text("FATAL: gpu_process_host failed on Windows\n", encoding="utf-8")
+            return DeadProc()
+
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(browser_inspector.platform, "system", return_value="Windows"),
+            mock.patch.object(browser_inspector.subprocess, "Popen", side_effect=always_dead),
+        ):
+            with self.assertRaises(browser_inspector.BrowserError) as ctx:
+                browser_inspector._launch_headless_chromium("C:\\chrome.exe", 1280, 720)
+        self.assertIn("gpu_process_host failed on Windows", str(ctx.exception))
+
+    def test_browser_session_launch_falls_back_to_next_browser_and_network_enable(self) -> None:
+        launched_exes: list[str] = []
+        cdp_calls: list[str] = []
+
+        class DummyProc:
+            pid = 555
+            def poll(self): return None
+            def terminate(self): pass
+            def kill(self): pass
+            def wait(self, timeout=None): return 0
+
+        class FakeCDP:
+            def __init__(self, ws_url: str) -> None:
+                self.ws_url = ws_url
+                self._ws = mock.Mock(closed=False)
+                self._thread = mock.Mock()
+                self._thread.is_alive.return_value = True
+
+            def call(self, method: str, params=None, timeout=10.0, cancel_check=None):
+                cdp_calls.append(f"{self.ws_url}:{method}:{bool(params)}")
+                if "broken" in self.ws_url and method == "Page.enable":
+                    raise browser_inspector.BrowserError("Page.enable hung")
+                if method == "Network.enable" and params:
+                    raise browser_inspector.BrowserError("Invalid parameters")
+                return {}
+
+            def close(self) -> None:
+                self._ws.closed = True
+
+        def fake_launch(exe, _w, _h, **_kw):
+            launched_exes.append(exe)
+            ud = Path(tempfile.mkdtemp(prefix="bi_test_"))
+            return DummyProc(), ud, (1111 if "chrome" in exe else 2222)
+
+        def fake_find_ws(port, **_kw):
+            return "ws://127.0.0.1:1111/broken" if port == 1111 else "ws://127.0.0.1:2222/good"
+
+        with (
+            mock.patch.object(browser_inspector, "find_browser_executable", return_value="C:\\chrome.exe"),
+            mock.patch.object(
+                browser_inspector,
+                "find_browser_candidates",
+                return_value=["C:\\chrome.exe", "C:\\msedge.exe"],
+            ),
+            mock.patch.object(browser_inspector, "_launch_headless_chromium", side_effect=fake_launch),
+            mock.patch.object(browser_inspector, "_find_page_ws_url", side_effect=fake_find_ws),
+            mock.patch.object(browser_inspector, "CDPClient", side_effect=FakeCDP),
+            mock.patch.object(browser_inspector.platform, "system", return_value="Linux"),
+        ):
+            sess = browser_inspector.BrowserSession.launch(1280, 800)
+            sess.close()
+
+        self.assertEqual(launched_exes, ["C:\\chrome.exe", "C:\\msedge.exe"])
+        self.assertIn("ws://127.0.0.1:2222/good:Network.enable:True", cdp_calls)
+        self.assertIn("ws://127.0.0.1:2222/good:Network.enable:False", cdp_calls)
 
 
 class WindowsCompatibilityAndSpecTests(unittest.TestCase):
@@ -903,6 +1091,22 @@ class WindowsCompatibilityAndSpecTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
             th.join(timeout=2)
+
+    def test_launcher_bundle_preserves_windows_browser_env_keys(self) -> None:
+        from launcher import bundle
+
+        for key in (
+            "PROGRAMW6432",
+            "SYSTEMDRIVE",
+            "PROCESSOR_ARCHITECTURE",
+            "PLAYWRIGHT_BROWSERS_PATH",
+            "AGENT_BROWSER_PATH",
+            "CHROME_PATH",
+            "CHROME_BIN",
+            "EDGE_PATH",
+            "PUPPETEER_EXECUTABLE_PATH",
+        ):
+            self.assertIn(key, bundle.SAFE_CHILD_ENV_KEYS)
 
 
 if __name__ == "__main__":

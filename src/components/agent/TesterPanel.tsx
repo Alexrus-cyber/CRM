@@ -87,6 +87,7 @@ export type LiveTesterState = {
   statusText: string;
   reasoning: string;
   content: string;
+  browserLog?: string[];
   actions: Array<{ type: string; label?: string; command?: string; url?: string }>;
 };
 
@@ -304,6 +305,16 @@ export function TesterPanel({
           </div>
           {liveTester.statusText && (
             <p className="text-[11px] text-muted">{liveTester.statusText}</p>
+          )}
+          {liveTester.browserLog && liveTester.browserLog.length > 0 && (
+            <div className="space-y-1 rounded-xl border border-cyan-500/30 bg-card/80 p-2">
+              <p className="text-[10px] font-semibold text-cyan-400">
+                Ход BrowserInspector ({liveTester.browserLog.length})
+              </p>
+              <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-muted">
+                {liveTester.browserLog.slice(-16).join("\n")}
+              </pre>
+            </div>
           )}
           {liveTester.reasoning && (
             <LiveReasoningBox text={liveTester.reasoning} streaming />
