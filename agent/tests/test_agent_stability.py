@@ -73,14 +73,15 @@ class ClientDisconnectAndServerTests(unittest.TestCase):
         h._headers_buffer = []
 
         # _json не должен падать при WinError 10053
-        h._json(200, {"ok": True})
-        self.assertTrue(getattr(h, "_client_disconnected", False))
+        with mock.patch.object(agent_mod, "log"):
+            h._json(200, {"ok": True})
+            self.assertTrue(getattr(h, "_client_disconnected", False))
 
-        # write при обрыве кидает BrokenPipeError и выставляет _client_disconnected
-        h._client_disconnected = False
-        with self.assertRaises(BrokenPipeError):
-            h.write(b"data: {}\n\n")
-        self.assertTrue(h._client_disconnected)
+            # write при обрыве кидает BrokenPipeError и выставляет _client_disconnected
+            h._client_disconnected = False
+            with self.assertRaises(BrokenPipeError):
+                h.write(b"data: {}\n\n")
+            self.assertTrue(h._client_disconnected)
 
     def test_sse_keepalive_sends_heartbeat_and_stops_cleanly(self) -> None:
         chunks: list[bytes] = []
@@ -119,7 +120,7 @@ class ClientDisconnectAndServerTests(unittest.TestCase):
             t.start()
             err_buf = io.StringIO()
             try:
-                with mock.patch("sys.stderr", err_buf):
+                with mock.patch("sys.stderr", err_buf), mock.patch.object(agent_mod, "log"):
                     # Отправляем GET /sandbox и мгновенно рвём сокет с RST (SO_LINGER=0)
                     sock = socket.create_connection(("127.0.0.1", port), timeout=2.0)
                     sock.setsockopt(
@@ -131,16 +132,16 @@ class ClientDisconnectAndServerTests(unittest.TestCase):
                     sock.close()
                     time.sleep(0.15)
 
-                # Обычный GET /sandbox работает и не тащит _github
-                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
-                conn.request("GET", "/sandbox")
-                resp = conn.getresponse()
-                body = json.loads(resp.read().decode("utf-8"))
-                conn.close()
-                self.assertEqual(resp.status, 200)
-                self.assertFalse(any("_github" in p.get("name", "") for p in body["projects"]))
-                self.assertTrue(any(p.get("name") == "demo" for p in body["projects"]))
-                self.assertNotIn("Traceback", err_buf.getvalue())
+                    # Обычный GET /sandbox работает и не тащит _github
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
+                    conn.request("GET", "/sandbox")
+                    resp = conn.getresponse()
+                    body = json.loads(resp.read().decode("utf-8"))
+                    conn.close()
+                    self.assertEqual(resp.status, 200)
+                    self.assertFalse(any("_github" in p.get("name", "") for p in body["projects"]))
+                    self.assertTrue(any(p.get("name") == "demo" for p in body["projects"]))
+                    self.assertNotIn("Traceback", err_buf.getvalue())
             finally:
                 agent_mod.SANDBOX_ROOT = prev_sb
                 srv.shutdown()
@@ -201,7 +202,12 @@ class CallModelRetryAndAntiLoopTests(unittest.TestCase):
                 return FailingStreamResponse()
             return OkJsonResponse()
 
-        with mock.patch.object(agent_mod, "_safe_model_urlopen", side_effect=fake_urlopen), mock.patch("time.sleep"):
+        log_messages: list[str] = []
+        with (
+            mock.patch.object(agent_mod, "_safe_model_urlopen", side_effect=fake_urlopen),
+            mock.patch("time.sleep"),
+            mock.patch.object(agent_mod, "log", side_effect=log_messages.append),
+        ):
             res = agent_mod.call_model(
                 "http://127.0.0.1:8888/v1",
                 "",
@@ -213,6 +219,7 @@ class CallModelRetryAndAntiLoopTests(unittest.TestCase):
 
         self.assertEqual(attempts, [True, True, False])
         self.assertEqual(res["choices"][0]["message"]["content"], "Готово!")
+        self.assertTrue(any("временный сбой модели" in m or "сбой потока модели" in m for m in log_messages))
 
     def test_call_model_aborts_retry_when_cancelled(self) -> None:
         with self.assertRaises(BrokenPipeError):
@@ -437,11 +444,41 @@ class BrowserInspectorStabilityTests(unittest.TestCase):
             srv.server_close()
             th.join(timeout=2)
 
-    @unittest.skipIf(os.name == "nt", "POSIX shell executable + process-group kill test")
+    @staticmethod
+    def _make_fake_browser_wrapper(tmp_dir: Path, name: str, script_path: Path) -> Path:
+        if os.name == "nt":
+            exe = tmp_dir / f"{name}.cmd"
+            exe.write_text(f'@echo off\r\n"{sys.executable}" "{script_path}" %*\r\n', encoding="utf-8")
+            return exe
+        exe = tmp_dir / f"{name}.sh"
+        exe.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script_path}" "$@"\n', encoding="utf-8")
+        exe.chmod(0o755)
+        return exe
+
+    @staticmethod
+    def _is_pid_alive(pid: int) -> bool:
+        if os.name == "nt":
+            import ctypes
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = kernel32.OpenProcess(0x100000 | 0x0400, False, pid)
+            if not handle:
+                return False
+            try:
+                wait_res = kernel32.WaitForSingleObject(handle, 0)
+                return wait_res != 0
+            finally:
+                kernel32.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
     def test_launch_headless_chromium_and_kill_proc_tree_no_pipe_deadlock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            pid_file = Path(tmp) / "grandchild.pid"
-            fake_py = Path(tmp) / "fake_browser.py"
+            tmp_path = Path(tmp)
+            pid_file = tmp_path / "grandchild.pid"
+            fake_py = tmp_path / "fake_browser.py"
             fake_py.write_text(
                 "\n".join(
                     [
@@ -457,19 +494,14 @@ class BrowserInspectorStabilityTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            fake_exe = Path(tmp) / "fake-chromium.sh"
-            fake_exe.write_text(
-                f'#!/bin/sh\nexec "{sys.executable}" "{fake_py}" "$@"\n',
-                encoding="utf-8",
-            )
-            fake_exe.chmod(0o755)
+            fake_exe = self._make_fake_browser_wrapper(tmp_path, "fake-chromium", fake_py)
 
             t0 = time.monotonic()
             proc, user_data, port = browser_inspector._launch_headless_chromium(str(fake_exe), 1280, 720)
             try:
                 self.assertEqual(port, 45555)
                 self.assertLess(time.monotonic() - t0, 3.0)
-                for _ in range(40):
+                for _ in range(50):
                     if pid_file.is_file() and pid_file.read_text(encoding="utf-8").strip().isdigit():
                         break
                     time.sleep(0.05)
@@ -480,34 +512,23 @@ class BrowserInspectorStabilityTests(unittest.TestCase):
                 elapsed_kill = time.monotonic() - t_kill
                 self.assertLess(elapsed_kill, 3.0)
 
-                time.sleep(0.1)
-                alive = True
-                try:
-                    os.kill(gc_pid, 0)
-                except OSError:
-                    alive = False
-                self.assertFalse(alive, "Дочерний процесс-внук (grandchild) не должен оставаться в живых после _kill_proc_tree")
+                time.sleep(0.15)
+                self.assertFalse(
+                    self._is_pid_alive(gc_pid),
+                    "Дочерний процесс-внук (grandchild) не должен оставаться в живых после _kill_proc_tree",
+                )
             finally:
                 browser_inspector._kill_proc_tree(proc)
                 import shutil as _sh
                 _sh.rmtree(user_data, ignore_errors=True)
 
-    @unittest.skipIf(os.name == "nt", "POSIX shell executable cancel test")
     def test_execute_browse_action_emits_status_and_cancels_during_launch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            fake_exe = Path(tmp) / "slow-chromium.sh"
-            fake_exe.write_text(
-                "\n".join(
-                    [
-                        "#!/bin/sh",
-                        f'exec "{sys.executable}" -c "import time; time.sleep(30)"',
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            fake_exe.chmod(0o755)
-            mgr = browser_inspector.BrowserSessionManager(sandbox_root=Path(tmp))
+            tmp_path = Path(tmp)
+            slow_py = tmp_path / "slow_browser.py"
+            slow_py.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+            fake_exe = self._make_fake_browser_wrapper(tmp_path, "slow-chromium", slow_py)
+            mgr = browser_inspector.BrowserSessionManager(sandbox_root=tmp_path)
             statuses: list[str] = []
             cancel_flag = {"stop": False}
 
@@ -530,7 +551,6 @@ class BrowserInspectorStabilityTests(unittest.TestCase):
             self.assertLess(time.monotonic() - t0, 3.0)
             self.assertTrue(any("Запускаю headless-браузер" in s for s in statuses))
 
-    @unittest.skipIf(os.name == "nt", "POSIX playwright probe timeout test")
     def test_find_browser_executable_playwright_probe_does_not_hang(self) -> None:
         import importlib.util as _iu
         import shutil as _sh
@@ -557,6 +577,143 @@ class BrowserInspectorStabilityTests(unittest.TestCase):
             res = browser_inspector.find_browser_executable(allow_subprocess=True)
         self.assertIsNone(res)
         self.assertLess(time.monotonic() - t0, 5.5)
+
+    def test_audit_degrades_gracefully_when_js_thread_times_out(self) -> None:
+        fake_cdp = mock.MagicMock()
+        fake_cdp._ws = mock.MagicMock()
+        fake_cdp._ws.closed = False
+        fake_cdp._thread = None
+        fake_cdp.evaluate.side_effect = browser_inspector.BrowserError("Браузер не ответил на Runtime.evaluate за 8 с")
+        fake_cdp.snapshot_telemetry.return_value = {
+            "consoleMessages": [{"level": "error", "text": "Uncaught RangeError"}],
+            "pageErrors": ["RangeError: boom"],
+            "failedRequests": [],
+        }
+
+        sess = browser_inspector.BrowserSession(cdp=fake_cdp, width=1280, height=720)
+        sess.current_url = "http://127.0.0.1:3000/"
+        result = sess.audit()
+
+        self.assertEqual(fake_cdp.evaluate.call_count, 1)
+        self.assertEqual(result["telemetry"]["pageErrors"], ["RangeError: boom"])
+        issues = result["dom"]["issues"]
+        self.assertTrue(any(i.get("kind") == "js_main_thread_blocked" for i in issues))
+
+    def test_navigate_aborts_immediately_when_cdp_dies(self) -> None:
+        fake_cdp = mock.MagicMock()
+        fake_cdp._ws = mock.MagicMock()
+        fake_cdp._ws.closed = False
+        fake_cdp._thread = None
+        fake_cdp.call.return_value = {"frameId": "f1"}
+
+        def die_on_eval(*_a, **_kw):
+            fake_cdp._ws.closed = True
+            raise browser_inspector.BrowserError("Соединение с браузером оборвалось")
+
+        fake_cdp.evaluate.side_effect = die_on_eval
+        sess = browser_inspector.BrowserSession(cdp=fake_cdp, width=1280, height=720)
+
+        t0 = time.monotonic()
+        with self.assertRaises(browser_inspector.BrowserError):
+            sess.navigate("http://127.0.0.1:3000/", wait_ms=0)
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+    def test_capture_screenshot_falls_back_to_from_surface_false_and_emits_granular_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = browser_inspector.BrowserSessionManager(sandbox_root=Path(tmp))
+            fake_cdp = mock.MagicMock()
+            fake_cdp._ws = mock.MagicMock()
+            fake_cdp._ws.closed = False
+            fake_cdp._thread = None
+
+            def fake_call(method, params=None, **_kw):
+                if method == "Page.captureScreenshot":
+                    if params and params.get("fromSurface") is True:
+                        raise browser_inspector.BrowserError("Браузер не ответил на Page.captureScreenshot за 4 с")
+                    return {"data": "ZmFrZWpwZWc="}
+                return {}
+
+            fake_cdp.call.side_effect = fake_call
+            fake_cdp.evaluate.return_value = "complete"
+            fake_cdp.snapshot_telemetry.return_value = {
+                "consoleMessages": [],
+                "pageErrors": [],
+                "failedRequests": [],
+            }
+
+            sess = browser_inspector.BrowserSession(cdp=fake_cdp, width=1440, height=900)
+            mgr._sessions["default"] = sess
+            statuses: list[str] = []
+
+            with mock.patch.object(sess, "audit", return_value={"dom": {"url": "http://127.0.0.1:3000/", "issues": []}, "telemetry": {"consoleMessages": [], "pageErrors": [], "failedRequests": []}}):
+                report, events = browser_inspector.execute_browse_action(
+                    mgr,
+                    {"action": "open", "url": "http://127.0.0.1:3000/"},
+                    trust_level="full",
+                    on_status=statuses.append,
+                )
+
+            self.assertIn("Открыта страница http://127.0.0.1:3000/", report)
+            self.assertEqual(events[0]["preview"], "data:image/jpeg;base64,ZmFrZWpwZWc=")
+            self.assertIn("Собираю DOM-метрики, анимации и ошибки консоли…", statuses)
+            self.assertIn("Делаю скриншот страницы…", statuses)
+            self.assertIn("Формирую отчёт по результатам осмотра…", statuses)
+
+    def test_websocket_close_does_not_block_on_stuck_writer_lock(self) -> None:
+        ws = browser_inspector._WebSocketClient.__new__(browser_inspector._WebSocketClient)
+        ws._sock = mock.MagicMock()
+        ws._write_lock = threading.Lock()
+        ws._buf = bytearray()
+        ws._assembled = bytearray()
+        ws._assembling_text = False
+        ws.closed = False
+        ws._write_lock.acquire()
+
+        t0 = time.monotonic()
+        try:
+            ws.close()
+        finally:
+            ws._write_lock.release()
+        self.assertLess(time.monotonic() - t0, 0.8)
+        self.assertTrue(ws.closed)
+        ws._sock.shutdown.assert_called_once()
+        ws._sock.close.assert_called_once()
+
+    def test_launch_flags_include_win_occlusion_and_no_proxy_by_default(self) -> None:
+        captured_cmds: list[list[str]] = []
+
+        class FakeProc:
+            pid = 12345
+            returncode = None
+            def poll(self): return None
+            def terminate(self): pass
+            def kill(self): pass
+            def wait(self, timeout=None): return 0
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmds.append(list(cmd))
+            for arg in cmd:
+                if arg.startswith("--user-data-dir="):
+                    ud = Path(arg.split("=", 1)[1])
+                    (ud / "DevToolsActivePort").write_text("45678\n/devtools/browser/abc\n", encoding="utf-8")
+            return FakeProc()
+
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(browser_inspector.platform, "system", return_value="Windows"),
+            mock.patch.object(browser_inspector.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            proc, user_data, port = browser_inspector._launch_headless_chromium("C:\\chrome.exe", 1280, 720)
+        import shutil as _sh
+        _sh.rmtree(user_data, ignore_errors=True)
+
+        self.assertEqual(port, 45678)
+        cmd0 = captured_cmds[0]
+        self.assertIn("--no-proxy-server", cmd0)
+        self.assertIn("--disable-renderer-accessibility", cmd0)
+        self.assertNotIn("--disable-gpu", cmd0)
+        features_arg = next(a for a in cmd0 if a.startswith("--disable-features="))
+        self.assertIn("CalculateNativeWinOcclusion", features_arg)
 
     def test_run_agent_emits_browse_project_live_status_events(self) -> None:
         sse_frames: list[str] = []
@@ -673,7 +830,10 @@ class WindowsCompatibilityAndSpecTests(unittest.TestCase):
             with mock.patch.object(sys, "frozen", True, create=True):
                 self.assertIsNone(browser_inspector.find_browser_executable(allow_subprocess=True))
 
-            with mock.patch.object(browser_inspector, "_BROWSER_AVAIL_CACHE", (0.0, False)):
+            with (
+                mock.patch.object(browser_inspector, "_BROWSER_AVAIL_CACHE", (0.0, False)),
+                mock.patch.object(agent_mod, "log"),
+            ):
                 srv = agent_mod.Server(("127.0.0.1", 0), agent_mod.Handler)
                 port = srv.server_address[1]
                 th = threading.Thread(target=srv.serve_forever, daemon=True)

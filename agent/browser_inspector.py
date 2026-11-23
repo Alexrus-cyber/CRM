@@ -316,43 +316,47 @@ def find_browser_executable(*, allow_subprocess: bool = True) -> Optional[str]:
     # Изолированный короткий probe пакета playwright без конфликта с asyncio-loop и pipe-зависаний.
     # В frozen exe (PyInstaller) sys.executable не принимает `-c` и запускает второй экземпляр exe.
     if allow_subprocess and not getattr(sys, "frozen", False):
+        probe_dir: Optional[Path] = None
         try:
             if importlib.util.find_spec("playwright") is not None:
-                with tempfile.TemporaryDirectory(prefix="crm-pw-probe-") as probe_dir:
-                    out_file = Path(probe_dir) / "exe.txt"
-                    probe_kwargs: Dict[str, Any] = {
-                        "stdin": subprocess.DEVNULL,
-                        "stderr": subprocess.DEVNULL,
-                    }
-                    if system == "Windows":
-                        probe_kwargs["creationflags"] = (
-                            getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                        )
-                    else:
-                        probe_kwargs["start_new_session"] = True
-                    with open(out_file, "wb") as out_fh:
-                        probe_proc = subprocess.Popen(
-                            [
-                                sys.executable,
-                                "-c",
-                                "from playwright.sync_api import sync_playwright\nwith sync_playwright() as p: print(p.chromium.executable_path or '')",
-                            ],
-                            stdout=out_fh,
-                            **probe_kwargs,
-                        )
-                    deadline = time.monotonic() + 3.5
-                    while probe_proc.poll() is None and time.monotonic() < deadline:
-                        time.sleep(0.05)
-                    if probe_proc.poll() is None:
-                        _kill_proc_tree(probe_proc)
-                    elif probe_proc.returncode == 0 and out_file.is_file():
-                        raw_out = out_file.read_text(encoding="utf-8", errors="ignore").strip()
-                        exe = raw_out.splitlines()[-1].strip() if raw_out else ""
-                        if exe and _safe_is_file(Path(exe)):
-                            return exe
+                probe_dir = Path(tempfile.mkdtemp(prefix="crm-pw-probe-"))
+                out_file = probe_dir / "exe.txt"
+                probe_kwargs: Dict[str, Any] = {
+                    "stdin": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                }
+                if system == "Windows":
+                    probe_kwargs["creationflags"] = (
+                        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    )
+                else:
+                    probe_kwargs["start_new_session"] = True
+                with open(out_file, "wb") as out_fh:
+                    probe_proc = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-c",
+                            "from playwright.sync_api import sync_playwright\nwith sync_playwright() as p: print(p.chromium.executable_path or '')",
+                        ],
+                        stdout=out_fh,
+                        **probe_kwargs,
+                    )
+                deadline = time.monotonic() + 3.5
+                while probe_proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if probe_proc.poll() is None:
+                    _kill_proc_tree(probe_proc)
+                elif probe_proc.returncode == 0 and out_file.is_file():
+                    raw_out = out_file.read_text(encoding="utf-8", errors="ignore").strip()
+                    exe = raw_out.splitlines()[-1].strip() if raw_out else ""
+                    if exe and _safe_is_file(Path(exe)):
+                        return exe
         except Exception:  # noqa: BLE001
             pass
+        finally:
+            if probe_dir is not None:
+                shutil.rmtree(probe_dir, ignore_errors=True)
 
     return None
 
@@ -511,8 +515,8 @@ class _WebSocketClient:
             leftover = bytes(raw_hdr[sep + 4 :])
             if leftover:
                 self._buf.extend(leftover)
-            # Периодический timeout чтения позволяет reader-потоку проверять закрытие сокета.
-            self._sock.settimeout(10.0)
+            # Периодический timeout чтения позволяет reader-потоку быстро реагировать на закрытие сокета.
+            self._sock.settimeout(2.0)
         except Exception:
             self.closed = True
             try:
@@ -522,14 +526,16 @@ class _WebSocketClient:
             raise
 
     def _read_exact(self, n: int, *, continuation: bool = False) -> bytes:
+        if n <= 0:
+            return b""
         mid_frame = bool(continuation or self._buf or n > 2)
-        deadline = time.monotonic() + (20.0 if mid_frame else 10.0)
+        deadline = time.monotonic() + (20.0 if mid_frame else 2.0)
         while len(self._buf) < n:
             if self.closed:
                 raise EOFError("WebSocket closed")
             try:
                 chunk = self._sock.recv(max(4096, n - len(self._buf)))
-            except TimeoutError:
+            except (TimeoutError, socket.timeout):
                 if self.closed:
                     raise EOFError("WebSocket closed") from None
                 if mid_frame:
@@ -562,8 +568,14 @@ class _WebSocketClient:
             header.append(0x80 | 127)
             header.extend(struct.pack("!Q", length))
         header.extend(mask_key)
-        masked = bytes(payload[i] ^ mask_key[i % 4] for i in range(length))
+        if length:
+            repeated = mask_key * ((length // 4) + 1)
+            masked = bytes(a ^ b for a, b in zip(payload, repeated))
+        else:
+            masked = b""
         with self._write_lock:
+            if self.closed:
+                raise BrowserError("Соединение с браузером закрыто")
             self._sock.sendall(bytes(header) + masked)
 
     def recv_text(self) -> Optional[str]:
@@ -581,7 +593,8 @@ class _WebSocketClient:
             mask = self._read_exact(4, continuation=True) if masked else b""
             data = self._read_exact(length, continuation=True) if length > 0 else b""
             if masked and data:
-                data = bytes(data[i] ^ mask[i % 4] for i in range(len(data)))
+                repeated = mask * ((len(data) // 4) + 1)
+                data = bytes(a ^ b for a, b in zip(data, repeated))
 
             if opcode == 0x8:  # close
                 self._assembled.clear()
@@ -616,13 +629,16 @@ class _WebSocketClient:
         was_closed = self.closed
         self.closed = True
         if not was_closed:
+            acquired = self._write_lock.acquire(timeout=0.25)
             try:
-                self._sock.settimeout(0.5)
+                self._sock.settimeout(0.35)
                 mask_key = secrets.token_bytes(4)
-                with self._write_lock:
-                    self._sock.sendall(bytes([0x88, 0x80]) + mask_key)
+                self._sock.sendall(bytes([0x88, 0x80]) + mask_key)
             except Exception:  # noqa: BLE001
                 pass
+            finally:
+                if acquired:
+                    self._write_lock.release()
         try:
             self._sock.shutdown(socket.SHUT_RDWR)
         except Exception:  # noqa: BLE001
@@ -658,7 +674,7 @@ class CDPClient:
             while not self._ws.closed:
                 try:
                     raw = self._ws.recv_text()
-                except TimeoutError:
+                except (TimeoutError, socket.timeout):
                     continue
                 except Exception:  # noqa: BLE001
                     break
@@ -686,11 +702,6 @@ class CDPClient:
         finally:
             self._ws.closed = True
             self._wake_pending()
-
-        self._ws.closed = True
-        with self._lock:
-            for slot in self._pending.values():
-                slot["event"].set()
 
     def _dismiss_dialog_async(self) -> None:
         def _run() -> None:
@@ -874,41 +885,84 @@ class CDPClient:
 
 AUDIT_JS = r"""
 (() => {
+  const tStart = (typeof performance !== "undefined" && performance.now) ? performance.now() : 0;
+  const overBudget = () => Boolean(tStart && (performance.now() - tStart) > 900);
   const vw = window.innerWidth || 0;
   const vh = window.innerHeight || 0;
   const docEl = document.documentElement;
   const body = document.body;
   const scrollWidth = docEl ? docEl.scrollWidth : 0;
   const scrollHeight = docEl ? docEl.scrollHeight : 0;
+  const esc = (s) => (typeof CSS !== "undefined" && CSS.escape ? CSS.escape(String(s)) : String(s).replace(/([^\w-])/g, "\\$1"));
 
   function makeSelector(el) {
     if (!el || !el.tagName) return "";
     const tag = el.tagName.toLowerCase();
-    if (el.id) return "#" + CSS.escape(el.id);
+    if (el.id) return "#" + esc(el.id);
     const dt = el.getAttribute("data-testid");
-    if (dt) return `${tag}[data-testid="${CSS.escape(dt)}"]`;
+    if (dt) return `${tag}[data-testid="${esc(dt)}"]`;
     const aria = el.getAttribute("aria-label");
     if (aria && aria.length <= 40) return `${tag}[aria-label="${aria.replace(/"/g, '\\"')}"]`;
     const cls = typeof el.className === "string"
       ? el.className.trim().split(/\s+/).filter((c) => c && !c.includes(":") && !c.includes("[")).slice(0, 2)
       : [];
-    let base = tag + (cls.length ? "." + cls.map((c) => CSS.escape(c)).join(".") : "");
+    let base = tag + (cls.length ? "." + cls.map((c) => esc(c)).join(".") : "");
     const parent = el.parentElement;
-    if (parent) {
-      const same = Array.from(parent.children).filter((ch) => ch.tagName === el.tagName);
-      if (same.length > 1) {
-        const idx = same.indexOf(el) + 1;
-        base += `:nth-of-type(${idx})`;
+    if (parent && parent.children && parent.children.length <= 60) {
+      let sameCount = 0;
+      let myIdx = 0;
+      for (let i = 0; i < parent.children.length; i++) {
+        const ch = parent.children[i];
+        if (ch.tagName === el.tagName) {
+          sameCount += 1;
+          if (ch === el) myIdx = sameCount;
+        }
       }
+      if (sameCount > 1 && myIdx > 0) base += `:nth-of-type(${myIdx})`;
     }
     return base.slice(0, 90);
   }
 
   function cleanText(el) {
-    return String(el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("placeholder") || "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 70);
+    if (!el) return "";
+    const raw = (el.childElementCount <= 8 ? el.textContent : "")
+      || el.getAttribute("aria-label")
+      || el.getAttribute("placeholder")
+      || el.getAttribute("title")
+      || "";
+    return String(raw).replace(/\s+/g, " ").trim().slice(0, 70);
+  }
+
+  function hasDirectOrSmallContent(el) {
+    for (let n = el.firstChild; n; n = n.nextSibling) {
+      if (n.nodeType === 3 && n.nodeValue && n.nodeValue.trim()) return true;
+    }
+    if (el.childElementCount <= 12 && (el.textContent || "").trim().length > 0) return true;
+    return Boolean(el.querySelector && el.querySelector("img,svg,canvas,video,button,input"));
+  }
+
+  function extractSnippet(root, limit) {
+    if (!root) return "";
+    const parts = [];
+    let total = 0;
+    try {
+      const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let node;
+      let steps = 0;
+      while ((node = tw.nextNode()) && total < limit && steps < 1500) {
+        steps += 1;
+        const p = node.parentElement;
+        if (p) {
+          const tn = p.tagName;
+          if (tn === "SCRIPT" || tn === "STYLE" || tn === "NOSCRIPT" || tn === "TEMPLATE") continue;
+        }
+        const txt = String(node.nodeValue || "").replace(/\s+/g, " ").trim();
+        if (!txt) continue;
+        parts.push(txt);
+        total += txt.length + 1;
+      }
+    } catch {}
+    return parts.join(" ").slice(0, limit);
   }
 
   function isVisibleStyle(st) {
@@ -932,62 +986,74 @@ AUDIT_JS = r"""
   }
 
   const SKIP_TAGS = new Set(["HTML", "HEAD", "META", "LINK", "STYLE", "SCRIPT", "TITLE", "NOSCRIPT", "TEMPLATE", "BR"]);
-  const all = Array.from(document.querySelectorAll("*")).slice(0, 1200);
-  for (const el of all) {
-    if (!el || SKIP_TAGS.has(el.tagName)) continue;
-    let st;
-    try { st = getComputedStyle(el); } catch { continue; }
-    if (st.display === "none") continue;
-    const rect = el.getBoundingClientRect();
-    const sel = makeSelector(el);
+  const walkRoot = body || docEl;
+  if (walkRoot) {
+    try {
+      const walker = document.createTreeWalker(walkRoot, NodeFilter.SHOW_ELEMENT);
+      let el = walker.currentNode;
+      let scanned = 0;
+      while (el && scanned < 800) {
+        if ((scanned & 63) === 63 && overBudget()) break;
+        scanned += 1;
+        if (!SKIP_TAGS.has(el.tagName)) {
+          let st = null;
+          try { st = getComputedStyle(el); } catch {}
+          if (st && st.display !== "none") {
+            const rect = el.getBoundingClientRect();
+            const sel = makeSelector(el);
 
-    if (rect.width > 0 && rect.height > 0 && rect.right > vw + 4 && overflowItems.length < 6) {
-      overflowItems.push({ selector: sel, right: Math.round(rect.right), width: Math.round(rect.width) });
-    }
+            if (rect.width > 0 && rect.height > 0 && rect.right > vw + 4 && overflowItems.length < 6) {
+              overflowItems.push({ selector: sel, right: Math.round(rect.right), width: Math.round(rect.width) });
+            }
 
-    const inViewport = rect.width >= 24 && rect.height >= 24 && rect.bottom > 0 && rect.top < vh;
-    const hasContent = (el.textContent || "").trim().length > 0 || el.querySelector("img,svg,canvas,video,button,input");
-    if (inViewport && hasContent && parseFloat(st.opacity) === 0 && el !== body && el !== docEl && stuckInvisible.length < 8) {
-      stuckInvisible.push({
-        selector: sel,
-        text: cleanText(el),
-        animationName: st.animationName,
-        transition: st.transitionProperty !== "all" || st.transitionDuration !== "0s" ? `${st.transitionProperty} ${st.transitionDuration}` : "",
-      });
-    }
+            const inViewport = rect.width >= 24 && rect.height >= 24 && rect.bottom > 0 && rect.top < vh;
+            if (inViewport && parseFloat(st.opacity) === 0 && el !== body && el !== docEl && stuckInvisible.length < 8) {
+              if (hasDirectOrSmallContent(el)) {
+                stuckInvisible.push({
+                  selector: sel,
+                  text: cleanText(el),
+                  animationName: st.animationName,
+                  transition: st.transitionProperty !== "all" || st.transitionDuration !== "0s" ? `${st.transitionProperty} ${st.transitionDuration}` : "",
+                });
+              }
+            }
 
-    if (el.tagName === "IMG") {
-      const img = el;
-      if (img.complete && img.naturalWidth === 0 && brokenImages.length < 8) {
-        brokenImages.push({ src: String(img.getAttribute("src") || "").slice(0, 120), alt: String(img.getAttribute("alt") || "").slice(0, 50) });
+            if (el.tagName === "IMG") {
+              if (el.complete && el.naturalWidth === 0 && brokenImages.length < 8) {
+                brokenImages.push({ src: String(el.getAttribute("src") || "").slice(0, 120), alt: String(el.getAttribute("alt") || "").slice(0, 50) });
+              }
+            }
+
+            if (
+              rect.width > 20 &&
+              rect.height > 10 &&
+              (st.overflowX === "hidden" || st.overflowX === "clip") &&
+              el.scrollWidth > el.clientWidth + 8 &&
+              clippedElements.length < 5
+            ) {
+              clippedElements.push({ selector: sel, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth });
+            }
+
+            const hasAnim = st.animationName && st.animationName !== "none";
+            const hasTrans = st.transitionDuration && st.transitionDuration !== "0s";
+            if ((hasAnim || hasTrans) && animatedNodes.length < 30) {
+              animatedNodes.push({
+                selector: sel,
+                text: cleanText(el).slice(0, 35),
+                animationName: hasAnim ? st.animationName : "",
+                animationDuration: hasAnim ? st.animationDuration : "",
+                animationPlayState: hasAnim ? st.animationPlayState : "",
+                transition: hasTrans ? `${st.transitionProperty} (${st.transitionDuration})` : "",
+                opacity: st.opacity,
+                transform: st.transform !== "none" ? st.transform : "",
+                rect: { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) },
+              });
+            }
+          }
+        }
+        el = walker.nextNode();
       }
-    }
-
-    if (
-      rect.width > 20 &&
-      rect.height > 10 &&
-      (st.overflowX === "hidden" || st.overflowX === "clip") &&
-      el.scrollWidth > el.clientWidth + 8 &&
-      clippedElements.length < 5
-    ) {
-      clippedElements.push({ selector: sel, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth });
-    }
-
-    const hasAnim = st.animationName && st.animationName !== "none";
-    const hasTrans = st.transitionDuration && st.transitionDuration !== "0s";
-    if ((hasAnim || hasTrans) && animatedNodes.length < 30) {
-      animatedNodes.push({
-        selector: sel,
-        text: cleanText(el).slice(0, 35),
-        animationName: hasAnim ? st.animationName : "",
-        animationDuration: hasAnim ? st.animationDuration : "",
-        animationPlayState: hasAnim ? st.animationPlayState : "",
-        transition: hasTrans ? `${st.transitionProperty} (${st.transitionDuration})` : "",
-        opacity: st.opacity,
-        transform: st.transform !== "none" ? st.transform : "",
-        rect: { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) },
-      });
-    }
+    } catch {}
   }
 
   if (overflowItems.length) {
@@ -1020,25 +1086,28 @@ AUDIT_JS = r"""
     });
   }
 
-  const webAnims = (typeof document.getAnimations === "function" ? document.getAnimations() : []).slice(0, 40).map((a) => {
-    const eff = a.effect;
-    const timing = eff && typeof eff.getTiming === "function" ? eff.getTiming() : {};
-    const target = eff && eff.target ? eff.target : null;
-    const st = target ? getComputedStyle(target) : null;
-    const rect = target ? target.getBoundingClientRect() : null;
-    return {
-      kind: a.animationName ? "css-animation" : (a.transitionProperty ? "css-transition" : "web-animation"),
-      name: a.animationName || a.transitionProperty || a.id || "animation",
-      playState: a.playState,
-      currentTimeMs: typeof a.currentTime === "number" ? Math.round(a.currentTime) : null,
-      durationMs: typeof timing.duration === "number" ? Math.round(timing.duration) : timing.duration,
-      iterations: timing.iterations === Infinity ? "infinite" : timing.iterations,
-      target: target ? makeSelector(target) : "",
-      opacity: st ? st.opacity : undefined,
-      transform: st && st.transform !== "none" ? st.transform : undefined,
-      rect: rect ? { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) } : undefined,
-    };
-  });
+  let webAnims = [];
+  try {
+    webAnims = (typeof document.getAnimations === "function" ? document.getAnimations() : []).slice(0, 40).map((a) => {
+      const eff = a.effect;
+      const timing = eff && typeof eff.getTiming === "function" ? eff.getTiming() : {};
+      const target = eff && eff.target ? eff.target : null;
+      const st = target ? getComputedStyle(target) : null;
+      const rect = target ? target.getBoundingClientRect() : null;
+      return {
+        kind: a.animationName ? "css-animation" : (a.transitionProperty ? "css-transition" : "web-animation"),
+        name: a.animationName || a.transitionProperty || a.id || "animation",
+        playState: a.playState,
+        currentTimeMs: typeof a.currentTime === "number" ? Math.round(a.currentTime) : null,
+        durationMs: typeof timing.duration === "number" ? Math.round(timing.duration) : timing.duration,
+        iterations: timing.iterations === Infinity ? "infinite" : timing.iterations,
+        target: target ? makeSelector(target) : "",
+        opacity: st ? st.opacity : undefined,
+        transform: st && st.transform !== "none" ? st.transform : undefined,
+        rect: rect ? { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) } : undefined,
+      };
+    });
+  } catch {}
 
   const pausedAnims = webAnims.filter((a) => a.playState === "paused");
   if (pausedAnims.length) {
@@ -1049,41 +1118,55 @@ AUDIT_JS = r"""
     });
   }
 
-  const interactiveCandidates = Array.from(
-    document.querySelectorAll("a[href], button, input, select, textarea, summary, [role='button'], [role='tab'], [onclick]")
-  );
-  for (const el of interactiveCandidates) {
-    if (interactive.length >= 35) break;
-    const st = getComputedStyle(el);
-    if (!isVisibleStyle(st)) continue;
-    const rect = el.getBoundingClientRect();
-    if (rect.width < 2 || rect.height < 2) continue;
-    if (rect.bottom < -50 || rect.top > vh + 120) continue;
-    interactive.push({
-      index: interactive.length + 1,
-      tag: el.tagName.toLowerCase(),
-      type: el.getAttribute("type") || undefined,
-      role: el.getAttribute("role") || undefined,
-      text: cleanText(el) || String(el.getAttribute("href") || "").slice(0, 40),
-      selector: makeSelector(el),
-      disabled: Boolean(el.disabled || el.getAttribute("aria-disabled") === "true"),
-      x: Math.round(rect.left + rect.width / 2),
-      y: Math.round(rect.top + rect.height / 2),
-      w: Math.round(rect.width),
-      h: Math.round(rect.height),
-    });
-  }
+  try {
+    const interactiveCandidates = document.querySelectorAll(
+      "a[href], button, input, select, textarea, summary, [role='button'], [role='tab'], [onclick]"
+    );
+    const candLen = Math.min(interactiveCandidates.length, 300);
+    for (let i = 0; i < candLen; i++) {
+      if (interactive.length >= 35 || ((i & 31) === 31 && overBudget())) break;
+      const el = interactiveCandidates[i];
+      const st = getComputedStyle(el);
+      if (!isVisibleStyle(st)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) continue;
+      if (rect.bottom < -50 || rect.top > vh + 120) continue;
+      interactive.push({
+        index: interactive.length + 1,
+        tag: el.tagName.toLowerCase(),
+        type: el.getAttribute("type") || undefined,
+        role: el.getAttribute("role") || undefined,
+        text: cleanText(el) || String(el.getAttribute("href") || "").slice(0, 40),
+        selector: makeSelector(el),
+        disabled: Boolean(el.disabled || el.getAttribute("aria-disabled") === "true"),
+        x: Math.round(rect.left + rect.width / 2),
+        y: Math.round(rect.top + rect.height / 2),
+        w: Math.round(rect.width),
+        h: Math.round(rect.height),
+      });
+    }
+  } catch {}
 
   const reducedMotion = Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const keyframesFound = [];
+  const keyframesSeen = new Set();
   try {
-    for (const sheet of Array.from(document.styleSheets)) {
+    const sheets = document.styleSheets;
+    let totalRules = 0;
+    for (let s = 0; s < sheets.length && s < 25; s++) {
+      if (overBudget() || totalRules >= 3000 || keyframesFound.length >= 25) break;
       let rules;
-      try { rules = sheet.cssRules; } catch { continue; }
+      try { rules = sheets[s].cssRules; } catch { continue; }
       if (!rules) continue;
-      for (const rule of Array.from(rules)) {
-        if (rule.type === CSSRule.KEYFRAMES_RULE && keyframesFound.length < 25) {
+      const maxR = Math.min(rules.length, 1200);
+      for (let r = 0; r < maxR && totalRules < 3000; r++) {
+        totalRules += 1;
+        if ((totalRules & 127) === 127 && overBudget()) break;
+        const rule = rules[r];
+        if (rule && rule.type === CSSRule.KEYFRAMES_RULE && rule.name && !keyframesSeen.has(rule.name)) {
+          keyframesSeen.add(rule.name);
           keyframesFound.push(rule.name);
+          if (keyframesFound.length >= 25) break;
         }
       }
     }
@@ -1094,7 +1177,7 @@ AUDIT_JS = r"""
     title: document.title || "",
     viewport: { width: vw, height: vh },
     scroll: { x: Math.round(window.scrollX), y: Math.round(window.scrollY), width: scrollWidth, height: scrollHeight },
-    textSnippet: (body ? (body.innerText || "") : "").replace(/\s+/g, " ").trim().slice(0, 700),
+    textSnippet: extractSnippet(body || docEl, 700),
     reducedMotion,
     keyframes: keyframesFound,
     webAnimations: webAnims,
@@ -1120,22 +1203,41 @@ def _js_locate_element(selector: str = "", text: str = "") -> str:
   if (selector) {{
     if (selector.startsWith("text=")) {{
       const q = selector.slice(5).trim().toLowerCase();
-      const pool = Array.from(document.querySelectorAll("button, a, [role='button'], [role='tab'], summary, label, input, *"));
-      el = pool.find((n) => (n.innerText || n.textContent || n.getAttribute("aria-label") || "").trim().toLowerCase().includes(q)) || null;
+      const pool = document.querySelectorAll("button, a, [role='button'], [role='tab'], summary, label, input");
+      for (let i = 0; i < pool.length && i < 400; i++) {{
+        const n = pool[i];
+        const t = (n.textContent || n.getAttribute("aria-label") || "").trim().toLowerCase();
+        if (t.includes(q)) {{ el = n; break; }}
+      }}
+      if (!el && document.body) {{
+        const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+        let node = tw.currentNode;
+        let seen = 0;
+        while (node && seen < 600) {{
+          seen += 1;
+          if (node.childElementCount <= 6) {{
+            const t = (node.textContent || node.getAttribute("aria-label") || "").trim().toLowerCase();
+            if (t.includes(q)) {{ el = node; break; }}
+          }}
+          node = tw.nextNode();
+        }}
+      }}
     }} else {{
       try {{ el = document.querySelector(selector); }} catch (e) {{ return {{ error: "Некорректный CSS-селектор: " + selector }}; }}
     }}
   }}
   if (!el && wantedText) {{
-    const pool = Array.from(document.querySelectorAll("button, a, [role='button'], [role='tab'], summary, input, textarea, select, label, div, span"));
-    el = pool.find((n) => {{
+    const pool = document.querySelectorAll("button, a, [role='button'], [role='tab'], summary, input, textarea, select, label, div, span");
+    for (let i = 0; i < pool.length && i < 500; i++) {{
+      const n = pool[i];
+      if (n.childElementCount > 12) continue;
       const st = getComputedStyle(n);
-      if (st.display === "none" || st.visibility === "hidden") return false;
+      if (st.display === "none" || st.visibility === "hidden") continue;
       const r = n.getBoundingClientRect();
-      if (r.width < 2 || r.height < 2) return false;
-      const t = (n.innerText || n.textContent || n.getAttribute("aria-label") || n.getAttribute("placeholder") || "").replace(/\\s+/g, " ").trim().toLowerCase();
-      return t === wantedText || t.includes(wantedText);
-    }}) || null;
+      if (r.width < 2 || r.height < 2) continue;
+      const t = (n.textContent || n.getAttribute("aria-label") || n.getAttribute("placeholder") || "").replace(/\\s+/g, " ").trim().toLowerCase();
+      if (t === wantedText || t.includes(wantedText)) {{ el = n; break; }}
+    }}
   }}
   if (!el) return {{ error: "Элемент не найден на странице" }};
   el.scrollIntoView({{ block: "center", inline: "center", behavior: "instant" }});
@@ -1144,7 +1246,7 @@ def _js_locate_element(selector: str = "", text: str = "") -> str:
   return {{
     ok: true,
     tag: el.tagName.toLowerCase(),
-    text: String(el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 80),
+    text: String(el.textContent || el.getAttribute("aria-label") || "").replace(/\\s+/g, " ").trim().slice(0, 80),
     x: Math.round(rect.left + rect.width / 2),
     y: Math.round(rect.top + rect.height / 2),
     w: Math.round(rect.width),
@@ -1252,6 +1354,13 @@ def _extract_ws_port_from_lines(lines: List[str]) -> int:
     return 0
 
 
+def _has_env_proxy() -> bool:
+    return any(
+        bool(os.environ.get(var))
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+    )
+
+
 def _launch_headless_chromium(
     executable: str,
     width: int,
@@ -1260,27 +1369,40 @@ def _launch_headless_chromium(
     cancel_check: Optional[Any] = None,
 ) -> Tuple[subprocess.Popen[Any], Path, int]:
     """Запускает headless Chromium без блокировки pipe; при сбое пробует `--headless` и `--no-sandbox`."""
+    is_windows = platform.system() == "Windows"
     is_headless_shell = "headless" in Path(executable).name.lower()
-    is_root = platform.system() != "Windows" and hasattr(os, "geteuid") and os.geteuid() == 0
+    is_root = not is_windows and hasattr(os, "geteuid") and os.geteuid() == 0
     needs_no_sandbox = is_root or _linux_userns_restricted()
 
+    # На Windows `--headless=new` + `--disable-gpu` без SwiftShader часто вешает Viz / `Page.captureScreenshot`,
+    # поэтому на Windows сначала пробуем нативный ANGLE/D3D11 (без `--disable-gpu`), а fallback — SwiftShader.
     if is_headless_shell:
-        base_attempts: List[Tuple[str, float, bool]] = [
-            ("--headless", 8.5, needs_no_sandbox),
+        base_attempts: List[Tuple[str, float, bool, bool]] = [
+            ("--headless", 8.5, needs_no_sandbox, not is_windows),
+        ]
+    elif is_windows:
+        base_attempts = [
+            ("--headless=new", 9.0, needs_no_sandbox, False),
+            ("--headless", 7.5, needs_no_sandbox, True),
         ]
     else:
         base_attempts = [
-            ("--headless=new", 9.0, needs_no_sandbox),
-            ("--headless", 7.0, needs_no_sandbox),
+            ("--headless=new", 9.0, needs_no_sandbox, True),
+            ("--headless", 7.0, needs_no_sandbox, True),
         ]
-    if platform.system() != "Windows" and not needs_no_sandbox:
+    if not is_windows and not needs_no_sandbox:
         # Fallback для контейнеров / Linux без user namespaces / AppArmor.
-        base_attempts.append(("--headless" if is_headless_shell else "--headless=new", 8.5, True))
+        base_attempts.append(("--headless" if is_headless_shell else "--headless=new", 8.5, True, True))
 
     last_error: Optional[Exception] = None
     skip_non_nosandbox = False
+    proxy_flag = (
+        "--proxy-bypass-list=<-loopback>;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16;*.local"
+        if _has_env_proxy()
+        else "--no-proxy-server"
+    )
 
-    for headless_flag, startup_timeout, use_no_sandbox in base_attempts:
+    for headless_flag, startup_timeout, use_no_sandbox, disable_gpu in base_attempts:
         if skip_non_nosandbox and not use_no_sandbox:
             continue
         if cancel_check and cancel_check():
@@ -1303,7 +1425,7 @@ def _launch_headless_chromium(
             "--noerrdialogs",
             "--password-store=basic",
             "--use-mock-keychain",
-            "--proxy-bypass-list=<-loopback>;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16;*.local",
+            proxy_flag,
             "--no-pings",
             "--metrics-recording-only",
             "--enable-automation",
@@ -1317,25 +1439,33 @@ def _launch_headless_chromium(
             "--disable-popup-blocking",
             "--disable-client-side-phishing-detection",
             "--disable-domain-reliability",
-            "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,PaintHolding,AutoDeElevate,HttpsUpgrades",
+            "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,PaintHolding,AutoDeElevate,HttpsUpgrades,CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BackForwardCache",
             "--disable-hang-monitor",
-            "--disable-gpu",
-            "--disable-gpu-sandbox",
+            "--disable-renderer-accessibility",
+            "--disable-ipc-flooding-protection",
             "--disable-dev-shm-usage",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
             "--disable-backgrounding-occluded-windows",
             "--mute-audio",
-            "about:blank",
         ]
+        if disable_gpu:
+            cmd.extend(["--disable-gpu", "--disable-gpu-sandbox"])
+            if is_windows:
+                cmd.extend(["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"])
+            else:
+                cmd.append("--enable-unsafe-swiftshader")
+        else:
+            cmd.append("--enable-unsafe-swiftshader")
         if use_no_sandbox:
             cmd.extend(["--no-sandbox", "--disable-setuid-sandbox"])
+        cmd.append("about:blank")
 
         popen_kwargs: Dict[str, Any] = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
         }
-        if platform.system() == "Windows":
+        if is_windows:
             popen_kwargs["creationflags"] = (
                 getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1580,7 +1710,12 @@ class BrowserSession:
             cdp = CDPClient(ws_url)
             cdp.call("Page.enable", timeout=10.0, cancel_check=cancel_check)
             cdp.call("Runtime.enable", timeout=10.0, cancel_check=cancel_check)
-            cdp.call("Network.enable", timeout=10.0, cancel_check=cancel_check)
+            cdp.call(
+                "Network.enable",
+                {"maxTotalBufferSize": 1048576, "maxResourceBufferSize": 524288},
+                timeout=10.0,
+                cancel_check=cancel_check,
+            )
             cdp.call(
                 "Emulation.setDeviceMetricsOverride",
                 {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": width <= 500},
@@ -1659,6 +1794,7 @@ class BrowserSession:
         start = time.monotonic()
         deadline = start + 8.0
         interactive_since: Optional[float] = None
+        consecutive_eval_timeouts = 0
         while time.monotonic() < deadline:
             _check_cancelled(cancel_check)
             remaining = max(0.5, deadline - time.monotonic())
@@ -1669,6 +1805,7 @@ class BrowserSession:
                     timeout=min(2.0, remaining),
                     cancel_check=cancel_check,
                 )
+                consecutive_eval_timeouts = 0
                 if state == "complete":
                     break
                 if state == "interactive":
@@ -1692,8 +1829,15 @@ class BrowserSession:
                                 "text": "Внешний ресурс задерживает readyState=loading (>4.5с); аудит выполнен по текущему DOM.",
                             })
                         break
-            except BrowserError:
+            except BrowserError as err:
                 _check_cancelled(cancel_check)
+                # Если браузер или CDP-соединение умерло — не крутим цикл ожидания до deadline.
+                self.ensure_cdp()
+                err_low = str(err).lower()
+                if "не ответил" in err_low or "timeout" in err_low:
+                    consecutive_eval_timeouts += 1
+                    if consecutive_eval_timeouts >= 2 and time.monotonic() - start >= 3.0:
+                        break
             _sleep_interruptible(0.15, cancel_check)
         if wait_ms > 0:
             _sleep_interruptible(min(wait_ms, 5000) / 1000.0, cancel_check)
@@ -1703,28 +1847,45 @@ class BrowserSession:
         _check_cancelled(cancel_check)
         if self._screenshots_disabled:
             return ""
+        attempts: List[Tuple[Dict[str, Any], float]] = [
+            ({"format": "jpeg", "quality": 76, "fromSurface": True, "optimizeForSpeed": True}, 4.5),
+            ({"format": "jpeg", "quality": 76, "fromSurface": False}, 3.0),
+        ]
         try:
             cdp = self.ensure_cdp()
-            if cancel_check is not None:
-                res = cdp.call(
-                    "Page.captureScreenshot",
-                    {"format": "jpeg", "quality": 76, "fromSurface": True, "optimizeForSpeed": True},
-                    timeout=6.0,
-                    cancel_check=cancel_check,
-                )
-            else:
-                res = cdp.call(
-                    "Page.captureScreenshot",
-                    {"format": "jpeg", "quality": 76, "fromSurface": True, "optimizeForSpeed": True},
-                    timeout=6.0,
-                )
-            b64 = str(res.get("data") or "")
-            return f"data:image/jpeg;base64,{b64}" if b64 else ""
+            for idx, (params, shot_timeout) in enumerate(attempts):
+                try:
+                    if cancel_check is not None:
+                        res = cdp.call("Page.captureScreenshot", params, timeout=shot_timeout, cancel_check=cancel_check)
+                    else:
+                        res = cdp.call("Page.captureScreenshot", params, timeout=shot_timeout)
+                    b64 = str(res.get("data") or "")
+                    return f"data:image/jpeg;base64,{b64}" if b64 else ""
+                except BrowserError as err:
+                    _check_cancelled(cancel_check)
+                    msg = str(err).lower()
+                    if idx == 0 and ("invalid" in msg or "parameter" in msg):
+                        # Старые сборки Chromium/Edge не принимают optimizeForSpeed.
+                        try:
+                            fallback_params = {"format": "jpeg", "quality": 76, "fromSurface": True}
+                            res = (
+                                cdp.call("Page.captureScreenshot", fallback_params, timeout=4.0, cancel_check=cancel_check)
+                                if cancel_check is not None
+                                else cdp.call("Page.captureScreenshot", fallback_params, timeout=4.0)
+                            )
+                            b64 = str(res.get("data") or "")
+                            return f"data:image/jpeg;base64,{b64}" if b64 else ""
+                        except BrowserError:
+                            _check_cancelled(cancel_check)
+                    if idx == 0 and self.is_alive():
+                        continue
+                    raise
         except BrowserError:
             _check_cancelled(cancel_check)
             # Не тормозим последующие шаги в этой сессии, если captureScreenshot заблокирован/таймаутится.
             self._screenshots_disabled = True
             return ""
+        return ""
 
     def audit(self, *, cancel_check: Optional[Any] = None) -> Dict[str, Any]:
         _check_cancelled(cancel_check)
@@ -1733,16 +1894,39 @@ class BrowserSession:
         for attempt in range(2):
             try:
                 if cancel_check is not None:
-                    dom_audit = cdp.evaluate(AUDIT_JS, await_promise=False, timeout=12.0, cancel_check=cancel_check) or {}
+                    dom_audit = cdp.evaluate(AUDIT_JS, await_promise=False, timeout=8.0, cancel_check=cancel_check) or {}
                 else:
-                    dom_audit = cdp.evaluate(AUDIT_JS, await_promise=False, timeout=12.0) or {}
+                    dom_audit = cdp.evaluate(AUDIT_JS, await_promise=False, timeout=8.0) or {}
                 break
             except BrowserError as err:
                 _check_cancelled(cancel_check)
+                self.ensure_cdp()
                 msg = str(err).lower()
                 if attempt == 0 and ("context" in msg or "destroyed" in msg or "navigation" in msg):
                     _sleep_interruptible(0.35, cancel_check)
                     continue
+                if "не ответил" in msg or "timeout" in msg:
+                    # Страница могла повесить свой главный JS-поток (например, бесконечный цикл);
+                    # возвращаем телеметрию и явную диагностику вместо зависания/ретраев инструмента.
+                    dom_audit = {
+                        "url": self.current_url,
+                        "title": "",
+                        "viewport": {"width": self.width, "height": self.height},
+                        "scroll": {"x": 0, "y": 0, "width": self.width, "height": self.height},
+                        "textSnippet": "",
+                        "issues": [
+                            {
+                                "kind": "js_main_thread_blocked",
+                                "severity": "error",
+                                "message": (
+                                    "JS-поток страницы не ответил на DOM-аудит за 8 с "
+                                    "(возможен бесконечный цикл, тяжёлый синхронный рендер или зависший скрипт)."
+                                ),
+                            }
+                        ],
+                        "interactive": [],
+                    }
+                    break
                 raise
         telemetry = cdp.snapshot_telemetry()
         return {
@@ -2179,13 +2363,14 @@ def execute_browse_action(
         else:
             session.navigate(url_to_open, wait_ms=wait_time_ms)
 
-    def _audit_session() -> Dict[str, Any]:
-        emit_status("Собираю DOM-метрики, анимации и ошибки консоли…")
+    def _audit_session(status_text: str = "Собираю DOM-метрики, анимации и ошибки консоли…") -> Dict[str, Any]:
+        emit_status(status_text)
         if cancel_check is not None:
             return session.audit(cancel_check=cancel_check)
         return session.audit()
 
     def _capture_shot() -> str:
+        emit_status("Делаю скриншот страницы…")
         if cancel_check is not None:
             return session.capture_screenshot(cancel_check=cancel_check)
         return session.capture_screenshot()
@@ -2201,6 +2386,7 @@ def execute_browse_action(
         _navigate_session(target_url, wait_ms)
         audit_data = _audit_session()
         shot = _capture_shot() if args.get("capture_screenshot", True) else ""
+        emit_status("Формирую отчёт по результатам осмотра…")
         report, meta = format_inspection_report(
             "open",
             audit_data,
@@ -2224,7 +2410,11 @@ def execute_browse_action(
     cdp = session.ensure_cdp()
     action_note = ""
     delta_actions = ("click", "hover", "scroll", "wait", "inspect_animations", "resize")
-    before_audit = _audit_session() if raw_action in delta_actions else {}
+    before_audit = (
+        _audit_session("Фиксирую состояние страницы перед действием…")
+        if raw_action in delta_actions
+        else {}
+    )
     delta: Optional[Dict[str, Any]] = None
     extra_shots: List[str] = []
     eval_result: Any = None
@@ -2364,6 +2554,7 @@ def execute_browse_action(
         if shot1:
             extra_shots.append(shot1)
 
+    emit_status("Формирую отчёт по результатам осмотра…")
     report, meta = format_inspection_report(
         raw_action,
         audit_data,
