@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { usePathname, useRouter } from "next/navigation";
+import { subscribeAppEvents } from "@/lib/clientEvents";
 
 /**
  * Живое обновление интерфейса.
@@ -46,7 +47,6 @@ export function LiveUpdates() {
 
   useEffect(() => {
     let disposed = false;
-    let source: EventSource | null = null;
     let timer: number | null = null;
     let interval: number | null = null;
     let lastRefresh = 0;
@@ -111,33 +111,29 @@ export function LiveUpdates() {
       }
     };
 
-    // 1. Мгновенный канал: серверное событие (без постоянного HTTP-поллинга).
-    try {
-      source = new EventSource("/api/events");
-      source.onopen = () => {
+    // 1. Мгновенный канал: общее серверное событие на вкладку (без лишних HTTP-соединений).
+    const unsubscribe = subscribeAppEvents({
+      onOpen: () => {
         stopFallbackPolling();
-      };
-      source.onerror = () => {
+      },
+      onError: () => {
         // Если прокси или сеть уронили SSE, включаем резервный опрос.
         startFallbackPolling();
-      };
-      source.addEventListener("update", (event) => {
+      },
+      onUpdate: (raw) => {
         try {
-          const data = JSON.parse((event as MessageEvent<string>).data) as { scope?: string };
+          const data = JSON.parse(raw) as { scope?: string };
           if (data?.scope && matchesPath(pathRef.current, data.scope)) schedule();
         } catch {
           /* некорректный пакет — игнорируем */
         }
-      });
-    } catch {
-      source = null;
-      startFallbackPolling();
-    }
+      },
+    });
 
     return () => {
       disposed = true;
       document.removeEventListener("visibilitychange", onVisible);
-      source?.close();
+      unsubscribe();
       if (timer !== null) window.clearTimeout(timer);
       if (interval !== null) window.clearInterval(interval);
     };

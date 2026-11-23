@@ -1671,4 +1671,23 @@ describe("вкладка «Агент»", () => {
     streamCtrl.current?.close();
     expect(await screen.findByText(/Анализ завершён\./i)).toBeTruthy();
   });
+
+  it("показывает ошибку при обрыве потока после частичного ответа без done и читает финальный кадр на EOF", async () => {
+    sseReply = [
+      'event: reasoning\r\ndata: {"text":"Начал анализировать..."}\r\n\r\n',
+      'event: action\r\ndata: {"type":"browser_inspect","label":"Проверка","url":"http://127.0.0.1:4100"}\r\n\r\n',
+    ].join("");
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Тест обрыва с частичным ответом" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    expect(await screen.findByText(/Поток ответа от агента оборвался без завершения/i)).toBeTruthy();
+
+    sseReply = 'event: text\r\ndata: {"text":"Успешный хвост"}\r\n\r\nevent: done\r\ndata: {}';
+    fireEvent.change(chatBox, { target: { value: "Тест хвоста EOF" } });
+    fireEvent.click(screen.getByText("Запустить"));
+    expect(await screen.findByText(/Успешный хвост/i)).toBeTruthy();
+    expect(screen.getAllByText(/Поток ответа от агента оборвался без завершения/i)).toHaveLength(1);
+  });
 });

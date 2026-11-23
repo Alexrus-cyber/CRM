@@ -101,6 +101,8 @@ import {
   type TesterRunItem,
 } from "./agent/TesterPanel";
 
+const SSE_IDLE_TIMEOUT_MS = 120_000;
+
 /**
  * Вкладка «Агент» блока ИИ (только главный администратор).
  *
@@ -784,6 +786,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const opTaskRef = useRef<OperatorTask | null>(null);
   const dismissedOpTaskIdsRef = useRef<Set<number>>(new Set());
   const runningRef = useRef(false);
+  const pendingApprovalRef = useRef<PendingApproval | null>(null);
   const chatAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
@@ -798,6 +801,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   useEffect(() => {
     runningRef.current = running;
   }, [running]);
+  useEffect(() => {
+    pendingApprovalRef.current = pendingApproval;
+  }, [pendingApproval]);
 
   const nextId = () => {
     counter.current += 1;
@@ -2280,6 +2286,26 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     let targetConvId = selectedTesterConvId;
     let persistedByServer = false;
     const draftId = `td_${Date.now()}`;
+    const testerAbortCtrl = new AbortController();
+    let testerIdleTimer: number | null = null;
+    let testerStalled = false;
+    const clearTesterWatchdog = () => {
+      if (testerIdleTimer !== null) {
+        window.clearTimeout(testerIdleTimer);
+        testerIdleTimer = null;
+      }
+    };
+    const armTesterWatchdog = () => {
+      clearTesterWatchdog();
+      testerIdleTimer = window.setTimeout(() => {
+        if (pendingApprovalRef.current !== null) {
+          armTesterWatchdog();
+          return;
+        }
+        testerStalled = true;
+        testerAbortCtrl.abort();
+      }, SSE_IDLE_TIMEOUT_MS);
+    };
 
     try {
       if (!targetConvId) {
@@ -2325,6 +2351,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       await persistSettings();
       const res = await fetch("/api/ai/agent", {
         method: "POST",
+        signal: testerAbortCtrl.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           agentRole: "tester",
@@ -2356,10 +2383,21 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let trailingCr = false;
+      let sawTesterDone = false;
+      let sawTesterError = false;
       let assistantText = "";
       let assistantReason = "";
       let draftActions: LiveTesterActionItem[] = [];
       const draftFiles: TesterChatFileItem[] = [];
+
+      const appendChunk = (chunkText: string) => {
+        if (!chunkText) return;
+        let normalized = (trailingCr ? "\r" : "") + chunkText;
+        trailingCr = normalized.endsWith("\r");
+        if (trailingCr) normalized = normalized.slice(0, -1);
+        buffer += normalized.replace(/\r\n/g, "\n");
+      };
 
       const processFrame = (raw: string) => {
         const lines = raw.split("\n");
@@ -2542,22 +2580,30 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             setTesterRuns((prev) => [savedRun, ...prev.filter((r) => r.id !== savedRun.id)]);
           }
         } else if (ev === "done") {
+          sawTesterDone = true;
           clearLiveBrowserLog();
           setPendingApproval(null);
         } else if (ev === "error") {
+          sawTesterError = true;
           clearLiveBrowserLog();
           const errTxt = String(data.error ?? "Ошибка тестировщика");
           setTesterError(errTxt);
         }
       };
 
+      armTesterWatchdog();
       while (true) {
         const { value, done } = await reader.read();
         if (done) {
-          buffer += decoder.decode().replace(/\r\n/g, "\n");
+          appendChunk(decoder.decode());
+          if (trailingCr) {
+            trailingCr = false;
+            buffer += "\r";
+          }
           break;
         }
-        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        armTesterWatchdog();
+        appendChunk(decoder.decode(value, { stream: true }));
         let boundary = buffer.indexOf("\n\n");
         while (boundary !== -1) {
           const raw = buffer.slice(0, boundary);
@@ -2566,10 +2612,14 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           if (raw.trim()) processFrame(raw);
         }
       }
+      clearTesterWatchdog();
       if (buffer.trim()) {
         for (const leftover of buffer.split("\n\n")) {
           if (leftover.trim()) processFrame(leftover);
         }
+      }
+      if (!sawTesterDone && !sawTesterError) {
+        setTesterError("Поток ответа от Тестировщика оборвался без завершения");
       }
 
       if (!persistedByServer && targetConvId && (assistantText || draftActions.length > 0 || assistantReason)) {
@@ -2587,8 +2637,13 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       }
       await refreshTesterData(targetConvId);
     } catch (caught) {
-      setTesterError(caught instanceof Error ? caught.message : "Не удалось запустить Тестировщика");
+      if (testerStalled) {
+        setTesterError("Тестировщик не отвечает (нет данных по SSE более 120 с)");
+      } else {
+        setTesterError(caught instanceof Error ? caught.message : "Не удалось запустить Тестировщика");
+      }
     } finally {
+      clearTesterWatchdog();
       clearLiveBrowserLog();
       setLiveTester(null);
       setTesterDirectRunning(false);
@@ -2698,6 +2753,25 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     let sawDone = false;
     const abortCtrl = new AbortController();
     chatAbortRef.current = abortCtrl;
+    let chatIdleTimer: number | null = null;
+    let chatStalled = false;
+    const clearChatWatchdog = () => {
+      if (chatIdleTimer !== null) {
+        window.clearTimeout(chatIdleTimer);
+        chatIdleTimer = null;
+      }
+    };
+    const armChatWatchdog = () => {
+      clearChatWatchdog();
+      chatIdleTimer = window.setTimeout(() => {
+        if (pendingApprovalRef.current !== null) {
+          armChatWatchdog();
+          return;
+        }
+        chatStalled = true;
+        abortCtrl.abort();
+      }, SSE_IDLE_TIMEOUT_MS);
+    };
 
     try {
       setStatus("Сохраняю переписку…");
@@ -2763,32 +2837,31 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let trailingCr = false;
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      const appendChunk = (chunkText: string) => {
+        if (!chunkText) return;
+        let normalized = (trailingCr ? "\r" : "") + chunkText;
+        trailingCr = normalized.endsWith("\r");
+        if (trailingCr) normalized = normalized.slice(0, -1);
+        buffer += normalized.replace(/\r\n/g, "\n");
+      };
 
-        let boundary = buffer.indexOf("\n\n");
-        while (boundary !== -1) {
-          const raw = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
-          boundary = buffer.indexOf("\n\n");
+      const processAgentFrame = (raw: string) => {
+        const lines = raw.split("\n");
+        const eventLine = lines.find((line) => line.startsWith("event:"));
+        const dataLines = lines.filter((line) => line.startsWith("data:"));
+        if (dataLines.length === 0) return;
+        const event = eventLine ? eventLine.slice(6).trim() : "message";
+        const dataText = dataLines.map((l) => l.slice(5).trimStart()).join("\n");
+        let data: Record<string, unknown>;
+        try {
+          data = JSON.parse(dataText) as Record<string, unknown>;
+        } catch {
+          return;
+        }
 
-          const lines = raw.split("\n");
-          const eventLine = lines.find((line) => line.startsWith("event:"));
-          const dataLines = lines.filter((line) => line.startsWith("data:"));
-          if (dataLines.length === 0) continue;
-          const event = eventLine ? eventLine.slice(6).trim() : "message";
-          const dataText = dataLines.map((l) => l.slice(5).trimStart()).join("\n");
-          let data: Record<string, unknown>;
-          try {
-            data = JSON.parse(dataText) as Record<string, unknown>;
-          } catch {
-            continue;
-          }
-
-          if (event === "status") {
+        if (event === "status") {
             const st = String(data.text ?? "");
             const nextActor = parseStatusActor(data, "agent_llm");
             if (nextActor) setLiveStatusActor(nextActor);
@@ -3061,6 +3134,11 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             assistantDraft.error = String(data.error ?? "Ошибка агента");
             patch((t) => ({ ...t, error: assistantDraft.error }));
             setStatus(null);
+            setLiveStatusActor(null);
+            setPendingApproval(null);
+            setScreenCapture(null);
+            setLiveTester(null);
+            browserRunStartRef.current = 0;
           } else if (event === "action") {
             if (data.type === "file") {
               const file: AgentFile = {
@@ -3187,20 +3265,57 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             browserRunStartRef.current = 0;
             void refreshSandbox(true);
           }
+      };
+
+      armChatWatchdog();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          appendChunk(decoder.decode());
+          if (trailingCr) {
+            trailingCr = false;
+            buffer += "\r";
+          }
+          break;
+        }
+        armChatWatchdog();
+        appendChunk(decoder.decode(value, { stream: true }));
+
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary !== -1) {
+          const raw = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          boundary = buffer.indexOf("\n\n");
+          if (raw.trim()) processAgentFrame(raw);
         }
       }
-      if (
-        !sawDone &&
-        !assistantDraft.error &&
-        !assistantDraft.content.trim() &&
-        assistantDraft.actions.length === 0 &&
-        assistantDraft.files.length === 0
-      ) {
+      clearChatWatchdog();
+      if (buffer.trim()) {
+        for (const leftover of buffer.split("\n\n")) {
+          if (leftover.trim()) processAgentFrame(leftover);
+        }
+      }
+      if (!sawDone && !assistantDraft.error) {
+        setStatus(null);
+        setLiveStatusActor(null);
+        setPendingApproval(null);
+        setScreenCapture(null);
+        setLiveTester(null);
+        clearLiveBrowserLog();
         assistantDraft.error = "Поток ответа от агента оборвался без завершения";
         patch((t) => ({ ...t, error: assistantDraft.error }));
       }
     } catch (caught) {
-      if (caught instanceof DOMException && caught.name === "AbortError") {
+      if (chatStalled) {
+        setStatus(null);
+        setLiveStatusActor(null);
+        setPendingApproval(null);
+        setScreenCapture(null);
+        setLiveTester(null);
+        clearLiveBrowserLog();
+        assistantDraft.error = "Агент не отвечает (нет данных по SSE более 120 с)";
+        patch((t) => ({ ...t, error: assistantDraft.error }));
+      } else if (caught instanceof DOMException && caught.name === "AbortError") {
         if (!assistantDraft.content.trim()) {
           assistantDraft.content = "Выполнение остановлено пользователем.";
           patch((t) => ({ ...t, content: assistantDraft.content }));
@@ -3214,6 +3329,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         patch((t) => ({ ...t, error: assistantDraft.error }));
       }
     } finally {
+      clearChatWatchdog();
       chatAbortRef.current = null;
       let updatedTurns = history;
       if (userSaved) {
