@@ -1309,4 +1309,68 @@ describe("вкладка «Агент»", () => {
     streamCtrl.current?.close();
     expect(await screen.findByText(/Проверка завершена\./i)).toBeTruthy();
   });
+
+  it("показывает live-журнал BrowserInspector и карточку сбоя с пошаговым трейсом", async () => {
+    const encoder = new TextEncoder();
+    const streamCtrl: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
+
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          streamCtrl.current = controller;
+          controller.enqueue(
+            encoder.encode(
+              `event: status\ndata: ${JSON.stringify({
+                text: "Вызываю инструмент: browse_project…",
+                source: "browser_inspector",
+                tool: "browse_project",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: status\ndata: ${JSON.stringify({
+                text: "Запускаю msedge.exe (попытка 1/3: --headless=new, D3D11/ANGLE, sandbox)…",
+                source: "browser_inspector",
+                tool: "browse_project",
+              })}\n\n`,
+            ),
+          );
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Открой проект в браузере" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    expect(await screen.findByText(/Ход BrowserInspector/i)).toBeTruthy();
+    expect(screen.getAllByText(/Запускаю msedge\.exe \(попытка 1\/3/i).length).toBeGreaterThanOrEqual(2);
+
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: action\ndata: ${JSON.stringify({
+          type: "browser_inspect",
+          action: "open",
+          url: "http://127.0.0.1:3000",
+          error: "Не удалось запустить Chromium (код 1): gpu_process_host failed",
+          trace: [
+            "[+0.01s] Старт действия «open»",
+            "[+0.25s] Попытка 1 завершилась с ошибкой: gpu_process_host failed",
+          ],
+          errorsCount: 1,
+        })}\n\n`,
+      ),
+    );
+    streamCtrl.current?.enqueue(encoder.encode('event: text\ndata: {"text":"Браузер не стартовал."}\n\n'));
+    streamCtrl.current?.enqueue(encoder.encode('event: done\ndata: {"steps":1,"files":0,"actions":1}\n\n'));
+    streamCtrl.current?.close();
+
+    expect(await screen.findByText(/Сбой BrowserInspector \(open\)/i)).toBeTruthy();
+    expect(screen.getByText(/Не удалось запустить Chromium \(код 1\)/i)).toBeTruthy();
+    expect(screen.getByText(/Журнал шагов BrowserInspector \(2\)/i)).toBeTruthy();
+    expect(screen.getByText(/\[\+0\.25s\] Попытка 1 завершилась с ошибкой/i)).toBeTruthy();
+  });
 });

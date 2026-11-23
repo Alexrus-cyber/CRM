@@ -66,6 +66,10 @@ VIEWPORT_PRESETS: Dict[str, Tuple[int, int]] = {
 class BrowserError(RuntimeError):
     """Ошибка запуска или интерактивного осмотра проекта в браузере."""
 
+    def __init__(self, message: str, *, trace: Optional[List[str]] = None) -> None:
+        super().__init__(message)
+        self.trace: List[str] = list(trace or [])
+
 
 def is_local_url(url: str) -> bool:
     parsed = urllib.parse.urlparse(str(url or "").strip())
@@ -182,6 +186,59 @@ def _windows_registry_browsers() -> List[Path]:
     return found
 
 
+_BROWSER_LOG_LOCK = threading.Lock()
+
+
+def _browser_log(msg: str) -> None:
+    """Пишет шаг BrowserInspector в stderr (видно в терминале и журнале Лаунчера) без падения на сломанном pipe."""
+    line = f"[browser] {time.strftime('%H:%M:%S')} {msg}"
+    with _BROWSER_LOG_LOCK:
+        stream = getattr(sys, "stderr", None)
+        if stream is None:
+            return
+        try:
+            stream.write(line + "\n")
+            stream.flush()
+        except UnicodeEncodeError:
+            try:
+                enc = getattr(stream, "encoding", None) or "utf-8"
+                stream.write((line + "\n").encode(enc, errors="replace").decode(enc, errors="replace"))
+                stream.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _emit_step(
+    on_status: Optional[Any],
+    msg: str,
+    *,
+    trace: Optional[List[str]] = None,
+    started_at: Optional[float] = None,
+    log_console: bool = True,
+) -> None:
+    """Фиксирует действие BrowserInspector в консоли, списке шагов и live-статусе интерфейса."""
+    text = str(msg or "").strip()
+    if not text:
+        return
+    if trace is not None:
+        if started_at is not None:
+            elapsed = max(0.0, time.monotonic() - started_at)
+            entry = f"[+{elapsed:.2f}s] {text}"
+        else:
+            entry = text
+        if not trace or trace[-1] != entry:
+            trace.append(entry)
+    if log_console:
+        _browser_log(text)
+    if on_status is not None:
+        try:
+            on_status(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 _BROWSER_AVAIL_LOCK = threading.Lock()
 _BROWSER_AVAIL_CACHE: Tuple[float, bool] = (0.0, False)
 
@@ -199,8 +256,30 @@ def cached_browser_available(ttl_seconds: float = 60.0) -> bool:
     return available
 
 
-def find_browser_executable(*, allow_subprocess: bool = True) -> Optional[str]:
-    """Ищет установленный Chromium / Chrome / Edge (включая реестр Windows и кеш Playwright)."""
+def find_browser_candidates(*, allow_subprocess: bool = True, limit: int = 8) -> List[str]:
+    """Возвращает список установленных Chromium / Chrome / Edge в порядке приоритета."""
+    found_list: List[str] = []
+    seen_norm: set[str] = set()
+
+    def _add(raw_path: Optional[str]) -> bool:
+        if not raw_path:
+            return False
+        cleaned = str(raw_path).strip().strip('"')
+        if not cleaned:
+            return False
+        p = Path(cleaned)
+        if not _safe_is_file(p):
+            return False
+        try:
+            norm = str(p.resolve()).lower()
+        except OSError:
+            norm = str(p).lower()
+        if norm in seen_norm:
+            return False
+        seen_norm.add(norm)
+        found_list.append(str(p))
+        return len(found_list) >= max(1, limit)
+
     for env_key in (
         "AGENT_BROWSER_PATH",
         "CHROME_PATH",
@@ -209,9 +288,8 @@ def find_browser_executable(*, allow_subprocess: bool = True) -> Optional[str]:
         "EDGE_PATH",
         "PUPPETEER_EXECUTABLE_PATH",
     ):
-        raw = str(os.environ.get(env_key) or "").strip().strip('"')
-        if raw and _safe_is_file(Path(raw)):
-            return str(Path(raw))
+        if _add(os.environ.get(env_key)):
+            return found_list
 
     names = [
         "google-chrome",
@@ -229,8 +307,8 @@ def find_browser_executable(*, allow_subprocess: bool = True) -> Optional[str]:
             found = shutil.which(name)
         except OSError:
             found = None
-        if found and _safe_is_file(Path(found)):
-            return found
+        if _add(found):
+            return found_list
 
     system = platform.system()
     candidates: List[Path] = []
@@ -270,8 +348,8 @@ def find_browser_executable(*, allow_subprocess: bool = True) -> Optional[str]:
         ])
 
     for path in candidates:
-        if _safe_is_file(path):
-            return str(path)
+        if _add(str(path)):
+            return found_list
 
     # Кеш Playwright (chromium-* / chromium_headless_shell-*)
     pw_roots: List[Path] = []
@@ -310,12 +388,12 @@ def find_browser_executable(*, allow_subprocess: bool = True) -> Optional[str]:
             "chromium-*/chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
         ):
             for match in _safe_glob(pw_root, pattern):
-                if _safe_is_file(match):
-                    return str(match)
+                if _add(str(match)):
+                    return found_list
 
     # Изолированный короткий probe пакета playwright без конфликта с asyncio-loop и pipe-зависаний.
     # В frozen exe (PyInstaller) sys.executable не принимает `-c` и запускает второй экземпляр exe.
-    if allow_subprocess and not getattr(sys, "frozen", False):
+    if allow_subprocess and not getattr(sys, "frozen", False) and not found_list:
         probe_dir: Optional[Path] = None
         try:
             if importlib.util.find_spec("playwright") is not None:
@@ -350,15 +428,20 @@ def find_browser_executable(*, allow_subprocess: bool = True) -> Optional[str]:
                 elif probe_proc.returncode == 0 and out_file.is_file():
                     raw_out = out_file.read_text(encoding="utf-8", errors="ignore").strip()
                     exe = raw_out.splitlines()[-1].strip() if raw_out else ""
-                    if exe and _safe_is_file(Path(exe)):
-                        return exe
+                    _add(exe)
         except Exception:  # noqa: BLE001
             pass
         finally:
             if probe_dir is not None:
                 shutil.rmtree(probe_dir, ignore_errors=True)
 
-    return None
+    return found_list
+
+
+def find_browser_executable(*, allow_subprocess: bool = True) -> Optional[str]:
+    """Ищет первый подходящий Chromium / Chrome / Edge (включая реестр Windows и кеш Playwright)."""
+    found = find_browser_candidates(allow_subprocess=allow_subprocess, limit=1)
+    return found[0] if found else None
 
 
 # --------------------------------------------------------------------------
@@ -1344,14 +1427,29 @@ def _read_stderr_log_lines(log_path: Path) -> List[str]:
         return []
 
 
-def _extract_ws_port_from_lines(lines: List[str]) -> int:
+def _extract_ws_endpoint_from_lines(lines: List[str]) -> Tuple[str, int]:
     for line in lines:
-        m = re.search(r"DevTools listening on ws://(?:\[[^\]]+\]|[^:]+):(\d+)/", line)
+        m = re.search(r"DevTools listening on ws://(\[[^\]]+\]|[^:]+):(\d+)/", line)
         if m:
-            port = int(m.group(1))
+            host = m.group(1)
+            port = int(m.group(2))
+            if host.lower() == "localhost":
+                host = "127.0.0.1"
             if port > 0:
-                return port
-    return 0
+                return host, port
+    return "", 0
+
+
+def _extract_ws_port_from_lines(lines: List[str]) -> int:
+    _host, port = _extract_ws_endpoint_from_lines(lines)
+    return port
+
+
+def _read_browser_diag_tail(user_data: Path) -> List[str]:
+    lines: List[str] = []
+    for name in ("browser-stderr.log", "chrome_debug.log"):
+        lines.extend(_read_stderr_log_lines(user_data / name))
+    return lines[-8:]
 
 
 def _has_env_proxy() -> bool:
@@ -1367,23 +1465,29 @@ def _launch_headless_chromium(
     height: int,
     *,
     cancel_check: Optional[Any] = None,
+    on_status: Optional[Any] = None,
+    trace: Optional[List[str]] = None,
+    started_at: Optional[float] = None,
+    force_disable_gpu: Optional[bool] = None,
 ) -> Tuple[subprocess.Popen[Any], Path, int]:
-    """Запускает headless Chromium без блокировки pipe; при сбое пробует `--headless` и `--no-sandbox`."""
+    """Запускает headless Chromium без блокировки pipe; при сбое пробует `--headless`, SwiftShader и `--no-sandbox`."""
     is_windows = platform.system() == "Windows"
-    is_headless_shell = "headless" in Path(executable).name.lower()
+    exe_name = Path(executable).name
+    is_headless_shell = "headless" in exe_name.lower()
     is_root = not is_windows and hasattr(os, "geteuid") and os.geteuid() == 0
     needs_no_sandbox = is_root or _linux_userns_restricted()
 
     # На Windows `--headless=new` + `--disable-gpu` без SwiftShader часто вешает Viz / `Page.captureScreenshot`,
-    # поэтому на Windows сначала пробуем нативный ANGLE/D3D11 (без `--disable-gpu`), а fallback — SwiftShader.
+    # поэтому на Windows сначала пробуем нативный ANGLE/D3D11 (без `--disable-gpu`), затем SwiftShader, затем `--no-sandbox`.
     if is_headless_shell:
         base_attempts: List[Tuple[str, float, bool, bool]] = [
-            ("--headless", 8.5, needs_no_sandbox, not is_windows),
+            ("--headless", 9.0, needs_no_sandbox, not is_windows),
         ]
     elif is_windows:
         base_attempts = [
-            ("--headless=new", 9.0, needs_no_sandbox, False),
-            ("--headless", 7.5, needs_no_sandbox, True),
+            ("--headless=new", 12.0, needs_no_sandbox, False),
+            ("--headless=new", 10.0, needs_no_sandbox, True),
+            ("--headless", 9.0, True, True),
         ]
     else:
         base_attempts = [
@@ -1394,6 +1498,11 @@ def _launch_headless_chromium(
         # Fallback для контейнеров / Linux без user namespaces / AppArmor.
         base_attempts.append(("--headless" if is_headless_shell else "--headless=new", 8.5, True, True))
 
+    if force_disable_gpu is not None:
+        filtered = [a for a in base_attempts if a[3] is force_disable_gpu]
+        if filtered:
+            base_attempts = filtered
+
     last_error: Optional[Exception] = None
     skip_non_nosandbox = False
     proxy_flag = (
@@ -1402,11 +1511,21 @@ def _launch_headless_chromium(
         else "--no-proxy-server"
     )
 
-    for headless_flag, startup_timeout, use_no_sandbox, disable_gpu in base_attempts:
+    total_attempts = len(base_attempts)
+    for idx, (headless_flag, startup_timeout, use_no_sandbox, disable_gpu) in enumerate(base_attempts, 1):
         if skip_non_nosandbox and not use_no_sandbox:
             continue
         if cancel_check and cancel_check():
             raise BrowserError("Осмотр в браузере отменён пользователем")
+
+        gpu_label = "SwiftShader" if disable_gpu else "D3D11/ANGLE"
+        sb_label = "no-sandbox" if use_no_sandbox else "sandbox"
+        _emit_step(
+            on_status,
+            f"Запускаю {exe_name} (попытка {idx}/{total_attempts}: {headless_flag}, {gpu_label}, {sb_label})…",
+            trace=trace,
+            started_at=started_at,
+        )
 
         user_data = Path(tempfile.mkdtemp(prefix="crm-browser-"))
         stderr_log = user_data / "browser-stderr.log"
@@ -1474,20 +1593,36 @@ def _launch_headless_chromium(
             popen_kwargs["start_new_session"] = True
 
         # Пишем stderr в файл, а не в PIPE — исключаем deadlock close() при выживших дочерних процессах.
-        with open(stderr_log, "wb") as err_fh:
-            proc = subprocess.Popen(cmd, stderr=err_fh, **popen_kwargs)
+        try:
+            with open(stderr_log, "wb") as err_fh:
+                proc = subprocess.Popen(cmd, stderr=err_fh, **popen_kwargs)
+        except OSError as err:
+            shutil.rmtree(user_data, ignore_errors=True)
+            last_error = BrowserError(f"Не удалось запустить {executable}: {err}")
+            _emit_step(on_status, f"Ошибка старта {exe_name}: {err}", trace=trace, started_at=started_at)
+            continue
 
-        deadline = time.monotonic() + startup_timeout
+        launch_t0 = time.monotonic()
+        last_beat = launch_t0
+        _emit_step(
+            on_status,
+            f"Процесс {exe_name} запущен (PID={proc.pid}), жду CDP-порт…",
+            trace=trace,
+            started_at=started_at,
+        )
+
+        deadline = launch_t0 + startup_timeout
         port_file = user_data / "DevToolsActivePort"
         crashed = False
         while time.monotonic() < deadline:
             if cancel_check and cancel_check():
+                _emit_step(on_status, f"Отмена: останавливаю PID={proc.pid}…", trace=trace, started_at=started_at)
                 _kill_proc_tree(proc)
                 shutil.rmtree(user_data, ignore_errors=True)
                 raise BrowserError("Осмотр в браузере отменён пользователем")
             if proc.poll() is not None:
-                stderr_lines = _read_stderr_log_lines(stderr_log)
-                err_tail = " | ".join(stderr_lines[-5:])
+                diag_lines = _read_browser_diag_tail(user_data)
+                err_tail = " | ".join(diag_lines[-5:])
                 lower_tail = err_tail.lower()
                 if not use_no_sandbox and any(
                     tok in lower_tail for tok in ("sandbox", "zygote", "namespace", "userns", "suid", "trapped")
@@ -1495,26 +1630,63 @@ def _launch_headless_chromium(
                     skip_non_nosandbox = True
                 _kill_proc_tree(proc)
                 shutil.rmtree(user_data, ignore_errors=True)
-                last_error = BrowserError(f"Браузер сразу завершился (код {proc.returncode}): {err_tail}")
+                msg_err = f"Браузер сразу завершился (код {proc.returncode}): {err_tail or 'нет вывода в логе'}"
+                last_error = BrowserError(msg_err)
+                _emit_step(on_status, f"Попытка {idx} завершилась с ошибкой: {msg_err[:180]}", trace=trace, started_at=started_at)
                 crashed = True
                 break
-            stderr_port = _extract_ws_port_from_lines(_read_stderr_log_lines(stderr_log))
+            stderr_lines = _read_stderr_log_lines(stderr_log)
+            if not stderr_lines and (user_data / "chrome_debug.log").is_file():
+                stderr_lines = _read_stderr_log_lines(user_data / "chrome_debug.log")
+            ws_host, stderr_port = _extract_ws_endpoint_from_lines(stderr_lines)
             if stderr_port > 0:
+                if ws_host:
+                    try:
+                        (user_data / ".cdp_host").write_text(ws_host, encoding="utf-8")
+                    except OSError:
+                        pass
+                _emit_step(
+                    on_status,
+                    f"CDP-порт {stderr_port} открыт ({ws_host or '127.0.0.1'}, {time.monotonic() - launch_t0:.2f} с)",
+                    trace=trace,
+                    started_at=started_at,
+                )
                 return proc, user_data, stderr_port
             if port_file.is_file():
                 try:
                     lines = port_file.read_text(encoding="utf-8", errors="ignore").splitlines()
                     first_line = lines[0].strip() if lines else ""
                     if first_line.isdigit() and int(first_line) > 0:
-                        return proc, user_data, int(first_line)
+                        detected_port = int(first_line)
+                        _emit_step(
+                            on_status,
+                            f"CDP-порт {detected_port} получен из DevToolsActivePort ({time.monotonic() - launch_t0:.2f} с)",
+                            trace=trace,
+                            started_at=started_at,
+                        )
+                        return proc, user_data, detected_port
                 except (IndexError, OSError):
                     pass
+            now_t = time.monotonic()
+            if now_t - last_beat >= 2.0:
+                last_beat = now_t
+                _emit_step(
+                    on_status,
+                    f"Жду инициализации CDP-порта {exe_name} ({now_t - launch_t0:.1f} с, PID={proc.pid})…",
+                    trace=trace,
+                    started_at=started_at,
+                )
             time.sleep(0.08)
 
         if not crashed:
+            diag_tail = " | ".join(_read_browser_diag_tail(user_data)[-4:])
             _kill_proc_tree(proc)
             shutil.rmtree(user_data, ignore_errors=True)
-            last_error = BrowserError("Таймаут запуска headless-браузера CDP")
+            timeout_msg = f"Таймаут запуска headless-браузера CDP за {startup_timeout:.0f} с" + (
+                f" ({diag_tail})" if diag_tail else ""
+            )
+            last_error = BrowserError(timeout_msg)
+            _emit_step(on_status, f"Попытка {idx}: {timeout_msg[:180]}", trace=trace, started_at=started_at)
 
     if last_error is not None:
         raise last_error
@@ -1533,16 +1705,35 @@ def _normalize_ws_host(ws_url: str, connected_host: str) -> str:
     return ws_url
 
 
+def _ordered_cdp_hosts(user_data_dir: Optional[Path]) -> Tuple[str, ...]:
+    if user_data_dir:
+        try:
+            hint_file = user_data_dir / ".cdp_host"
+            if hint_file.is_file():
+                hinted = hint_file.read_text(encoding="utf-8", errors="ignore").strip()
+                if hinted == "[::1]":
+                    return ("[::1]", "127.0.0.1")
+                if hinted == "127.0.0.1":
+                    return ("127.0.0.1", "[::1]")
+        except OSError:
+            pass
+    return ("127.0.0.1", "[::1]")
+
+
 def _find_page_ws_url(
     port: int,
     user_data_dir: Optional[Path] = None,
     *,
     cancel_check: Optional[Any] = None,
+    on_status: Optional[Any] = None,
+    trace: Optional[List[str]] = None,
+    started_at: Optional[float] = None,
 ) -> str:
     deadline = time.monotonic() + 6.5
     last_err = ""
     last_create_attempt = 0.0
-    hosts = ("127.0.0.1", "[::1]")
+    hosts = _ordered_cdp_hosts(user_data_dir)
+    logged_probe = False
     while time.monotonic() < deadline:
         if cancel_check and cancel_check():
             raise BrowserError("Осмотр в браузере отменён пользователем")
@@ -1550,14 +1741,30 @@ def _find_page_ws_url(
             if cancel_check and cancel_check():
                 raise BrowserError("Осмотр в браузере отменён пользователем")
             try:
+                if not logged_probe:
+                    logged_probe = True
+                    _emit_step(
+                        on_status,
+                        f"Запрашиваю список вкладок CDP: http://{host}:{port}/json/list…",
+                        trace=trace,
+                        started_at=started_at,
+                    )
                 with _LOCAL_OPENER.open(f"http://{host}:{port}/json/list", timeout=0.8) as resp:
                     targets = json.loads(resp.read().decode("utf-8"))
                 for item in targets:
                     if item.get("type") == "page" and item.get("webSocketDebuggerUrl"):
-                        return _normalize_ws_host(str(item["webSocketDebuggerUrl"]), host)
+                        ws = _normalize_ws_host(str(item["webSocketDebuggerUrl"]), host)
+                        _emit_step(on_status, f"Найдена вкладка CDP: {ws}", trace=trace, started_at=started_at)
+                        return ws
                 now = time.monotonic()
                 if now - last_create_attempt >= 0.5:
                     last_create_attempt = now
+                    _emit_step(
+                        on_status,
+                        f"Открытых вкладок нет — создаю новую вкладку CDP ({host}:{port})…",
+                        trace=trace,
+                        started_at=started_at,
+                    )
                     for method in ("PUT", "GET"):
                         try:
                             req = urllib.request.Request(
@@ -1567,7 +1774,9 @@ def _find_page_ws_url(
                             with _LOCAL_OPENER.open(req, timeout=0.9) as new_resp:
                                 created = json.loads(new_resp.read().decode("utf-8"))
                             if isinstance(created, dict) and created.get("webSocketDebuggerUrl"):
-                                return _normalize_ws_host(str(created["webSocketDebuggerUrl"]), host)
+                                ws = _normalize_ws_host(str(created["webSocketDebuggerUrl"]), host)
+                                _emit_step(on_status, f"Создана вкладка CDP: {ws}", trace=trace, started_at=started_at)
+                                return ws
                         except Exception:  # noqa: BLE001
                             continue
                     # Fallback через browser WebSocket (`Target.createTarget`) для сборок без `/json/new`.
@@ -1583,6 +1792,12 @@ def _find_page_ws_url(
                                 if len(lines) >= 2 and lines[1].strip():
                                     browser_ws = f"ws://{host}:{port}{lines[1].strip()}"
                         if browser_ws:
+                            _emit_step(
+                                on_status,
+                                f"Создаю вкладку через Target.createTarget ({browser_ws})…",
+                                trace=trace,
+                                started_at=started_at,
+                            )
                             b_cdp = CDPClient(_normalize_ws_host(browser_ws, host))
                             try:
                                 res = b_cdp.call(
@@ -1593,7 +1808,9 @@ def _find_page_ws_url(
                                 )
                                 target_id = str(res.get("targetId") or "")
                                 if target_id:
-                                    return f"ws://{host}:{port}/devtools/page/{target_id}"
+                                    ws = f"ws://{host}:{port}/devtools/page/{target_id}"
+                                    _emit_step(on_status, f"Создана вкладка Target.createTarget: {ws}", trace=trace, started_at=started_at)
+                                    return ws
                             finally:
                                 b_cdp.close()
                     except Exception:  # noqa: BLE001
@@ -1673,65 +1890,182 @@ class BrowserSession:
         *,
         on_status: Optional[Any] = None,
         cancel_check: Optional[Any] = None,
+        trace: Optional[List[str]] = None,
+        started_at: Optional[float] = None,
     ) -> "BrowserSession":
+        t0 = started_at if started_at is not None else time.monotonic()
         _check_cancelled(cancel_check)
-        if on_status:
-            on_status("Ищу браузер Chromium / Chrome / Edge…")
+        _emit_step(on_status, "Ищу браузер Chromium / Chrome / Edge…", trace=trace, started_at=t0)
         exe = find_browser_executable()
         if not exe:
+            _emit_step(on_status, "Браузер Chromium / Chrome / Edge не найден", trace=trace, started_at=t0)
             raise BrowserError(
                 "На машине не найден браузер Chromium / Chrome / Edge для интерактивного осмотра проекта. "
                 "Установите Chrome/Edge или Playwright Chromium (npx playwright install chromium) "
                 "либо задайте переменную окружения AGENT_BROWSER_PATH."
             )
-        _check_cancelled(cancel_check)
-        if on_status:
-            on_status("Запускаю headless-браузер…")
-        if cancel_check is not None:
-            try:
-                sig = inspect.signature(_launch_headless_chromium)
-                accepts_cancel = "cancel_check" in sig.parameters or any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-                )
-            except (TypeError, ValueError):
-                accepts_cancel = False
-            if accepts_cancel:
-                proc, user_data, port = _launch_headless_chromium(exe, width, height, cancel_check=cancel_check)
-            else:
-                proc, user_data, port = _launch_headless_chromium(exe, width, height)
-        else:
-            proc, user_data, port = _launch_headless_chromium(exe, width, height)
-        cdp: Optional[CDPClient] = None
+        _emit_step(on_status, f"Найден браузер: {exe}", trace=trace, started_at=t0)
+
+        # Список запасных установленных браузеров на случай, если основной заблокирован политикой/GPU.
+        exe_candidates: List[str] = [exe]
+        if (
+            getattr(find_browser_executable, "_mock_name", None) is None
+            or getattr(find_browser_candidates, "_mock_name", None) is not None
+        ):
+            for alt in find_browser_candidates(allow_subprocess=False, limit=4):
+                if alt not in exe_candidates:
+                    exe_candidates.append(alt)
+
         try:
-            _check_cancelled(cancel_check)
-            if on_status:
-                on_status("Подключаюсь к браузеру по CDP…")
-            ws_url = _find_page_ws_url(port, user_data_dir=user_data, cancel_check=cancel_check)
-            cdp = CDPClient(ws_url)
-            cdp.call("Page.enable", timeout=10.0, cancel_check=cancel_check)
-            cdp.call("Runtime.enable", timeout=10.0, cancel_check=cancel_check)
-            cdp.call(
-                "Network.enable",
-                {"maxTotalBufferSize": 1048576, "maxResourceBufferSize": 524288},
-                timeout=10.0,
-                cancel_check=cancel_check,
+            launch_sig = inspect.signature(_launch_headless_chromium)
+            launch_params = launch_sig.parameters
+            launch_accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in launch_params.values())
+        except (TypeError, ValueError):
+            launch_params = {}  # type: ignore[assignment]
+            launch_accepts_varkw = False
+
+        try:
+            ws_sig = inspect.signature(_find_page_ws_url)
+            ws_params = ws_sig.parameters
+            ws_accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in ws_params.values())
+        except (TypeError, ValueError):
+            ws_params = {}  # type: ignore[assignment]
+            ws_accepts_varkw = False
+
+        def _call_launch_helper(target_exe: str, force_disable_gpu: Optional[bool] = None) -> Tuple[subprocess.Popen[Any], Path, int]:
+            kw: Dict[str, Any] = {}
+            if cancel_check is not None and (launch_accepts_varkw or "cancel_check" in launch_params):
+                kw["cancel_check"] = cancel_check
+            if on_status is not None and (launch_accepts_varkw or "on_status" in launch_params):
+                kw["on_status"] = on_status
+            if trace is not None and (launch_accepts_varkw or "trace" in launch_params):
+                kw["trace"] = trace
+            if launch_accepts_varkw or "started_at" in launch_params:
+                kw["started_at"] = t0
+            if force_disable_gpu is not None and (launch_accepts_varkw or "force_disable_gpu" in launch_params):
+                kw["force_disable_gpu"] = force_disable_gpu
+            return _launch_headless_chromium(target_exe, width, height, **kw)
+
+        def _call_find_ws(port_num: int, user_dir: Path) -> str:
+            kw: Dict[str, Any] = {"user_data_dir": user_dir}
+            if cancel_check is not None and (ws_accepts_varkw or "cancel_check" in ws_params):
+                kw["cancel_check"] = cancel_check
+            if on_status is not None and (ws_accepts_varkw or "on_status" in ws_params):
+                kw["on_status"] = on_status
+            if trace is not None and (ws_accepts_varkw or "trace" in ws_params):
+                kw["trace"] = trace
+            if ws_accepts_varkw or "started_at" in ws_params:
+                kw["started_at"] = t0
+            return _find_page_ws_url(port_num, **kw)
+
+        is_mocked_launch = getattr(_launch_headless_chromium, "_mock_name", None) is not None
+        last_error: Optional[Exception] = None
+
+        for exe_idx, candidate_exe in enumerate(exe_candidates):
+            if exe_idx > 0:
+                _emit_step(
+                    on_status,
+                    f"Основной браузер не запустился — пробую запасной: {candidate_exe}…",
+                    trace=trace,
+                    started_at=t0,
+                )
+            gpu_modes: List[Optional[bool]] = (
+                [None, True]
+                if (platform.system() == "Windows" and not is_mocked_launch)
+                else [None]
             )
-            cdp.call(
-                "Emulation.setDeviceMetricsOverride",
-                {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": width <= 500},
-                timeout=10.0,
-                cancel_check=cancel_check,
-            )
-        except Exception:
-            if cdp is not None:
+            for mode_idx, gpu_mode in enumerate(gpu_modes):
+                if mode_idx > 0:
+                    _emit_step(
+                        on_status,
+                        f"Повтор запуска {Path(candidate_exe).name} с принудительным SwiftShader…",
+                        trace=trace,
+                        started_at=t0,
+                    )
+                _check_cancelled(cancel_check)
+                _emit_step(on_status, "Запускаю headless-браузер…", trace=trace, started_at=t0)
                 try:
-                    cdp.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            _kill_proc_tree(proc)
-            shutil.rmtree(user_data, ignore_errors=True)
-            raise
-        return cls(cdp=cdp, proc=proc, user_data_dir=user_data, width=width, height=height)
+                    proc, user_data, port = _call_launch_helper(candidate_exe, force_disable_gpu=gpu_mode)
+                except BrowserError as err:
+                    _check_cancelled(cancel_check)
+                    last_error = err
+                    if gpu_mode is None and len(gpu_modes) > 1:
+                        # Если сам процесс уже перебрал все попытки внутри _launch_headless_chromium, не повторяем ту же тройку.
+                        break
+                    break
+
+                cdp: Optional[CDPClient] = None
+                try:
+                    _check_cancelled(cancel_check)
+                    _emit_step(
+                        on_status,
+                        f"Подключаюсь к браузеру по CDP (порт {port})…",
+                        trace=trace,
+                        started_at=t0,
+                    )
+                    ws_url = _call_find_ws(port, user_data)
+                    ws_t0 = time.monotonic()
+                    _emit_step(
+                        on_status,
+                        f"Устанавливаю WebSocket CDP соединение ({ws_url})…",
+                        trace=trace,
+                        started_at=t0,
+                    )
+                    cdp = CDPClient(ws_url)
+                    _emit_step(
+                        on_status,
+                        f"WebSocket CDP подключён ({(time.monotonic() - ws_t0) * 1000:.0f} мс), активирую домены…",
+                        trace=trace,
+                        started_at=t0,
+                    )
+                    cdp.call("Page.enable", timeout=10.0, cancel_check=cancel_check)
+                    cdp.call("Runtime.enable", timeout=10.0, cancel_check=cancel_check)
+                    try:
+                        cdp.call(
+                            "Network.enable",
+                            {"maxTotalBufferSize": 1048576, "maxResourceBufferSize": 524288},
+                            timeout=10.0,
+                            cancel_check=cancel_check,
+                        )
+                    except BrowserError as net_err:
+                        _check_cancelled(cancel_check)
+                        if "invalid" in str(net_err).lower() or "parameter" in str(net_err).lower():
+                            cdp.call("Network.enable", timeout=10.0, cancel_check=cancel_check)
+                        else:
+                            raise
+                    cdp.call(
+                        "Emulation.setDeviceMetricsOverride",
+                        {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": width <= 500},
+                        timeout=10.0,
+                        cancel_check=cancel_check,
+                    )
+                    _emit_step(
+                        on_status,
+                        f"Домены CDP и viewport {width}×{height} готовы",
+                        trace=trace,
+                        started_at=t0,
+                    )
+                    return cls(cdp=cdp, proc=proc, user_data_dir=user_data, width=width, height=height)
+                except Exception as err:
+                    if cdp is not None:
+                        try:
+                            cdp.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    _kill_proc_tree(proc)
+                    shutil.rmtree(user_data, ignore_errors=True)
+                    _check_cancelled(cancel_check)
+                    last_error = err
+                    _emit_step(
+                        on_status,
+                        f"Сбой инициализации CDP: {err}",
+                        trace=trace,
+                        started_at=t0,
+                    )
+
+        if last_error is not None:
+            raise last_error
+        raise BrowserError("Не удалось запустить headless-браузер CDP")
 
     def is_alive(self) -> bool:
         if self.cdp is None or self.cdp._ws.closed:
@@ -1753,10 +2087,25 @@ class BrowserSession:
             raise BrowserError("Процесс браузера завершился неожиданно")
         return self.cdp
 
-    def set_viewport(self, width: int, height: int, *, cancel_check: Optional[Any] = None) -> None:
+    def set_viewport(
+        self,
+        width: int,
+        height: int,
+        *,
+        cancel_check: Optional[Any] = None,
+        on_status: Optional[Any] = None,
+        trace: Optional[List[str]] = None,
+        started_at: Optional[float] = None,
+    ) -> None:
         self.width = width
         self.height = height
         cdp = self.ensure_cdp()
+        _emit_step(
+            on_status,
+            f"Устанавливаю viewport {width}×{height}…",
+            trace=trace,
+            started_at=started_at,
+        )
         if cancel_check is not None:
             cdp.call(
                 "Emulation.setDeviceMetricsOverride",
@@ -1778,10 +2127,11 @@ class BrowserSession:
         *,
         on_status: Optional[Any] = None,
         cancel_check: Optional[Any] = None,
+        trace: Optional[List[str]] = None,
+        started_at: Optional[float] = None,
     ) -> None:
         _check_cancelled(cancel_check)
-        if on_status:
-            on_status(f"Открываю страницу {url}…")
+        _emit_step(on_status, f"Открываю страницу {url}…", trace=trace, started_at=started_at)
         cdp = self.ensure_cdp()
         cdp.clear_telemetry()
         nav_res = (
@@ -1791,10 +2141,13 @@ class BrowserSession:
         )
         if nav_res.get("errorText"):
             raise BrowserError(f"Браузер не смог открыть {url}: {nav_res['errorText']}")
+        _emit_step(on_status, "Page.navigate выполнен, жду готовности DOM…", trace=trace, started_at=started_at)
         start = time.monotonic()
+        last_beat = start
         deadline = start + 8.0
         interactive_since: Optional[float] = None
         consecutive_eval_timeouts = 0
+        final_state = "unknown"
         while time.monotonic() < deadline:
             _check_cancelled(cancel_check)
             remaining = max(0.5, deadline - time.monotonic())
@@ -1806,13 +2159,26 @@ class BrowserSession:
                     cancel_check=cancel_check,
                 )
                 consecutive_eval_timeouts = 0
+                final_state = str(state or "unknown")
                 if state == "complete":
                     break
                 if state == "interactive":
                     if interactive_since is None:
                         interactive_since = time.monotonic()
+                        _emit_step(
+                            on_status,
+                            "DOM загружен (readyState=interactive), дожидаюсь ресурсов…",
+                            trace=trace,
+                            started_at=started_at,
+                        )
                     # Если DOM уже готов > 2.0с (например, завис внешний шрифт/аналитика), продолжаем.
                     elif time.monotonic() - interactive_since >= 2.0:
+                        _emit_step(
+                            on_status,
+                            "DOM готов >2 с при зависшем внешнем ресурсе — перехожу к аудиту",
+                            trace=trace,
+                            started_at=started_at,
+                        )
                         break
                 elif time.monotonic() - start >= 4.5:
                     # Если заблокирован внешний скрипт в <head>, но DOM уже присутствует — не ждём полный таймаут.
@@ -1828,7 +2194,22 @@ class BrowserSession:
                                 "level": "warning",
                                 "text": "Внешний ресурс задерживает readyState=loading (>4.5с); аудит выполнен по текущему DOM.",
                             })
+                        _emit_step(
+                            on_status,
+                            "Внешний ресурс держит readyState=loading (>4.5 с), но DOM готов — продолжаю",
+                            trace=trace,
+                            started_at=started_at,
+                        )
                         break
+                now_t = time.monotonic()
+                if now_t - last_beat >= 1.5:
+                    last_beat = now_t
+                    _emit_step(
+                        on_status,
+                        f"Загрузка страницы (readyState={final_state}, {now_t - start:.1f} с)…",
+                        trace=trace,
+                        started_at=started_at,
+                    )
             except BrowserError as err:
                 _check_cancelled(cancel_check)
                 # Если браузер или CDP-соединение умерло — не крутим цикл ожидания до deadline.
@@ -1836,36 +2217,96 @@ class BrowserSession:
                 err_low = str(err).lower()
                 if "не ответил" in err_low or "timeout" in err_low:
                     consecutive_eval_timeouts += 1
+                    _emit_step(
+                        on_status,
+                        f"Ожидание document.readyState не ответило ({consecutive_eval_timeouts}/2)…",
+                        trace=trace,
+                        started_at=started_at,
+                    )
                     if consecutive_eval_timeouts >= 2 and time.monotonic() - start >= 3.0:
                         break
             _sleep_interruptible(0.15, cancel_check)
+        _emit_step(
+            on_status,
+            f"Страница готова (readyState={final_state}, {time.monotonic() - start:.2f} с)",
+            trace=trace,
+            started_at=started_at,
+        )
         if wait_ms > 0:
-            _sleep_interruptible(min(wait_ms, 5000) / 1000.0, cancel_check)
+            clamped_wait = min(wait_ms, 5000)
+            _emit_step(
+                on_status,
+                f"Выдерживаю паузу {clamped_wait} мс для анимаций/гидрации…",
+                trace=trace,
+                started_at=started_at,
+            )
+            _sleep_interruptible(clamped_wait / 1000.0, cancel_check)
         self.current_url = url
 
-    def capture_screenshot(self, *, cancel_check: Optional[Any] = None) -> str:
+    def capture_screenshot(
+        self,
+        *,
+        cancel_check: Optional[Any] = None,
+        on_status: Optional[Any] = None,
+        trace: Optional[List[str]] = None,
+        started_at: Optional[float] = None,
+    ) -> str:
         _check_cancelled(cancel_check)
         if self._screenshots_disabled:
+            _emit_step(
+                on_status,
+                "Скриншоты отключены для этой сессии (предыдущий вызов Page.captureScreenshot завис)",
+                trace=trace,
+                started_at=started_at,
+            )
             return ""
-        attempts: List[Tuple[Dict[str, Any], float]] = [
-            ({"format": "jpeg", "quality": 76, "fromSurface": True, "optimizeForSpeed": True}, 4.5),
-            ({"format": "jpeg", "quality": 76, "fromSurface": False}, 3.0),
+        attempts: List[Tuple[Dict[str, Any], float, str]] = [
+            ({"format": "jpeg", "quality": 76, "fromSurface": True, "optimizeForSpeed": True}, 4.5, "fromSurface=True"),
+            ({"format": "jpeg", "quality": 76, "fromSurface": False}, 3.0, "fromSurface=False"),
         ]
         try:
             cdp = self.ensure_cdp()
-            for idx, (params, shot_timeout) in enumerate(attempts):
+            for idx, (params, shot_timeout, label) in enumerate(attempts):
+                shot_t0 = time.monotonic()
+                _emit_step(
+                    on_status,
+                    f"Выполняю Page.captureScreenshot ({label}, таймаут {shot_timeout:.1f} с)…",
+                    trace=trace,
+                    started_at=started_at,
+                )
                 try:
                     if cancel_check is not None:
                         res = cdp.call("Page.captureScreenshot", params, timeout=shot_timeout, cancel_check=cancel_check)
                     else:
                         res = cdp.call("Page.captureScreenshot", params, timeout=shot_timeout)
                     b64 = str(res.get("data") or "")
-                    return f"data:image/jpeg;base64,{b64}" if b64 else ""
+                    if b64:
+                        kb = max(1, (len(b64) * 3) // 4096)
+                        _emit_step(
+                            on_status,
+                            f"Скриншот получен ({kb} КБ за {(time.monotonic() - shot_t0) * 1000:.0f} мс)",
+                            trace=trace,
+                            started_at=started_at,
+                        )
+                        return f"data:image/jpeg;base64,{b64}"
+                    _emit_step(
+                        on_status,
+                        f"Page.captureScreenshot ({label}) вернул пустые данные",
+                        trace=trace,
+                        started_at=started_at,
+                    )
+                    return ""
                 except BrowserError as err:
                     _check_cancelled(cancel_check)
                     msg = str(err).lower()
                     if idx == 0 and ("invalid" in msg or "parameter" in msg):
                         # Старые сборки Chromium/Edge не принимают optimizeForSpeed.
+                        _emit_step(
+                            on_status,
+                            "Повтор Page.captureScreenshot без optimizeForSpeed…",
+                            trace=trace,
+                            started_at=started_at,
+                        )
                         try:
                             fallback_params = {"format": "jpeg", "quality": 76, "fromSurface": True}
                             res = (
@@ -1874,23 +2315,53 @@ class BrowserSession:
                                 else cdp.call("Page.captureScreenshot", fallback_params, timeout=4.0)
                             )
                             b64 = str(res.get("data") or "")
-                            return f"data:image/jpeg;base64,{b64}" if b64 else ""
+                            if b64:
+                                kb = max(1, (len(b64) * 3) // 4096)
+                                _emit_step(
+                                    on_status,
+                                    f"Скриншот получен ({kb} КБ)",
+                                    trace=trace,
+                                    started_at=started_at,
+                                )
+                                return f"data:image/jpeg;base64,{b64}"
+                            return ""
                         except BrowserError:
                             _check_cancelled(cancel_check)
+                    _emit_step(
+                        on_status,
+                        f"Page.captureScreenshot ({label}) не удался: {err}",
+                        trace=trace,
+                        started_at=started_at,
+                    )
                     if idx == 0 and self.is_alive():
                         continue
                     raise
-        except BrowserError:
+        except BrowserError as err:
             _check_cancelled(cancel_check)
             # Не тормозим последующие шаги в этой сессии, если captureScreenshot заблокирован/таймаутится.
             self._screenshots_disabled = True
+            _emit_step(
+                on_status,
+                f"Скриншот пропущен ({err}) — продолжаю без изображения",
+                trace=trace,
+                started_at=started_at,
+            )
             return ""
         return ""
 
-    def audit(self, *, cancel_check: Optional[Any] = None) -> Dict[str, Any]:
+    def audit(
+        self,
+        *,
+        cancel_check: Optional[Any] = None,
+        on_status: Optional[Any] = None,
+        trace: Optional[List[str]] = None,
+        started_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
         _check_cancelled(cancel_check)
         cdp = self.ensure_cdp()
         dom_audit: Dict[str, Any] = {}
+        audit_t0 = time.monotonic()
+        _emit_step(on_status, "Запускаю Runtime.evaluate(AUDIT_JS)…", trace=trace, started_at=started_at)
         for attempt in range(2):
             try:
                 if cancel_check is not None:
@@ -1903,11 +2374,23 @@ class BrowserSession:
                 self.ensure_cdp()
                 msg = str(err).lower()
                 if attempt == 0 and ("context" in msg or "destroyed" in msg or "navigation" in msg):
+                    _emit_step(
+                        on_status,
+                        "Контекст страницы обновился (навигация) — повторяю DOM-аудит…",
+                        trace=trace,
+                        started_at=started_at,
+                    )
                     _sleep_interruptible(0.35, cancel_check)
                     continue
                 if "не ответил" in msg or "timeout" in msg:
                     # Страница могла повесить свой главный JS-поток (например, бесконечный цикл);
                     # возвращаем телеметрию и явную диагностику вместо зависания/ретраев инструмента.
+                    _emit_step(
+                        on_status,
+                        "JS-поток страницы не ответил на DOM-аудит за 8 с — сохраняю телеметрию без падения",
+                        trace=trace,
+                        started_at=started_at,
+                    )
                     dom_audit = {
                         "url": self.current_url,
                         "title": "",
@@ -1929,12 +2412,26 @@ class BrowserSession:
                     break
                 raise
         telemetry = cdp.snapshot_telemetry()
+        _emit_step(
+            on_status,
+            (
+                f"DOM-аудит завершён ({(time.monotonic() - audit_t0) * 1000:.0f} мс: "
+                f"интерактивных={len(dom_audit.get('interactive') or [])}, "
+                f"проблем={len(dom_audit.get('issues') or [])}, "
+                f"ошибок JS={len(telemetry.get('pageErrors') or [])}, "
+                f"сеть={len(telemetry.get('failedRequests') or [])})"
+            ),
+            trace=trace,
+            started_at=started_at,
+        )
         return {
             "dom": dom_audit,
             "telemetry": telemetry,
         }
 
     def close(self) -> None:
+        if self.proc is not None or self.cdp is not None:
+            _browser_log(f"Закрываю сессию браузера (PID={getattr(self.proc, 'pid', None)})")
         if self.cdp:
             try:
                 self.cdp.close()
@@ -1968,6 +2465,8 @@ class BrowserSessionManager:
         *,
         on_status: Optional[Any] = None,
         cancel_check: Optional[Any] = None,
+        trace: Optional[List[str]] = None,
+        started_at: Optional[float] = None,
     ) -> BrowserSession:
         _check_cancelled(cancel_check)
         stale: Optional[BrowserSession] = None
@@ -1976,30 +2475,35 @@ class BrowserSessionManager:
             session = self._sessions.get(session_id)
             if session is not None:
                 if session.is_alive():
+                    _emit_step(
+                        on_status,
+                        f"Переиспользую активную сессию «{session_id}» ({session.current_url or 'about:blank'})",
+                        trace=trace,
+                        started_at=started_at,
+                    )
                     return session
                 stale = self._sessions.pop(session_id, None)
                 preserved_origins = set(session.approved_external_origins)
         if stale is not None:
+            _emit_step(on_status, f"Предыдущая сессия «{session_id}» завершилась — перезапускаю…", trace=trace, started_at=started_at)
             stale.close()
-        if on_status is not None or cancel_check is not None:
-            try:
-                sig = inspect.signature(BrowserSession.launch)
-                accepts_extra = "on_status" in sig.parameters or "cancel_check" in sig.parameters or any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-                )
-            except (TypeError, ValueError):
-                accepts_extra = False
-            if accepts_extra:
-                created = BrowserSession.launch(
-                    width=width,
-                    height=height,
-                    on_status=on_status,
-                    cancel_check=cancel_check,
-                )
-            else:
-                created = BrowserSession.launch(width=width, height=height)
-        else:
-            created = BrowserSession.launch(width=width, height=height)
+        try:
+            sig = inspect.signature(BrowserSession.launch)
+            params = sig.parameters
+            accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        except (TypeError, ValueError):
+            params = {}  # type: ignore[assignment]
+            accepts_varkw = False
+        launch_kw: Dict[str, Any] = {"width": width, "height": height}
+        if on_status is not None and (accepts_varkw or "on_status" in params):
+            launch_kw["on_status"] = on_status
+        if cancel_check is not None and (accepts_varkw or "cancel_check" in params):
+            launch_kw["cancel_check"] = cancel_check
+        if trace is not None and (accepts_varkw or "trace" in params):
+            launch_kw["trace"] = trace
+        if started_at is not None and (accepts_varkw or "started_at" in params):
+            launch_kw["started_at"] = started_at
+        created = BrowserSession.launch(**launch_kw)
         if preserved_origins:
             created.approved_external_origins.update(preserved_origins)
         with self._lock:
@@ -2206,13 +2710,16 @@ def execute_browse_action(
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Точка входа инструмента `browse_project`."""
     _check_cancelled(cancel_check)
+    started_at = time.monotonic()
+    trace_log: List[str] = []
 
     def emit_status(msg: str) -> None:
-        if on_status and msg:
-            try:
-                on_status(msg)
-            except Exception:  # noqa: BLE001
-                pass
+        _emit_step(on_status, msg, trace=trace_log, started_at=started_at, log_console=True)
+
+    def forward_child_status(msg: str) -> None:
+        # Вложенные методы уже печатают шаг в stderr внутри своего _emit_step;
+        # здесь фиксируем его в trace_log и передаём в UI без повторного stderr.
+        _emit_step(on_status, msg, trace=trace_log, started_at=started_at, log_console=False)
 
     raw_action = str(args.get("action") or "").strip().lower()
     if not raw_action:
@@ -2222,354 +2729,434 @@ def execute_browse_action(
 
     session_id = str(args.get("session_id") or "default").strip()[:40] or "default"
     events: List[Dict[str, Any]] = []
-
-    if raw_action == "close":
-        closed = manager.close_session(session_id)
-        return (
-            f"Браузерная сессия «{session_id}» закрыта."
-            if closed
-            else f"Активной браузерной сессии «{session_id}» не было.",
-            events,
-        )
-
-    known_actions = (
-        "open",
-        "resize",
-        "click",
-        "hover",
-        "type",
-        "press",
-        "scroll",
-        "wait",
-        "inspect_animations",
-        "evaluate",
-    )
-    if raw_action not in known_actions:
-        raise BrowserError(
-            f"Неизвестное действие '{raw_action}'. Доступно: open, click, hover, type, press, scroll, resize, wait, inspect_animations, evaluate, close"
-        )
-
-    existing = manager.get_existing(session_id)
-    default_w = existing.width if existing else 1440
-    default_h = existing.height if existing else 900
-    width, height = normalize_viewport(
-        args.get("viewport"),
-        args.get("width"),
-        args.get("height"),
-        default_w=default_w,
-        default_h=default_h,
-    )
+    emit_status(f"Старт действия «{raw_action}» (сессия «{session_id}»)")
 
     try:
-        wait_ms = max(0, min(5000, int(args.get("wait_ms") if args.get("wait_ms") is not None else 450)))
-    except (TypeError, ValueError):
-        wait_ms = 450
+        if raw_action == "close":
+            emit_status(f"Закрываю сессию «{session_id}»…")
+            closed = manager.close_session(session_id)
+            emit_status(
+                f"Сессия «{session_id}» закрыта" if closed else f"Сессия «{session_id}» уже не активна"
+            )
+            return (
+                f"Браузерная сессия «{session_id}» закрыта."
+                if closed
+                else f"Активной браузерной сессии «{session_id}» не было.",
+                events,
+            )
 
-    target_url = str(args.get("url") or "").strip()
-    sandbox_project = str(args.get("sandbox_project") or "").strip()
-
-    if target_url and existing and existing.current_url and target_url.startswith(("/", "#")):
-        target_url = urllib.parse.urljoin(existing.current_url, target_url)
-
-    # Быстрая валидация до запуска headless-браузера, чтобы не тратить 5-10 с впустую.
-    if raw_action == "open" and not target_url and not sandbox_project:
-        raise BrowserError("Для action='open' укажите url (например http://127.0.0.1:8123) или sandbox_project")
-    if raw_action != "open" and not target_url and not sandbox_project:
-        if not existing or not existing.is_alive() or not existing.current_url:
-            raise BrowserError("Сначала откройте проект: browse_project(action='open', url='...' или sandbox_project='...')")
-    if raw_action == "evaluate" and not str(args.get("script") or "").strip():
-        raise BrowserError("Для action='evaluate' укажите script")
-
-    if sandbox_project and not target_url:
-        resolved_sb = sandbox_mod.safe_resolve(manager.sandbox_root, sandbox_project, allow_root=False)
-        if not resolved_sb.exists():
-            raise BrowserError(f"Проект или файл не найден в Sandbox: {sandbox_project}")
-
-    # Проверка внешнего адреса при уровне доверия verified (localhost и Sandbox открываются сразу).
-    if target_url:
-        target_url = validate_browser_url(target_url)
-        if not is_local_url(target_url) and trust_level == "verified":
-            parsed = urllib.parse.urlparse(target_url)
-            origin = f"{parsed.scheme}://{parsed.netloc}"
-            if not existing or origin not in existing.approved_external_origins:
-                if approval_fn is None:
-                    raise BrowserError("Для открытия внешнего сайта в режиме проверки требуется разрешение пользователя")
-                emit_status(f"Жду разрешения пользователя для входа на {parsed.netloc}…")
-                decision = approval_fn(
-                    {
-                        "kind": "browser_inspect",
-                        "title": f"Разрешить Агенту зайти на внешний сайт {parsed.netloc}?",
-                        "description": f"Агент хочет открыть {target_url} в изолированном браузере и проверить вёрстку/анимации.",
-                        "url": target_url,
-                    }
-                )
-                if not decision.get("approved"):
-                    return f"Пользователь отклонил открытие внешнего сайта {target_url}.", events
-                if existing:
-                    existing.approved_external_origins.add(origin)
-
-    _check_cancelled(cancel_check)
-    if on_status is not None or cancel_check is not None:
-        session = manager.get_or_create(
-            session_id,
-            width,
-            height,
-            on_status=on_status,
-            cancel_check=cancel_check,
+        known_actions = (
+            "open",
+            "resize",
+            "click",
+            "hover",
+            "type",
+            "press",
+            "scroll",
+            "wait",
+            "inspect_animations",
+            "evaluate",
         )
-    else:
-        session = manager.get_or_create(session_id, width, height)
+        if raw_action not in known_actions:
+            raise BrowserError(
+                f"Неизвестное действие '{raw_action}'. Доступно: open, click, hover, type, press, scroll, resize, wait, inspect_animations, evaluate, close"
+            )
 
-    if target_url and not is_local_url(target_url):
-        parsed = urllib.parse.urlparse(target_url)
-        session.approved_external_origins.add(f"{parsed.scheme}://{parsed.netloc}")
+        existing = manager.get_existing(session_id)
+        default_w = existing.width if existing else 1440
+        default_h = existing.height if existing else 900
+        width, height = normalize_viewport(
+            args.get("viewport"),
+            args.get("width"),
+            args.get("height"),
+            default_w=default_w,
+            default_h=default_h,
+        )
 
-    sandbox_note = ""
-    if sandbox_project and not target_url:
-        srv = session.static_servers.get(sandbox_project)
-        if srv is None:
-            emit_status("Поднимаю локальный сервер для проекта Sandbox…")
-            srv = StaticSandboxServer(manager.sandbox_root, sandbox_project)
-            session.static_servers[sandbox_project] = srv
-        target_url = srv.url
-        if getattr(srv, "is_directory_listing", False):
-            if getattr(srv, "has_package_json", False):
-                sandbox_note = (
-                    " (внимание: в папке есть package.json, но нет index.html/dist/build — "
-                    "показан список файлов; для React/Next.js/Vite запустите сборку или dev-сервер и передайте url)"
-                )
-            else:
-                sandbox_note = " (внимание: в корне не найден index.html — открыт список файлов)"
+        try:
+            wait_ms = max(0, min(5000, int(args.get("wait_ms") if args.get("wait_ms") is not None else 450)))
+        except (TypeError, ValueError):
+            wait_ms = 450
 
-    def _call_cdp(cdp_client: CDPClient, method: str, params: Optional[Dict[str, Any]] = None, *, timeout: float = 20.0) -> Dict[str, Any]:
-        if cancel_check is not None:
-            return cdp_client.call(method, params, timeout=timeout, cancel_check=cancel_check)
-        return cdp_client.call(method, params, timeout=timeout)
+        target_url = str(args.get("url") or "").strip()
+        sandbox_project = str(args.get("sandbox_project") or "").strip()
 
-    def _eval_cdp(
-        cdp_client: CDPClient,
-        expr: str,
-        *,
-        await_promise: bool = True,
-        timeout: float = 15.0,
-    ) -> Any:
-        if cancel_check is not None:
-            return cdp_client.evaluate(expr, await_promise=await_promise, timeout=timeout, cancel_check=cancel_check)
-        return cdp_client.evaluate(expr, await_promise=await_promise, timeout=timeout)
+        if target_url and existing and existing.current_url and target_url.startswith(("/", "#")):
+            target_url = urllib.parse.urljoin(existing.current_url, target_url)
 
-    def _navigate_session(url_to_open: str, wait_time_ms: int) -> None:
-        if on_status is not None or cancel_check is not None:
-            session.navigate(url_to_open, wait_ms=wait_time_ms, on_status=on_status, cancel_check=cancel_check)
-        else:
-            session.navigate(url_to_open, wait_ms=wait_time_ms)
-
-    def _audit_session(status_text: str = "Собираю DOM-метрики, анимации и ошибки консоли…") -> Dict[str, Any]:
-        emit_status(status_text)
-        if cancel_check is not None:
-            return session.audit(cancel_check=cancel_check)
-        return session.audit()
-
-    def _capture_shot() -> str:
-        emit_status("Делаю скриншот страницы…")
-        if cancel_check is not None:
-            return session.capture_screenshot(cancel_check=cancel_check)
-        return session.capture_screenshot()
-
-    if raw_action == "open":
-        if not target_url:
+        # Быстрая валидация до запуска headless-браузера, чтобы не тратить 5-10 с впустую.
+        if raw_action == "open" and not target_url and not sandbox_project:
             raise BrowserError("Для action='open' укажите url (например http://127.0.0.1:8123) или sandbox_project")
-        if (width, height) != (session.width, session.height):
+        if raw_action != "open" and not target_url and not sandbox_project:
+            if not existing or not existing.is_alive() or not existing.current_url:
+                raise BrowserError("Сначала откройте проект: browse_project(action='open', url='...' или sandbox_project='...')")
+        if raw_action == "evaluate" and not str(args.get("script") or "").strip():
+            raise BrowserError("Для action='evaluate' укажите script")
+
+        if sandbox_project and not target_url:
+            resolved_sb = sandbox_mod.safe_resolve(manager.sandbox_root, sandbox_project, allow_root=False)
+            if not resolved_sb.exists():
+                raise BrowserError(f"Проект или файл не найден в Sandbox: {sandbox_project}")
+
+        # Проверка внешнего адреса при уровне доверия verified (localhost и Sandbox открываются сразу).
+        if target_url:
+            target_url = validate_browser_url(target_url)
+            if not is_local_url(target_url) and trust_level == "verified":
+                parsed = urllib.parse.urlparse(target_url)
+                origin = f"{parsed.scheme}://{parsed.netloc}"
+                if not existing or origin not in existing.approved_external_origins:
+                    if approval_fn is None:
+                        raise BrowserError("Для открытия внешнего сайта в режиме проверки требуется разрешение пользователя")
+                    emit_status(f"Жду разрешения пользователя для входа на {parsed.netloc}…")
+                    decision = approval_fn(
+                        {
+                            "kind": "browser_inspect",
+                            "title": f"Разрешить Агенту зайти на внешний сайт {parsed.netloc}?",
+                            "description": f"Агент хочет открыть {target_url} в изолированном браузере и проверить вёрстку/анимации.",
+                            "url": target_url,
+                        }
+                    )
+                    if not decision.get("approved"):
+                        emit_status(f"Пользователь отклонил открытие внешнего сайта {parsed.netloc}")
+                        return f"Пользователь отклонил открытие внешнего сайта {target_url}.", events
+                    if existing:
+                        existing.approved_external_origins.add(origin)
+
+        _check_cancelled(cancel_check)
+        try:
+            gm_sig = inspect.signature(manager.get_or_create)
+            gm_params = gm_sig.parameters
+            gm_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in gm_params.values())
+        except (TypeError, ValueError):
+            gm_params = {}  # type: ignore[assignment]
+            gm_varkw = False
+
+        gm_kw: Dict[str, Any] = {}
+        if gm_varkw or "on_status" in gm_params:
+            gm_kw["on_status"] = forward_child_status
+        if cancel_check is not None and (gm_varkw or "cancel_check" in gm_params):
+            gm_kw["cancel_check"] = cancel_check
+        if gm_varkw or "trace" in gm_params:
+            # Передаём локальный список только если не используется forward_child_status (он уже пишет в trace_log).
+            gm_kw["trace"] = None
+        if gm_varkw or "started_at" in gm_params:
+            gm_kw["started_at"] = started_at
+        session = manager.get_or_create(session_id, width, height, **gm_kw)
+
+        if target_url and not is_local_url(target_url):
+            parsed = urllib.parse.urlparse(target_url)
+            session.approved_external_origins.add(f"{parsed.scheme}://{parsed.netloc}")
+
+        sandbox_note = ""
+        if sandbox_project and not target_url:
+            srv = session.static_servers.get(sandbox_project)
+            if srv is None:
+                emit_status(f"Поднимаю локальный HTTP-сервер для Sandbox «{sandbox_project}»…")
+                srv = StaticSandboxServer(manager.sandbox_root, sandbox_project)
+                session.static_servers[sandbox_project] = srv
+                emit_status(f"Локальный сервер Sandbox слушает {srv.url}")
+            target_url = srv.url
+            if getattr(srv, "is_directory_listing", False):
+                if getattr(srv, "has_package_json", False):
+                    sandbox_note = (
+                        " (внимание: в папке есть package.json, но нет index.html/dist/build — "
+                        "показан список файлов; для React/Next.js/Vite запустите сборку или dev-сервер и передайте url)"
+                    )
+                else:
+                    sandbox_note = " (внимание: в корне не найден index.html — открыт список файлов)"
+
+        def _call_cdp(cdp_client: CDPClient, method: str, params: Optional[Dict[str, Any]] = None, *, timeout: float = 20.0) -> Dict[str, Any]:
             if cancel_check is not None:
-                session.set_viewport(width, height, cancel_check=cancel_check)
+                return cdp_client.call(method, params, timeout=timeout, cancel_check=cancel_check)
+            return cdp_client.call(method, params, timeout=timeout)
+
+        def _eval_cdp(
+            cdp_client: CDPClient,
+            expr: str,
+            *,
+            await_promise: bool = True,
+            timeout: float = 15.0,
+        ) -> Any:
+            if cancel_check is not None:
+                return cdp_client.evaluate(expr, await_promise=await_promise, timeout=timeout, cancel_check=cancel_check)
+            return cdp_client.evaluate(expr, await_promise=await_promise, timeout=timeout)
+
+        def _set_vp(w: int, h: int) -> None:
+            try:
+                vp_sig = inspect.signature(session.set_viewport)
+                vp_params = vp_sig.parameters
+                vp_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in vp_params.values())
+            except (TypeError, ValueError):
+                vp_params = {}  # type: ignore[assignment]
+                vp_varkw = False
+            vp_kw: Dict[str, Any] = {}
+            if cancel_check is not None and (vp_varkw or "cancel_check" in vp_params):
+                vp_kw["cancel_check"] = cancel_check
+            if vp_varkw or "on_status" in vp_params:
+                vp_kw["on_status"] = forward_child_status
+            if vp_varkw or "started_at" in vp_params:
+                vp_kw["started_at"] = started_at
+            session.set_viewport(w, h, **vp_kw)
+
+        def _navigate_session(url_to_open: str, wait_time_ms: int) -> None:
+            try:
+                nav_sig = inspect.signature(session.navigate)
+                nav_params = nav_sig.parameters
+                nav_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in nav_params.values())
+            except (TypeError, ValueError):
+                nav_params = {}  # type: ignore[assignment]
+                nav_varkw = False
+            nav_kw: Dict[str, Any] = {"wait_ms": wait_time_ms}
+            if nav_varkw or "on_status" in nav_params:
+                nav_kw["on_status"] = forward_child_status
+            if cancel_check is not None and (nav_varkw or "cancel_check" in nav_params):
+                nav_kw["cancel_check"] = cancel_check
+            if nav_varkw or "started_at" in nav_params:
+                nav_kw["started_at"] = started_at
+            session.navigate(url_to_open, **nav_kw)
+
+        def _audit_session(status_text: str = "Собираю DOM-метрики, анимации и ошибки консоли…") -> Dict[str, Any]:
+            emit_status(status_text)
+            try:
+                au_sig = inspect.signature(session.audit)
+                au_params = au_sig.parameters
+                au_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in au_params.values())
+            except (TypeError, ValueError):
+                au_params = {}  # type: ignore[assignment]
+                au_varkw = False
+            au_kw: Dict[str, Any] = {}
+            if cancel_check is not None and (au_varkw or "cancel_check" in au_params):
+                au_kw["cancel_check"] = cancel_check
+            if au_varkw or "on_status" in au_params:
+                au_kw["on_status"] = forward_child_status
+            if au_varkw or "started_at" in au_params:
+                au_kw["started_at"] = started_at
+            return session.audit(**au_kw)
+
+        def _capture_shot() -> str:
+            emit_status("Делаю скриншот страницы…")
+            try:
+                sh_sig = inspect.signature(session.capture_screenshot)
+                sh_params = sh_sig.parameters
+                sh_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sh_params.values())
+            except (TypeError, ValueError):
+                sh_params = {}  # type: ignore[assignment]
+                sh_varkw = False
+            sh_kw: Dict[str, Any] = {}
+            if cancel_check is not None and (sh_varkw or "cancel_check" in sh_params):
+                sh_kw["cancel_check"] = cancel_check
+            if sh_varkw or "on_status" in sh_params:
+                sh_kw["on_status"] = forward_child_status
+            if sh_varkw or "started_at" in sh_params:
+                sh_kw["started_at"] = started_at
+            return session.capture_screenshot(**sh_kw)
+
+        if raw_action == "open":
+            if not target_url:
+                raise BrowserError("Для action='open' укажите url (например http://127.0.0.1:8123) или sandbox_project")
+            if (width, height) != (session.width, session.height):
+                _set_vp(width, height)
+            _navigate_session(target_url, wait_ms)
+            audit_data = _audit_session()
+            shot = _capture_shot() if args.get("capture_screenshot", True) else ""
+            emit_status("Формирую отчёт по результатам осмотра…")
+            report, meta = format_inspection_report(
+                "open",
+                audit_data,
+                action_note=f"Открыта страница {target_url}{sandbox_note}",
+            )
+            emit_status(f"Осмотр «open» завершён за {time.monotonic() - started_at:.2f} с ({meta.get('summary') or 'ок'})")
+            events.append({
+                "type": "browser_inspect",
+                "action": "open",
+                **meta,
+                "trace": list(trace_log),
+                **({"_images": [shot], "preview": shot} if shot else {}),
+            })
+            return report, events
+
+        # Для остальных действий страница уже должна быть открыта (или передали url/sandbox_project сразу).
+        if not session.current_url:
+            if target_url:
+                _navigate_session(target_url, 300)
             else:
-                session.set_viewport(width, height)
-        _navigate_session(target_url, wait_ms)
+                raise BrowserError("Сначала откройте проект: browse_project(action='open', url='...' или sandbox_project='...')")
+
+        cdp = session.ensure_cdp()
+        action_note = ""
+        delta_actions = ("click", "hover", "scroll", "wait", "inspect_animations", "resize")
+        before_audit = (
+            _audit_session("Фиксирую состояние страницы перед действием…")
+            if raw_action in delta_actions
+            else {}
+        )
+        delta: Optional[Dict[str, Any]] = None
+        extra_shots: List[str] = []
+        eval_result: Any = None
+
+        if raw_action == "resize":
+            emit_status(f"Меняю размер окна браузера на {width}×{height}…")
+            _set_vp(width, height)
+            _sleep_interruptible(min(wait_ms, 1500) / 1000.0, cancel_check)
+            action_note = f"Размер окна изменён на {width}×{height}"
+
+        elif raw_action in ("click", "hover"):
+            emit_status(f"Выполняю «{raw_action}» в браузере…")
+            selector = str(args.get("selector") or "").strip()
+            text_q = str(args.get("text") or "").strip()
+            if args.get("x") is not None and args.get("y") is not None:
+                try:
+                    tx, ty = int(args["x"]), int(args["y"])
+                except (TypeError, ValueError) as err:
+                    raise BrowserError("Координаты x и y должны быть числами") from err
+                target_desc = f"({tx}, {ty})"
+            else:
+                emit_status(f"Ищу элемент на странице (selector={selector or '—'}, text={text_q or '—'})…")
+                loc = _eval_cdp(cdp, _js_locate_element(selector, text_q), await_promise=False) or {}
+                if not isinstance(loc, dict) or loc.get("error"):
+                    raise BrowserError(str((loc or {}).get("error") if isinstance(loc, dict) else "Элемент не найден"))
+                if "x" not in loc or "y" not in loc:
+                    raise BrowserError("Не удалось определить координаты элемента на странице")
+                tx, ty = int(loc["x"]), int(loc["y"])
+                target_desc = f"<{loc.get('tag')}> «{loc.get('text') or selector or text_q}» в ({tx}, {ty})"
+
+            emit_status(f"Отправляю событие мыши ({raw_action}) в {target_desc}…")
+            _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": tx, "y": ty, "button": "none"})
+            if raw_action == "click":
+                _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": tx, "y": ty, "button": "left", "clickCount": 1})
+                _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": tx, "y": ty, "button": "left", "clickCount": 1})
+                action_note = f"Клик по {target_desc}"
+            else:
+                action_note = f"Наведение курсора на {target_desc}"
+            if wait_ms > 0:
+                _sleep_interruptible(wait_ms / 1000.0, cancel_check)
+
+        elif raw_action == "type":
+            emit_status("Ввожу текст в элемент страницы…")
+            selector = str(args.get("selector") or "").strip()
+            text_val = str(args.get("text") or "")
+            if selector:
+                emit_status(f"Ищу поле ввода ({selector})…")
+                loc = _eval_cdp(cdp, _js_locate_element(selector, ""), await_promise=False) or {}
+                if not isinstance(loc, dict) or loc.get("error"):
+                    raise BrowserError(str((loc or {}).get("error") if isinstance(loc, dict) else "Элемент не найден"))
+                if "x" not in loc or "y" not in loc:
+                    raise BrowserError("Не удалось определить координаты элемента ввода на странице")
+                tx, ty = int(loc["x"]), int(loc["y"])
+                _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": tx, "y": ty, "button": "none"})
+                _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": tx, "y": ty, "button": "left", "clickCount": 1})
+                _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": tx, "y": ty, "button": "left", "clickCount": 1})
+                if args.get("clear"):
+                    _eval_cdp(
+                        cdp,
+                        f"(() => {{ const el = document.querySelector({json.dumps(selector)}); if (el && 'value' in el) el.value = ''; }})()",
+                        await_promise=False,
+                    )
+            emit_status(f"Вставляю текст ({len(text_val)} симв.)…")
+            _call_cdp(cdp, "Input.insertText", {"text": text_val})
+            if wait_ms > 0:
+                _sleep_interruptible(min(wait_ms, 1500) / 1000.0, cancel_check)
+            action_note = f"Введён текст «{text_val[:50]}»"
+
+        elif raw_action == "press":
+            key_raw = str(args.get("text") or args.get("key") or "Enter").strip()
+            emit_status(f"Нажимаю клавишу {key_raw}…")
+            mapped = KEY_MAP.get(key_raw.lower(), (key_raw, key_raw, 0))
+            key_val, code_val, vk = mapped
+            _call_cdp(cdp, "Input.dispatchKeyEvent", {"type": "keyDown", "key": key_val, "code": code_val, "windowsVirtualKeyCode": vk})
+            _call_cdp(cdp, "Input.dispatchKeyEvent", {"type": "keyUp", "key": key_val, "code": code_val, "windowsVirtualKeyCode": vk})
+            if wait_ms > 0:
+                _sleep_interruptible(min(wait_ms, 1500) / 1000.0, cancel_check)
+            action_note = f"Нажата клавиша {key_val}"
+
+        elif raw_action == "scroll":
+            emit_status("Прокручиваю страницу…")
+            selector = str(args.get("selector") or "").strip()
+            direction = str(args.get("direction") or "down").strip().lower()
+            if selector:
+                loc = _eval_cdp(cdp, _js_locate_element(selector, ""), await_promise=False) or {}
+                if loc.get("error"):
+                    raise BrowserError(str(loc["error"]))
+                action_note = f"Прокрутка к {selector}"
+            elif args.get("scroll_y") is not None:
+                try:
+                    sy = int(args["scroll_y"])
+                except (TypeError, ValueError) as err:
+                    raise BrowserError("scroll_y должен быть числом") from err
+                _eval_cdp(cdp, f"window.scrollTo({{ top: {sy}, behavior: 'smooth' }})", await_promise=False)
+                action_note = f"Прокрутка к y={sy}px"
+            else:
+                if direction == "top":
+                    _eval_cdp(cdp, "window.scrollTo({ top: 0, behavior: 'smooth' })", await_promise=False)
+                elif direction == "bottom":
+                    _eval_cdp(cdp, "window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' })", await_promise=False)
+                elif direction == "up":
+                    _eval_cdp(cdp, f"window.scrollBy({{ top: -{max(200, int(session.height * 0.75))}, behavior: 'smooth' }})", await_promise=False)
+                else:
+                    _eval_cdp(cdp, f"window.scrollBy({{ top: {max(200, int(session.height * 0.75))}, behavior: 'smooth' }})", await_promise=False)
+                action_note = f"Прокрутка ({direction})"
+            _sleep_interruptible(max(0.4, min(wait_ms, 3000) / 1000.0), cancel_check)
+
+        elif raw_action == "wait":
+            wait_sec = max(0.2, min(wait_ms or 800, 5000) / 1000.0)
+            emit_status(f"Жду {wait_sec:.1f} с для стабилизации анимаций/загрузки…")
+            _sleep_interruptible(wait_sec, cancel_check)
+            action_note = f"Ожидание {wait_ms}мс для проверки анимаций/загрузки"
+
+        elif raw_action == "inspect_animations":
+            emit_status("Замеряю динамику анимаций и переходов…")
+            if args.get("capture_screenshot", True):
+                shot0 = _capture_shot()
+                if shot0:
+                    extra_shots.append(shot0)
+            sample_ms = max(250, min(wait_ms or 600, 3000))
+            emit_status(f"Выдерживаю интервал замера анимаций ({sample_ms} мс)…")
+            _sleep_interruptible(sample_ms / 1000.0, cancel_check)
+            action_note = f"Замер анимаций и переходов (интервал {sample_ms}мс)"
+
+        elif raw_action == "evaluate":
+            emit_status("Выполняю инспектирующий JS-скрипт на странице…")
+            script = str(args.get("script") or "").strip()
+            if not script:
+                raise BrowserError("Для action='evaluate' укажите script")
+            await_promise = bool(args.get("await_promise", True))
+            eval_result = _eval_cdp(cdp, script[:8000], await_promise=await_promise, timeout=8.0)
+            action_note = "Выполнен инспектирующий скрипт"
+
         audit_data = _audit_session()
-        shot = _capture_shot() if args.get("capture_screenshot", True) else ""
+        if raw_action in ("click", "hover", "scroll", "wait", "inspect_animations", "resize"):
+            delta = compare_animation_snapshots(before_audit.get("dom") or {}, audit_data.get("dom") or {})
+
+        if args.get("capture_screenshot", True):
+            shot1 = _capture_shot()
+            if shot1:
+                extra_shots.append(shot1)
+
         emit_status("Формирую отчёт по результатам осмотра…")
         report, meta = format_inspection_report(
-            "open",
+            raw_action,
             audit_data,
-            action_note=f"Открыта страница {target_url}{sandbox_note}",
+            delta=delta,
+            eval_result=eval_result,
+            action_note=action_note,
         )
+        emit_status(f"Осмотр «{raw_action}» завершён за {time.monotonic() - started_at:.2f} с ({meta.get('summary') or 'ок'})")
+        preview = extra_shots[-1] if extra_shots else ""
         events.append({
             "type": "browser_inspect",
-            "action": "open",
+            "action": raw_action,
             **meta,
-            **({"_images": [shot], "preview": shot} if shot else {}),
+            "trace": list(trace_log),
+            **({"_images": extra_shots[:2], "preview": preview} if extra_shots else {}),
         })
         return report, events
-
-    # Для остальных действий страница уже должна быть открыта (или передали url/sandbox_project сразу).
-    if not session.current_url:
-        if target_url:
-            _navigate_session(target_url, 300)
-        else:
-            raise BrowserError("Сначала откройте проект: browse_project(action='open', url='...' или sandbox_project='...')")
-
-    cdp = session.ensure_cdp()
-    action_note = ""
-    delta_actions = ("click", "hover", "scroll", "wait", "inspect_animations", "resize")
-    before_audit = (
-        _audit_session("Фиксирую состояние страницы перед действием…")
-        if raw_action in delta_actions
-        else {}
-    )
-    delta: Optional[Dict[str, Any]] = None
-    extra_shots: List[str] = []
-    eval_result: Any = None
-
-    if raw_action == "resize":
-        emit_status(f"Меняю размер окна браузера на {width}×{height}…")
-        if cancel_check is not None:
-            session.set_viewport(width, height, cancel_check=cancel_check)
-        else:
-            session.set_viewport(width, height)
-        _sleep_interruptible(min(wait_ms, 1500) / 1000.0, cancel_check)
-        action_note = f"Размер окна изменён на {width}×{height}"
-
-    elif raw_action in ("click", "hover"):
-        emit_status(f"Выполняю «{raw_action}» в браузере…")
-        selector = str(args.get("selector") or "").strip()
-        text_q = str(args.get("text") or "").strip()
-        if args.get("x") is not None and args.get("y") is not None:
-            try:
-                tx, ty = int(args["x"]), int(args["y"])
-            except (TypeError, ValueError) as err:
-                raise BrowserError("Координаты x и y должны быть числами") from err
-            target_desc = f"({tx}, {ty})"
-        else:
-            loc = _eval_cdp(cdp, _js_locate_element(selector, text_q), await_promise=False) or {}
-            if not isinstance(loc, dict) or loc.get("error"):
-                raise BrowserError(str((loc or {}).get("error") if isinstance(loc, dict) else "Элемент не найден"))
-            if "x" not in loc or "y" not in loc:
-                raise BrowserError("Не удалось определить координаты элемента на странице")
-            tx, ty = int(loc["x"]), int(loc["y"])
-            target_desc = f"<{loc.get('tag')}> «{loc.get('text') or selector or text_q}» в ({tx}, {ty})"
-
-        _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": tx, "y": ty, "button": "none"})
-        if raw_action == "click":
-            _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": tx, "y": ty, "button": "left", "clickCount": 1})
-            _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": tx, "y": ty, "button": "left", "clickCount": 1})
-            action_note = f"Клик по {target_desc}"
-        else:
-            action_note = f"Наведение курсора на {target_desc}"
-        if wait_ms > 0:
-            _sleep_interruptible(wait_ms / 1000.0, cancel_check)
-
-    elif raw_action == "type":
-        emit_status("Ввожу текст в элемент страницы…")
-        selector = str(args.get("selector") or "").strip()
-        text_val = str(args.get("text") or "")
-        if selector:
-            loc = _eval_cdp(cdp, _js_locate_element(selector, ""), await_promise=False) or {}
-            if not isinstance(loc, dict) or loc.get("error"):
-                raise BrowserError(str((loc or {}).get("error") if isinstance(loc, dict) else "Элемент не найден"))
-            if "x" not in loc or "y" not in loc:
-                raise BrowserError("Не удалось определить координаты элемента ввода на странице")
-            tx, ty = int(loc["x"]), int(loc["y"])
-            _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": tx, "y": ty, "button": "none"})
-            _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": tx, "y": ty, "button": "left", "clickCount": 1})
-            _call_cdp(cdp, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": tx, "y": ty, "button": "left", "clickCount": 1})
-            if args.get("clear"):
-                _eval_cdp(
-                    cdp,
-                    f"(() => {{ const el = document.querySelector({json.dumps(selector)}); if (el && 'value' in el) el.value = ''; }})()",
-                    await_promise=False,
-                )
-        _call_cdp(cdp, "Input.insertText", {"text": text_val})
-        if wait_ms > 0:
-            _sleep_interruptible(min(wait_ms, 1500) / 1000.0, cancel_check)
-        action_note = f"Введён текст «{text_val[:50]}»"
-
-    elif raw_action == "press":
-        key_raw = str(args.get("text") or args.get("key") or "Enter").strip()
-        emit_status(f"Нажимаю клавишу {key_raw}…")
-        mapped = KEY_MAP.get(key_raw.lower(), (key_raw, key_raw, 0))
-        key_val, code_val, vk = mapped
-        _call_cdp(cdp, "Input.dispatchKeyEvent", {"type": "keyDown", "key": key_val, "code": code_val, "windowsVirtualKeyCode": vk})
-        _call_cdp(cdp, "Input.dispatchKeyEvent", {"type": "keyUp", "key": key_val, "code": code_val, "windowsVirtualKeyCode": vk})
-        if wait_ms > 0:
-            _sleep_interruptible(min(wait_ms, 1500) / 1000.0, cancel_check)
-        action_note = f"Нажата клавиша {key_val}"
-
-    elif raw_action == "scroll":
-        emit_status("Прокручиваю страницу…")
-        selector = str(args.get("selector") or "").strip()
-        direction = str(args.get("direction") or "down").strip().lower()
-        if selector:
-            loc = _eval_cdp(cdp, _js_locate_element(selector, ""), await_promise=False) or {}
-            if loc.get("error"):
-                raise BrowserError(str(loc["error"]))
-            action_note = f"Прокрутка к {selector}"
-        elif args.get("scroll_y") is not None:
-            try:
-                sy = int(args["scroll_y"])
-            except (TypeError, ValueError) as err:
-                raise BrowserError("scroll_y должен быть числом") from err
-            _eval_cdp(cdp, f"window.scrollTo({{ top: {sy}, behavior: 'smooth' }})", await_promise=False)
-            action_note = f"Прокрутка к y={sy}px"
-        else:
-            if direction == "top":
-                _eval_cdp(cdp, "window.scrollTo({ top: 0, behavior: 'smooth' })", await_promise=False)
-            elif direction == "bottom":
-                _eval_cdp(cdp, "window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' })", await_promise=False)
-            elif direction == "up":
-                _eval_cdp(cdp, f"window.scrollBy({{ top: -{max(200, int(session.height * 0.75))}, behavior: 'smooth' }})", await_promise=False)
-            else:
-                _eval_cdp(cdp, f"window.scrollBy({{ top: {max(200, int(session.height * 0.75))}, behavior: 'smooth' }})", await_promise=False)
-            action_note = f"Прокрутка ({direction})"
-        _sleep_interruptible(max(0.4, min(wait_ms, 3000) / 1000.0), cancel_check)
-
-    elif raw_action == "wait":
-        emit_status("Жду завершения анимаций/загрузки…")
-        _sleep_interruptible(max(0.2, min(wait_ms or 800, 5000) / 1000.0), cancel_check)
-        action_note = f"Ожидание {wait_ms}мс для проверки анимаций/загрузки"
-
-    elif raw_action == "inspect_animations":
-        emit_status("Замеряю динамику анимаций и переходов…")
-        if args.get("capture_screenshot", True):
-            shot0 = _capture_shot()
-            if shot0:
-                extra_shots.append(shot0)
-        sample_ms = max(250, min(wait_ms or 600, 3000))
-        _sleep_interruptible(sample_ms / 1000.0, cancel_check)
-        action_note = f"Замер анимаций и переходов (интервал {sample_ms}мс)"
-
-    elif raw_action == "evaluate":
-        emit_status("Выполняю скрипт на странице…")
-        script = str(args.get("script") or "").strip()
-        if not script:
-            raise BrowserError("Для action='evaluate' укажите script")
-        await_promise = bool(args.get("await_promise", True))
-        eval_result = _eval_cdp(cdp, script[:8000], await_promise=await_promise, timeout=8.0)
-        action_note = "Выполнен инспектирующий скрипт"
-
-    audit_data = _audit_session()
-    if raw_action in ("click", "hover", "scroll", "wait", "inspect_animations", "resize"):
-        delta = compare_animation_snapshots(before_audit.get("dom") or {}, audit_data.get("dom") or {})
-
-    if args.get("capture_screenshot", True):
-        shot1 = _capture_shot()
-        if shot1:
-            extra_shots.append(shot1)
-
-    emit_status("Формирую отчёт по результатам осмотра…")
-    report, meta = format_inspection_report(
-        raw_action,
-        audit_data,
-        delta=delta,
-        eval_result=eval_result,
-        action_note=action_note,
-    )
-    preview = extra_shots[-1] if extra_shots else ""
-    events.append({
-        "type": "browser_inspect",
-        "action": raw_action,
-        **meta,
-        **({"_images": extra_shots[:2], "preview": preview} if extra_shots else {}),
-    })
-    return report, events
+    except Exception as err:
+        emit_status(f"Ошибка на шаге «{raw_action}»: {err}")
+        if isinstance(err, BrowserError):
+            if not getattr(err, "trace", None):
+                err.trace = list(trace_log)
+            raise
+        raise BrowserError(str(err), trace=trace_log) from err
 
 
 # --------------------------------------------------------------------------

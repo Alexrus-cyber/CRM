@@ -572,6 +572,8 @@ class BrowserInspectorAllActionsTests(unittest.TestCase):
                     )
                     self.assertIn("Demo App", txt)
                     self.assertTrue(evs[0]["preview"].startswith("data:image/jpeg;base64,"))
+                    self.assertTrue(evs[0].get("trace"))
+                    self.assertTrue(any("Page.navigate" in step for step in evs[0]["trace"]))
 
                     for act_args in (
                         {"action": "resize", "viewport": "mobile", "wait_ms": 10},

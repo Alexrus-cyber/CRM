@@ -311,6 +311,10 @@ _LOCAL_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({})
 class QaToolError(Exception):
     """Ошибка QA-инструмента."""
 
+    def __init__(self, message: str = "", *, trace: Optional[List[str]] = None) -> None:
+        super().__init__(message)
+        self.trace: List[str] = list(trace or [])
+
 
 def _is_blocked_metadata_target(url: str) -> Optional[str]:
     parsed = urlparse(str(url or "").strip())
@@ -1124,6 +1128,7 @@ def run_qa_tool(
         summary_lines: List[str] = []
         any_errors = False
         no_browser_reason = ""
+        no_browser_trace: List[str] = []
         try:
             for vp in ("desktop", "mobile"):
                 if cancel_check and cancel_check():
@@ -1160,13 +1165,15 @@ def run_qa_tool(
                     )
                 except (browser_inspector.BrowserError, sandbox_mod.SandboxError) as err:
                     msg = str(err)
+                    err_trace = list(getattr(err, "trace", None) or [])
                     if cancel_check and cancel_check():
-                        raise QaToolError(msg) from err
+                        raise QaToolError(msg, trace=err_trace) from err
                     if vp == "desktop":
                         if "не найден браузер" in msg.lower():
                             no_browser_reason = msg
+                            no_browser_trace = err_trace
                             break
-                        raise QaToolError(msg) from err
+                        raise QaToolError(msg, trace=err_trace) from err
                     summary_lines.append(f"Mobile ({vp}): {msg}")
                     continue
                 for ev in evs:
@@ -1217,12 +1224,27 @@ def run_qa_tool(
                         "details": "; ".join(fallback_parts)[:400],
                     }
                 )
+            if no_browser_trace or no_browser_reason:
+                events.append(
+                    {
+                        "type": "browser_inspect",
+                        "action": "open",
+                        "url": url or proj,
+                        "error": no_browser_reason,
+                        "summary": "Браузер не найден — выполнен fallback HTTP/статика",
+                        "trace": no_browser_trace,
+                        "issuesCount": 0,
+                        "errorsCount": 1 if fb_fail else 0,
+                        "animationsCount": 0,
+                    }
+                )
             events.append(
                 {
                     "type": "qa_check",
                     "tool": "qa_browser_audit",
                     "label": "Браузерный аудит (fallback без Chromium)",
                     "status": fb_status,
+                    "trace": no_browser_trace,
                 }
             )
             return "\n".join(fallback_parts), events
