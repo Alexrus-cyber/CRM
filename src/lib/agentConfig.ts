@@ -1,4 +1,34 @@
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { assertSafeAgentUrl, isLoopbackHostname } from "./ssrf";
+
+function readLocalAgentTokenFile(port: number): string {
+  try {
+    const filePath = join(homedir(), ".crm-agent", `http-token-${port}.json`);
+    const raw = readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw) as { token?: unknown };
+    return typeof parsed?.token === "string" ? parsed.token.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+export function resolveAgentAuthToken(endpoint: string): { token: string; fromFile: boolean } {
+  const envTok = (process.env.AGENT_HTTP_TOKEN ?? "").trim();
+  if (envTok) return { token: envTok, fromFile: false };
+  try {
+    const u = new URL(endpoint);
+    const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    if (!isLoopbackHostname(host)) return { token: "", fromFile: false };
+    const port = u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return { token: "", fromFile: false };
+    const fileTok = readLocalAgentTokenFile(port);
+    return { token: fileTok, fromFile: Boolean(fileTok) };
+  } catch {
+    return { token: "", fromFile: false };
+  }
+}
 
 /**
  * Базовый адрес локального Python-агента (`agent/agent.py`).
@@ -76,10 +106,31 @@ export async function fetchAgent(
         : (timeoutSig ?? options?.reqSignal ?? init.signal);
 
     try {
-      const response = await fetch(`${endpoint}${pathAndQuery}`, {
+      const auth = resolveAgentAuthToken(endpoint);
+      const reqHeaders = new Headers(init.headers);
+      const hasCallerAuth = reqHeaders.has("authorization") || reqHeaders.has("x-agent-token");
+      if (!hasCallerAuth && auth.token) {
+        reqHeaders.set("Authorization", `Bearer ${auth.token}`);
+      }
+      const hasHeaders = Array.from(reqHeaders.keys()).length > 0;
+      const reqInit: RequestInit = {
         ...init,
+        ...(hasHeaders ? { headers: reqHeaders } : {}),
         signal,
-      });
+      };
+      let response = await fetch(`${endpoint}${pathAndQuery}`, reqInit);
+      if (response.status === 401 && !hasCallerAuth && auth.fromFile) {
+        const refreshed = resolveAgentAuthToken(endpoint);
+        if (refreshed.token && refreshed.token !== auth.token) {
+          const retryHeaders = new Headers(init.headers);
+          retryHeaders.set("Authorization", `Bearer ${refreshed.token}`);
+          response = await fetch(`${endpoint}${pathAndQuery}`, {
+            ...init,
+            headers: retryHeaders,
+            signal,
+          });
+        }
+      }
       return { endpoint, response };
     } catch (err) {
       lastError = err;

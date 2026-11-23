@@ -2118,6 +2118,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           source: exportSource.trim(),
           destination: exportDest.trim(),
           mode: exportMode,
+          confirmed: true,
         }),
       });
       const data = (await res.json().catch(() => ({}))) as {

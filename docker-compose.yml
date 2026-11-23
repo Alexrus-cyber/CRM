@@ -18,6 +18,7 @@ services:
       CRM_ADMIN_NAME: ${CRM_ADMIN_NAME:-Главный администратор}
       CRM_ADMIN_PASSWORD: ${CRM_ADMIN_PASSWORD:-}
       AGENT_URL: ${AGENT_URL:-http://host.docker.internal:8899}
+      AGENT_HTTP_TOKEN: ${AGENT_HTTP_TOKEN:-}
       CRM_ALLOW_REMOTE_AGENT: ${CRM_ALLOW_REMOTE_AGENT:-1}
       AI_BASE_URL: ${AI_BASE_URL:-}
       AI_API_KEY: ${AI_API_KEY:-}
