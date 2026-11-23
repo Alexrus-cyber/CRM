@@ -1094,6 +1094,8 @@ def run_tool(
     tester_ctx: Optional[Dict[str, Any]] = None,
     qa_state: Optional[Dict[str, Any]] = None,
     run_state: Optional[Dict[str, Any]] = None,
+    on_status: Optional[Any] = None,
+    cancel_check: Optional[Any] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Выполнить инструмент с учётом Sandbox и уровня доверия."""
     args = args or {}
@@ -1130,6 +1132,8 @@ def run_tool(
                 checks_sink=checks_sink,
                 unlimited=unlimited,
                 tester_run_key=run_key,
+                on_status=on_status,
+                cancel_check=cancel_check,
             )
         except qa_tools.QaToolError as error:
             raise AgentError(str(error)) from error
@@ -1339,6 +1343,8 @@ def run_tool(
                 args,
                 trust_level=trust,
                 approval_fn=approval_fn,
+                on_status=on_status,
+                cancel_check=cancel_check,
             )
         except (browser_inspector.BrowserError, sandbox_mod.SandboxError) as error:
             raise AgentError(str(error)) from error
@@ -3316,8 +3322,13 @@ def run_tester_session(
                             tester_ctx=tester_ctx,
                             qa_state=qa_state,
                             run_state=tester_run_state,
+                            on_status=lambda msg_s: _emit("tester_status", {"runKey": run_key, "text": msg_s}),
+                            cancel_check=cancel_check if callable(cancel_check) else None,
                         )
                     except AgentError as error:
+                        if callable(cancel_check) and cancel_check():
+                            run_error = "Клиент закрыл соединение"
+                            raise BrokenPipeError from error
                         t_res, t_events = f"Ошибка QA-инструмента {t_name}: {error}", []
                     except BrokenPipeError:
                         raise
@@ -4558,7 +4569,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     @contextlib.contextmanager
-    def _sse_keepalive(self, interval: float = 8.0):
+    def _sse_keepalive(self, interval: float = 2.0):
         stop_ev = threading.Event()
 
         def _beat() -> None:
@@ -4598,10 +4609,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.write(sse({"approvalId": approval_id, "nonce": nonce, **payload}, "approval_required"))
             self.write(sse({"text": "Жду подтверждения на сайте…"}, "status"))
-            deadline = threading.Event()
             elapsed = 0
             while elapsed < APPROVAL_TIMEOUT:
-                if event.wait(timeout=10):
+                if getattr(self, "_client_disconnected", False):
+                    return {"approved": False, "note": "Клиент закрыл соединение"}
+                if event.wait(timeout=2):
                     extra = entry.get("extra") if isinstance(entry.get("extra"), dict) else {}
                     return {
                         "approved": bool(entry["approved"]),
@@ -4609,7 +4621,7 @@ class Handler(BaseHTTPRequestHandler):
                         "destination": str(entry.get("destination") or ""),
                         **extra,
                     }
-                elapsed += 10
+                elapsed += 2
                 # Поддерживаем SSE-соединение живым во время ожидания человека.
                 self.write(b": keepalive\n\n")
             return {"approved": False, "note": "Истекло время ожидания подтверждения на сайте"}
@@ -5045,6 +5057,11 @@ class Handler(BaseHTTPRequestHandler):
                         args = _parse_json_dict_relaxed(str(raw_args)) or {}
 
                     self.write(sse({"text": f"Вызываю инструмент: {name}…"}, "status"))
+
+                    def _on_tool_status(msg_text: str) -> None:
+                        if not _is_disconnected() and msg_text:
+                            self._safe_write(sse({"text": msg_text}, "status"))
+
                     try:
                         tester_ctx["discovered_max_context"] = discovered_max_context
                         with self._sse_keepalive():
@@ -5060,14 +5077,20 @@ class Handler(BaseHTTPRequestHandler):
                                 tester_ctx=tester_ctx,
                                 qa_state=qa_state,
                                 run_state=run_state,
+                                on_status=_on_tool_status,
+                                cancel_check=_is_disconnected,
                             )
                     except AgentError as error:
+                        if _is_disconnected():
+                            raise BrokenPipeError from error
                         result_text, events = f"Ошибка инструмента: {error}", []
                     except BrokenPipeError:
                         raise
                     except Exception as error:  # noqa: BLE001
                         log(f"сбой инструмента {name}: {traceback.format_exc()}")
                         result_text, events = f"Внутренний сбой инструмента {name}: {error}", []
+                    if _is_disconnected():
+                        raise BrokenPipeError
 
                     for event in events:
                         img = event.pop("_image", None)

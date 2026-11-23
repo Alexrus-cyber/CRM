@@ -351,6 +351,282 @@ class BrowserInspectorStabilityTests(unittest.TestCase):
                     trust_level="full",
                 )
 
+    def test_execute_browse_action_early_validation_never_launches_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = browser_inspector.BrowserSessionManager(sandbox_root=Path(tmp))
+            with mock.patch.object(
+                browser_inspector.BrowserSession,
+                "launch",
+                side_effect=AssertionError("Браузер не должен запускаться до валидации аргументов"),
+            ):
+                for bad_args in (
+                    {"action": "open"},
+                    {"action": "click", "selector": "#btn"},
+                    {"action": "unknown_action", "url": "http://127.0.0.1:3000"},
+                    {"action": "open", "sandbox_project": "missing_folder"},
+                    {"action": "evaluate", "url": "http://127.0.0.1:3000"},
+                ):
+                    with self.assertRaises(browser_inspector.BrowserError):
+                        browser_inspector.execute_browse_action(mgr, bad_args, trust_level="full")
+
+    def test_cdp_client_call_fails_fast_when_reader_thread_dead(self) -> None:
+        cdp = browser_inspector.CDPClient.__new__(browser_inspector.CDPClient)
+        cdp._lock = threading.Lock()
+        cdp._pending = {}
+        cdp._next_id = 1
+        cdp._ws = mock.MagicMock()
+        cdp._ws.closed = False
+        dead_thread = threading.Thread(target=lambda: None)
+        dead_thread.start()
+        dead_thread.join(timeout=1.0)
+        cdp._thread = dead_thread
+
+        t0 = time.monotonic()
+        with self.assertRaises(browser_inspector.BrowserError):
+            cdp.call("Page.enable", timeout=15.0)
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+    def test_find_page_ws_url_normalizes_localhost_and_recovers_after_empty_list(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        state = {"list_calls": 0, "created": False}
+
+        class MockCdpHttp(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                if self.path == "/json/list":
+                    state["list_calls"] += 1
+                    payload = (
+                        [{"type": "page", "webSocketDebuggerUrl": f"ws://localhost:{self.server.server_port}/devtools/page/p1"}]
+                        if state["created"]
+                        else []
+                    )
+                    body = json.dumps(payload).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_PUT(self) -> None:
+                if self.path.startswith("/json/new"):
+                    state["created"] = True
+                    body = json.dumps(
+                        {"type": "page", "webSocketDebuggerUrl": f"ws://localhost:{self.server.server_port}/devtools/page/p1"}
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        srv = HTTPServer(("127.0.0.1", 0), MockCdpHttp)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            ws_url = browser_inspector._find_page_ws_url(srv.server_port)
+            self.assertEqual(ws_url, f"ws://127.0.0.1:{srv.server_port}/devtools/page/p1")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            th.join(timeout=2)
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell executable + process-group kill test")
+    def test_launch_headless_chromium_and_kill_proc_tree_no_pipe_deadlock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "grandchild.pid"
+            fake_py = Path(tmp) / "fake_browser.py"
+            fake_py.write_text(
+                "\n".join(
+                    [
+                        "import subprocess, sys, time",
+                        f"gc = subprocess.Popen([{sys.executable!r}, '-c', 'import time; time.sleep(30)'])",
+                        f"with open({str(pid_file)!r}, 'w', encoding='utf-8') as fh:",
+                        "    fh.write(str(gc.pid))",
+                        "sys.stderr.write('DevTools listening on ws://127.0.0.1:45555/devtools/browser/test\\n')",
+                        "sys.stderr.flush()",
+                        "time.sleep(30)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_exe = Path(tmp) / "fake-chromium.sh"
+            fake_exe.write_text(
+                f'#!/bin/sh\nexec "{sys.executable}" "{fake_py}" "$@"\n',
+                encoding="utf-8",
+            )
+            fake_exe.chmod(0o755)
+
+            t0 = time.monotonic()
+            proc, user_data, port = browser_inspector._launch_headless_chromium(str(fake_exe), 1280, 720)
+            try:
+                self.assertEqual(port, 45555)
+                self.assertLess(time.monotonic() - t0, 3.0)
+                for _ in range(40):
+                    if pid_file.is_file() and pid_file.read_text(encoding="utf-8").strip().isdigit():
+                        break
+                    time.sleep(0.05)
+                gc_pid = int(pid_file.read_text(encoding="utf-8").strip())
+
+                t_kill = time.monotonic()
+                browser_inspector._kill_proc_tree(proc)
+                elapsed_kill = time.monotonic() - t_kill
+                self.assertLess(elapsed_kill, 3.0)
+
+                time.sleep(0.1)
+                alive = True
+                try:
+                    os.kill(gc_pid, 0)
+                except OSError:
+                    alive = False
+                self.assertFalse(alive, "Дочерний процесс-внук (grandchild) не должен оставаться в живых после _kill_proc_tree")
+            finally:
+                browser_inspector._kill_proc_tree(proc)
+                import shutil as _sh
+                _sh.rmtree(user_data, ignore_errors=True)
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell executable cancel test")
+    def test_execute_browse_action_emits_status_and_cancels_during_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_exe = Path(tmp) / "slow-chromium.sh"
+            fake_exe.write_text(
+                "\n".join(
+                    [
+                        "#!/bin/sh",
+                        f'exec "{sys.executable}" -c "import time; time.sleep(30)"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_exe.chmod(0o755)
+            mgr = browser_inspector.BrowserSessionManager(sandbox_root=Path(tmp))
+            statuses: list[str] = []
+            cancel_flag = {"stop": False}
+
+            def trigger_cancel() -> None:
+                time.sleep(0.25)
+                cancel_flag["stop"] = True
+
+            threading.Thread(target=trigger_cancel, daemon=True).start()
+            t0 = time.monotonic()
+            with mock.patch.object(browser_inspector, "find_browser_executable", return_value=str(fake_exe)):
+                with self.assertRaises(browser_inspector.BrowserError) as ctx_err:
+                    browser_inspector.execute_browse_action(
+                        mgr,
+                        {"action": "open", "url": "http://127.0.0.1:8123"},
+                        trust_level="full",
+                        on_status=statuses.append,
+                        cancel_check=lambda: cancel_flag["stop"],
+                    )
+            self.assertIn("отменён", str(ctx_err.exception).lower())
+            self.assertLess(time.monotonic() - t0, 3.0)
+            self.assertTrue(any("Запускаю headless-браузер" in s for s in statuses))
+
+    @unittest.skipIf(os.name == "nt", "POSIX playwright probe timeout test")
+    def test_find_browser_executable_playwright_probe_does_not_hang(self) -> None:
+        import importlib.util as _iu
+        import shutil as _sh
+
+        orig_popen = browser_inspector.subprocess.Popen
+
+        def slow_popen(cmd, **kwargs):
+            if isinstance(cmd, list) and "-c" in cmd:
+                return orig_popen(
+                    [sys.executable, "-c", "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); time.sleep(30)"],
+                    **kwargs,
+                )
+            return orig_popen(cmd, **kwargs)
+
+        t0 = time.monotonic()
+        with (
+            mock.patch.object(_sh, "which", return_value=None),
+            mock.patch.object(browser_inspector, "_safe_is_file", return_value=False),
+            mock.patch.object(browser_inspector, "_safe_is_dir", return_value=False),
+            mock.patch.object(browser_inspector, "_safe_glob", return_value=[]),
+            mock.patch.object(_iu, "find_spec", return_value=object()),
+            mock.patch.object(browser_inspector.subprocess, "Popen", side_effect=slow_popen),
+        ):
+            res = browser_inspector.find_browser_executable(allow_subprocess=True)
+        self.assertIsNone(res)
+        self.assertLess(time.monotonic() - t0, 5.5)
+
+    def test_run_agent_emits_browse_project_live_status_events(self) -> None:
+        sse_frames: list[str] = []
+
+        class CollectingWriter:
+            def write(self, data: bytes) -> int:
+                sse_frames.append(data.decode("utf-8", errors="replace"))
+                return len(data)
+
+            def flush(self) -> None:
+                pass
+
+        h = agent_mod.Handler.__new__(agent_mod.Handler)
+        h.wfile = CollectingWriter()  # type: ignore[assignment]
+        h._client_disconnected = False
+
+        calls = {"n": 0}
+
+        def fake_call_model(*_args, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_b1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "browse_project",
+                                            "arguments": json.dumps({"action": "open", "url": "http://127.0.0.1:8123"}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            return {"choices": [{"message": {"role": "assistant", "content": "Готово, страница проверена."}}]}
+
+        def fake_execute_browse(mgr, args, *, trust_level="verified", approval_fn=None, on_status=None, cancel_check=None):
+            if on_status:
+                on_status("Запускаю headless-браузер…")
+                on_status("Открываю страницу http://127.0.0.1:8123…")
+            self.assertTrue(callable(cancel_check))
+            return "Интерактивный осмотр проекта (open): OK", [
+                {"type": "browser_inspect", "action": "open", "url": "http://127.0.0.1:8123", "summary": "ok"}
+            ]
+
+        with (
+            mock.patch.object(agent_mod, "call_model", side_effect=fake_call_model),
+            mock.patch.object(browser_inspector, "execute_browse_action", side_effect=fake_execute_browse),
+        ):
+            h.run_agent(
+                {
+                    "messages": [{"role": "user", "content": "проверь сайт"}],
+                    "model": "test-model",
+                    "baseUrl": "http://127.0.0.1:8888/v1",
+                    "trustLevel": "verified",
+                }
+            )
+
+        joined = "".join(sse_frames)
+        self.assertIn("Запускаю headless-браузер…", joined)
+        self.assertIn("Открываю страницу http://127.0.0.1:8123…", joined)
+        self.assertIn("Готово, страница проверена.", joined)
+
 
 class WindowsCompatibilityAndSpecTests(unittest.TestCase):
     def test_code_tools_windows_cmd_bin_and_python_bin(self) -> None:

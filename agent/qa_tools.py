@@ -825,6 +825,8 @@ def run_qa_tool(
     checks_sink: Optional[List[Dict[str, Any]]] = None,
     unlimited: bool = False,
     tester_run_key: str = "",
+    on_status: Optional[Callable[[str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Выполняет один QA-инструмент Тестировщика."""
     args = args or {}
@@ -1124,6 +1126,17 @@ def run_qa_tool(
         no_browser_reason = ""
         try:
             for vp in ("desktop", "mobile"):
+                if cancel_check and cancel_check():
+                    raise QaToolError("Браузерный QA-аудит отменён пользователем")
+                if on_status:
+                    try:
+                        on_status(
+                            "Запускаю браузерный QA-аудит (desktop)…"
+                            if vp == "desktop"
+                            else "Проверяю мобильный вид (mobile viewport)…"
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 open_args: Dict[str, Any] = {
                     "action": "open" if vp == "desktop" else "resize",
                     "viewport": vp,
@@ -1138,10 +1151,17 @@ def run_qa_tool(
                         open_args["url"] = url
                 try:
                     txt, evs = browser_inspector.execute_browse_action(
-                        mgr, open_args, trust_level=trust, approval_fn=approval_fn
+                        mgr,
+                        open_args,
+                        trust_level=trust,
+                        approval_fn=approval_fn,
+                        on_status=on_status,
+                        cancel_check=cancel_check,
                     )
                 except (browser_inspector.BrowserError, sandbox_mod.SandboxError) as err:
                     msg = str(err)
+                    if cancel_check and cancel_check():
+                        raise QaToolError(msg) from err
                     if vp == "desktop":
                         if "не найден браузер" in msg.lower():
                             no_browser_reason = msg
