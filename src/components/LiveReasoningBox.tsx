@@ -11,11 +11,15 @@ import { cn } from "@/lib/utils";
 export function LiveReasoningBox({
   text,
   streaming = false,
+  defaultOpen = false,
+  badgeLabel = "в эфире",
   className,
   bodyClassName,
 }: {
   text: string;
   streaming?: boolean;
+  defaultOpen?: boolean;
+  badgeLabel?: string;
   className?: string;
   bodyClassName?: string;
 }) {
@@ -26,12 +30,15 @@ export function LiveReasoningBox({
   useLayoutEffect(() => {
     if (!streaming) {
       userToggledRef.current = false;
+      if (defaultOpen && detailsRef.current) {
+        detailsRef.current.open = true;
+      }
       return;
     }
     if (detailsRef.current && !userToggledRef.current) {
       detailsRef.current.open = true;
     }
-  }, [streaming]);
+  }, [streaming, defaultOpen]);
 
   useEffect(() => {
     if (!streaming) {
@@ -56,6 +63,7 @@ export function LiveReasoningBox({
   return (
     <details
       ref={detailsRef}
+      open={defaultOpen || undefined}
       onToggle={() => {
         if (streaming && detailsRef.current) {
           userToggledRef.current = !detailsRef.current.open;
@@ -71,7 +79,7 @@ export function LiveReasoningBox({
         {streaming && (
           <span className="inline-flex items-center gap-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-500">
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
-            в эфире
+            {badgeLabel}
           </span>
         )}
       </summary>

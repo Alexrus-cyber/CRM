@@ -2129,7 +2129,7 @@ export async function completeTesterRun(
         }))
     : [];
   const storedActions = Array.isArray(input.actions)
-    ? input.actions.slice(0, 60).map((act) => {
+    ? input.actions.slice(0, 120).map((act) => {
         if (act && typeof act === "object" && !Array.isArray(act) && "preview" in act) {
           const rest = { ...(act as Record<string, unknown>) };
           delete rest.preview;

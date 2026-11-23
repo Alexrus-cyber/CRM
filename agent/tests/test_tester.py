@@ -718,6 +718,251 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
             for act in done_ev["actions"]:
                 self.assertNotIn("preview", act)
 
+    def test_tester_emits_live_actions_and_actors_for_all_tools_including_sandbox_and_code_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            sandbox_mod.write_file(root, "app/index.html", "<!doctype html><h1>Hello QA</h1>")
+            sandbox_mod.write_file(root, "app/app.js", "const price = 42;\nconsole.log(price);\n")
+
+            events: list[tuple[str, dict]] = []
+            step_idx = 0
+
+            def _fake_model(*_a: object, **kw: object) -> dict:
+                nonlocal step_idx
+                step_idx += 1
+                on_status = kw.get("on_status")
+                if callable(on_status):
+                    on_status("Модель рассуждает (30 симв., 5 с)…")
+                if step_idx <= 7:
+                    # 7 шагов по 8 инструментов (sandbox_list, sandbox_read_file, code_search) = 56 > старый срез 50
+                    calls = []
+                    for i in range(8):
+                        tool_name = ("sandbox_list", "sandbox_read_file", "code_search")[i % 3]
+                        if tool_name == "sandbox_list":
+                            t_args = {"path": "app"}
+                        elif tool_name == "sandbox_read_file":
+                            t_args = {"path": "app/app.js"}
+                        else:
+                            t_args = {"query": "price", "sandbox_project": "app"}
+                        calls.append(
+                            {
+                                "id": f"tc_{step_idx}_{i}",
+                                "function": {"name": tool_name, "arguments": json.dumps(t_args)},
+                            }
+                        )
+                    return {
+                        "choices": [{"message": {"content": "", "tool_calls": calls}}],
+                        "usage": {"total_tokens": 20},
+                    }
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "tc_submit",
+                                        "function": {
+                                            "name": "qa_submit_report",
+                                            "arguments": '{"status":"passed","summary":"Все 56+ чтений проверены"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"total_tokens": 25},
+                }
+
+            with mock.patch.object(agent_mod, "call_model", side_effect=_fake_model):
+                txt, _ = agent_mod.run_tool(
+                    "call_tester",
+                    {"sandbox_project": "app", "summary": "Проверь код и файлы"},
+                    trust_level="verified",
+                    sandbox_root=root,
+                    tester_ctx={
+                        "emit_sse": lambda ev, data: events.append((ev, data)),
+                        "base_url": "http://127.0.0.1:8888/v1",
+                        "api_key": "",
+                        "model": "qwen3",
+                        "params": {},
+                        "recent_reports": [],
+                    },
+                )
+
+            self.assertIn("Все 56+ чтений проверены", txt)
+            action_evs = [d["action"] for ev, d in events if ev == "tester_action"]
+            self.assertTrue(
+                any(a.get("type") == "tester_tool" and a.get("status") == "running" and a.get("tool") == "sandbox_list" for a in action_evs)
+            )
+            self.assertTrue(
+                any(a.get("type") == "tester_tool" and a.get("status") == "ok" and a.get("tool") == "code_search" and isinstance(a.get("durationMs"), int) for a in action_evs)
+            )
+            statuses = [d for ev, d in events if ev == "tester_status"]
+            self.assertTrue(any(s.get("actor") == "tester_llm" and s.get("step") == 1 for s in statuses))
+            self.assertTrue(any(s.get("actor") == "tester_tool" and s.get("tool") == "sandbox_read_file" for s in statuses))
+            done_ev = next(d for ev, d in events if ev == "tester_done")
+            # 7 * 8 + 1 qa_submit_report = 57 действий, больше старого среза 50!
+            self.assertEqual(len(done_ev["actions"]), 57)
+
+    def test_direct_tester_emits_tester_tool_actions_and_actor_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sb_root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            sandbox_mod.write_file(sb_root, "app/index.html", "<!doctype html><h1>Direct QA</h1>")
+
+            prev_sb = agent_mod.SANDBOX_ROOT
+            agent_mod.SANDBOX_ROOT = sb_root
+            srv = agent_mod.Server(("127.0.0.1", 0), agent_mod.Handler)
+            port = srv.server_address[1]
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+
+            step = 0
+
+            def _fake_model(*_a: object, **_kw: object) -> dict:
+                nonlocal step
+                step += 1
+                if step == 1:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "dc_list",
+                                            "function": {"name": "sandbox_list", "arguments": '{"path":"app"}'},
+                                        },
+                                        {
+                                            "id": "dc_read",
+                                            "function": {"name": "sandbox_read_file", "arguments": '{"path":"app/index.html"}'},
+                                        },
+                                    ],
+                                }
+                            }
+                        ],
+                        "usage": {"total_tokens": 30},
+                    }
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "dc_sub",
+                                        "function": {
+                                            "name": "qa_submit_report",
+                                            "arguments": '{"status":"passed","summary":"Прямой прогон ОК"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"total_tokens": 20},
+                }
+
+            try:
+                with mock.patch.object(agent_mod, "call_model", side_effect=_fake_model):
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{port}/run",
+                        data=json.dumps(
+                            {
+                                "agentRole": "tester",
+                                "sandboxProject": "app",
+                                "messages": [{"role": "user", "content": "Проверь index.html"}],
+                                "settings": {"baseUrl": "http://127.0.0.1:8888/v1", "model": "m"},
+                                "trustLevel": "full",
+                            }
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        raw = resp.read().decode("utf-8")
+                self.assertIn('"actor": "tester_llm"', raw)
+                self.assertIn('"actor": "tester_tool"', raw)
+                self.assertIn('"type": "tester_tool"', raw)
+                self.assertIn('"status": "running"', raw)
+                self.assertIn('"status": "ok"', raw)
+                self.assertIn("Чтение файла: app/index.html", raw)
+                self.assertIn("event: tester_done", raw)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                agent_mod.SANDBOX_ROOT = prev_sb
+
+    def test_call_model_aborts_infinite_keepalive_stream_by_idle_timeout(self) -> None:
+        seen_streams: list[bool] = []
+        stop_srv = threading.Event()
+
+        class _KeepaliveStreamFallbackJsonHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                is_stream = bool(payload.get("stream"))
+                seen_streams.append(is_stream)
+                if not is_stream:
+                    body = json.dumps(
+                        {
+                            "choices": [
+                                {"message": {"role": "assistant", "content": "Ответ без потока"}}
+                            ],
+                            "usage": {"total_tokens": 12},
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for _ in range(80):
+                    try:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                    except OSError:
+                        break
+                    if stop_srv.wait(0.05):
+                        break
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _KeepaliveStreamFallbackJsonHandler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        prev_timeout = agent_mod.TIMEOUT
+        try:
+            agent_mod.TIMEOUT = 0.35
+            t0 = time.monotonic()
+            with mock.patch.object(agent_mod.time, "sleep"):
+                res = agent_mod.call_model(
+                    f"http://127.0.0.1:{port}/v1",
+                    "",
+                    "test-model",
+                    [{"role": "user", "content": "hi"}],
+                    None,
+                    {},
+                    on_text=lambda _txt: None,
+                )
+            elapsed = time.monotonic() - t0
+            self.assertEqual(seen_streams, [True, False])
+            self.assertEqual(res["choices"][0]["message"]["content"], "Ответ без потока")
+            # Keepalive-поток должен оборваться около TIMEOUT (~0.35-0.55с), а не ждать все 4с (80 * 0.05с)!
+            self.assertLess(elapsed, 2.0)
+        finally:
+            stop_srv.set()
+            agent_mod.TIMEOUT = prev_timeout
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

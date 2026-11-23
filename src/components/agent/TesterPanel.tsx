@@ -6,6 +6,9 @@ import {
   Check,
   CheckCircle2,
   Coins,
+  Compass,
+  Download,
+  FileText,
   FlaskConical,
   History,
   Loader2,
@@ -16,9 +19,10 @@ import {
   Sparkles,
   Trash2,
   TriangleAlert,
+  Wrench,
   X,
 } from "lucide-react";
-import type { AiSettings } from "@/lib/ai";
+import { formatBytes, type AiSettings } from "@/lib/ai";
 import type { GenParams } from "@/lib/genParams";
 import { cn } from "@/lib/utils";
 import { LiveReasoningBox } from "../LiveReasoningBox";
@@ -69,16 +73,30 @@ export type TesterConversationItem = {
   updatedAt: string;
 };
 
+export type TesterChatFileItem = {
+  name: string;
+  mime: string;
+  size: number;
+  data?: string;
+};
+
 export type TesterChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
   reasoning?: string;
+  actions?: LiveTesterActionItem[];
+  files?: TesterChatFileItem[];
   error?: string;
 };
 
 export type LiveTesterActionItem = {
   type: string;
+  callId?: string;
+  step?: number;
+  tool?: string;
+  status?: string;
+  durationMs?: number;
   label?: string;
   command?: string;
   url?: string;
@@ -86,10 +104,34 @@ export type LiveTesterActionItem = {
   viewport?: string;
   summary?: string;
   error?: string;
+  trace?: string[];
+  path?: string;
+  project?: string;
+  sandboxProject?: string;
+  reportSummary?: string;
+  criticalCount?: number;
+  minorCount?: number;
   errorsCount?: number;
   issuesCount?: number;
   animationsCount?: number;
 };
+
+export function upsertLiveTesterAction(
+  prev: LiveTesterActionItem[],
+  next: LiveTesterActionItem,
+): LiveTesterActionItem[] {
+  if (next.callId) {
+    const runningIdx = prev.findIndex(
+      (item) => item.callId === next.callId && item.type === "tester_tool" && item.status === "running",
+    );
+    if (runningIdx !== -1) {
+      const updated = [...prev];
+      updated[runningIdx] = next;
+      return updated;
+    }
+  }
+  return [...prev, next];
+}
 
 export function formatLiveTesterAction(act: LiveTesterActionItem): string {
   if (act.type === "browser_inspect") {
@@ -100,8 +142,28 @@ export function formatLiveTesterAction(act: LiveTesterActionItem): string {
     const detail = act.summary || act.url || "осмотр завершён";
     return `Осмотр проекта${scope}: ${detail}`;
   }
+  if (act.type === "tester_tool") {
+    const title = act.label || act.tool || "Инструмент";
+    if (act.status === "running") return `${title} · выполняется…`;
+    if (act.error) return `${title} · ошибка: ${act.error}`;
+    const dur = typeof act.durationMs === "number" && act.durationMs > 0 ? ` (${act.durationMs} мс)` : "";
+    return act.summary && act.summary !== "выполнено" ? `${title} — ${act.summary}${dur}` : `${title}${dur}`;
+  }
+  if (act.type === "tester_report") {
+    const crit = act.criticalCount ?? 0;
+    const minor = act.minorCount ?? 0;
+    return `Итоговый QA-отчёт (${act.sandboxProject || "."}): крит. ${crit}, мелк. ${minor}`;
+  }
+  if (act.type === "command_result") {
+    return act.command ? `Команда: ${act.command}` : act.label || "Команда";
+  }
+  if (act.type === "sandbox_update" || act.type === "sandbox_file") {
+    return act.path ? `Файл Sandbox: ${act.path}` : act.label || act.type;
+  }
   return act.label || act.command || act.url || act.type;
 }
+
+export type LiveTesterActor = "tester_llm" | "tester_tool" | "browser_inspector" | "approval" | "tester";
 
 export type LiveTesterState = {
   runKey: string;
@@ -111,11 +173,116 @@ export type LiveTesterState = {
   summary: string;
   model: string;
   statusText: string;
+  actor?: LiveTesterActor;
+  step?: number;
   reasoning: string;
   content: string;
   browserLog?: string[];
   actions: LiveTesterActionItem[];
 };
+
+export function resolveLiveTesterActorMeta(live: LiveTesterState): {
+  label: string;
+  badgeClass: string;
+} {
+  if (live.actor === "browser_inspector" || (live.browserLog && live.browserLog.length > 0)) {
+    return {
+      label: "BrowserInspector работает",
+      badgeClass: "border-cyan-500/40 bg-cyan-500/15 text-cyan-300",
+    };
+  }
+  if (live.actor === "approval") {
+    return {
+      label: "Ждёт вашего подтверждения",
+      badgeClass: "border-amber-500/40 bg-amber-500/15 text-amber-300",
+    };
+  }
+  if (live.actor === "tester_tool") {
+    return {
+      label: `Тестировщик · инструмент${live.step ? ` (шаг ${live.step})` : ""}`,
+      badgeClass: "border-sky-500/40 bg-sky-500/15 text-sky-300",
+    };
+  }
+  return {
+    label: `Тестировщик · модель${live.step ? ` (шаг ${live.step})` : ""}`,
+    badgeClass: "border-violet-500/40 bg-violet-500/15 text-violet-300",
+  };
+}
+
+export function TesterActionsList({
+  actions,
+  maxHeightClass = "max-h-56",
+}: {
+  actions: LiveTesterActionItem[];
+  maxHeightClass?: string;
+}) {
+  if (actions.length === 0) return null;
+  return (
+    <div className="space-y-1">
+      <p className="text-[10px] font-semibold text-muted">
+        Действия Тестировщика ({actions.length})
+      </p>
+      <ul
+        className={cn(
+          "space-y-1 overflow-y-auto rounded-xl border border-border/80 bg-card/70 p-2",
+          maxHeightClass,
+        )}
+      >
+        {actions.map((act, idx) => {
+          const isRunning = act.status === "running";
+          const hasError = Boolean(act.error) || act.status === "error";
+          const isBrowser = act.type === "browser_inspect";
+          const isQa = act.type === "qa_check" || act.type === "tester_report";
+          const traceLines = Array.isArray(act.trace) ? act.trace : [];
+          return (
+            <li
+              key={`${act.callId || act.type}-${idx}`}
+              className={cn(
+                "rounded-lg border px-2 py-1 text-[10px]",
+                hasError
+                  ? "border-red-500/35 bg-red-500/10 text-red-300"
+                  : isRunning
+                    ? "border-cyan-500/35 bg-cyan-500/10 text-cyan-200"
+                    : isBrowser
+                      ? "border-cyan-500/25 bg-card text-cyan-300"
+                      : isQa
+                        ? "border-violet-500/25 bg-card text-violet-200"
+                        : "border-border/70 bg-card text-text/90",
+              )}
+            >
+              <div className="flex items-start gap-1.5">
+                {isRunning ? (
+                  <Loader2 size={11} className="mt-0.5 shrink-0 animate-spin text-cyan-400" />
+                ) : hasError ? (
+                  <TriangleAlert size={11} className="mt-0.5 shrink-0 text-red-400" />
+                ) : isBrowser ? (
+                  <Compass size={11} className="mt-0.5 shrink-0 text-cyan-400" />
+                ) : isQa ? (
+                  <FlaskConical size={11} className="mt-0.5 shrink-0 text-violet-400" />
+                ) : (
+                  <Wrench size={11} className="mt-0.5 shrink-0 text-emerald-400" />
+                )}
+                <span className="min-w-0 flex-1 break-words leading-snug">
+                  {formatLiveTesterAction(act)}
+                </span>
+              </div>
+              {traceLines.length > 0 && (
+                <details className="mt-1 rounded border border-border/60 bg-card2/70 px-1.5 py-0.5">
+                  <summary className="cursor-pointer select-none text-[9px] text-muted hover:text-text">
+                    Трейс BrowserInspector ({traceLines.length})
+                  </summary>
+                  <pre className="mt-0.5 max-h-28 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[9px] text-muted">
+                    {traceLines.join("\n")}
+                  </pre>
+                </details>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
 
 const STATUS_META: Record<
   TesterRunItem["status"],
@@ -319,16 +486,31 @@ export function TesterPanel({
         )}
       </div>
 
-      {/* Живой поток работы Тестировщика (когда Агент вызвал call_tester) */}
+      {/* Живой поток работы Тестировщика (при call_tester или ручном запуске) */}
       {liveTester && (
         <div className="space-y-2 rounded-2xl border border-violet-500/40 bg-violet-500/5 p-3">
-          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-            <span className="flex items-center gap-1.5 font-semibold text-violet-300">
-              <Loader2 size={13} className="animate-spin" />
-              Тестировщик проверяет: {liveTester.sandboxProject || "."}
-            </span>
-            <span className="text-[10px] text-muted">Модель: {liveTester.model || activeModelLabel}</span>
-          </div>
+          {(() => {
+            const actorMeta = resolveLiveTesterActorMeta(liveTester);
+            return (
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="flex items-center gap-1.5 font-semibold text-violet-300">
+                    <Loader2 size={13} className="animate-spin" />
+                    Тестировщик проверяет: {liveTester.sandboxProject || "."}
+                  </span>
+                  <span
+                    className={cn(
+                      "inline-flex items-center rounded-md border px-2 py-0.5 text-[10px] font-semibold",
+                      actorMeta.badgeClass,
+                    )}
+                  >
+                    {actorMeta.label}
+                  </span>
+                </div>
+                <span className="text-[10px] text-muted">Модель: {liveTester.model || activeModelLabel}</span>
+              </div>
+            );
+          })()}
           {liveTester.statusText && (
             <p className="text-[11px] text-muted">{liveTester.statusText}</p>
           )}
@@ -343,33 +525,19 @@ export function TesterPanel({
             </div>
           )}
           {liveTester.reasoning && (
-            <LiveReasoningBox text={liveTester.reasoning} streaming />
+            <LiveReasoningBox
+              text={liveTester.reasoning}
+              streaming={liveTester.actor !== "browser_inspector" && !liveTester.browserLog?.length}
+              defaultOpen
+              badgeLabel="Тестировщик · в эфире"
+            />
           )}
           {liveTester.content && (
             <p className="whitespace-pre-wrap rounded-xl border border-border bg-card2 p-2 text-[11px] text-text">
               {liveTester.content}
             </p>
           )}
-          {liveTester.actions.length > 0 && (
-            <div className="flex flex-wrap gap-1">
-              {liveTester.actions.slice(-8).map((act, idx) => (
-                <span
-                  key={`${act.type}-${idx}`}
-                  className={cn(
-                    "max-w-full truncate rounded-md border px-2 py-0.5 text-[10px]",
-                    act.error
-                      ? "border-red-500/40 bg-red-500/10 text-red-300"
-                      : act.type === "browser_inspect"
-                        ? "border-cyan-500/35 bg-cyan-500/10 text-cyan-300"
-                        : "border-border bg-card text-muted",
-                  )}
-                  title={formatLiveTesterAction(act)}
-                >
-                  {formatLiveTesterAction(act)}
-                </span>
-              ))}
-            </div>
-          )}
+          <TesterActionsList actions={liveTester.actions} />
         </div>
       )}
 
@@ -544,7 +712,7 @@ export function TesterPanel({
 
       {/* Лента сообщений отдельного чата Тестировщика */}
       <div className="rounded-2xl border border-border bg-card">
-        <div className="max-h-[300px] space-y-2 overflow-y-auto p-3">
+        <div className="max-h-[420px] space-y-2 overflow-y-auto p-3">
           {loading ? (
             <p className="flex items-center justify-center gap-1.5 py-6 text-[11px] text-muted">
               <Loader2 size={12} className="animate-spin" /> Загружаю переписку тестировщика…
@@ -555,25 +723,67 @@ export function TesterPanel({
               либо вы можете запустить ручную QA-проверку ниже.
             </p>
           ) : (
-            messages.map((msg) => (
-              <div
-                key={msg.id}
-                className={cn("flex", msg.role === "user" ? "justify-end" : "justify-start")}
-              >
+            messages.map((msg, msgIdx) => {
+              const isLiveDraft = Boolean(
+                liveTester && directRunning && msg.id.startsWith("td_") && msgIdx === messages.length - 1,
+              );
+              return (
                 <div
-                  className={cn(
-                    "max-w-[92%] space-y-1.5 rounded-2xl px-3 py-2 text-xs",
-                    msg.role === "user" ? "bg-violet-500/20" : "border border-border bg-card2",
-                  )}
+                  key={msg.id}
+                  className={cn("flex", msg.role === "user" ? "justify-end" : "justify-start")}
                 >
-                  {msg.reasoning && <LiveReasoningBox text={msg.reasoning} />}
-                  <p className="whitespace-pre-wrap break-words leading-relaxed">{msg.content}</p>
-                  {msg.error && (
-                    <p className="text-[11px] text-red-400">{msg.error}</p>
-                  )}
+                  <div
+                    className={cn(
+                      "max-w-[92%] space-y-1.5 rounded-2xl px-3 py-2 text-xs",
+                      msg.role === "user" ? "bg-violet-500/20" : "border border-border bg-card2",
+                    )}
+                  >
+                    {!isLiveDraft && msg.reasoning && <LiveReasoningBox text={msg.reasoning} />}
+                    {!isLiveDraft && msg.actions && msg.actions.length > 0 && (
+                      <TesterActionsList actions={msg.actions} maxHeightClass="max-h-48" />
+                    )}
+                    {msg.content ? (
+                      <p className="whitespace-pre-wrap break-words leading-relaxed">{msg.content}</p>
+                    ) : isLiveDraft ? (
+                      <p className="flex items-center gap-1.5 text-[11px] text-muted">
+                        <Loader2 size={11} className="animate-spin" /> Тестировщик формирует ответ…
+                      </p>
+                    ) : null}
+                    {!isLiveDraft && msg.files && msg.files.length > 0 && (
+                      <div className="space-y-1">
+                        {msg.files.map((file, fIdx) =>
+                          file.data ? (
+                            <a
+                              key={`${file.name}-${fIdx}`}
+                              href={`data:${file.mime};base64,${file.data}`}
+                              download={file.name}
+                              className="flex items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1.5 text-[11px] font-medium text-emerald-500 transition hover:bg-emerald-500/20"
+                            >
+                              <FileText size={13} />
+                              <span className="min-w-0 flex-1 truncate">{file.name}</span>
+                              <span className="text-[10px] text-muted">{formatBytes(file.size)}</span>
+                              <Download size={12} />
+                            </a>
+                          ) : (
+                            <div
+                              key={`${file.name}-${fIdx}`}
+                              className="flex items-center gap-2 rounded-xl border border-border bg-card px-2.5 py-1.5 text-[11px] text-muted"
+                            >
+                              <FileText size={13} />
+                              <span className="min-w-0 flex-1 truncate">{file.name}</span>
+                              <span className="text-[10px]">{formatBytes(file.size)}</span>
+                            </div>
+                          ),
+                        )}
+                      </div>
+                    )}
+                    {msg.error && (
+                      <p className="text-[11px] text-red-400">{msg.error}</p>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))
+              );
+            })
           )}
         </div>
 

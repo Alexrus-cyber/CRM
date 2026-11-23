@@ -1532,5 +1532,143 @@ describe("вкладка «Агент»", () => {
     streamCtrl.current?.enqueue(encoder.encode('event: done\r\ndata: {"steps":1,"files":0,"actions":1}\r\n\r\n'));
     streamCtrl.current?.close();
     expect(await screen.findByText(/Прямая проверка выполнена\./i)).toBeTruthy();
+    // После завершения liveTester история сообщения сохраняет и показывает выполненное действие осмотра!
+    expect(
+      await screen.findByText(/Осмотр проекта \(resize · 390×844\): анимаций: 20, проблем: 0, ошибок: 0/i),
+    ).toBeTruthy();
+  });
+
+  it("показывает полные мысли и все действия Тестировщика без обрезки, чётко различает активного исполнителя и обновляет tester_tool по callId", async () => {
+    const encoder = new TextEncoder();
+    const streamCtrl: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
+
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          streamCtrl.current = controller;
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_run\ndata: ${JSON.stringify({
+                runKey: "rk-full",
+                runId: 91,
+                testerConversationId: 2,
+                sandboxProject: "crm-ui",
+                model: "qwen3",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_status\ndata: ${JSON.stringify({
+                runKey: "rk-full",
+                text: "Тестировщик: шаг 1 — жду ответ модели…",
+                actor: "tester_llm",
+                source: "tester_llm",
+                step: 1,
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_reasoning\ndata: ${JSON.stringify({
+                runKey: "rk-full",
+                text: "Шаг 1: проверяю структуру.\n\nШаг 2: проверяю все эндпоинты без обрезки строки.\n\nУникальная_концовка_мысли_шага_3",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_action\ndata: ${JSON.stringify({
+                runKey: "rk-full",
+                action: {
+                  type: "tester_tool",
+                  callId: "c_0",
+                  step: 1,
+                  tool: "sandbox_list",
+                  label: "Список файлов Sandbox: crm-ui",
+                  status: "running",
+                },
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: tester_action\ndata: ${JSON.stringify({
+                runKey: "rk-full",
+                action: {
+                  type: "tester_tool",
+                  callId: "c_0",
+                  step: 1,
+                  tool: "sandbox_list",
+                  label: "Список файлов Sandbox: crm-ui",
+                  status: "ok",
+                  summary: "12 файлов",
+                  durationMs: 14,
+                },
+              })}\n\n`,
+            ),
+          );
+          for (let i = 1; i <= 9; i++) {
+            controller.enqueue(
+              encoder.encode(
+                `event: tester_action\ndata: ${JSON.stringify({
+                  runKey: "rk-full",
+                  action: {
+                    type: "tester_tool",
+                    callId: `c_${i}`,
+                    step: 2,
+                    tool: "sandbox_read_file",
+                    label: `Чтение файла: crm-ui/part_${i}.ts`,
+                    status: "ok",
+                    summary: `строк: ${i * 10}`,
+                    durationMs: 5,
+                  },
+                })}\n\n`,
+              ),
+            );
+          }
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Создай и проверь crm-ui" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    // Основной Агент не показывает спиннер «агент думает…», а чётко сообщает, что ждёт Тестировщика
+    expect(await screen.findByText(/Основной Агент передал проверку Тестировщику и ждёт отчёт/i)).toBeTruthy();
+    expect(screen.queryByText(/агент думает…/i)).toBeNull();
+
+    // Виден индикатор активного исполнителя и полные размышления шага 3 (без line-clamp-3)
+    expect((await screen.findAllByText(/Тестировщик · модель \(шаг 1\)/i)).length).toBeGreaterThanOrEqual(2);
+    expect((await screen.findAllByText(/Уникальная_концовка_мысли_шага_3/i)).length).toBeGreaterThanOrEqual(2);
+
+    // Заглушка running обновилась в готовое действие (без дубля), и показаны ВСЕ 10 действий (включая #1 и #9)
+    expect(screen.queryByText(/выполняется…/i)).toBeNull();
+    expect((await screen.findAllByText(/Действия Тестировщика \(10\)/i)).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText(/Список файлов Sandbox: crm-ui — 12 файлов/i).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText(/Чтение файла: crm-ui\/part_9\.ts/i).length).toBeGreaterThanOrEqual(2);
+
+    // Переключение исполнителя на BrowserInspector отображается явно
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: tester_status\ndata: ${JSON.stringify({
+          runKey: "rk-full",
+          text: "Открываю страницу http://127.0.0.1:4100/…",
+          source: "browser_inspector",
+          actor: "browser_inspector",
+          tool: "qa_browser_audit",
+          step: 3,
+        })}\n\n`,
+      ),
+    );
+    expect((await screen.findAllByText(/BrowserInspector работает/i)).length).toBeGreaterThanOrEqual(2);
+
+    streamCtrl.current?.enqueue(encoder.encode('event: text\ndata: {"text":"Анализ завершён."}\n\n'));
+    streamCtrl.current?.enqueue(encoder.encode('event: done\ndata: {"steps":1,"files":0,"actions":0}\n\n'));
+    streamCtrl.current?.close();
+    expect(await screen.findByText(/Анализ завершён\./i)).toBeTruthy();
   });
 });

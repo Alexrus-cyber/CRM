@@ -38,24 +38,92 @@ function cleanAttachments(value: unknown): Array<{ name: string; size: number; m
   }));
 }
 
-function cleanActions(value: unknown): Array<{ type: "open_url"; url: string; label: string; autoplay: boolean }> {
-  if (!Array.isArray(value)) return [];
-  const actions: Array<{ type: "open_url"; url: string; label: string; autoplay: boolean }> = [];
-  for (const item of value) {
-    if (!isDict(item) || item.type !== "open_url") continue;
-    const rawUrl = String(item.url ?? "").slice(0, 2_048);
-    try {
-      const url = new URL(rawUrl);
-      if (url.protocol !== "http:" && url.protocol !== "https:") continue;
-      actions.push({
-        type: "open_url",
-        url: url.toString(),
-        label: String(item.label ?? url.toString()).slice(0, 300),
-        autoplay: Boolean(item.autoplay),
-      });
-    } catch {
-      // Не сохраняем некорректную или небезопасную ссылку.
+const ALLOWED_ACTION_TYPES = new Set([
+  "open_url",
+  "command_result",
+  "sandbox_update",
+  "sandbox_restart",
+  "browser_inspect",
+  "tester_tool",
+  "tester_report",
+  "tester_minor_decision",
+  "qa_check",
+  "plan_step",
+  "create_task",
+  "github_pr",
+  "github_issue",
+  "github_comment",
+  "github_review",
+  "github_ci",
+  "github_branch",
+  "github_commit",
+  "github_merge",
+  "github_pr_update",
+  "github_pr_files",
+  "github_ci_runs",
+  "github_checks",
+  "github_search",
+  "github_read_file",
+  "github_repo_tree",
+  "github_compare",
+  "github_diff",
+  "github_release",
+]);
+
+function sanitizeActionValue(val: unknown, depth = 0): unknown {
+  if (val === null || typeof val === "boolean") return val;
+  if (typeof val === "number") return Number.isFinite(val) ? val : 0;
+  if (typeof val === "string") {
+    if (val.startsWith("data:image/")) return undefined;
+    return val.slice(0, 4_000);
+  }
+  if (depth >= 3) return undefined;
+  if (Array.isArray(val)) {
+    return val
+      .slice(0, 40)
+      .map((item) => sanitizeActionValue(item, depth + 1))
+      .filter((item) => item !== undefined);
+  }
+  if (isDict(val)) {
+    const out: Dict = {};
+    for (const [k, v] of Object.entries(val)) {
+      if (k === "preview" || k === "data" || k === "_image" || k === "_images") continue;
+      const cleaned = sanitizeActionValue(v, depth + 1);
+      if (cleaned !== undefined) out[k.slice(0, 80)] = cleaned;
     }
+    return out;
+  }
+  return undefined;
+}
+
+function cleanActions(value: unknown): Dict[] {
+  if (!Array.isArray(value)) return [];
+  const actions: Dict[] = [];
+  for (const item of value) {
+    if (!isDict(item)) continue;
+    const type = typeof item.type === "string" ? item.type.trim() : "";
+    if (!type || !ALLOWED_ACTION_TYPES.has(type)) continue;
+    if (type === "open_url") {
+      const rawUrl = String(item.url ?? "").slice(0, 2_048);
+      try {
+        const url = new URL(rawUrl);
+        if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+        actions.push({
+          type: "open_url",
+          url: url.toString(),
+          label: String(item.label ?? url.toString()).slice(0, 300),
+          autoplay: Boolean(item.autoplay),
+        });
+      } catch {
+        // Не сохраняем некорректную или небезопасную ссылку.
+      }
+      continue;
+    }
+    const sanitized = sanitizeActionValue(item, 0);
+    if (isDict(sanitized)) {
+      actions.push(sanitized);
+    }
+    if (actions.length >= 120) break;
   }
   return actions;
 }

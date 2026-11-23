@@ -87,9 +87,14 @@ import {
 import { ApprovalToast } from "./ApprovalToast";
 import { GithubIcon, GithubIntegrationPanel, type GithubAccountPublic } from "./agent/GithubIntegrationPanel";
 import {
+  TesterActionsList,
   TesterPanel,
-  formatLiveTesterAction,
+  resolveLiveTesterActorMeta,
+  upsertLiveTesterAction,
+  type LiveTesterActionItem,
+  type LiveTesterActor,
   type LiveTesterState,
+  type TesterChatFileItem,
   type TesterChatMessage,
   type TesterConversationItem,
   type TesterIssueItem,
@@ -126,9 +131,14 @@ type AgentAction = {
     | "github_merge"
     | "tester_report"
     | "tester_minor_decision"
+    | "tester_tool"
     | "qa_check";
   action?: string;
   kind?: string;
+  callId?: string;
+  step?: number;
+  tool?: string;
+  durationMs?: number;
   url?: string;
   previewUrl?: string;
   port?: number | null;
@@ -428,6 +438,72 @@ type TranscriptMeta = {
   createdAt: string;
 };
 
+function parseLiveTesterActionItem(raw: Record<string, unknown>): LiveTesterActionItem {
+  return {
+    type: String(raw.type ?? "qa_check"),
+    callId: raw.callId ? String(raw.callId) : undefined,
+    step: typeof raw.step === "number" ? raw.step : undefined,
+    tool: raw.tool ? String(raw.tool) : undefined,
+    status: raw.status ? String(raw.status) : undefined,
+    durationMs: typeof raw.durationMs === "number" ? raw.durationMs : undefined,
+    label: raw.label ? String(raw.label) : undefined,
+    command: raw.command ? String(raw.command) : undefined,
+    url: raw.url ? String(raw.url) : undefined,
+    action: raw.action ? String(raw.action) : undefined,
+    viewport: raw.viewport ? String(raw.viewport) : undefined,
+    summary: raw.summary ? String(raw.summary) : undefined,
+    error: raw.error ? String(raw.error) : undefined,
+    trace: Array.isArray(raw.trace) ? raw.trace.map(String).slice(-80) : undefined,
+    path: raw.path ? String(raw.path) : undefined,
+    project: raw.project ? String(raw.project) : undefined,
+    sandboxProject: raw.sandboxProject ? String(raw.sandboxProject) : undefined,
+    reportSummary: raw.reportSummary ? String(raw.reportSummary) : undefined,
+    criticalCount: typeof raw.criticalCount === "number" ? raw.criticalCount : undefined,
+    minorCount: typeof raw.minorCount === "number" ? raw.minorCount : undefined,
+    errorsCount: typeof raw.errorsCount === "number" ? raw.errorsCount : undefined,
+    issuesCount: typeof raw.issuesCount === "number" ? raw.issuesCount : undefined,
+    animationsCount: typeof raw.animationsCount === "number" ? raw.animationsCount : undefined,
+  };
+}
+
+function parseLiveTesterActor(data: Record<string, unknown>): LiveTesterActor | undefined {
+  const raw = String(data.actor ?? data.source ?? "");
+  if (
+    raw === "browser_inspector" ||
+    raw === "tester_llm" ||
+    raw === "tester_tool" ||
+    raw === "approval" ||
+    raw === "tester"
+  ) {
+    return raw;
+  }
+  if (data.tool === "browse_project" || data.tool === "qa_browser_audit") {
+    return "browser_inspector";
+  }
+  return undefined;
+}
+
+type StatusActor = "agent_llm" | "agent_tool" | "tester" | "tester_llm" | "tester_tool" | "browser_inspector" | "approval";
+
+function parseStatusActor(data: Record<string, unknown>, fallback?: StatusActor): StatusActor | undefined {
+  const raw = String(data.actor ?? data.source ?? "");
+  if (
+    raw === "agent_llm" ||
+    raw === "agent_tool" ||
+    raw === "tester" ||
+    raw === "tester_llm" ||
+    raw === "tester_tool" ||
+    raw === "browser_inspector" ||
+    raw === "approval"
+  ) {
+    return raw;
+  }
+  if (data.tool === "browse_project" || data.tool === "qa_browser_audit") {
+    return "browser_inspector";
+  }
+  return fallback;
+}
+
 function decodeStoredTurn(message: StoredTurn): Turn {
   return {
     id: `m${message.id}`,
@@ -672,6 +748,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const [testerDirectPrompt, setTesterDirectPrompt] = useState("");
   const [testerDirectProject, setTesterDirectProject] = useState(".");
   const [liveTester, setLiveTester] = useState<LiveTesterState | null>(null);
+  const [liveStatusActor, setLiveStatusActor] = useState<StatusActor | null>(null);
   const [liveBrowserLog, setLiveBrowserLog] = useState<string[]>([]);
   const [testerError, setTesterError] = useState<string | null>(null);
   const [testerDecisionBusy, setTesterDecisionBusy] = useState<number | null>(null);
@@ -878,7 +955,20 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       if (!res.ok) return;
       const data = (await res.json().catch(() => null)) as { messages?: StoredTurn[] } | null;
       if (data && Array.isArray(data.messages)) {
-        setSelectedTesterMessages(data.messages.map(decodeStoredTurn));
+        setSelectedTesterMessages(
+          data.messages.map((m): TesterChatMessage => {
+            const decoded = decodeStoredTurn(m);
+            return {
+              id: decoded.id,
+              role: decoded.role,
+              content: decoded.content,
+              reasoning: decoded.reasoning,
+              actions: decoded.actions as LiveTesterActionItem[],
+              files: decoded.files,
+              error: decoded.error,
+            };
+          }),
+        );
       }
     } catch {
       /* фоновая загрузка */
@@ -1809,7 +1899,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       setApprovalDest("");
       setApprovalTaskDraft("");
       setLiveTester((prev) =>
-        prev ? { ...prev, statusText: "Тестировщик: продолжаю проверку…" } : prev,
+        prev
+          ? { ...prev, actor: "tester", statusText: "Тестировщик: продолжаю проверку…" }
+          : prev,
       );
       if (launchedTaskId !== undefined) {
         void refreshOpTask(launchedTaskId);
@@ -2266,6 +2358,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       let buffer = "";
       let assistantText = "";
       let assistantReason = "";
+      let draftActions: LiveTesterActionItem[] = [];
+      const draftFiles: TesterChatFileItem[] = [];
 
       const processFrame = (raw: string) => {
         const lines = raw.split("\n");
@@ -2309,6 +2403,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             summary: promptText,
             model: String(createdRun?.model ?? settings.model ?? ""),
             statusText: "Тестировщик начал проверку…",
+            actor: "tester",
             reasoning: "",
             content: "",
             browserLog: [],
@@ -2316,17 +2411,30 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           });
         } else if (ev === "status") {
           const st = String(data.text ?? "");
+          const actor = parseLiveTesterActor(data);
+          const step = typeof data.step === "number" ? data.step : undefined;
           const isBrowserStep =
             data.source === "browser_inspector" ||
             data.tool === "browse_project" ||
             data.tool === "qa_browser_audit";
           if (isBrowserStep && data.done === true) {
             clearLiveBrowserLog();
-            setLiveTester((prev) => (prev ? { ...prev, statusText: st, browserLog: [] } : prev));
+            setLiveTester((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    statusText: st,
+                    actor: actor ?? "tester",
+                    ...(step !== undefined ? { step } : {}),
+                    browserLog: [],
+                  }
+                : prev,
+            );
           } else if (isBrowserStep && st) {
             const isBrowserStart =
               st.startsWith("Вызываю инструмент: browse_project") ||
               st.startsWith("Вызываю инструмент: qa_browser_audit") ||
+              st.startsWith("BrowserInspector:") ||
               st.startsWith("Тестировщик: browse_project") ||
               st.startsWith("Тестировщик: qa_browser_audit");
             const logLine = pushLiveBrowserLog(st, isBrowserStart);
@@ -2335,6 +2443,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 ? {
                     ...prev,
                     statusText: st,
+                    actor: "browser_inspector",
+                    ...(step !== undefined ? { step } : {}),
                     browserLog: (isBrowserStart ? [] : prev.browserLog ?? []).concat(logLine).slice(-60),
                   }
                 : prev,
@@ -2346,6 +2456,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 ? {
                     ...prev,
                     statusText: st,
+                    ...(actor ? { actor } : {}),
+                    ...(step !== undefined ? { step } : {}),
                     ...(st ? { browserLog: [] } : {}),
                   }
                 : prev,
@@ -2353,44 +2465,48 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           }
         } else if (ev === "reasoning") {
           assistantReason = String(data.text ?? "");
+          setLiveTester((prev) => (prev ? { ...prev, reasoning: assistantReason, actor: "tester_llm" } : prev));
           setSelectedTesterMessages((prev) =>
             prev.map((m) => (m.id === draftId ? { ...m, reasoning: assistantReason } : m)),
           );
         } else if (ev === "text") {
           clearLiveBrowserLog();
           assistantText = String(data.text ?? "");
+          setLiveTester((prev) => (prev ? { ...prev, content: assistantText } : prev));
           setSelectedTesterMessages((prev) =>
             prev.map((m) => (m.id === draftId ? { ...m, content: assistantText } : m)),
           );
         } else if (ev === "action") {
-          const actType = String(data.type ?? "qa_check");
-          if (actType === "browser_inspect") {
-            clearLiveBrowserLog();
+          if (data.type === "file") {
+            const fileItem: TesterChatFileItem = {
+              name: String(data.name ?? "файл"),
+              mime: String(data.mime ?? "application/octet-stream"),
+              size: Number(data.size ?? 0),
+              data: typeof data.data === "string" ? data.data : undefined,
+            };
+            draftFiles.push(fileItem);
+            setSelectedTesterMessages((prev) =>
+              prev.map((m) => (m.id === draftId ? { ...m, files: [...draftFiles] } : m)),
+            );
+          } else {
+            const actItem = parseLiveTesterActionItem(data);
+            if (actItem.type === "browser_inspect") {
+              clearLiveBrowserLog();
+            }
+            draftActions = upsertLiveTesterAction(draftActions, actItem);
+            setLiveTester((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    ...(actItem.type === "browser_inspect" ? { browserLog: [] } : {}),
+                    actions: upsertLiveTesterAction(prev.actions, actItem),
+                  }
+                : prev,
+            );
+            setSelectedTesterMessages((prev) =>
+              prev.map((m) => (m.id === draftId ? { ...m, actions: draftActions } : m)),
+            );
           }
-          setLiveTester((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  ...(actType === "browser_inspect" ? { browserLog: [] } : {}),
-                  actions: [
-                    ...prev.actions,
-                    {
-                      type: actType,
-                      label: data.label ? String(data.label) : undefined,
-                      command: data.command ? String(data.command) : undefined,
-                      url: data.url ? String(data.url) : undefined,
-                      action: data.action ? String(data.action) : undefined,
-                      viewport: data.viewport ? String(data.viewport) : undefined,
-                      summary: data.summary ? String(data.summary) : undefined,
-                      error: data.error ? String(data.error) : undefined,
-                      errorsCount: typeof data.errorsCount === "number" ? data.errorsCount : undefined,
-                      issuesCount: typeof data.issuesCount === "number" ? data.issuesCount : undefined,
-                      animationsCount: typeof data.animationsCount === "number" ? data.animationsCount : undefined,
-                    },
-                  ],
-                }
-              : prev,
-          );
         } else if (ev === "approval_required") {
           setPendingApproval({
             approvalId: String(data.approvalId ?? ""),
@@ -2409,7 +2525,13 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               : undefined,
           });
           setLiveTester((prev) =>
-            prev ? { ...prev, statusText: "Тестировщик ждёт вашего подтверждения на сайте…" } : prev,
+            prev
+              ? {
+                  ...prev,
+                  actor: "approval",
+                  statusText: "Тестировщик ждёт вашего подтверждения на сайте…",
+                }
+              : prev,
           );
         } else if (ev === "tester_done") {
           clearLiveBrowserLog();
@@ -2450,14 +2572,16 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         }
       }
 
-      if (!persistedByServer && targetConvId && assistantText) {
+      if (!persistedByServer && targetConvId && (assistantText || draftActions.length > 0 || assistantReason)) {
         await fetch(`/api/agent/conversations/${targetConvId}/messages`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             role: "assistant",
-            content: assistantText,
+            content: assistantText || "Проверка завершена.",
             reasoning: assistantReason,
+            actions: draftActions,
+            files: draftFiles.map(({ name, mime, size }) => ({ name, mime, size })),
           }),
         }).catch(() => undefined);
       }
@@ -2553,6 +2677,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     ]);
     setRunning(true);
     setStatus("Отправляю агенту…");
+    setLiveStatusActor("agent_llm");
     setLiveBrowserLog([]);
     browserRunStartRef.current = 0;
     autoScrollPausedRef.current = false;
@@ -2665,6 +2790,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
 
           if (event === "status") {
             const st = String(data.text ?? "");
+            const nextActor = parseStatusActor(data, "agent_llm");
+            if (nextActor) setLiveStatusActor(nextActor);
             setStatus(st);
             const isBrowserStep =
               data.source === "browser_inspector" ||
@@ -2672,10 +2799,13 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               data.tool === "qa_browser_audit";
             if (isBrowserStep && data.done === true) {
               clearLiveBrowserLog();
+              if (!data.actor) setLiveStatusActor("agent_llm");
             } else if (isBrowserStep && st) {
+              setLiveStatusActor("browser_inspector");
               const isBrowserStart =
                 st.startsWith("Вызываю инструмент: browse_project") ||
-                st.startsWith("Вызываю инструмент: qa_browser_audit");
+                st.startsWith("Вызываю инструмент: qa_browser_audit") ||
+                st.startsWith("BrowserInspector:");
               pushLiveBrowserLog(st, isBrowserStart);
             } else if (st) {
               clearLiveBrowserLog();
@@ -2756,8 +2886,15 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               setApprovalGhMergeMethod(mm === "squash" || mm === "rebase" ? mm : "merge");
             }
             setLiveTester((prev) =>
-              prev ? { ...prev, statusText: "Тестировщик ждёт вашего подтверждения на сайте…" } : prev,
+              prev
+                ? {
+                    ...prev,
+                    actor: "approval",
+                    statusText: "Тестировщик ждёт вашего подтверждения на сайте…",
+                  }
+                : prev,
             );
+            setLiveStatusActor("approval");
             scrollDown();
           } else if (event === "github") {
             const ghRepoName = `${String(data.owner ?? "")}/${String(data.repo ?? "")}`;
@@ -2786,6 +2923,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             if (createdRun) {
               setTesterRuns((prev) => [createdRun, ...prev.filter((r) => r.id !== createdRun.id)]);
             }
+            setLiveStatusActor("tester");
             setLiveTester({
               runKey: String(data.runKey ?? "default"),
               runId: typeof data.runId === "number" ? data.runId : createdRun?.id,
@@ -2797,6 +2935,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               summary: String(createdRun?.summary ?? data.summary ?? ""),
               model: String(createdRun?.model ?? data.model ?? settings.model ?? ""),
               statusText: "Тестировщик запущен в новом чате…",
+              actor: "tester",
               reasoning: "",
               content: "",
               browserLog: [],
@@ -2804,6 +2943,10 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             });
           } else if (event === "tester_status") {
             const st = String(data.text ?? "");
+            const testerActor = parseLiveTesterActor(data);
+            const step = typeof data.step === "number" ? data.step : undefined;
+            const statusActor = parseStatusActor(data, "tester");
+            if (statusActor) setLiveStatusActor(statusActor);
             setStatus(st);
             const isBrowserStep =
               data.source === "browser_inspector" ||
@@ -2811,17 +2954,30 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               data.tool === "qa_browser_audit";
             if (isBrowserStep && data.done === true) {
               clearLiveBrowserLog();
-              setLiveTester((prev) => (prev ? { ...prev, statusText: st, browserLog: [] } : prev));
+              setLiveTester((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      statusText: st,
+                      actor: testerActor ?? "tester",
+                      ...(step !== undefined ? { step } : {}),
+                      browserLog: [],
+                    }
+                  : prev,
+              );
             } else if (isBrowserStep && st) {
               const isBrowserStart =
                 st.startsWith("Тестировщик: browse_project") ||
-                st.startsWith("Тестировщик: qa_browser_audit");
+                st.startsWith("Тестировщик: qa_browser_audit") ||
+                st.startsWith("BrowserInspector:");
               const logLine = pushLiveBrowserLog(st, isBrowserStart);
               setLiveTester((prev) =>
                 prev
                   ? {
                       ...prev,
                       statusText: st,
+                      actor: "browser_inspector",
+                      ...(step !== undefined ? { step } : {}),
                       browserLog: (isBrowserStart ? [] : prev.browserLog ?? []).concat(logLine).slice(-60),
                     }
                   : prev,
@@ -2833,6 +2989,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   ? {
                       ...prev,
                       statusText: st,
+                      ...(testerActor ? { actor: testerActor } : {}),
+                      ...(step !== undefined ? { step } : {}),
                       ...(st ? { browserLog: [] } : {}),
                     }
                   : prev,
@@ -2840,7 +2998,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             }
           } else if (event === "tester_reasoning") {
             const r = String(data.text ?? "");
-            setLiveTester((prev) => (prev ? { ...prev, reasoning: r } : prev));
+            setLiveStatusActor("tester_llm");
+            setLiveTester((prev) => (prev ? { ...prev, reasoning: r, actor: "tester_llm" } : prev));
           } else if (event === "tester_text") {
             const c = String(data.text ?? "");
             setLiveTester((prev) => (prev ? { ...prev, content: c } : prev));
@@ -2850,37 +3009,23 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 ? (data.action as Record<string, unknown>)
                 : null;
             if (act) {
-              const actType = String(act.type ?? "qa_check");
-              if (actType === "browser_inspect") {
+              const actItem = parseLiveTesterActionItem(act);
+              if (actItem.type === "browser_inspect") {
                 clearLiveBrowserLog();
               }
               setLiveTester((prev) =>
                 prev
                   ? {
                       ...prev,
-                      ...(actType === "browser_inspect" ? { browserLog: [] } : {}),
-                      actions: [
-                        ...prev.actions,
-                        {
-                          type: actType,
-                          label: act.label ? String(act.label) : undefined,
-                          command: act.command ? String(act.command) : undefined,
-                          url: act.url ? String(act.url) : undefined,
-                          action: act.action ? String(act.action) : undefined,
-                          viewport: act.viewport ? String(act.viewport) : undefined,
-                          summary: act.summary ? String(act.summary) : undefined,
-                          error: act.error ? String(act.error) : undefined,
-                          errorsCount: typeof act.errorsCount === "number" ? act.errorsCount : undefined,
-                          issuesCount: typeof act.issuesCount === "number" ? act.issuesCount : undefined,
-                          animationsCount: typeof act.animationsCount === "number" ? act.animationsCount : undefined,
-                        },
-                      ],
+                      ...(actItem.type === "browser_inspect" ? { browserLog: [] } : {}),
+                      actions: upsertLiveTesterAction(prev.actions, actItem),
                     }
                   : prev,
               );
             }
           } else if (event === "tester_done") {
             clearLiveBrowserLog();
+            setLiveStatusActor("agent_llm");
             const savedRun =
               data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
             if (savedRun) {
@@ -3034,6 +3179,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           } else if (event === "done") {
             sawDone = true;
             setStatus(null);
+            setLiveStatusActor(null);
             setPendingApproval(null);
             setScreenCapture(null);
             setLiveTester(null);
@@ -3111,6 +3257,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       setPendingApproval(null);
       setScreenCapture(null);
       setLiveTester(null);
+      setLiveStatusActor(null);
       setLiveBrowserLog([]);
       browserRunStartRef.current = 0;
       setStatus(null);
@@ -4509,32 +4656,62 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   {turn.content ? (
                     <p className="whitespace-pre-wrap break-words leading-relaxed">{turn.content}</p>
                   ) : turn.role === "assistant" && running ? (
-                    <p className="flex items-center gap-1.5 text-muted">
-                      <Loader2 size={12} className="animate-spin" /> агент думает…
-                    </p>
+                    isStreamingTurn && liveTester ? (
+                      <p className="flex items-center gap-1.5 text-muted">
+                        <FlaskConical size={12} className="text-violet-400" />
+                        Основной Агент передал проверку Тестировщику и ждёт отчёт…
+                      </p>
+                    ) : isStreamingTurn && liveBrowserLog.length > 0 ? (
+                      <p className="flex items-center gap-1.5 text-muted">
+                        <Compass size={12} className="animate-pulse text-cyan-400" />
+                        Основной Агент ждёт отчёт BrowserInspector…
+                      </p>
+                    ) : (
+                      <p className="flex items-center gap-1.5 text-muted">
+                        <Loader2 size={12} className="animate-spin" /> агент думает…
+                      </p>
+                    )
                   ) : null}
 
                   {turn.reasoning && turn.reasoning.trim() && (
-                    <LiveReasoningBox text={turn.reasoning} streaming={isStreamingTurn} />
+                    <LiveReasoningBox
+                      text={turn.reasoning}
+                      streaming={isStreamingTurn && !liveTester && liveBrowserLog.length === 0}
+                    />
                   )}
 
                   {isStreamingTurn && liveTester && (
                     <div className="space-y-1.5 rounded-xl border border-violet-500/40 bg-violet-500/10 p-2.5 text-[11px]">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="flex items-center gap-1.5 font-semibold text-violet-300">
-                          <Loader2 size={12} className="animate-spin" />
-                          Тестировщик · {liveTester.sandboxProject || "."}
-                        </span>
-                        {isTabs && (
-                          <button
-                            type="button"
-                            onClick={() => setActiveTab("tester")}
-                            className="rounded-md border border-violet-500/40 bg-card px-2 py-0.5 text-[10px] font-medium text-violet-300 hover:bg-violet-500/20"
-                          >
-                            Открыть Тестировщик
-                          </button>
-                        )}
-                      </div>
+                      {(() => {
+                        const actorMeta = resolveLiveTesterActorMeta(liveTester);
+                        return (
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="flex items-center gap-1.5 font-semibold text-violet-300">
+                                <Loader2 size={12} className="animate-spin" />
+                                Тестировщик · {liveTester.sandboxProject || "."}
+                              </span>
+                              <span
+                                className={cn(
+                                  "inline-flex items-center rounded-md border px-1.5 py-0.5 text-[10px] font-semibold",
+                                  actorMeta.badgeClass,
+                                )}
+                              >
+                                {actorMeta.label}
+                              </span>
+                            </div>
+                            {isTabs && (
+                              <button
+                                type="button"
+                                onClick={() => setActiveTab("tester")}
+                                className="rounded-md border border-violet-500/40 bg-card px-2 py-0.5 text-[10px] font-medium text-violet-300 hover:bg-violet-500/20"
+                              >
+                                Открыть Тестировщик
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })()}
                       <p className="text-[10px] text-muted">{liveTester.statusText}</p>
                       {liveTester.browserLog && liveTester.browserLog.length > 0 && (
                         <div className="space-y-0.5 rounded-lg border border-cyan-500/30 bg-card/70 px-2 py-1.5">
@@ -4546,20 +4723,20 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                           </pre>
                         </div>
                       )}
-                      {liveTester.actions.length > 0 && (
-                        <ul className="space-y-0.5 text-[10px] text-text/90">
-                          {liveTester.actions.slice(-5).map((act, aIdx) => (
-                            <li key={`lt-act-${aIdx}`} className="truncate">
-                              • {formatLiveTesterAction(act)}
-                            </li>
-                          ))}
-                        </ul>
-                      )}
                       {liveTester.reasoning && (
-                        <p className="line-clamp-3 whitespace-pre-wrap rounded-lg border border-border/60 bg-card/60 px-2 py-1 text-[10px] text-muted">
-                          {liveTester.reasoning}
+                        <LiveReasoningBox
+                          text={liveTester.reasoning}
+                          streaming={liveTester.actor !== "browser_inspector" && !liveTester.browserLog?.length}
+                          defaultOpen
+                          badgeLabel="Тестировщик · в эфире"
+                        />
+                      )}
+                      {liveTester.content && (
+                        <p className="whitespace-pre-wrap rounded-lg border border-border bg-card/70 px-2 py-1.5 text-[10px] text-text">
+                          {liveTester.content}
                         </p>
                       )}
+                      <TesterActionsList actions={liveTester.actions} maxHeightClass="max-h-48" />
                     </div>
                   )}
 
@@ -4950,14 +5127,17 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                         </div>
                       );
                     }
-                    if (action.type === "tester_minor_decision" || action.type === "qa_check") {
+                    if (action.type === "tester_minor_decision" || action.type === "qa_check" || action.type === "tester_tool") {
                       return (
                         <div
                           key={`qa-act-${index}`}
                           className="flex items-center gap-2 rounded-xl border border-violet-500/35 bg-violet-500/10 px-2.5 py-2 text-[11px] text-text"
                         >
                           <FlaskConical size={13} className="shrink-0 text-violet-400" />
-                          <span className="min-w-0 flex-1 truncate">{action.label || action.type}</span>
+                          <span className="min-w-0 flex-1 truncate">
+                            {action.label || action.tool || action.type}
+                            {action.summary ? ` — ${action.summary}` : ""}
+                          </span>
                         </div>
                       );
                     }
@@ -5053,8 +5233,31 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             </div>
           )}
           {status && (
-            <p className="mb-2 flex items-center gap-1.5 text-[11px] text-muted">
-              <Loader2 size={11} className="animate-spin" /> {status}
+            <p className="mb-2 flex flex-wrap items-center gap-1.5 text-[11px] text-muted">
+              <Loader2 size={11} className="animate-spin" />
+              {liveStatusActor && (
+                <span
+                  className={cn(
+                    "rounded border px-1.5 py-0.5 text-[10px] font-semibold",
+                    liveStatusActor === "browser_inspector"
+                      ? "border-cyan-500/40 bg-cyan-500/15 text-cyan-300"
+                      : liveStatusActor === "tester" || liveStatusActor === "tester_llm" || liveStatusActor === "tester_tool"
+                        ? "border-violet-500/40 bg-violet-500/15 text-violet-300"
+                        : liveStatusActor === "approval"
+                          ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
+                          : "border-border bg-card2 text-text",
+                  )}
+                >
+                  {liveStatusActor === "browser_inspector"
+                    ? "BrowserInspector"
+                    : liveStatusActor === "tester" || liveStatusActor === "tester_llm" || liveStatusActor === "tester_tool"
+                      ? "Тестировщик"
+                      : liveStatusActor === "approval"
+                        ? "Ожидает подтверждения"
+                        : "Агент"}
+                </span>
+              )}
+              <span>{status}</span>
             </p>
           )}
           {notice && <p className="mb-2 text-[11px] text-emerald-500">{notice}</p>}
