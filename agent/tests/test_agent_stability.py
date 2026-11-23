@@ -1294,6 +1294,268 @@ class WindowsCompatibilityAndSpecTests(unittest.TestCase):
             fake_sess.close.assert_called_once()
             self.assertTrue(any("закрыта после шага «click»" in s for s in statuses))
 
+    def test_handler_write_aborts_on_stalled_client_socket_instead_of_hanging(self) -> None:
+        closed_ev = threading.Event()
+        orig_mgr_cls = browser_inspector.BrowserSessionManager
+
+        class TrackBrowserMgr(orig_mgr_cls):
+            def close_all(self) -> None:
+                closed_ev.set()
+                super().close_all()
+
+        big_preview = "data:image/jpeg;base64," + ("A" * 6_000_000)
+        calls = {"n": 0}
+
+        def fake_call_model(*_a, **_kw):
+            calls["n"] += 1
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_b_stall",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "browse_project",
+                                        "arguments": json.dumps({"action": "open", "url": "http://127.0.0.1:8123"}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+
+        def fake_browse(*_a, **_kw):
+            return "Осмотр OK", [
+                {
+                    "type": "browser_inspect",
+                    "action": "open",
+                    "url": "http://127.0.0.1:8123",
+                    "preview": big_preview,
+                    "summary": "ok",
+                }
+            ]
+
+        srv = agent_mod.Server(("127.0.0.1", 0), agent_mod.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        log_messages: list[str] = []
+        sock = None
+        try:
+            with (
+                mock.patch.object(agent_mod, "SSE_WRITE_TIMEOUT", 0.25),
+                mock.patch.object(agent_mod, "call_model", side_effect=fake_call_model),
+                mock.patch.object(browser_inspector, "execute_browse_action", side_effect=fake_browse),
+                mock.patch.object(browser_inspector, "BrowserSessionManager", TrackBrowserMgr),
+                mock.patch.object(agent_mod, "log", side_effect=log_messages.append),
+            ):
+                sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                body = json.dumps(
+                    {
+                        "messages": [{"role": "user", "content": "проверь сайт"}],
+                        "settings": {"baseUrl": "http://127.0.0.1:9999/v1", "model": "test-model"},
+                        "trustLevel": "verified",
+                    }
+                ).encode("utf-8")
+                sock.sendall(
+                    f"POST /run HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                    f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n".encode("ascii")
+                    + body
+                )
+                t0 = time.monotonic()
+                finished = closed_ev.wait(timeout=3.0)
+                elapsed = time.monotonic() - t0
+                self.assertTrue(finished, "Зависшая запись в нечитающий SSE-сокет должна прерываться по таймауту")
+                self.assertLess(elapsed, 2.0)
+                self.assertTrue(any("не отвечает более" in m for m in log_messages))
+        finally:
+            if sock is not None:
+                sock.close()
+            srv.shutdown()
+            srv.server_close()
+
+        # Также проверяем пост-отчётную запись статуса прямо после «передаю отчёт Агенту» при TimeoutError на сокете.
+        class StallAfterActionWriter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def write(self, data: bytes) -> int:
+                self.calls += 1
+                text = data.decode("utf-8", errors="ignore")
+                if "BrowserInspector завершил шаг" in text:
+                    raise TimeoutError("timed out")
+                return len(data)
+
+            def flush(self) -> None:
+                pass
+
+        h = agent_mod.Handler.__new__(agent_mod.Handler)
+        h.wfile = StallAfterActionWriter()  # type: ignore[assignment]
+        h._client_disconnected = False
+        with (
+            mock.patch.object(agent_mod, "SSE_WRITE_TIMEOUT", 0.25),
+            mock.patch.object(agent_mod, "call_model", side_effect=fake_call_model),
+            mock.patch.object(browser_inspector, "execute_browse_action", side_effect=fake_browse),
+            mock.patch.object(browser_inspector, "_browser_log") as br_log,
+            mock.patch.object(agent_mod, "log"),
+        ):
+            with self.assertRaises(BrokenPipeError):
+                h.run_agent(
+                    {
+                        "messages": [{"role": "user", "content": "проверь"}],
+                        "settings": {"baseUrl": "http://127.0.0.1:9999/v1", "model": "test-model"},
+                        "trustLevel": "verified",
+                    }
+                )
+        self.assertTrue(h._client_disconnected)
+        self.assertTrue(any("передаю отчёт Агенту" in str(c.args[0]) for c in br_log.call_args_list))
+
+    def test_sse_keepalive_does_not_block_or_leak_lock_when_writer_busy(self) -> None:
+        class RecordingWriter:
+            def __init__(self) -> None:
+                self.chunks: list[bytes] = []
+
+            def write(self, data: bytes) -> int:
+                self.chunks.append(data)
+                return len(data)
+
+            def flush(self) -> None:
+                pass
+
+        h = agent_mod.Handler.__new__(agent_mod.Handler)
+        h.wfile = RecordingWriter()  # type: ignore[assignment]
+        h._client_disconnected = False
+
+        # Пока основной поток держит _write_lock, _try_write_keepalive уступает без ожидания/дедлока.
+        lock = h._get_write_lock()
+        lock.acquire()
+        try:
+            t0 = time.monotonic()
+            ok = h._try_write_keepalive(b": keepalive\n\n")
+            self.assertTrue(ok)
+            self.assertLess(time.monotonic() - t0, 0.5)
+        finally:
+            lock.release()
+
+        with h._sse_keepalive(interval=0.04):
+            time.sleep(0.14)
+        self.assertTrue(any(b": keepalive\n\n" in c for c in h.wfile.chunks))  # type: ignore[attr-defined]
+        # После выхода из контекста lock свободен и последующая запись не блокируется.
+        h.write(b"event: status\ndata: {\"text\":\"ok\"}\n\n")
+
+    def test_call_model_aborts_stuck_headers_before_response_and_skips_loopback_timeout_retry(self) -> None:
+        import urllib.request
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        stop_ev = threading.Event()
+        requests_seen = {"count": 0}
+
+        class HangingHeaderHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:  # noqa: ARG002
+                return
+
+            def do_POST(self) -> None:  # noqa: N802
+                requests_seen["count"] += 1
+                ln = int(self.headers.get("Content-Length") or 0)
+                if ln > 0:
+                    self.rfile.read(ln)
+                stop_ev.wait(timeout=5.0)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), HangingHeaderHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        try:
+            # 1) _safe_model_urlopen не перебирает другие loopback-кандидаты после TimeoutError.
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=b'{"model":"m","messages":[]}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises((TimeoutError, urllib.error.URLError)):
+                agent_mod._safe_model_urlopen(req, timeout=0.25)  # type: ignore[arg-type]
+            self.assertEqual(requests_seen["count"], 1)
+
+            # 2) cancel_check немедленно прерывает сокет call_model ещё ДО получения HTTP-заголовков.
+            requests_seen["count"] = 0
+            cancel_state = {"stop": False}
+
+            def cancel_soon() -> None:
+                time.sleep(0.15)
+                cancel_state["stop"] = True
+
+            threading.Thread(target=cancel_soon, daemon=True).start()
+            t0 = time.monotonic()
+            with mock.patch.object(agent_mod, "TIMEOUT", 10):
+                with self.assertRaises(BrokenPipeError):
+                    agent_mod.call_model(
+                        f"http://127.0.0.1:{port}/v1",
+                        "",
+                        "test-model",
+                        [{"role": "user", "content": "hi"}],
+                        None,
+                        on_text=lambda _t: None,
+                        cancel_check=lambda: cancel_state["stop"],
+                    )
+            self.assertLess(time.monotonic() - t0, 1.5)
+            self.assertEqual(requests_seen["count"], 1)
+        finally:
+            stop_ev.set()
+            srv.shutdown()
+            srv.server_close()
+
+    def test_call_model_non_stream_respects_timeout_and_cancel_check(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        stop_ev = threading.Event()
+        requests_seen = {"count": 0}
+
+        class StuckBodyHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt: str, *args: object) -> None:  # noqa: ARG002
+                return
+
+            def do_POST(self) -> None:  # noqa: N802
+                requests_seen["count"] += 1
+                ln = int(self.headers.get("Content-Length") or 0)
+                if ln > 0:
+                    self.rfile.read(ln)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b'{"choices":')
+                self.wfile.flush()
+                stop_ev.wait(timeout=5.0)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), StuckBodyHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        try:
+            t0 = time.monotonic()
+            with mock.patch.object(agent_mod, "TIMEOUT", 0.25), mock.patch("time.sleep"):
+                with self.assertRaises(agent_mod.AgentError):
+                    agent_mod.call_model(
+                        f"http://127.0.0.1:{port}/v1",
+                        "",
+                        "test-model",
+                        [{"role": "user", "content": "hi"}],
+                        None,
+                        params={"stream": False},
+                    )
+            self.assertLess(time.monotonic() - t0, 2.5)
+            self.assertGreaterEqual(requests_seen["count"], 1)
+        finally:
+            stop_ev.set()
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
