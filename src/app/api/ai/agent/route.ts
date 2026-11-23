@@ -557,6 +557,16 @@ export async function POST(req: Request) {
           parsed.testerConversationId = mapped.testerConversationId;
         }
         return `event: ${ev}\ndata: ${JSON.stringify(parsed)}\n\n`;
+      } else if (ev === "action") {
+        const rk = typeof parsed.runKey === "string"
+          ? parsed.runKey
+          : (typeof parsed.testerRunKey === "string" ? parsed.testerRunKey : "");
+        const mapped = rk ? activeTesterRuns.get(rk) : undefined;
+        if (mapped) {
+          if (!parsed.runId) parsed.runId = mapped.runId;
+          if (!parsed.testerConversationId) parsed.testerConversationId = mapped.testerConversationId;
+        }
+        return `event: action\ndata: ${JSON.stringify(parsed)}\n\n`;
       } else if (ev === "tester_done") {
         const runKey = String(parsed.runKey ?? "default");
         const mapped = activeTesterRuns.get(runKey);

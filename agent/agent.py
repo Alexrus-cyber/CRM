@@ -2534,240 +2534,367 @@ def call_model(
         if api_key:
             request.add_header("Authorization", f"Bearer {api_key}")
         try:
-            with _safe_model_urlopen(request, timeout=TIMEOUT) as response:
-                if not body_payload.get("stream"):
-                    raw = response.read().decode("utf-8", "replace")
-                    try:
-                        return json.loads(raw)
-                    except json.JSONDecodeError as error:
-                        raise AgentError("Сервер модели вернул не JSON", retryable=True) from error
+            resp_holder: Dict[str, Any] = {"resp": None}
+            hb_lock = threading.Lock()
+            hb_stop = threading.Event()
+            hb_started = time.monotonic()
+            hb_state: Dict[str, Any] = {
+                "last_meaningful": hb_started,
+                "last_status": 0.0,
+                "last_log": 0.0,
+                "reason_len": 0,
+                "text_len": 0,
+                "tool_chars": 0,
+                "tool_names": [],
+                "saw_finish": False,
+                "idle_timed_out": False,
+            }
 
-                # Читаем поток построчно; если сервер проигнорировал stream=True и прислал JSON,
-                # подхватываем первую строку и собираем как обычный ответ.
-                raw_lines: List[str] = []
-                content_parts: List[str] = []
-                reasoning_parts: List[str] = []
-                tool_calls_map: Dict[int, Dict[str, Any]] = {}
-                in_think = False
-                tag_buf = ""
-                last_reason_emit = 0.0
-                last_text_emit = 0.0
-                is_sse = False
-                stream_usage: Optional[Dict[str, Any]] = None
-                saw_finish = False
-                saw_finish_reason = ""
-                finish_deadline: Optional[float] = None
-
-                def _usage_has_counts(usage_obj: Any) -> bool:
-                    if not isinstance(usage_obj, dict):
-                        return False
-                    for uk in (
-                        "total_tokens",
-                        "prompt_tokens",
-                        "completion_tokens",
-                        "input_tokens",
-                        "output_tokens",
-                        "total",
-                        "prompt",
-                        "completion",
-                    ):
-                        try:
-                            if int(usage_obj.get(uk) or 0) > 0:
-                                return True
-                        except (TypeError, ValueError):
-                            continue
-                    return False
-
-                def _shrink_response_socket_timeout(seconds: float) -> None:
-                    try:
-                        fp = getattr(response, "fp", None)
-                        raw_fp = getattr(fp, "raw", None) or getattr(response, "raw", None)
-                        sock = getattr(raw_fp, "_sock", None)
-                        if sock is not None and hasattr(sock, "settimeout"):
-                            sock.settimeout(seconds)
-                    except Exception:  # noqa: BLE001
-                        pass
-
+            def _close_resp_socket(resp_obj: Any) -> None:
                 try:
-                    for raw_bytes in response:
+                    fp = getattr(resp_obj, "fp", None)
+                    raw_fp = getattr(fp, "raw", None) or getattr(resp_obj, "raw", None)
+                    sock = getattr(raw_fp, "_sock", None)
+                    if sock is not None:
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        try:
+                            sock.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
+
+            def _hb_loop() -> None:
+                poll_interval = min(1.0, max(0.15, float(TIMEOUT) * 0.5))
+                while not hb_stop.wait(poll_interval):
+                    if cancel_check and cancel_check():
+                        _close_resp_socket(resp_holder.get("resp"))
+                        break
+                    now_hb = time.monotonic()
+                    with hb_lock:
+                        idle_sec = now_hb - float(hb_state["last_meaningful"])
+                        elapsed = now_hb - hb_started
+                        finished = bool(hb_state["saw_finish"])
+                        r_len = int(hb_state["reason_len"])
+                        t_len = int(hb_state["text_len"])
+                        tc_len = int(hb_state["tool_chars"])
+                        t_names = list(hb_state["tool_names"])
+                        since_status = now_hb - float(hb_state["last_status"])
+                        since_log = now_hb - float(hb_state["last_log"])
+                    if body_payload.get("stream") and not finished and idle_sec > TIMEOUT:
+                        with hb_lock:
+                            hb_state["idle_timed_out"] = True
+                        log(
+                            f"поток модели не прислал токенов за {idle_sec:.1f}с "
+                            f"(TIMEOUT={TIMEOUT}с) — прерываю зависший поток"
+                        )
+                        _close_resp_socket(resp_holder.get("resp"))
+                        break
+                    if not finished and elapsed >= 5.0 and since_status >= 5.0:
+                        with hb_lock:
+                            hb_state["last_status"] = now_hb
+                        if on_status:
+                            try:
+                                if t_names:
+                                    names_str = ", ".join(t_names[:3])
+                                    on_status(
+                                        f"Модель формирует вызов {names_str} ({tc_len} симв., {elapsed:.0f} с)…"
+                                    )
+                                elif r_len > 0 and t_len == 0:
+                                    on_status(f"Модель рассуждает ({r_len} симв., {elapsed:.0f} с)…")
+                                elif t_len > 0:
+                                    on_status(f"Модель отвечает ({t_len} симв., {elapsed:.0f} с)…")
+                                else:
+                                    on_status(f"Жду ответ модели ({elapsed:.0f} с)…")
+                            except Exception:  # noqa: BLE001
+                                pass
+                        if elapsed >= 10.0 and (hb_state["last_log"] == 0.0 or since_log >= 30.0):
+                            with hb_lock:
+                                hb_state["last_log"] = now_hb
+                            log(
+                                f"ожидание/ответ модели ({elapsed:.0f}с, idle={idle_sec:.0f}с, "
+                                f"reason={r_len}, text={t_len}, tools={t_names})"
+                            )
+
+            hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+            hb_thread.start()
+            try:
+                with _safe_model_urlopen(request, timeout=TIMEOUT) as response:
+                    resp_holder["resp"] = response
+                    if not body_payload.get("stream"):
+                        raw = response.read().decode("utf-8", "replace")
                         if cancel_check and cancel_check():
                             raise BrokenPipeError("Клиент закрыл соединение")
-                        if saw_finish and finish_deadline is not None:
-                            rem = finish_deadline - time.monotonic()
-                            if rem <= 0:
-                                break
-                            _shrink_response_socket_timeout(max(0.1, rem))
-                        line = raw_bytes.decode("utf-8", "replace").rstrip("\r\n")
-                        stripped = line.strip()
-                        if not stripped:
-                            continue
-                        if not is_sse:
-                            if stripped.startswith("data:") or stripped.startswith("event:") or stripped.startswith(":"):
-                                is_sse = True
-                            elif stripped.startswith("{"):
-                                raw_lines.append(line)
-                                rest = response.read().decode("utf-8", "replace")
-                                if rest:
-                                    raw_lines.append(rest)
-                                try:
-                                    parsed_json = json.loads("\n".join(raw_lines))
-                                except json.JSONDecodeError as error:
-                                    raise AgentError("Сервер модели вернул не JSON", retryable=True) from error
-                                if isinstance(parsed_json, dict) and parsed_json.get("error"):
-                                    err_obj = parsed_json["error"]
-                                    err_msg = str(err_obj.get("message") if isinstance(err_obj, dict) else err_obj)
-                                    raise AgentError(f"Модель вернула ошибку: {err_msg}", retryable=True)
-                                msg = (parsed_json.get("choices") or [{}])[0].get("message") or {}
-                                r_full = str(msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
-                                c_full = str(msg.get("content") or "")
-                                c_clean, c_think = _split_inline_think(c_full)
-                                if c_think and not r_full:
-                                    r_full = c_think
-                                    c_full = c_clean
-                                if r_full and on_reasoning:
-                                    on_reasoning(r_full)
-                                if c_full and not msg.get("tool_calls") and on_text:
-                                    on_text(c_full)
-                                return parsed_json
-                            else:
-                                is_sse = True
-
-                        if not stripped.startswith("data:"):
-                            continue
-                        data_str = stripped[5:].strip()
-                        if data_str == "[DONE]":
-                            break
                         try:
-                            chunk = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
+                            return json.loads(raw)
+                        except json.JSONDecodeError as error:
+                            raise AgentError("Сервер модели вернул не JSON", retryable=True) from error
 
-                        if isinstance(chunk, dict) and chunk.get("error"):
-                            err_obj = chunk["error"]
-                            err_msg = str(err_obj.get("message") if isinstance(err_obj, dict) else err_obj)
-                            err_code = str(err_obj.get("code") or err_obj.get("type") or "") if isinstance(err_obj, dict) else ""
-                            retryable = any(w in (err_msg + " " + err_code).lower() for w in ("rate", "timeout", "overload", "502", "503", "504", "429"))
-                            raise AgentError(f"Модель вернула ошибку в потоке: {err_msg}", retryable=retryable)
+                    # Читаем поток построчно; если сервер проигнорировал stream=True и прислал JSON,
+                    # подхватываем первую строку и собираем как обычный ответ.
+                    raw_lines: List[str] = []
+                    content_parts: List[str] = []
+                    reasoning_parts: List[str] = []
+                    tool_calls_map: Dict[int, Dict[str, Any]] = {}
+                    in_think = False
+                    tag_buf = ""
+                    last_reason_emit = 0.0
+                    last_text_emit = 0.0
+                    is_sse = False
+                    stream_usage: Optional[Dict[str, Any]] = None
+                    saw_finish = False
+                    saw_finish_reason = ""
+                    finish_deadline: Optional[float] = None
 
-                        if isinstance(chunk.get("usage"), dict):
-                            stream_usage = chunk["usage"]
+                    def _usage_has_counts(usage_obj: Any) -> bool:
+                        if not isinstance(usage_obj, dict):
+                            return False
+                        for uk in (
+                            "total_tokens",
+                            "prompt_tokens",
+                            "completion_tokens",
+                            "input_tokens",
+                            "output_tokens",
+                            "total",
+                            "prompt",
+                            "completion",
+                        ):
+                            try:
+                                if int(usage_obj.get(uk) or 0) > 0:
+                                    return True
+                            except (TypeError, ValueError):
+                                continue
+                        return False
 
-                        choices = chunk.get("choices") or []
-                        if not choices:
-                            if saw_finish and (
-                                _usage_has_counts(stream_usage)
-                                or (finish_deadline is not None and time.monotonic() >= finish_deadline)
-                            ):
+                    def _shrink_response_socket_timeout(seconds: float) -> None:
+                        try:
+                            fp = getattr(response, "fp", None)
+                            raw_fp = getattr(fp, "raw", None) or getattr(response, "raw", None)
+                            sock = getattr(raw_fp, "_sock", None)
+                            if sock is not None and hasattr(sock, "settimeout"):
+                                sock.settimeout(seconds)
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    try:
+                        for raw_bytes in response:
+                            if cancel_check and cancel_check():
+                                raise BrokenPipeError("Клиент закрыл соединение")
+                            if saw_finish and finish_deadline is not None:
+                                rem = finish_deadline - time.monotonic()
+                                if rem <= 0:
+                                    break
+                                _shrink_response_socket_timeout(max(0.1, rem))
+                            line = raw_bytes.decode("utf-8", "replace").rstrip("\r\n")
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            if not is_sse:
+                                if stripped.startswith("data:") or stripped.startswith("event:") or stripped.startswith(":"):
+                                    is_sse = True
+                                elif stripped.startswith("{"):
+                                    raw_lines.append(line)
+                                    rest = response.read().decode("utf-8", "replace")
+                                    if rest:
+                                        raw_lines.append(rest)
+                                    try:
+                                        parsed_json = json.loads("\n".join(raw_lines))
+                                    except json.JSONDecodeError as error:
+                                        raise AgentError("Сервер модели вернул не JSON", retryable=True) from error
+                                    if isinstance(parsed_json, dict) and parsed_json.get("error"):
+                                        err_obj = parsed_json["error"]
+                                        err_msg = str(err_obj.get("message") if isinstance(err_obj, dict) else err_obj)
+                                        raise AgentError(f"Модель вернула ошибку: {err_msg}", retryable=True)
+                                    msg = (parsed_json.get("choices") or [{}])[0].get("message") or {}
+                                    r_full = str(msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+                                    c_full = str(msg.get("content") or "")
+                                    c_clean, c_think = _split_inline_think(c_full)
+                                    if c_think and not r_full:
+                                        r_full = c_think
+                                        c_full = c_clean
+                                    if r_full and on_reasoning:
+                                        on_reasoning(r_full)
+                                    if c_full and not msg.get("tool_calls") and on_text:
+                                        on_text(c_full)
+                                    return parsed_json
+                                else:
+                                    is_sse = True
+
+                            if not stripped.startswith("data:"):
+                                continue
+                            data_str = stripped[5:].strip()
+                            if data_str == "[DONE]":
                                 break
-                            continue
-                        choice = choices[0] or {}
-                        finish_reason = choice.get("finish_reason")
-                        delta = choice.get("delta") or {}
-                        msg_fb = choice.get("message") or {}
+                            try:
+                                chunk = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
 
-                        r_piece = (
-                            delta.get("reasoning_content")
-                            or delta.get("reasoning")
-                            or msg_fb.get("reasoning_content")
-                            or msg_fb.get("reasoning")
-                            or ""
-                        )
-                        if isinstance(r_piece, str) and r_piece:
-                            reasoning_parts.append(r_piece)
-                            now = time.monotonic()
-                            if on_reasoning and (last_reason_emit == 0.0 or now - last_reason_emit >= 0.2):
-                                last_reason_emit = now
-                                on_reasoning("".join(reasoning_parts))
+                            if isinstance(chunk, dict) and chunk.get("error"):
+                                err_obj = chunk["error"]
+                                err_msg = str(err_obj.get("message") if isinstance(err_obj, dict) else err_obj)
+                                err_code = str(err_obj.get("code") or err_obj.get("type") or "") if isinstance(err_obj, dict) else ""
+                                retryable = any(w in (err_msg + " " + err_code).lower() for w in ("rate", "timeout", "overload", "502", "503", "504", "429"))
+                                raise AgentError(f"Модель вернула ошибку в потоке: {err_msg}", retryable=retryable)
 
-                        c_piece = delta.get("content") if delta.get("content") is not None else msg_fb.get("content")
-                        if isinstance(c_piece, str) and c_piece:
-                            c_out, t_out, in_think, tag_buf = _process_stream_think_chunk(c_piece, in_think, tag_buf)
-                            if t_out:
-                                reasoning_parts.append(t_out)
+                            if isinstance(chunk.get("usage"), dict):
+                                stream_usage = chunk["usage"]
+
+                            choices = chunk.get("choices") or []
+                            if not choices:
+                                if saw_finish and (
+                                    _usage_has_counts(stream_usage)
+                                    or (finish_deadline is not None and time.monotonic() >= finish_deadline)
+                                ):
+                                    break
+                                continue
+                            choice = choices[0] or {}
+                            finish_reason = choice.get("finish_reason")
+                            delta = choice.get("delta") or {}
+                            msg_fb = choice.get("message") or {}
+                            got_meaningful = False
+
+                            r_piece = (
+                                delta.get("reasoning_content")
+                                or delta.get("reasoning")
+                                or msg_fb.get("reasoning_content")
+                                or msg_fb.get("reasoning")
+                                or ""
+                            )
+                            if isinstance(r_piece, str) and r_piece:
+                                got_meaningful = True
+                                reasoning_parts.append(r_piece)
                                 now = time.monotonic()
                                 if on_reasoning and (last_reason_emit == 0.0 or now - last_reason_emit >= 0.2):
                                     last_reason_emit = now
                                     on_reasoning("".join(reasoning_parts))
-                            if c_out:
-                                content_parts.append(c_out)
-                                now = time.monotonic()
-                                if on_text and not tool_calls_map and (last_text_emit == 0.0 or now - last_text_emit >= 0.2):
-                                    last_text_emit = now
-                                    on_text("".join(content_parts))
 
-                        tc_deltas = delta.get("tool_calls") or msg_fb.get("tool_calls") or []
-                        if isinstance(tc_deltas, list):
-                            for pos, tc in enumerate(tc_deltas):
-                                if not isinstance(tc, dict):
-                                    continue
-                                idx = tc.get("index")
-                                if not isinstance(idx, int):
-                                    idx = pos
-                                entry = tool_calls_map.setdefault(
-                                    idx,
-                                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
-                                )
-                                if tc.get("id"):
-                                    entry["id"] = str(tc["id"])
-                                if tc.get("type"):
-                                    entry["type"] = str(tc["type"])
-                                fn = tc.get("function") or {}
-                                if isinstance(fn, dict):
-                                    if fn.get("name"):
-                                        entry["function"]["name"] += str(fn["name"])
-                                    if fn.get("arguments"):
-                                        entry["function"]["arguments"] += str(fn["arguments"])
+                            c_piece = delta.get("content") if delta.get("content") is not None else msg_fb.get("content")
+                            if isinstance(c_piece, str) and c_piece:
+                                got_meaningful = True
+                                c_out, t_out, in_think, tag_buf = _process_stream_think_chunk(c_piece, in_think, tag_buf)
+                                if t_out:
+                                    reasoning_parts.append(t_out)
+                                    now = time.monotonic()
+                                    if on_reasoning and (last_reason_emit == 0.0 or now - last_reason_emit >= 0.2):
+                                        last_reason_emit = now
+                                        on_reasoning("".join(reasoning_parts))
+                                if c_out:
+                                    content_parts.append(c_out)
+                                    now = time.monotonic()
+                                    if on_text and not tool_calls_map and (last_text_emit == 0.0 or now - last_text_emit >= 0.2):
+                                        last_text_emit = now
+                                        on_text("".join(content_parts))
 
-                        if finish_reason:
-                            saw_finish = True
-                            saw_finish_reason = str(finish_reason)
-                            if _usage_has_counts(stream_usage):
-                                break
-                            # Если сервер забыл отправить [DONE] или шлёт keep-alive — ждём хвост строго не более 2.0с.
-                            if finish_deadline is None:
-                                finish_deadline = time.monotonic() + 2.0
-                            _shrink_response_socket_timeout(max(0.1, finish_deadline - time.monotonic()))
-                except (http.client.HTTPException, TimeoutError, ConnectionError, ssl.SSLError, OSError) as stream_err:
-                    if not (saw_finish and (content_parts or reasoning_parts or tool_calls_map)):
-                        raise AgentError(
-                            f"Сбой соединения при чтении ответа модели: {stream_err}",
-                            retryable=True,
-                        ) from stream_err
-                    log(
-                        f"ответ модели уже завершён (finish_reason={saw_finish_reason}); "
-                        f"игнорирую обрыв/таймаут хвоста: {stream_err}"
-                    )
+                            tc_deltas = delta.get("tool_calls") or msg_fb.get("tool_calls") or []
+                            if isinstance(tc_deltas, list) and tc_deltas:
+                                got_meaningful = True
+                                for pos, tc in enumerate(tc_deltas):
+                                    if not isinstance(tc, dict):
+                                        continue
+                                    idx = tc.get("index")
+                                    if not isinstance(idx, int):
+                                        idx = pos
+                                    entry = tool_calls_map.setdefault(
+                                        idx,
+                                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                                    )
+                                    if tc.get("id"):
+                                        entry["id"] = str(tc["id"])
+                                    if tc.get("type"):
+                                        entry["type"] = str(tc["type"])
+                                    fn = tc.get("function") or {}
+                                    if isinstance(fn, dict):
+                                        if fn.get("name"):
+                                            entry["function"]["name"] += str(fn["name"])
+                                        if fn.get("arguments"):
+                                            entry["function"]["arguments"] += str(fn["arguments"])
 
-                if tag_buf:
-                    if in_think:
-                        reasoning_parts.append(tag_buf)
-                    else:
-                        content_parts.append(tag_buf)
+                            if got_meaningful or finish_reason:
+                                with hb_lock:
+                                    hb_state["last_meaningful"] = time.monotonic()
+                                    hb_state["reason_len"] = sum(len(p) for p in reasoning_parts)
+                                    hb_state["text_len"] = sum(len(p) for p in content_parts)
+                                    if tool_calls_map:
+                                        hb_state["tool_names"] = [
+                                            str(tool_calls_map[k]["function"].get("name") or "tool")
+                                            for k in sorted(tool_calls_map.keys())
+                                        ]
+                                        hb_state["tool_chars"] = sum(
+                                            len(str(tool_calls_map[k]["function"].get("arguments") or ""))
+                                            for k in tool_calls_map
+                                        )
 
-                final_reasoning = "".join(reasoning_parts)
-                final_content = "".join(content_parts)
-                c_clean, c_think = _split_inline_think(final_content)
-                if c_think:
-                    final_reasoning = ((final_reasoning + "\n\n") if final_reasoning else "") + c_think
-                    final_content = c_clean
-                assembled_tools = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
-                if final_reasoning and on_reasoning:
-                    on_reasoning(final_reasoning)
-                if final_content and not assembled_tools and on_text:
-                    on_text(final_content)
-                msg_obj: Dict[str, Any] = {
-                    "role": "assistant",
-                    "content": final_content,
-                    **({"reasoning_content": final_reasoning} if final_reasoning else {}),
-                    **({"tool_calls": assembled_tools} if assembled_tools else {}),
-                }
-                choice_out: Dict[str, Any] = {"message": msg_obj}
-                if saw_finish_reason:
-                    choice_out["finish_reason"] = saw_finish_reason
-                result_obj: Dict[str, Any] = {"choices": [choice_out]}
-                if stream_usage:
-                    result_obj["usage"] = stream_usage
-                return result_obj
+                            if finish_reason:
+                                saw_finish = True
+                                saw_finish_reason = str(finish_reason)
+                                with hb_lock:
+                                    hb_state["saw_finish"] = True
+                                if _usage_has_counts(stream_usage):
+                                    break
+                                # Если сервер забыл отправить [DONE] или шлёт keep-alive — ждём хвост строго не более 2.0с.
+                                if finish_deadline is None:
+                                    finish_deadline = time.monotonic() + 2.0
+                                _shrink_response_socket_timeout(max(0.1, finish_deadline - time.monotonic()))
+                    except (http.client.HTTPException, TimeoutError, ConnectionError, ssl.SSLError, OSError) as stream_err:
+                        if cancel_check and cancel_check():
+                            raise BrokenPipeError("Клиент закрыл соединение") from stream_err
+                        if hb_state.get("idle_timed_out"):
+                            raise AgentError(
+                                f"Модель не прислала полезных данных за {TIMEOUT} с",
+                                retryable=True,
+                            ) from stream_err
+                        if not (saw_finish and (content_parts or reasoning_parts or tool_calls_map)):
+                            raise AgentError(
+                                f"Сбой соединения при чтении ответа модели: {stream_err}",
+                                retryable=True,
+                            ) from stream_err
+                        log(
+                            f"ответ модели уже завершён (finish_reason={saw_finish_reason}); "
+                            f"игнорирую обрыв/таймаут хвоста: {stream_err}"
+                        )
+
+                    if cancel_check and cancel_check():
+                        raise BrokenPipeError("Клиент закрыл соединение")
+                    if hb_state.get("idle_timed_out"):
+                        raise AgentError(f"Модель не прислала полезных данных за {TIMEOUT} с", retryable=True)
+
+                    if tag_buf:
+                        if in_think:
+                            reasoning_parts.append(tag_buf)
+                        else:
+                            content_parts.append(tag_buf)
+
+                    final_reasoning = "".join(reasoning_parts)
+                    final_content = "".join(content_parts)
+                    c_clean, c_think = _split_inline_think(final_content)
+                    if c_think:
+                        final_reasoning = ((final_reasoning + "\n\n") if final_reasoning else "") + c_think
+                        final_content = c_clean
+                    assembled_tools = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
+                    if final_reasoning and on_reasoning:
+                        on_reasoning(final_reasoning)
+                    if final_content and not assembled_tools and on_text:
+                        on_text(final_content)
+                    msg_obj: Dict[str, Any] = {
+                        "role": "assistant",
+                        "content": final_content,
+                        **({"reasoning_content": final_reasoning} if final_reasoning else {}),
+                        **({"tool_calls": assembled_tools} if assembled_tools else {}),
+                    }
+                    choice_out: Dict[str, Any] = {"message": msg_obj}
+                    if saw_finish_reason:
+                        choice_out["finish_reason"] = saw_finish_reason
+                    result_obj: Dict[str, Any] = {"choices": [choice_out]}
+                    if stream_usage:
+                        result_obj["usage"] = stream_usage
+                    return result_obj
+            finally:
+                hb_stop.set()
+                hb_thread.join(timeout=0.3)
         except BrokenPipeError:
             raise
         except AgentError:
@@ -2912,7 +3039,11 @@ def call_model(
 
             if error.retryable and transient_retries < 3:
                 transient_retries += 1
-                if cur_payload.get("stream") and (transient_retries >= 2 or "timed out" in detail):
+                if cur_payload.get("stream") and (
+                    transient_retries >= 2
+                    or "timed out" in detail
+                    or "не прислала полезных данных" in detail
+                ):
                     cur_payload["stream"] = False
                     cur_payload.pop("stream_options", None)
                     log(f"сбой потока модели (повтор #{transient_retries}/3): переключаюсь на non-stream JSON")
@@ -3127,6 +3258,93 @@ def _build_sandbox_tree_preview(sandbox_root: Path, sandbox_project: str) -> str
         return f"(не удалось прочитать дерево: {err})"
 
 
+def _format_tool_target_label(name: str, args: Optional[Dict[str, Any]]) -> str:
+    """Короткая понятная подпись инструмента с параметрами для live-ленты и истории."""
+    a = args if isinstance(args, dict) else {}
+    if name == "sandbox_list":
+        target = str(a.get("path") or ".").strip() or "."
+        return f"Список файлов Sandbox: {target}"
+    if name == "sandbox_read_file":
+        return f"Чтение файла: {str(a.get('path') or '').strip() or '—'}"
+    if name == "sandbox_write_file":
+        return f"Запись файла: {str(a.get('path') or '').strip() or '—'}"
+    if name == "sandbox_mkdir":
+        return f"Создание папки: {str(a.get('path') or '').strip() or '—'}"
+    if name == "code_search":
+        q = str(a.get("query") or "").strip()[:60]
+        return f"Поиск по коду: «{q or '—'}»"
+    if name == "code_read_files":
+        raw_f = a.get("files") or a.get("paths") or []
+        if isinstance(raw_f, list) and raw_f:
+            names = []
+            for item in raw_f[:3]:
+                if isinstance(item, dict):
+                    names.append(str(item.get("path") or ""))
+                else:
+                    names.append(str(item))
+            suffix = f" (+{len(raw_f) - 3})" if len(raw_f) > 3 else ""
+            return f"Чтение файлов ({len(raw_f)}): {', '.join(x for x in names if x)}{suffix}"
+        return "Чтение файлов кода"
+    if name == "code_file_stats":
+        return "Статистика файлов проекта"
+    if name == "code_symbols":
+        return f"Символы кода: {str(a.get('path') or a.get('sandbox_project') or '.').strip()}"
+    if name == "code_refs":
+        return f"Поиск ссылок на «{str(a.get('symbol') or a.get('query') or '').strip()[:50]}»"
+    if name == "code_deps":
+        return f"Граф зависимостей: {str(a.get('path') or a.get('sandbox_project') or '.').strip()}"
+    if name == "git_history":
+        return f"История Git: {str(a.get('path') or a.get('ref') or 'HEAD').strip()}"
+    if name == "security_scan":
+        return f"Проверка безопасности кода: {str(a.get('sandbox_project') or a.get('target') or '.').strip()}"
+    if name == "schema_inspect":
+        return f"Инспекция схемы БД: {str(a.get('sandbox_project') or a.get('target') or '.').strip()}"
+    if name == "endpoint_inventory":
+        return "Инвентаризация API-эндпоинтов"
+    if name == "agent_plan":
+        return f"План / журнал фактов ({str(a.get('action') or 'get')})"
+    if name == "run_typecheck":
+        return f"Проверка типов (typecheck): {str(a.get('sandbox_project') or a.get('target') or '.').strip()}"
+    if name == "run_lint_file":
+        return f"Линтинг: {str(a.get('path') or a.get('sandbox_project') or '.').strip()}"
+    if name == "run_tests_subset":
+        return f"Запуск поднабора тестов: {str(a.get('path') or a.get('filter') or 'auto').strip()}"
+    if name == "qa_static_review":
+        return f"Статический анализ: {str(a.get('sandbox_project') or '.').strip()}"
+    if name == "qa_run_tests":
+        cmd = str(a.get("command") or "").strip()[:80]
+        return f"Запуск тестов: {cmd or str(a.get('sandbox_project') or '.')}"
+    if name == "qa_http_audit":
+        target = str(a.get("url") or a.get("sandbox_project") or "/").strip()
+        return f"HTTP-аудит: {target}"
+    if name == "qa_browser_audit":
+        target = str(a.get("url") or a.get("sandbox_project") or ".").strip()
+        return f"Браузерный аудит (desktop + mobile): {target}"
+    if name == "qa_security_audit":
+        return f"QA-аудит безопасности: {str(a.get('sandbox_project') or '.').strip()}"
+    if name == "qa_auth_matrix_audit":
+        return f"QA-проверка матрицы прав: {str(a.get('sandbox_project') or '.').strip()}"
+    if name == "qa_schema_audit":
+        return f"QA-проверка схемы БД: {str(a.get('sandbox_project') or '.').strip()}"
+    if name == "qa_submit_report":
+        return f"Итоговый QA-отчёт ({str(a.get('status') or 'passed')})"
+    if name == "browse_project":
+        act = str(a.get("action") or "open").strip()
+        target = str(a.get("url") or a.get("sandbox_project") or a.get("selector") or "").strip()
+        return f"BrowserInspector ({act})" + (f": {target[:70]}" if target else "")
+    if name == "run_command":
+        return f"Команда: {str(a.get('command') or '').strip()[:80]}"
+    return name
+
+
+def _summarize_tool_output(text: str, *, is_error: bool = False) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return "ошибка выполнения" if is_error else "выполнено"
+    first = next((ln.strip() for ln in raw.splitlines() if ln.strip()), raw)
+    return first[:200]
+
+
 def run_tester_session(
     *,
     summary: str,
@@ -3164,6 +3382,7 @@ def run_tester_session(
     run_key = uuid.uuid4().hex[:12]
     proj_clean = str(sandbox_project or ".").strip() or "."
     title = f"Тест: {proj_clean}" if proj_clean != "." else f"Тест: {summary[:48].strip() or 'проект'}"
+    log(f"Тестировщик [{run_key}] старт: project={proj_clean}, model={model or MODEL}")
 
     _emit(
         "tester_start",
@@ -3234,14 +3453,24 @@ def run_tester_session(
             return {"approved": False, "note": "Требуется подтверждение на сайте"}
         _emit(
             "tester_status",
-            {"runKey": run_key, "text": "Тестировщик ждёт вашего подтверждения на сайте…"},
+            {
+                "runKey": run_key,
+                "text": "Тестировщик ждёт вашего подтверждения на сайте…",
+                "source": "approval",
+                "actor": "approval",
+            },
         )
         try:
             return approval_fn(req)
         finally:
             _emit(
                 "tester_status",
-                {"runKey": run_key, "text": "Тестировщик: продолжаю проверку…"},
+                {
+                    "runKey": run_key,
+                    "text": "Тестировщик: продолжаю проверку…",
+                    "source": "tester",
+                    "actor": "tester",
+                },
             )
 
     wrapped_tool_approval = _tester_approval_wrapper if approval_fn is not None else None
@@ -3254,18 +3483,29 @@ def run_tester_session(
             steps += 1
             _emit(
                 "tester_status",
-                {"runKey": run_key, "text": f"Тестировщик: шаг {steps} проверки…"},
+                {
+                    "runKey": run_key,
+                    "text": f"Тестировщик: шаг {steps} — жду ответ модели…",
+                    "source": "tester_llm",
+                    "actor": "tester_llm",
+                    "step": steps,
+                },
+            )
+            llm_t0 = time.monotonic()
+            log(
+                f"Тестировщик [{run_key}] шаг {steps}: запрос к модели "
+                f"(msgs={len(tester_messages)}, imgs={_count_message_images(tester_messages)})"
             )
 
             def _on_t_reason(piece: str) -> None:
                 combined = ((tester_thinking + "\n\n" if tester_thinking else "") + piece).strip()
                 if combined:
-                    _emit("tester_reasoning", {"runKey": run_key, "text": combined})
+                    _emit("tester_reasoning", {"runKey": run_key, "text": combined, "step": steps})
 
             def _on_t_text(piece: str) -> None:
                 cleaned = piece.strip()
                 if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
-                    _emit("tester_text", {"runKey": run_key, "text": cleaned})
+                    _emit("tester_text", {"runKey": run_key, "text": cleaned, "step": steps})
 
             step_forced_no_tools = force_no_tools_next
             use_tools_for_step = use_tools and not step_forced_no_tools
@@ -3281,7 +3521,16 @@ def run_tester_session(
                     params,
                     on_reasoning=_on_t_reason,
                     on_text=_on_t_text,
-                    on_status=lambda msg_s: _emit("tester_status", {"runKey": run_key, "text": msg_s}),
+                    on_status=lambda msg_s: _emit(
+                        "tester_status",
+                        {
+                            "runKey": run_key,
+                            "text": f"Тестировщик (шаг {steps}): {msg_s}",
+                            "source": "tester_llm",
+                            "actor": "tester_llm",
+                            "step": steps,
+                        },
+                    ),
                     context_limit=discovered_max_context,
                     state_out=call_state,
                     cancel_check=cancel_check if callable(cancel_check) else None,
@@ -3346,6 +3595,10 @@ def run_tester_session(
                 _emit("tester_reasoning", {"runKey": run_key, "text": tester_thinking})
 
             tool_calls = msg.get("tool_calls") or []
+            log(
+                f"Тестировщик [{run_key}] шаг {steps}: ответ модели за {time.monotonic() - llm_t0:.2f}с "
+                f"(reason={len(reasoning)}, content={len(content)}, tools={[str((c.get('function') or {}).get('name') or '') for c in tool_calls]}, tok={step_usage['total']})"
+            )
             if not tool_calls and not step_forced_no_tools:
                 parsed = parse_text_tool_call(content)
                 if not parsed and not content.strip() and reasoning:
@@ -3374,7 +3627,16 @@ def run_tester_session(
                     and steps < steps_cap
                 ):
                     empty_reply_nudges += 1
-                    _emit("tester_status", {"runKey": run_key, "text": "Тестировщик: фиксирую итоговый отчёт…"})
+                    _emit(
+                        "tester_status",
+                        {
+                            "runKey": run_key,
+                            "text": "Тестировщик: фиксирую итоговый отчёт…",
+                            "source": "tester_llm",
+                            "actor": "tester_llm",
+                            "step": steps,
+                        },
+                    )
                     tester_messages.append({"role": "assistant", "content": "(рассуждения завершены)"})
                     tester_messages.append(
                         {
@@ -3402,12 +3664,16 @@ def run_tester_session(
                 else:
                     t_args = _parse_json_dict_relaxed(str(raw_args)) or {}
 
+                cid = str(call.get("id") or f"tcall_{steps}_{idx}")
+                tool_label = _format_tool_target_label(t_name, t_args if isinstance(t_args, dict) else {})
+                is_browser_tool = t_name in ("browse_project", "qa_browser_audit")
+                t_started = time.monotonic()
+                t_failed = False
+
                 if t_name in ("call_tester", "confirm_minor_fixes"):
                     t_res, t_events = "Инструмент недоступен внутри Тестировщика — используй QA-инструменты и qa_submit_report.", []
                 else:
-                    is_browser_tool = t_name in ("browse_project", "qa_browser_audit")
                     tester_browser_trace: List[str] = []
-                    t_started = time.monotonic()
 
                     def _on_tester_tool_status(msg_s: str) -> None:
                         if not msg_s:
@@ -3422,18 +3688,52 @@ def run_tester_session(
                                     "runKey": run_key,
                                     "text": msg_s,
                                     "source": "browser_inspector",
+                                    "actor": "browser_inspector",
                                     "tool": t_name,
+                                    "step": steps,
                                 },
                             )
                         else:
-                            _emit("tester_status", {"runKey": run_key, "text": msg_s})
+                            _emit(
+                                "tester_status",
+                                {
+                                    "runKey": run_key,
+                                    "text": msg_s,
+                                    "source": "tester_tool",
+                                    "actor": "tester_tool",
+                                    "tool": t_name,
+                                    "step": steps,
+                                },
+                            )
 
+                    log(f"Тестировщик [{run_key}] шаг {steps}: инструмент {t_name} ({tool_label})")
                     _emit(
                         "tester_status",
                         {
                             "runKey": run_key,
-                            "text": f"Тестировщик: {t_name}…",
-                            **({"source": "browser_inspector", "tool": t_name} if is_browser_tool else {}),
+                            "text": (
+                                f"BrowserInspector: {tool_label}…"
+                                if is_browser_tool
+                                else f"Тестировщик (шаг {steps}): {tool_label}…"
+                            ),
+                            "source": "browser_inspector" if is_browser_tool else "tester_tool",
+                            "actor": "browser_inspector" if is_browser_tool else "tester_tool",
+                            "tool": t_name,
+                            "step": steps,
+                        },
+                    )
+                    _emit(
+                        "tester_action",
+                        {
+                            "runKey": run_key,
+                            "action": {
+                                "type": "tester_tool",
+                                "callId": cid,
+                                "step": steps,
+                                "tool": t_name,
+                                "label": tool_label,
+                                "status": "running",
+                            },
                         },
                     )
                     try:
@@ -3453,6 +3753,7 @@ def run_tester_session(
                             cancel_check=cancel_check if callable(cancel_check) else None,
                         )
                     except AgentError as error:
+                        t_failed = True
                         if callable(cancel_check) and cancel_check():
                             run_error = "Клиент закрыл соединение"
                             raise BrokenPipeError from error
@@ -3485,6 +3786,7 @@ def run_tester_session(
                     except BrokenPipeError:
                         raise
                     except Exception as error:  # noqa: BLE001
+                        t_failed = True
                         log(f"сбой QA-инструмента {t_name}: {traceback.format_exc()}")
                         if is_browser_tool:
                             err_trace = list(getattr(error, "trace", None) or []) or list(tester_browser_trace)
@@ -3513,6 +3815,13 @@ def run_tester_session(
                         else:
                             t_res, t_events = f"Внутренний сбой QA-инструмента {t_name}: {error}", []
 
+                elapsed_ms = int((time.monotonic() - t_started) * 1000)
+                log(
+                    f"Тестировщик [{run_key}] шаг {steps}: инструмент {t_name} завершён за {elapsed_ms}мс "
+                    f"(events={len(t_events)}, error={t_failed})"
+                )
+
+                emitted_non_file = False
                 for ev in t_events:
                     img = ev.pop("_image", None)
                     if isinstance(img, str) and img.startswith("data:image/"):
@@ -3531,12 +3840,39 @@ def run_tester_session(
                             }
                         )
                     else:
-                        tester_actions.append(
-                            {k: v for k, v in ev.items() if k != "preview"}
+                        emitted_non_file = True
+                        enriched = (
+                            {
+                                **ev,
+                                "callId": cid,
+                                "step": steps,
+                                "tool": ev.get("tool") or t_name,
+                                "durationMs": elapsed_ms,
+                            }
                             if isinstance(ev, dict)
                             else ev
                         )
-                        _emit("tester_action", {"runKey": run_key, "action": ev})
+                        tester_actions.append(
+                            {k: v for k, v in enriched.items() if k != "preview"}
+                            if isinstance(enriched, dict)
+                            else enriched
+                        )
+                        _emit("tester_action", {"runKey": run_key, "action": enriched})
+
+                if not emitted_non_file:
+                    synth_ev: Dict[str, Any] = {
+                        "type": "tester_tool",
+                        "callId": cid,
+                        "step": steps,
+                        "tool": t_name,
+                        "label": tool_label,
+                        "status": "error" if t_failed else "ok",
+                        "summary": _summarize_tool_output(t_res, is_error=t_failed),
+                        "durationMs": elapsed_ms,
+                        **({"error": _summarize_tool_output(t_res, is_error=True)} if t_failed else {}),
+                    }
+                    tester_actions.append(synth_ev)
+                    _emit("tester_action", {"runKey": run_key, "action": synth_ev})
 
                 if is_browser_tool:
                     browser_inspector._browser_log(
@@ -3548,12 +3884,13 @@ def run_tester_session(
                             "runKey": run_key,
                             "text": f"BrowserInspector завершил шаг ({t_name}) — передаю данные Тестировщику…",
                             "source": "browser_inspector",
+                            "actor": "tester",
                             "tool": t_name,
+                            "step": steps,
                             "done": True,
                         },
                     )
 
-                cid = str(call.get("id") or f"tcall_{steps}_{idx}")
                 assistant_calls.append(
                     {
                         "id": cid,
@@ -3646,7 +3983,16 @@ def run_tester_session(
             report["status"] = "error"
             report["summary"] = run_error
 
-    _emit("tester_status", {"runKey": run_key, "text": "Тестировщик: завершаю и передаю данные Агенту…"})
+    _emit(
+        "tester_status",
+        {
+            "runKey": run_key,
+            "text": "Тестировщик: завершаю и передаю данные Агенту…",
+            "source": "tester",
+            "actor": "tester",
+            "done": True,
+        },
+    )
 
     critical_issues = list(report.get("criticalIssues") or [])
     minor_issues = list(report.get("minorIssues") or [])
@@ -3663,6 +4009,10 @@ def run_tester_session(
         "total": tester_usage_total,
         "model": model or MODEL,
     }
+    log(
+        f"Тестировщик [{run_key}] финиш: status={status}, steps={steps}, "
+        f"actions={len(tester_actions)}, crit={len(critical_issues)}, minor={len(minor_issues)}, tok={tester_usage_total}"
+    )
 
     # Сначала закрываем прогон Тестировщика в БД и убираем спиннер в UI, затем спрашиваем решение по мелким правкам.
     done_payload = {
@@ -3677,8 +4027,8 @@ def run_tester_session(
         "model": model or MODEL,
         "fullResponse": tester_final_text or report_summary,
         "reasoning": tester_thinking,
-        "actions": tester_actions[:50],
-        "files": tester_files[:20],
+        "actions": tester_actions[:120],
+        "files": tester_files[:30],
         "error": run_error,
         "usage": usage_out,
     }
@@ -5109,7 +5459,28 @@ class Handler(BaseHTTPRequestHandler):
                     self.write(sse({"text": "Достигнут лимит токенов на прогон"}, "status"))
                     break
                 steps += 1
-                self.write(sse({"text": "Думаю…" if steps == 1 else f"Шаг {steps}: уточняю план…"}, "status"))
+                role_label = "Тестировщик" if agent_role == "tester" else "Агент"
+                llm_actor = "tester_llm" if agent_role == "tester" else "agent_llm"
+                self.write(
+                    sse(
+                        {
+                            "text": (
+                                f"Тестировщик: шаг {steps} — жду ответ модели…"
+                                if agent_role == "tester"
+                                else ("Думаю…" if steps == 1 else f"Шаг {steps}: уточняю план…")
+                            ),
+                            "source": llm_actor,
+                            "actor": llm_actor,
+                            "step": steps,
+                        },
+                        "status",
+                    )
+                )
+                llm_started = time.monotonic()
+                log(
+                    f"{role_label} шаг {steps}: запрос к модели "
+                    f"(msgs={len(messages)}, imgs={_count_message_images(messages)})"
+                )
 
                 def _emit_live_reasoning(step_reasoning: str) -> None:
                     combined = ((thinking + "\n\n" if thinking else "") + step_reasoning).strip()
@@ -5136,7 +5507,17 @@ class Handler(BaseHTTPRequestHandler):
                             params,
                             on_reasoning=_emit_live_reasoning,
                             on_text=_emit_live_text,
-                            on_status=lambda msg_s: self.write(sse({"text": msg_s}, "status")),
+                            on_status=lambda msg_s: self.write(
+                                sse(
+                                    {
+                                        "text": f"{role_label} (шаг {steps}): {msg_s}" if agent_role == "tester" else msg_s,
+                                        "source": llm_actor,
+                                        "actor": llm_actor,
+                                        "step": steps,
+                                    },
+                                    "status",
+                                )
+                            ),
                             context_limit=discovered_max_context,
                             state_out=call_state,
                             cancel_check=_is_disconnected,
@@ -5203,6 +5584,11 @@ class Handler(BaseHTTPRequestHandler):
                     thinking += ("\n\n" if thinking else "") + reasoning
                     self.write(sse({"text": thinking}, "reasoning"))
                 tool_calls = message.get("tool_calls") or []
+                log(
+                    f"{role_label} шаг {steps}: ответ модели за {time.monotonic() - llm_started:.2f}с "
+                    f"(reason={len(reasoning)}, content={len(content)}, "
+                    f"tools={[str((c.get('function') or {}).get('name') or '') for c in tool_calls]}, tok={step_usage['total']})"
+                )
 
                 if not tool_calls and not step_forced_no_tools:
                     parsed = parse_text_tool_call(content)
@@ -5233,7 +5619,17 @@ class Handler(BaseHTTPRequestHandler):
                         and (steps_limit == 0 or steps < steps_limit)
                     ):
                         direct_empty_reply_nudges += 1
-                        self.write(sse({"text": "Тестировщик: фиксирую итоговый отчёт…"}, "status"))
+                        self.write(
+                            sse(
+                                {
+                                    "text": "Тестировщик: фиксирую итоговый отчёт…",
+                                    "source": "tester_llm",
+                                    "actor": "tester_llm",
+                                    "step": steps,
+                                },
+                                "status",
+                            )
+                        )
                         messages.append({"role": "assistant", "content": "(рассуждения завершены)"})
                         messages.append(
                             {
@@ -5263,19 +5659,58 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         args = _parse_json_dict_relaxed(str(raw_args)) or {}
 
+                    call_id = str(call.get("id") or f"call_{steps}_{index}")
                     is_browser_tool = name in ("browse_project", "qa_browser_audit")
+                    is_tester_call = name == "call_tester"
+                    tool_label = _format_tool_target_label(name, args if isinstance(args, dict) else {})
                     browser_trace: List[str] = []
                     tool_started = time.monotonic()
+                    tool_failed = False
 
+                    tool_actor = (
+                        "browser_inspector"
+                        if is_browser_tool
+                        else ("tester" if is_tester_call else ("tester_tool" if agent_role == "tester" else "agent_tool"))
+                    )
+                    log(f"{role_label} шаг {steps}: инструмент {name} ({tool_label})")
                     self.write(
                         sse(
                             {
-                                "text": f"Вызываю инструмент: {name}…",
-                                **({"source": "browser_inspector", "tool": name} if is_browser_tool else {}),
+                                "text": (
+                                    f"BrowserInspector: {tool_label}…"
+                                    if is_browser_tool
+                                    else (
+                                        "Передаю задачу Тестировщику…"
+                                        if is_tester_call
+                                        else (
+                                            f"Тестировщик (шаг {steps}): {tool_label}…"
+                                            if agent_role == "tester"
+                                            else f"Вызываю инструмент: {name}…"
+                                        )
+                                    )
+                                ),
+                                "source": tool_actor,
+                                "actor": tool_actor,
+                                "step": steps,
+                                **({"tool": name} if (is_browser_tool or agent_role == "tester") else {}),
                             },
                             "status",
                         )
                     )
+                    if agent_role == "tester":
+                        self.write(
+                            sse(
+                                {
+                                    "type": "tester_tool",
+                                    "callId": call_id,
+                                    "step": steps,
+                                    "tool": name,
+                                    "label": tool_label,
+                                    "status": "running",
+                                },
+                                "action",
+                            )
+                        )
 
                     def _on_tool_status(msg_text: str) -> None:
                         if not msg_text:
@@ -5285,9 +5720,13 @@ class Handler(BaseHTTPRequestHandler):
                             if not browser_trace or browser_trace[-1] != line:
                                 browser_trace.append(line)
                         if not _is_disconnected():
-                            payload: Dict[str, Any] = {"text": msg_text}
-                            if is_browser_tool:
-                                payload["source"] = "browser_inspector"
+                            payload: Dict[str, Any] = {
+                                "text": msg_text,
+                                "source": tool_actor,
+                                "actor": tool_actor,
+                                "step": steps,
+                            }
+                            if is_browser_tool or agent_role == "tester":
                                 payload["tool"] = name
                             self._safe_write(sse(payload, "status"))
 
@@ -5310,6 +5749,7 @@ class Handler(BaseHTTPRequestHandler):
                                 cancel_check=_is_disconnected,
                             )
                     except AgentError as error:
+                        tool_failed = True
                         if _is_disconnected():
                             raise BrokenPipeError from error
                         if is_browser_tool:
@@ -5341,6 +5781,7 @@ class Handler(BaseHTTPRequestHandler):
                     except BrokenPipeError:
                         raise
                     except Exception as error:  # noqa: BLE001
+                        tool_failed = True
                         log(f"сбой инструмента {name}: {traceback.format_exc()}")
                         if is_browser_tool:
                             err_trace = list(getattr(error, "trace", None) or []) or list(browser_trace)
@@ -5371,6 +5812,13 @@ class Handler(BaseHTTPRequestHandler):
                     if _is_disconnected():
                         raise BrokenPipeError
 
+                    elapsed_ms = int((time.monotonic() - tool_started) * 1000)
+                    log(
+                        f"{role_label} шаг {steps}: инструмент {name} завершён за {elapsed_ms}мс "
+                        f"(events={len(events)}, error={tool_failed})"
+                    )
+
+                    emitted_non_file = False
                     for event in events:
                         img = event.pop("_image", None)
                         if isinstance(img, str) and img.startswith("data:image/"):
@@ -5391,15 +5839,44 @@ class Handler(BaseHTTPRequestHandler):
                                         "size": int(event.get("size") or 0),
                                     }
                                 )
+                            self.write(sse(event, "action"))
                         else:
+                            emitted_non_file = True
                             actions += 1
+                            out_ev = (
+                                {
+                                    **event,
+                                    "callId": call_id,
+                                    "step": steps,
+                                    "tool": event.get("tool") or name,
+                                    "durationMs": elapsed_ms,
+                                }
+                                if agent_role == "tester" and isinstance(event, dict)
+                                else event
+                            )
                             if agent_role == "tester":
                                 direct_actions_log.append(
-                                    {k: v for k, v in event.items() if k != "preview"}
-                                    if isinstance(event, dict)
-                                    else event
+                                    {k: v for k, v in out_ev.items() if k != "preview"}
+                                    if isinstance(out_ev, dict)
+                                    else out_ev
                                 )
-                        self.write(sse(event, "action"))
+                            self.write(sse(out_ev, "action"))
+
+                    if agent_role == "tester" and not emitted_non_file:
+                        actions += 1
+                        synth_ev: Dict[str, Any] = {
+                            "type": "tester_tool",
+                            "callId": call_id,
+                            "step": steps,
+                            "tool": name,
+                            "label": tool_label,
+                            "status": "error" if tool_failed else "ok",
+                            "summary": _summarize_tool_output(result_text, is_error=tool_failed),
+                            "durationMs": elapsed_ms,
+                            **({"error": _summarize_tool_output(result_text, is_error=True)} if tool_failed else {}),
+                        }
+                        direct_actions_log.append(synth_ev)
+                        self.write(sse(synth_ev, "action"))
 
                     if is_browser_tool:
                         target_label = "Тестировщику" if agent_role == "tester" else "Агенту"
@@ -5411,14 +5888,28 @@ class Handler(BaseHTTPRequestHandler):
                                 {
                                     "text": f"BrowserInspector завершил шаг ({name}) — передаю данные {target_label}…",
                                     "source": "browser_inspector",
+                                    "actor": "tester" if agent_role == "tester" else "agent",
                                     "tool": name,
+                                    "step": steps,
+                                    "done": True,
+                                },
+                                "status",
+                            )
+                        )
+                    elif is_tester_call:
+                        self.write(
+                            sse(
+                                {
+                                    "text": "Тестировщик завершил проверку — основной Агент анализирует итоги…",
+                                    "source": "tester",
+                                    "actor": "agent",
+                                    "step": steps,
                                     "done": True,
                                 },
                                 "status",
                             )
                         )
 
-                    call_id = str(call.get("id") or f"call_{steps}_{index}")
                     assistant_calls.append(
                         {
                             "id": call_id,
@@ -5545,8 +6036,8 @@ class Handler(BaseHTTPRequestHandler):
                         "model": model or MODEL,
                         "fullResponse": final_text,
                         "reasoning": thinking,
-                        "actions": direct_actions_log[:50],
-                        "files": direct_files_log[:20],
+                        "actions": direct_actions_log[:120],
+                        "files": direct_files_log[:30],
                         "skipUsageRecord": True,
                         "usage": {
                             "prompt": usage_prompt,

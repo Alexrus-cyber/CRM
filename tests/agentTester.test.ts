@@ -322,4 +322,126 @@ describe("Tester sub-agent DB, token isolation & API orchestration", () => {
     const userMsgsCount = msgsInDirect.filter((m) => m.role === "user").length;
     expect(userMsgsCount).toBe(1);
   });
+
+  it("обогащает action (tester_report) полями runId/testerConversationId, сохраняет до 120 actions и чистит base64 в messages API", async () => {
+    const agentChat = await repo.createAgentConversation(userA, "agent", "Обогащение и действия");
+    const encoder = new TextEncoder();
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                `event: tester_start\ndata: ${JSON.stringify({
+                  runKey: "rk-enrich",
+                  sandboxProject: "portal",
+                  summary: "Проверка портала",
+                  model: "gpt-test",
+                })}\n\n`,
+              ),
+            );
+            controller.enqueue(
+              encoder.encode(
+                `event: action\ndata: ${JSON.stringify({
+                  type: "tester_report",
+                  runKey: "rk-enrich",
+                  sandboxProject: "portal",
+                  status: "passed",
+                  reportSummary: "Ок",
+                  criticalCount: 0,
+                  minorCount: 0,
+                })}\n\n`,
+              ),
+            );
+            controller.enqueue(
+              encoder.encode(
+                `event: tester_done\ndata: ${JSON.stringify({
+                  runKey: "rk-enrich",
+                  sandboxProject: "portal",
+                  status: "passed",
+                  reportSummary: "Ок",
+                  actions: Array.from({ length: 85 }, (_, idx) => ({
+                    type: "tester_tool",
+                    tool: "code_search",
+                    label: `Поиск #${idx + 1}`,
+                    status: "ok",
+                  })),
+                })}\n\n`,
+              ),
+            );
+            controller.enqueue(encoder.encode('event: text\ndata: {"text":"Готово"}\n\n'));
+            controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
+            controller.close();
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      }),
+    );
+
+    const agentRoute = await import("@/app/api/ai/agent/route");
+    const res = await agentRoute.POST(
+      new Request("http://localhost/api/ai/agent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agentRole: "agent",
+          agentConversationId: agentChat.id,
+          messages: [{ role: "user", content: "Проверь портал" }],
+        }),
+      }),
+    );
+    const sseText = await res.text();
+    const actionLine = sseText
+      .split("\n\n")
+      .find((f) => f.includes("event: action") && f.includes("tester_report"));
+    expect(actionLine).toBeTruthy();
+    const actionJson = JSON.parse(actionLine!.split("\n").find((l) => l.startsWith("data:"))!.slice(5)) as {
+      runId?: number;
+      testerConversationId?: number;
+    };
+    expect(typeof actionJson.runId).toBe("number");
+    expect(typeof actionJson.testerConversationId).toBe("number");
+
+    const qaMsgs = await repo.listAgentConversationMessages(actionJson.testerConversationId!);
+    const assistantMsg = qaMsgs.find((m) => m.role === "assistant");
+    expect(Array.isArray(assistantMsg?.actions)).toBe(true);
+    expect(assistantMsg?.actions?.length).toBe(85);
+
+    // POST /api/agent/conversations/[id]/messages сохраняет безопасные actions без base64 и валидирует open_url
+    const msgRoute = await import("@/app/api/agent/conversations/[id]/messages/route");
+    const postMsgRes = await msgRoute.POST(
+      new Request(`http://localhost/api/agent/conversations/${agentChat.id}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          role: "assistant",
+          content: "Итог",
+          actions: [
+            { type: "open_url", url: "https://example.com/ok", label: "Safe", autoplay: false },
+            { type: "open_url", url: "javascript:alert(1)", label: "Evil", autoplay: false },
+            {
+              type: "browser_inspect",
+              action: "open",
+              summary: "ok",
+              preview: "data:image/jpeg;base64,HUGE",
+            },
+            { type: "tester_tool", tool: "sandbox_read_file", label: "Чтение", status: "ok" },
+            { type: "unknown_evil_type", foo: "bar" },
+          ],
+        }),
+      }),
+      { params: Promise.resolve({ id: String(agentChat.id) }) },
+    );
+    expect(postMsgRes.status).toBe(200);
+    const savedPayload = (await postMsgRes.json()) as {
+      message: { actions: Array<Record<string, unknown>> };
+    };
+    expect(savedPayload.message.actions).toHaveLength(3);
+    expect(savedPayload.message.actions[0]?.type).toBe("open_url");
+    expect(savedPayload.message.actions[1]?.type).toBe("browser_inspect");
+    expect(savedPayload.message.actions[1]).not.toHaveProperty("preview");
+    expect(savedPayload.message.actions[2]?.type).toBe("tester_tool");
+  });
 });
