@@ -10,6 +10,11 @@ const PUBLIC_API_PREFIXES = [
   "/api/agent/bot/",
 ];
 
+const SANDBOX_PREVIEW_PREFIXES = [
+  "/api/ai/agent/sandbox/preview",
+  "/api/ai/agent/sandbox/proxy",
+];
+
 const PROTECTED_PAGE_PREFIXES = [
   "/dashboard",
   "/tasks",
@@ -68,6 +73,10 @@ export function proxy(req: NextRequest) {
     const hasAuthHeader = Boolean(req.headers.get("authorization")?.trim());
     if (!hasCookie && !hasAuthHeader) {
       return attachCsp(NextResponse.json({ error: "Unauthorized" }, { status: 401 }));
+    }
+    // Роуты предпросмотра Sandbox отдают пользовательский HTML/JS со своей изолированной CSP.
+    if (SANDBOX_PREVIEW_PREFIXES.some((prefix) => pathname.startsWith(prefix))) {
+      return NextResponse.next();
     }
     return attachCsp(NextResponse.next());
   }

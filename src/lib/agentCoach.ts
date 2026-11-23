@@ -1,7 +1,8 @@
 import { aiAuthHeaders, aiEndpoint, normalizeBaseUrl, type ReasoningMode } from "@/lib/ai";
+import { fetchAgent, resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { applyGenParams, normalizeGenParams, type GenParams } from "@/lib/genParams";
 import { findTaskMode, type OperatorTaskMode } from "@/lib/operatorModes";
-import { assertSafeAgentUrl, safeAiFetch } from "@/lib/ssrf";
+import { safeAiFetch } from "@/lib/ssrf";
 
 export type CoachInput = {
   agentUrl: string;
@@ -140,33 +141,37 @@ export async function requestAgentStepCoaching(input: CoachInput): Promise<Coach
 
   // 1. Сначала пробуем обратиться напрямую к работающему процессу Агента (`agent/agent.py /coach`).
   try {
-    const safeAgentBase = assertSafeAgentUrl(input.agentUrl).toString().replace(/\/+$/, "");
-    const res = await fetch(`${safeAgentBase}/coach`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        taskPrompt: input.taskPrompt,
-        taskMode: input.taskMode,
-        phase,
-        step: input.step,
-        ...(input.plannedAction !== undefined ? { plannedAction: input.plannedAction } : {}),
-        ...(input.aimPoint ? { aimPoint: input.aimPoint } : {}),
-        lastAction: input.lastAction ?? null,
-        lastResult: resultStr,
-        observation: obsStr,
-        userHint: userHintStr,
-        ...(cursorCtxStr ? { cursorContext: cursorCtxStr } : {}),
-        ...(input.cursorCrop ? { cursorCrop: input.cursorCrop } : {}),
-        repeatStreak,
-        failedChecks,
-        params: input.params ?? resolvedParams,
-        history: (input.history ?? []).slice(-10),
-        ...(input.screenshot ? { screenshot: input.screenshot } : {}),
-        ...(input.settings ? { settings: input.settings } : {}),
-      }),
-      cache: "no-store",
-      signal: AbortSignal.timeout(15_000),
-    });
+    const safeAgentBase = resolveSafeAgentUrl(input.agentUrl);
+    const { response: res } = await fetchAgent(
+      safeAgentBase,
+      "/coach",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          taskPrompt: input.taskPrompt,
+          taskMode: input.taskMode,
+          phase,
+          step: input.step,
+          ...(input.plannedAction !== undefined ? { plannedAction: input.plannedAction } : {}),
+          ...(input.aimPoint ? { aimPoint: input.aimPoint } : {}),
+          lastAction: input.lastAction ?? null,
+          lastResult: resultStr,
+          observation: obsStr,
+          userHint: userHintStr,
+          ...(cursorCtxStr ? { cursorContext: cursorCtxStr } : {}),
+          ...(input.cursorCrop ? { cursorCrop: input.cursorCrop } : {}),
+          repeatStreak,
+          failedChecks,
+          params: input.params ?? resolvedParams,
+          history: (input.history ?? []).slice(-10),
+          ...(input.screenshot ? { screenshot: input.screenshot } : {}),
+          ...(input.settings ? { settings: input.settings } : {}),
+        }),
+        cache: "no-store",
+      },
+      { timeoutMs: 15_000 },
+    );
     if (res.ok) {
       const data = (await res.json()) as {
         ok?: boolean;

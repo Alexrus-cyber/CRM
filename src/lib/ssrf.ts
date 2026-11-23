@@ -117,10 +117,11 @@ export async function assertSafeAiUrl(rawUrl: string): Promise<URL> {
     if (err instanceof Error && err.message.includes("запрещ")) {
       throw err;
     }
-    // Если локальный офлайн-хост без DNS (например внутренний Docker-сервис), не падаем на EAI_AGAIN,
-    // но явные DNS-записи с link-local IP уже отфильтрованы выше.
+    // Если локальный офлайн-хост без DNS (например внутренний Docker-сервис или mDNS .local),
+    // не падаем на временном отсутствии DNS — явные link-local IP уже отфильтрованы выше.
     const code = (err as { code?: string })?.code;
-    if (code && code !== "ENOTFOUND" && code !== "EAI_AGAIN") {
+    const isLocalName = host.endsWith(".local") || host.endsWith(".lan") || !host.includes(".");
+    if (code && code !== "ENOTFOUND" && code !== "EAI_AGAIN" && !(isLocalName && code === "ETIMEOUT")) {
       throw new Error("Ошибка DNS-проверки адреса");
     }
   }
@@ -152,7 +153,9 @@ export function assertSafeAgentUrl(rawUrl: string): URL {
   }
   const allowRemote = process.env.CRM_ALLOW_REMOTE_AGENT === "1";
   if (!allowRemote && !isLoopbackHostname(host)) {
-    throw new Error("AGENT_URL должен указывать на локальный хост (127.0.0.1 / localhost)");
+    throw new Error(
+      "AGENT_URL должен указывать на локальный хост (127.0.0.1 / localhost). Для подключения агента по локальной сети (LAN) задайте CRM_ALLOW_REMOTE_AGENT=1.",
+    );
   }
   if (url.port) {
     const port = Number(url.port);

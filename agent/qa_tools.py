@@ -594,6 +594,11 @@ def run_qa_http_audit(
         if not target.exists():
             raise QaToolError(f"Проект в Sandbox не найден: {rel}")
         serve_dir = target.parent if target.is_file() else target
+        if target.is_dir() and not (serve_dir / "index.html").is_file():
+            for sub_name in ("dist", "build", "public", "out"):
+                if (serve_dir / sub_name / "index.html").is_file():
+                    serve_dir = serve_dir / sub_name
+                    break
         temp_srv, _, clean_url = _serve_static_temp(serve_dir)
         if not routes and target.is_file():
             routes = [f"/{target.name}"]
@@ -640,11 +645,9 @@ def run_qa_http_audit(
             started = time.monotonic()
             try:
                 req = urllib.request.Request(full_url, data=req_data, headers=req_headers, method=req_method)
-                parsed_full = urlparse(full_url)
-                host_low = (parsed_full.hostname or "").strip().lower().strip("[]")
                 open_fn = (
                     _LOCAL_HTTP_OPENER.open
-                    if host_low in ("127.0.0.1", "localhost", "::1")
+                    if browser_inspector.is_local_url(full_url)
                     else urllib.request.urlopen
                 )
                 with open_fn(req, timeout=req_timeout) as resp:

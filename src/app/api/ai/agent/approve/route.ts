@@ -1,6 +1,6 @@
 import { getAgentTask } from "@/db/repo";
 import { consumeAgentApproval, peekAgentApproval } from "@/lib/agentApprovals";
-import { resolveSafeAgentUrl } from "@/lib/agentConfig";
+import { fetchAgent, resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 
@@ -68,38 +68,42 @@ export async function POST(req: Request) {
     rawScreenshot.startsWith("data:image/") && rawScreenshot.length <= 2_800_000 ? rawScreenshot : "";
 
   try {
-    const upstream = await fetch(`${agentUrl}/approve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        approvalId,
-        ...(checked.nonce ? { nonce: checked.nonce } : {}),
-        approved: Boolean(body?.approved),
-        approverUserId: me.id,
-        note: typeof body?.note === "string" ? body.note.slice(0, 500) : "",
-        destination: typeof body?.destination === "string" ? body.destination.slice(0, 500) : "",
-        ...(Number.isFinite(body?.taskId) ? { taskId: Number(body?.taskId) } : {}),
-        ...(typeof body?.taskPrompt === "string" ? { taskPrompt: body.taskPrompt.slice(0, 4000) } : {}),
-        ...(typeof body?.mode === "string" ? { mode: body.mode.slice(0, 40) } : {}),
-        ...(typeof body?.coachMode === "string" ? { coachMode: body.coachMode.slice(0, 40) } : {}),
-        ...(typeof body?.operatorTrustLevel === "string"
-          ? { operatorTrustLevel: body.operatorTrustLevel.slice(0, 20) }
-          : {}),
-        ...(validScreenshot ? { screenshot: validScreenshot } : {}),
-        ...(typeof body?.screenSummary === "string"
-          ? { screenSummary: body.screenSummary.slice(0, 8000) }
-          : {}),
-        ...(typeof body?.commitMessage === "string"
-          ? { commitMessage: body.commitMessage.slice(0, 1000) }
-          : {}),
-        ...(typeof body?.branch === "string" ? { branch: body.branch.slice(0, 200) } : {}),
-        ...(typeof body?.prTitle === "string" ? { prTitle: body.prTitle.slice(0, 300) } : {}),
-        ...(typeof body?.prBody === "string" ? { prBody: body.prBody.slice(0, 8000) } : {}),
-        ...(typeof body?.mergeMethod === "string" ? { mergeMethod: body.mergeMethod.slice(0, 20) } : {}),
-      }),
-      cache: "no-store",
-      signal: AbortSignal.timeout(10_000),
-    });
+    const { response: upstream } = await fetchAgent(
+      agentUrl,
+      "/approve",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          approvalId,
+          ...(checked.nonce ? { nonce: checked.nonce } : {}),
+          approved: Boolean(body?.approved),
+          approverUserId: me.id,
+          note: typeof body?.note === "string" ? body.note.slice(0, 500) : "",
+          destination: typeof body?.destination === "string" ? body.destination.slice(0, 500) : "",
+          ...(Number.isFinite(body?.taskId) ? { taskId: Number(body?.taskId) } : {}),
+          ...(typeof body?.taskPrompt === "string" ? { taskPrompt: body.taskPrompt.slice(0, 4000) } : {}),
+          ...(typeof body?.mode === "string" ? { mode: body.mode.slice(0, 40) } : {}),
+          ...(typeof body?.coachMode === "string" ? { coachMode: body.coachMode.slice(0, 40) } : {}),
+          ...(typeof body?.operatorTrustLevel === "string"
+            ? { operatorTrustLevel: body.operatorTrustLevel.slice(0, 20) }
+            : {}),
+          ...(validScreenshot ? { screenshot: validScreenshot } : {}),
+          ...(typeof body?.screenSummary === "string"
+            ? { screenSummary: body.screenSummary.slice(0, 8000) }
+            : {}),
+          ...(typeof body?.commitMessage === "string"
+            ? { commitMessage: body.commitMessage.slice(0, 1000) }
+            : {}),
+          ...(typeof body?.branch === "string" ? { branch: body.branch.slice(0, 200) } : {}),
+          ...(typeof body?.prTitle === "string" ? { prTitle: body.prTitle.slice(0, 300) } : {}),
+          ...(typeof body?.prBody === "string" ? { prBody: body.prBody.slice(0, 8000) } : {}),
+          ...(typeof body?.mergeMethod === "string" ? { mergeMethod: body.mergeMethod.slice(0, 20) } : {}),
+        }),
+        cache: "no-store",
+      },
+      { timeoutMs: 10_000, reqSignal: req.signal },
+    );
     const data = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
     if (upstream.ok || upstream.status === 404 || upstream.status === 403) {
       consumeAgentApproval(approvalId, me.id);

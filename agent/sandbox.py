@@ -313,7 +313,11 @@ def list_tree(root: Path, rel_path: str = ".", *, unlimited: bool = False) -> Di
                     file_count += len(fnames)
                     if not unlimited and file_count >= 2000:
                         break
-                projects.append({"name": child.name, "files": file_count})
+                has_index = any(
+                    (child / sub).is_file()
+                    for sub in ("index.html", "dist/index.html", "build/index.html", "public/index.html", "out/index.html")
+                ) or any(p.is_file() for p in child.glob("*.html"))
+                projects.append({"name": child.name, "files": file_count, "hasIndex": has_index})
 
     if base.is_file():
         entries, walk_truncated = [base], False
@@ -683,20 +687,45 @@ class ProcessManager:
             dead = [pid for pid, info in self._procs.items() if info["proc"].poll() is not None]
             for pid in dead:
                 self._procs.pop(pid, None)
-            return [
-                {
+            result: List[Dict[str, Any]] = []
+            for pid, info in self._procs.items():
+                if not info.get("url"):
+                    late_out = "\n".join(info.get("lines") or [])
+                    detected = _detect_local_url(info.get("command", ""), late_out)
+                    if detected:
+                        info["url"] = detected
+                url = str(info.get("url") or "")
+                port = extract_port_from_url(url)
+                result.append({
                     "pid": pid,
                     "command": info["command"],
                     "cwd": info["cwd"],
-                    "url": info["url"],
+                    "url": url,
+                    "port": port,
+                    "alive": True,
                     "startedAt": info["startedAt"],
-                }
-                for pid, info in self._procs.items()
-            ]
+                })
+            return result
+
+    def allowed_ports(self) -> set[int]:
+        ports: set[int] = set()
+        for item in self.list():
+            port = item.get("port")
+            if isinstance(port, int) and 1 <= port <= 65535:
+                ports.add(port)
+        return ports
+
+
+def extract_port_from_url(url: str) -> Optional[int]:
+    match = re.match(r"^https?://(?:\[[^\]]+\]|[^:/]+):(\d{2,5})", str(url or "").strip())
+    if not match:
+        return None
+    port = int(match.group(1))
+    return port if 1 <= port <= 65535 else None
 
 
 def _detect_local_url(command: str, output: str) -> str:
-    match = re.search(r"https?://(?:127\.0\.0\.1|localhost|0\.0\.0\.0):(\d{2,5})", output or "")
+    match = re.search(r"https?://(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\]):(\d{2,5})", output or "")
     if match:
         return f"http://127.0.0.1:{match.group(1)}"
     # Подсказка из команды: `http.server 8123` или `--port 5173` или `PORT=3001`.

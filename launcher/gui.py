@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import tkinter as tk
+import urllib.parse
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -678,14 +679,22 @@ class LauncherApp:
         limits = crm_client.profile_limits(profile)
         op = profile.get("operator") if isinstance(profile.get("operator"), dict) else {}
 
-        # Автозаполнение сервера и персонального токена Оператора из CRM.
+        # Автозаполнение сервера и персонального токена Оператора из CRM (в LAN не затираем адрес CRM старым localhost).
         if op.get("serverUrl"):
-            self.settings.set_value("operator", "crm_server", str(op["serverUrl"]))
+            op_server = str(op["serverUrl"])
+            cur_crm = crm_client.normalize_server_url(self.settings.crm_url)
+            cur_host = urllib.parse.urlparse(cur_crm).hostname or ""
+            op_host = urllib.parse.urlparse(op_server).hostname or ""
+            if cur_crm and not crm_client._is_loopback_host(cur_host) and crm_client._is_loopback_host(op_host):
+                op_server = cur_crm
+            self.settings.set_value("operator", "crm_server", op_server)
+        else:
+            op_server = ""
         if op.get("token"):
             self.settings.set_value("operator", "crm_token", str(op["token"]))
         if self.spec.id == "operator":
-            if op.get("serverUrl") and "crm_server" in self.field_vars:
-                self.field_vars["crm_server"].set(str(op["serverUrl"]))
+            if op_server and "crm_server" in self.field_vars:
+                self.field_vars["crm_server"].set(op_server)
             if op.get("token") and "crm_token" in self.field_vars:
                 self.field_vars["crm_token"].set(str(op["token"]))
 

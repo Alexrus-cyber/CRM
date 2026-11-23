@@ -266,13 +266,27 @@ export function OperatorPanel({ unlimited = true }: { unlimited?: boolean } = {}
   // обновлении списка токенов.
   const appliedConnection = useRef<{ id: number | null; server: string }>({ id: null, server: "" });
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const origin = window.location.origin;
+    if (origin && !appliedConnection.current.server) {
+      setServer((prev) => (prev === "http://localhost:3000" ? origin : prev));
+    }
+  }, []);
+
   const onConnectionChange = useCallback((next: ConnectionSelection) => {
     setConnection(next);
     const applied = appliedConnection.current;
     const changed = applied.id !== next.connectionId || applied.server !== next.server;
     appliedConnection.current = { id: next.connectionId, server: next.server };
-    // Адрес CRM берём из подключения: команда должна смотреть в тот же сервер.
-    if (changed && next.server) setServer(next.server);
+    // Адрес CRM берём из подключения, но в LAN не затираем текущий origin старым localhost.
+    if (changed && next.server) {
+      const browserOrigin = typeof window !== "undefined" ? window.location.origin : "";
+      const nextIsLoopback = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:\d+)?$/i.test(next.server);
+      const browserIsLoopback =
+        !browserOrigin || /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:\d+)?$/i.test(browserOrigin);
+      setServer(nextIsLoopback && !browserIsLoopback ? browserOrigin : next.server);
+    }
   }, []);
 
   const fetchTasks = useCallback(async (): Promise<OperatorTask[] | null> => {

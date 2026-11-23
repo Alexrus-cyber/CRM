@@ -6,7 +6,7 @@ import {
   updateAgentConnection,
 } from "@/db/repo";
 import { hasOperatorAccess } from "@/lib/aiPolicy";
-import { getCurrentUser } from "@/lib/auth";
+import { getCurrentUser, resolveRequestOrigin } from "@/lib/auth";
 
 /**
  * Подключения бота-оператора: адрес CRM, с которым работает бот.
@@ -54,7 +54,7 @@ export async function POST(req: Request) {
 
   const body = (await req.json().catch(() => null)) as { name?: string; serverUrl?: string } | null;
   const name = cleanName(body?.name);
-  const fallback = new URL(req.url).origin;
+  const fallback = resolveRequestOrigin(req);
   const serverUrl = normalizeServerUrl(body?.serverUrl, fallback);
   if (!name) return Response.json({ error: "Укажите название подключения" }, { status: 400 });
   if (serverUrl === null) {

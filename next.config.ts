@@ -1,6 +1,8 @@
 import type { NextConfig } from "next";
 
-const isProd = process.env.NODE_ENV === "production";
+const enableHsts =
+  process.env.CRM_ENABLE_HSTS === "1" ||
+  (process.env.CRM_PUBLIC_URL ?? "").trim().toLowerCase().startsWith("https://");
 
 const securityHeaders = [
   { key: "X-Content-Type-Options", value: "nosniff" },
@@ -8,7 +10,7 @@ const securityHeaders = [
   { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
   { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },
   { key: "X-DNS-Prefetch-Control", value: "off" },
-  ...(isProd
+  ...(enableHsts
     ? [{ key: "Strict-Transport-Security", value: "max-age=31536000; includeSubDomains" }]
     : []),
 ];

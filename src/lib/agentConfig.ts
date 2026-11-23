@@ -99,4 +99,4 @@ export const AGENT_URL = (() => {
 })();
 
 export const AGENT_START_HINT =
-  "Запустите агента в папке проекта: python3 agent/agent.py (или задайте AGENT_URL на локальный порт)";
+  "Запустите агента на компьютере: python3 agent/agent.py (для доступа из локальной сети LAN / Docker задайте AGENT_HOST=0.0.0.0 и на сервере CRM: AGENT_URL + CRM_ALLOW_REMOTE_AGENT=1)";

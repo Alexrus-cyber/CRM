@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { resolveSafeAgentUrl } from "@/lib/agentConfig";
+import { fetchAgent, resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { getGithubConnectionWithSecret } from "@/db/repo";
 import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
@@ -59,21 +59,26 @@ export async function POST(req: Request) {
     let sandboxError = "";
     try {
       const agentUrl = resolveSafeAgentUrl();
-      const agentRes = await fetch(`${agentUrl}/github/sync`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: me.id,
-          login: conn.login,
-          name: conn.name,
-          email: conn.email,
-          token: conn.token,
-          owner,
-          repo,
-          branch,
-        }),
-        signal: AbortSignal.timeout(25_000),
-      });
+      const { response: agentRes } = await fetchAgent(
+        agentUrl,
+        "/github/sync",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            userId: me.id,
+            login: conn.login,
+            name: conn.name,
+            email: conn.email,
+            token: conn.token,
+            owner,
+            repo,
+            branch,
+          }),
+          cache: "no-store",
+        },
+        { timeoutMs: 25_000, reqSignal: req.signal },
+      );
       if (agentRes.ok) {
         const data = (await agentRes.json().catch(() => ({}))) as {
           ok?: boolean;
