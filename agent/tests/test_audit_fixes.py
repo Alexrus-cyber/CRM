@@ -27,6 +27,7 @@ for p in (str(AGENT_DIR), str(REPO_ROOT)):
 
 import agent as agent_mod  # noqa: E402
 import browser_inspector  # noqa: E402
+import code_tools  # noqa: E402
 import desktop_operator as operator_mod  # noqa: E402
 import fileforge  # noqa: E402
 import github_tools  # noqa: E402
@@ -167,10 +168,10 @@ class SecurityAndIsolationFixesTests(unittest.TestCase):
                 mock.patch("sandbox._terminate_proc_tree"),
             ):
                 for idx in range(sandbox_mod.MAX_BG_PROCESSES):
-                    pm.start(root, f"python3 -m http.server {8100 + idx}", owner="agent")
+                    pm.start(root, f'"{sys.executable}" -m http.server {8100 + idx}', owner="agent")
 
                 with self.assertRaises(sandbox_mod.SandboxError):
-                    pm.start(root, "python3 -m http.server 8999", owner="agent")
+                    pm.start(root, f'"{sys.executable}" -m http.server 8999', owner="agent")
 
                 reg_file = root / ".tmp" / ".crm_agent_procs.json"
                 self.assertTrue(reg_file.is_file())
@@ -182,7 +183,7 @@ class SecurityAndIsolationFixesTests(unittest.TestCase):
             # run_command raise_on_timeout=False возвращает exitCode=124 и timedOut=True
             res = sandbox_mod.run_command(
                 root,
-                'python3 -c "import time; time.sleep(5)"',
+                f'"{sys.executable}" -c "import time; time.sleep(5)"',
                 timeout=1,
                 raise_on_timeout=False,
             )
@@ -192,9 +193,48 @@ class SecurityAndIsolationFixesTests(unittest.TestCase):
             with self.assertRaises(sandbox_mod.SandboxError):
                 sandbox_mod.run_command(
                     root,
-                    'python3 -c "import time; time.sleep(5)"',
+                    f'"{sys.executable}" -c "import time; time.sleep(5)"',
                     timeout=1,
                 )
+
+    def test_windows_shell_argv_preserves_quotes_zip_bytes_sanitized_and_git_disables_fsmonitor(self) -> None:
+        # 1. На Windows _shell_argv строит сырую строку cmd.exe /s /c "...", не искажая вложенные кавычки через list2cmdline
+        with (
+            mock.patch.object(sandbox_mod.platform, "system", return_value="Windows"),
+            mock.patch.dict(os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}, clear=False),
+        ):
+            cmd = r'"E:\Python313\python.exe" -c "import time; time.sleep(10)"'
+            argv = sandbox_mod._shell_argv(cmd)
+            self.assertIsInstance(argv, str)
+            self.assertEqual(
+                argv,
+                r'C:\Windows\System32\cmd.exe /s /c ""E:\Python313\python.exe" -c "import time; time.sleep(10)""',
+            )
+
+        # 2. _zip_bytes санитизирует имена даже при внутреннем вызове
+        with self.assertRaises(fileforge.FileForgeError):
+            fileforge._zip_bytes({"../../evil.txt": "bad"})
+        raw = fileforge._zip_bytes({"/safe/inner.txt": "ok"})
+        with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+            self.assertEqual(zf.namelist(), ["safe/inner.txt"])
+
+        # 3. code_tools._run_argv отключает core.fsmonitor, gc.auto и optional locks для git
+        seen: dict[str, object] = {}
+
+        def _fake_tree_run(argv, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs.get("env") or {})
+            return 0, "ok", False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            with mock.patch.object(sandbox_mod, "run_subprocess_with_tree_timeout", side_effect=_fake_tree_run):
+                rc, out = code_tools._run_argv(["git", "status"], cwd=root, sandbox_root=root)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "ok")
+        self.assertIn("core.fsmonitor=false", seen["argv"])  # type: ignore[arg-type]
+        self.assertIn("gc.auto=0", seen["argv"])  # type: ignore[arg-type]
+        self.assertEqual(seen["env"].get("GIT_OPTIONAL_LOCKS"), "0")  # type: ignore[union-attr]
 
 
 class QaAndBrowserFixesTests(unittest.TestCase):

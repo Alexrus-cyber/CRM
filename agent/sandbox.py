@@ -32,7 +32,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 DEFAULT_SANDBOX_DIR = Path(__file__).resolve().parent / "sandbox"
@@ -560,9 +560,12 @@ def sanitized_env(root: Path, cwd: Path) -> Dict[str, str]:
     return env
 
 
-def _shell_argv(command: str) -> List[str]:
+def _shell_argv(command: str) -> Union[str, List[str]]:
     if platform.system() == "Windows":
-        return ["cmd", "/c", command]
+        comspec = (os.environ.get("COMSPEC") or "cmd.exe").strip() or "cmd.exe"
+        if " " in comspec and not (comspec.startswith('"') and comspec.endswith('"')):
+            comspec = f'"{comspec}"'
+        return f'{comspec} /s /c "{command}"'
     bash = shutil.which("bash")
     if bash:
         return [bash, "-lc", command]
@@ -597,7 +600,7 @@ def _terminate_proc_tree(proc: subprocess.Popen[Any]) -> None:
 
 
 def run_subprocess_with_tree_timeout(
-    argv: List[str],
+    argv: Union[str, List[str]],
     *,
     cwd: Path,
     env: Optional[Dict[str, str]] = None,
@@ -633,12 +636,13 @@ def run_subprocess_with_tree_timeout(
             stdout_text, _ = proc.communicate(timeout=2)
         except Exception:  # noqa: BLE001
             stdout_text = ""
+        return 124, (stdout_text or "").strip(), True
+    finally:
         try:
             if proc.stdout:
                 proc.stdout.close()
         except OSError:
             pass
-        return 124, (stdout_text or "").strip(), True
 
 
 MAX_BG_PROCESSES = 12

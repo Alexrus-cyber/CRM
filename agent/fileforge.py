@@ -331,7 +331,7 @@ def _zip_bytes(files: Dict[str, str]) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, content in files.items():
-            info = zipfile.ZipInfo(name, ZIP_STAMP)
+            info = zipfile.ZipInfo(_sanitize_zip_member_name(name), ZIP_STAMP)
             info.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(info, content.encode("utf-8"))
     return buffer.getvalue()

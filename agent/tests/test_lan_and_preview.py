@@ -10,6 +10,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 AGENT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = AGENT_DIR.parent
@@ -146,7 +147,11 @@ class LanAndPreviewTests(unittest.TestCase):
             (sb_root / "vite" / "dist" / "index.html").write_text("<h1>Vite Dist</h1>", encoding="utf-8")
             (sb_root / "vite" / "dist" / "assets" / "app.js").write_text("window.OK=1;", encoding="utf-8")
             (sb_root / "rawdir").mkdir()
-            (sb_root / "rawdir" / "bad<script>.txt").write_text("hi", encoding="utf-8")
+            (sb_root / "rawdir" / "bad&'name.txt").write_text("hi", encoding="utf-8")
+            has_angle_file = False
+            if os.name != "nt":
+                (sb_root / "rawdir" / "bad<script>.txt").write_text("hi", encoding="utf-8")
+                has_angle_file = True
 
             app_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _DummyAppHandler)
             app_port = app_srv.server_address[1]
@@ -198,8 +203,19 @@ class LanAndPreviewTests(unittest.TestCase):
                 # 3. Directory without index.html renders escaped file listing
                 with opener.open(f"{base}/sandbox/preview/rawdir", timeout=3) as r:
                     html_txt = r.read().decode("utf-8")
-                    self.assertIn("bad&lt;script&gt;.txt", html_txt)
-                    self.assertNotIn("bad<script>.txt", html_txt)
+                    self.assertIn("bad&amp;&#x27;name.txt", html_txt)
+                    self.assertNotIn("bad&'name.txt", html_txt)
+                    if has_angle_file:
+                        self.assertIn("bad&lt;script&gt;.txt", html_txt)
+                        self.assertNotIn("bad<script>.txt", html_txt)
+                fake_script_entry = mock.MagicMock()
+                fake_script_entry.name = "bad<script>.txt"
+                fake_script_entry.is_dir.return_value = False
+                fake_script_entry.stat.return_value = mock.MagicMock(st_size=2)
+                with mock.patch("pathlib.Path.iterdir", return_value=[fake_script_entry]):
+                    rendered = agent_mod._render_sandbox_dir_html("rawdir", sb_root / "rawdir", "/sandbox/preview").decode("utf-8")
+                    self.assertIn("bad&lt;script&gt;.txt", rendered)
+                    self.assertNotIn("bad<script>.txt", rendered)
 
                 # 4. Path traversal rejected
                 with self.assertRaises(urllib.error.HTTPError) as ctx_err:

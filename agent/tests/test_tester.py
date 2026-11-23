@@ -94,7 +94,7 @@ class QaToolsTests(unittest.TestCase):
 
             txt, events = qa_tools.run_qa_tool(
                 "qa_run_tests",
-                {"sandbox_project": "proj", "command": "python3 test_math.py"},
+                {"sandbox_project": "proj", "command": f'"{sys.executable}" test_math.py'},
                 sandbox_root=root,
                 trust_level="full",
                 approval_fn=None,

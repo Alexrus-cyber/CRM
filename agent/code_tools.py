@@ -267,10 +267,23 @@ def _run_argv(
     timeout: int = 120,
 ) -> Tuple[int, str]:
     env = sandbox_mod.sanitized_env(sandbox_root, cwd)
+    run_args = list(argv)
+    if run_args and run_args[0] == "git":
+        run_args = [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "protocol.ext.allow=never",
+            *run_args[1:],
+        ]
+        env["GIT_OPTIONAL_LOCKS"] = "0"
     safe_timeout = max(5, min(300, _safe_int(timeout, 120)))
     try:
         code, out, timed_out = sandbox_mod.run_subprocess_with_tree_timeout(
-            argv,
+            run_args,
             cwd=cwd,
             env=env,
             timeout=safe_timeout,

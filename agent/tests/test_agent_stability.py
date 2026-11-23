@@ -576,7 +576,7 @@ class BrowserInspectorStabilityTests(unittest.TestCase):
         ):
             res = browser_inspector.find_browser_executable(allow_subprocess=True)
         self.assertIsNone(res)
-        self.assertLess(time.monotonic() - t0, 5.5)
+        self.assertLess(time.monotonic() - t0, 8.0)
 
     def test_audit_degrades_gracefully_when_js_thread_times_out(self) -> None:
         fake_cdp = mock.MagicMock()

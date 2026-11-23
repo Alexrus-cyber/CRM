@@ -29,7 +29,10 @@ class SandboxSecurityTests(unittest.TestCase):
                     sandbox_mod.safe_resolve(root, bad)
 
             link = root / "escape"
-            os.symlink(str(outside), str(link))
+            try:
+                os.symlink(str(outside), str(link))
+            except OSError as err:
+                self.skipTest(f"Создание симлинков недоступно в этой среде: {err}")
             with self.assertRaises(sandbox_mod.SandboxError):
                 sandbox_mod.safe_resolve(root, "escape")
 
@@ -57,7 +60,10 @@ class SandboxSecurityTests(unittest.TestCase):
             # Симлинк внутри экспортируемой/архивируемой директории наружу должен блокироваться
             outside_secret = Path(tmp) / "host_secret.txt"
             outside_secret.write_text("SECRET_HOST", encoding="utf-8")
-            os.symlink(str(outside_secret), str(root / "app" / "leak.txt"))
+            try:
+                os.symlink(str(outside_secret), str(root / "app" / "leak.txt"))
+            except OSError as err:
+                self.skipTest(f"Создание симлинков недоступно в этой среде: {err}")
             with self.assertRaises(sandbox_mod.SandboxError):
                 sandbox_mod.export_path(root, "app", str(Path(tmp) / "export_out"))
             with self.assertRaises(sandbox_mod.SandboxError):
@@ -68,7 +74,10 @@ class SandboxSecurityTests(unittest.TestCase):
             root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
             os.environ["OPENAI_API_KEY"] = "sk-secret-do-not-leak"
             try:
-                res = sandbox_mod.run_command(root, 'python3 -c "import os; print(os.environ.get(\'OPENAI_API_KEY\', \'STRIPPED\'))"')
+                res = sandbox_mod.run_command(
+                    root,
+                    f'"{sys.executable}" -c "import os; print(os.environ.get(\'OPENAI_API_KEY\', \'STRIPPED\'))"',
+                )
                 self.assertEqual(res["exitCode"], 0)
                 self.assertIn("STRIPPED", res["output"])
             finally:

@@ -2732,9 +2732,14 @@ def call_model(
                         sock.close()
                     except Exception:  # noqa: BLE001
                         pass
+                    try:
+                        if getattr(sock, "_io_refs", 0) > 0:
+                            socket.socket._real_close(sock)
+                    except Exception:  # noqa: BLE001
+                        pass
 
             def _hb_loop() -> None:
-                poll_interval = min(1.0, max(0.15, float(TIMEOUT) * 0.5))
+                poll_interval = 0.15 if cancel_check else min(1.0, max(0.15, float(TIMEOUT) * 0.5))
                 while not hb_stop.wait(poll_interval):
                     if cancel_check and cancel_check():
                         _close_resp_socket(resp_holder.get("resp"), conn_holder)
