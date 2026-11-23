@@ -139,6 +139,7 @@ MAX_STEPS = _env_int("AGENT_MAX_STEPS", 500, minimum=1)
 MAX_STEPS_LIMIT = MAX_STEPS
 MAX_RUN_TOKENS = _env_int("AGENT_MAX_RUN_TOKENS", 2500000, minimum=0)
 TIMEOUT = _env_int("AGENT_TIMEOUT", 180, minimum=5)
+SSE_WRITE_TIMEOUT = _env_int("AGENT_SSE_WRITE_TIMEOUT", 30, minimum=5)
 APPROVAL_TIMEOUT = _env_int("AGENT_APPROVAL_TIMEOUT", 600, minimum=10)
 
 WORKSPACE = _init_workspace()
@@ -155,6 +156,40 @@ MAX_RAG_CHARS = 2_000_000
 PENDING_APPROVALS: Dict[str, Dict[str, Any]] = {}
 APPROVAL_LOCK = threading.Lock()
 _ORIG_URLOPEN = urllib.request.urlopen
+_MODEL_CONN_TLS = threading.local()
+
+
+class _TrackingHTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        super().connect()
+        holder = getattr(_MODEL_CONN_TLS, "holder", None)
+        if isinstance(holder, dict):
+            holder["conn"] = self
+            holder["sock"] = getattr(self, "sock", None)
+
+
+class _TrackingHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self) -> None:
+        super().connect()
+        holder = getattr(_MODEL_CONN_TLS, "holder", None)
+        if isinstance(holder, dict):
+            holder["conn"] = self
+            holder["sock"] = getattr(self, "sock", None)
+
+
+class _TrackingHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: Any) -> Any:
+        return self.do_open(_TrackingHTTPConnection, req)
+
+
+class _TrackingHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: Any) -> Any:
+        return self.do_open(
+            _TrackingHTTPSConnection,
+            req,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -168,8 +203,17 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         )
 
 
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
-_NO_REDIRECT_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler)
+_NO_REDIRECT_OPENER = urllib.request.build_opener(
+    _TrackingHTTPHandler(),
+    _TrackingHTTPSHandler(),
+    _NoRedirectHandler(),
+)
+_NO_REDIRECT_LOCAL_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _TrackingHTTPHandler(),
+    _TrackingHTTPSHandler(),
+    _NoRedirectHandler(),
+)
 
 
 def _is_blocked_metadata_ip(ip_str: str) -> bool:
@@ -273,6 +317,28 @@ def _loopback_url_candidates(url: str) -> List[str]:
     return out
 
 
+def _should_retry_loopback_candidate(exc: BaseException) -> bool:
+    reason = getattr(exc, "reason", None)
+    if isinstance(exc, (TimeoutError, socket.timeout)) or isinstance(reason, (TimeoutError, socket.timeout)):
+        return False
+    target = reason if isinstance(reason, BaseException) else exc
+    if isinstance(target, (ConnectionRefusedError, socket.gaierror)):
+        return True
+    err_no = getattr(target, "errno", None)
+    if err_no in (
+        errno.ECONNREFUSED,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+        errno.EADDRNOTAVAIL,
+    ):
+        return True
+    msg = str(target).lower()
+    return any(
+        tok in msg
+        for tok in ("connection refused", "10061", "name or service not known", "nodename nor servname")
+    )
+
+
 def _safe_model_urlopen(request: urllib.request.Request, timeout: int = TIMEOUT) -> Any:
     use_custom = urllib.request.urlopen is _ORIG_URLOPEN
     try:
@@ -282,7 +348,11 @@ def _safe_model_urlopen(request: urllib.request.Request, timeout: int = TIMEOUT)
     opener = _NO_REDIRECT_LOCAL_OPENER if _is_local_or_lan_host(host) else _NO_REDIRECT_OPENER
     candidates = _loopback_url_candidates(request.full_url)
     last_err: Optional[Exception] = None
+    holder = getattr(_MODEL_CONN_TLS, "holder", None)
     for idx, cand_url in enumerate(candidates):
+        if isinstance(holder, dict):
+            holder["conn"] = None
+            holder["sock"] = None
         req_i = request
         if idx > 0:
             req_i = urllib.request.Request(
@@ -297,7 +367,12 @@ def _safe_model_urlopen(request: urllib.request.Request, timeout: int = TIMEOUT)
             return urllib.request.urlopen(req_i, timeout=timeout)
         except urllib.error.URLError as exc:
             last_err = exc
-            if idx + 1 >= len(candidates) or isinstance(exc, urllib.error.HTTPError):
+            if (
+                idx + 1 >= len(candidates)
+                or isinstance(exc, urllib.error.HTTPError)
+                or (isinstance(holder, dict) and holder.get("aborted"))
+                or not _should_retry_loopback_candidate(exc)
+            ):
                 raise
     if last_err is not None:
         raise last_err
@@ -2535,6 +2610,7 @@ def call_model(
             request.add_header("Authorization", f"Bearer {api_key}")
         try:
             resp_holder: Dict[str, Any] = {"resp": None}
+            conn_holder: Dict[str, Any] = {"conn": None, "sock": None, "aborted": False}
             hb_lock = threading.Lock()
             hb_stop = threading.Event()
             hb_started = time.monotonic()
@@ -2550,28 +2626,40 @@ def call_model(
                 "idle_timed_out": False,
             }
 
-            def _close_resp_socket(resp_obj: Any) -> None:
+            def _close_resp_socket(resp_obj: Any, conn_info: Optional[Dict[str, Any]] = None) -> None:
+                socks_to_close: List[Any] = []
                 try:
                     fp = getattr(resp_obj, "fp", None)
                     raw_fp = getattr(fp, "raw", None) or getattr(resp_obj, "raw", None)
                     sock = getattr(raw_fp, "_sock", None)
                     if sock is not None:
-                        try:
-                            sock.shutdown(socket.SHUT_RDWR)
-                        except Exception:  # noqa: BLE001
-                            pass
-                        try:
-                            sock.close()
-                        except Exception:  # noqa: BLE001
-                            pass
+                        socks_to_close.append(sock)
                 except Exception:  # noqa: BLE001
                     pass
+                if isinstance(conn_info, dict):
+                    conn_info["aborted"] = True
+                    c_sock = conn_info.get("sock")
+                    if c_sock is not None and c_sock not in socks_to_close:
+                        socks_to_close.append(c_sock)
+                    conn_obj = conn_info.get("conn")
+                    conn_sock = getattr(conn_obj, "sock", None) if conn_obj is not None else None
+                    if conn_sock is not None and conn_sock not in socks_to_close:
+                        socks_to_close.append(conn_sock)
+                for sock in socks_to_close:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        sock.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
             def _hb_loop() -> None:
                 poll_interval = min(1.0, max(0.15, float(TIMEOUT) * 0.5))
                 while not hb_stop.wait(poll_interval):
                     if cancel_check and cancel_check():
-                        _close_resp_socket(resp_holder.get("resp"))
+                        _close_resp_socket(resp_holder.get("resp"), conn_holder)
                         break
                     now_hb = time.monotonic()
                     with hb_lock:
@@ -2584,14 +2672,14 @@ def call_model(
                         t_names = list(hb_state["tool_names"])
                         since_status = now_hb - float(hb_state["last_status"])
                         since_log = now_hb - float(hb_state["last_log"])
-                    if body_payload.get("stream") and not finished and idle_sec > TIMEOUT:
+                    if not finished and idle_sec > TIMEOUT:
                         with hb_lock:
                             hb_state["idle_timed_out"] = True
                         log(
-                            f"поток модели не прислал токенов за {idle_sec:.1f}с "
-                            f"(TIMEOUT={TIMEOUT}с) — прерываю зависший поток"
+                            f"поток модели не прислал данных за {idle_sec:.1f}с "
+                            f"(TIMEOUT={TIMEOUT}с) — прерываю зависший запрос"
                         )
-                        _close_resp_socket(resp_holder.get("resp"))
+                        _close_resp_socket(resp_holder.get("resp"), conn_holder)
                         break
                     if not finished and elapsed >= 5.0 and since_status >= 5.0:
                         with hb_lock:
@@ -2621,6 +2709,8 @@ def call_model(
 
             hb_thread = threading.Thread(target=_hb_loop, daemon=True)
             hb_thread.start()
+            prev_conn_holder = getattr(_MODEL_CONN_TLS, "holder", None)
+            _MODEL_CONN_TLS.holder = conn_holder
             try:
                 with _safe_model_urlopen(request, timeout=TIMEOUT) as response:
                     resp_holder["resp"] = response
@@ -2628,6 +2718,11 @@ def call_model(
                         raw = response.read().decode("utf-8", "replace")
                         if cancel_check and cancel_check():
                             raise BrokenPipeError("Клиент закрыл соединение")
+                        if hb_state.get("idle_timed_out"):
+                            raise AgentError(
+                                f"Модель не прислала полезных данных за {TIMEOUT} с",
+                                retryable=True,
+                            )
                         try:
                             return json.loads(raw)
                         except json.JSONDecodeError as error:
@@ -2893,6 +2988,7 @@ def call_model(
                         result_obj["usage"] = stream_usage
                     return result_obj
             finally:
+                _MODEL_CONN_TLS.holder = prev_conn_holder
                 hb_stop.set()
                 hb_thread.join(timeout=0.3)
         except BrokenPipeError:
@@ -2904,11 +3000,19 @@ def call_model(
             retryable = error.code in (408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
             raise AgentError(f"Модель вернула ошибку {error.code}: {detail}", retryable=retryable) from error
         except urllib.error.URLError as error:
+            if cancel_check and cancel_check():
+                raise BrokenPipeError("Клиент закрыл соединение") from error
+            if hb_state.get("idle_timed_out"):
+                raise AgentError(f"Модель не прислала полезных данных за {TIMEOUT} с", retryable=True) from error
             raise AgentError(
                 f"Не удалось связаться с моделью по адресу {chat_url(base_url)}: {error.reason}",
                 retryable=True,
             ) from error
         except (http.client.HTTPException, TimeoutError, ConnectionError, ssl.SSLError, OSError) as error:
+            if cancel_check and cancel_check():
+                raise BrokenPipeError("Клиент закрыл соединение") from error
+            if hb_state.get("idle_timed_out"):
+                raise AgentError(f"Модель не прислала полезных данных за {TIMEOUT} с", retryable=True) from error
             raise AgentError(
                 f"Сбой соединения при чтении ответа модели: {error}",
                 retryable=True,
@@ -5068,6 +5172,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "Некорректный JSON"})
             return
 
+        self._ensure_sse_socket_timeout()
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -5076,8 +5181,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-Accel-Buffering", "no")
             self._send_cors_headers()
             self.end_headers()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
-            if _is_client_disconnect(exc):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout, OSError) as exc:
+            if isinstance(exc, (TimeoutError, socket.timeout)) or _is_client_disconnect(exc):
                 self._client_disconnected = True
                 return
             raise
@@ -5095,18 +5200,71 @@ class Handler(BaseHTTPRequestHandler):
                 log(traceback.format_exc())
                 self._safe_write(sse({"error": "Внутренняя ошибка агента"}, "error"))
 
+    def _ensure_sse_socket_timeout(self, timeout_sec: Optional[float] = None) -> None:
+        conn = getattr(self, "connection", None)
+        if conn is None or not hasattr(conn, "settimeout"):
+            return
+        target = float(SSE_WRITE_TIMEOUT if timeout_sec is None else timeout_sec)
+        if target <= 0:
+            return
+        try:
+            cur = conn.gettimeout() if hasattr(conn, "gettimeout") else None
+            if cur is None or cur > target:
+                conn.settimeout(target)
+        except OSError:
+            pass
+
     def write(self, chunk: bytes) -> None:
+        if getattr(self, "_client_disconnected", False):
+            raise BrokenPipeError from None
         with self._get_write_lock():
             if getattr(self, "_client_disconnected", False):
                 raise BrokenPipeError from None
+            self._ensure_sse_socket_timeout()
+            started = time.monotonic()
             try:
                 self.wfile.write(chunk)
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError) as exc:
-                if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)) or _is_client_disconnect(exc):
+                elapsed = time.monotonic() - started
+                if elapsed >= 5.0:
+                    log(f"медленная доставка SSE клиенту ({elapsed:.1f}с, {len(chunk)} байт)")
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout, OSError) as exc:
+                if isinstance(exc, (TimeoutError, socket.timeout)):
+                    log(f"клиентский SSE-канал не отвечает более {SSE_WRITE_TIMEOUT}с — прерываю прогон")
+                if (
+                    isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout))
+                    or _is_client_disconnect(exc)
+                ):
                     self._client_disconnected = True
                     raise BrokenPipeError from None
                 raise
+
+    def _try_write_keepalive(self, chunk: bytes = b": keepalive\n\n") -> bool:
+        if getattr(self, "_client_disconnected", False):
+            return False
+        lock = self._get_write_lock()
+        if not lock.acquire(timeout=0.15):
+            # Основной поток прямо сейчас отправляет данные — не встаём в очередь за lock.
+            return not getattr(self, "_client_disconnected", False)
+        try:
+            if getattr(self, "_client_disconnected", False):
+                return False
+            self._ensure_sse_socket_timeout()
+            self.wfile.write(chunk)
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout, OSError) as exc:
+            if isinstance(exc, (TimeoutError, socket.timeout)):
+                log(f"клиентский SSE-канал не отвечает более {SSE_WRITE_TIMEOUT}с (keepalive) — прерываю прогон")
+            if (
+                isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout))
+                or _is_client_disconnect(exc)
+            ):
+                self._client_disconnected = True
+                return False
+            return False
+        finally:
+            lock.release()
 
     def _safe_write(self, chunk: bytes) -> None:
         try:
@@ -5120,13 +5278,9 @@ class Handler(BaseHTTPRequestHandler):
 
         def _beat() -> None:
             while not stop_ev.wait(interval):
-                if getattr(self, "_client_disconnected", False):
+                if getattr(self, "_client_disconnected", False) or stop_ev.is_set():
                     break
-                try:
-                    self.write(b": keepalive\n\n")
-                except BrokenPipeError:
-                    break
-                except Exception:  # noqa: BLE001
+                if not self._try_write_keepalive(b": keepalive\n\n"):
                     break
 
         th = threading.Thread(target=_beat, daemon=True)
@@ -5169,7 +5323,8 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 elapsed += 2
                 # Поддерживаем SSE-соединение живым во время ожидания человека.
-                self.write(b": keepalive\n\n")
+                if not self._try_write_keepalive(b": keepalive\n\n"):
+                    return {"approved": False, "note": "Клиент закрыл соединение"}
             return {"approved": False, "note": "Истекло время ожидания подтверждения на сайте"}
         finally:
             with APPROVAL_LOCK:
