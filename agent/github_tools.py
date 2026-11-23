@@ -22,7 +22,10 @@ import json
 import os
 import platform
 import re
+import shutil
+import stat
 import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -189,6 +192,43 @@ def _gh_api(
         raise GithubToolError(redact_secret(f"Ошибка сети GitHub API: {err.reason}", token)) from err
 
 
+def _create_git_askpass_helper() -> Tuple[Path, Path]:
+    """Создаёт приватный временный GIT_ASKPASS-скрипт, читающий токен только из env."""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="crm-git-askpass-"))
+    try:
+        os.chmod(tmp_dir, 0o700)
+    except OSError:
+        pass
+    if platform.system() == "Windows":
+        script = tmp_dir / "askpass.cmd"
+        script.write_text(
+            "@echo off\r\n"
+            "setlocal EnableDelayedExpansion\r\n"
+            "echo(%~1| findstr /I \"username\" >nul\r\n"
+            "if !errorlevel!==0 (\r\n"
+            "  echo x-access-token\r\n"
+            ") else (\r\n"
+            "  echo(!CRM_GH_ASKPASS_TOKEN!\r\n"
+            ")\r\n",
+            encoding="ascii",
+        )
+    else:
+        script = tmp_dir / "askpass.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  *Username*|*username*) printf '%s\\n' 'x-access-token' ;;\n"
+            "  *) printf '%s\\n' \"$CRM_GH_ASKPASS_TOKEN\" ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+    try:
+        os.chmod(script, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    except OSError:
+        pass
+    return tmp_dir, script
+
+
 def _run_git(
     args: List[str],
     *,
@@ -200,9 +240,6 @@ def _run_git(
     timeout: int = 45,
 ) -> Tuple[int, str, str]:
     cmd: List[str] = ["git", "-c", "protocol.ext.allow=never", "-c", "core.fsmonitor=false", "-c", "credential.helper="]
-    if use_auth and token:
-        basic = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
-        cmd.extend(["-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}"])
     cmd.extend(args)
 
     env = {
@@ -244,6 +281,13 @@ def _run_git(
         env["GIT_AUTHOR_EMAIL"] = author_email
         env["GIT_COMMITTER_EMAIL"] = author_email
 
+    askpass_dir: Optional[Path] = None
+    if use_auth and token:
+        askpass_dir, askpass_script = _create_git_askpass_helper()
+        env["GIT_ASKPASS"] = str(askpass_script)
+        env["SSH_ASKPASS"] = ""
+        env["CRM_GH_ASKPASS_TOKEN"] = token
+
     git_kwargs: Dict[str, Any] = {
         "cwd": str(cwd),
         "env": env,
@@ -264,6 +308,9 @@ def _run_git(
         raise GithubToolError("Команда git не установлена в системе") from err
     except subprocess.TimeoutExpired as err:
         raise GithubToolError(f"Таймаут git ({timeout} с)") from err
+    finally:
+        if askpass_dir is not None:
+            shutil.rmtree(askpass_dir, ignore_errors=True)
 
     return (
         proc.returncode,

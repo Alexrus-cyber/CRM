@@ -1,12 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { agentLoopbackCandidates, fetchAgent, resolveSafeAgentUrl } from "@/lib/agentConfig";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { agentLoopbackCandidates, fetchAgent, resolveAgentAuthToken, resolveSafeAgentUrl } from "@/lib/agentConfig";
 
 const prevAgentUrl = process.env.AGENT_URL;
+const prevAgentToken = process.env.AGENT_HTTP_TOKEN;
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   if (prevAgentUrl === undefined) delete process.env.AGENT_URL;
   else process.env.AGENT_URL = prevAgentUrl;
+  if (prevAgentToken === undefined) delete process.env.AGENT_HTTP_TOKEN;
+  else process.env.AGENT_HTTP_TOKEN = prevAgentToken;
 });
 
 describe("agentConfig loopback resilience", () => {
@@ -67,5 +74,67 @@ describe("agentConfig loopback resilience", () => {
     expect(endpoint).toBe("http://127.0.0.1:8899");
     expect(response.status).toBe(200);
     expect(called).toEqual(["http://127.0.0.1:8899/health"]);
+  });
+
+  it("fetchAgent attaches AGENT_HTTP_TOKEN Bearer header when set", async () => {
+    process.env.AGENT_HTTP_TOKEN = "secret-http-tok";
+    const seenAuth: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const hdrs = new Headers(init?.headers);
+        seenAuth.push(hdrs.get("authorization") ?? "");
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }),
+    );
+
+    const { response } = await fetchAgent("http://127.0.0.1:8899", "/sandbox");
+    expect(response.status).toBe(200);
+    expect(seenAuth).toEqual(["Bearer secret-http-tok"]);
+  });
+
+  it("resolveAgentAuthToken never reads local token file for non-loopback hosts", () => {
+    delete process.env.AGENT_HTTP_TOKEN;
+    const tok = resolveAgentAuthToken("http://host.docker.internal:8899");
+    expect(tok).toEqual({ token: "", fromFile: false });
+  });
+
+  it("fetchAgent refreshes loopback token file once on 401 when agent rotated token", async () => {
+    delete process.env.AGENT_HTTP_TOKEN;
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const fakeHome = mkdtempSync(join(tmpdir(), "crm-agent-home-"));
+    try {
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      const tokenDir = join(fakeHome, ".crm-agent");
+      mkdirSync(tokenDir, { recursive: true });
+      const tokenPath = join(tokenDir, "http-token-18899.json");
+      writeFileSync(tokenPath, JSON.stringify({ token: "old-tok" }), "utf8");
+
+      const seenAuth: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+          const auth = new Headers(init?.headers).get("authorization") ?? "";
+          seenAuth.push(auth);
+          if (auth === "Bearer old-tok") {
+            writeFileSync(tokenPath, JSON.stringify({ token: "new-tok" }), "utf8");
+            return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }),
+      );
+
+      const { response } = await fetchAgent("http://127.0.0.1:18899", "/sandbox");
+      expect(response.status).toBe(200);
+      expect(seenAuth).toEqual(["Bearer old-tok", "Bearer new-tok"]);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = prevUserProfile;
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
   });
 });

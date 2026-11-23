@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import atexit
 import io
+import json
 import os
 import platform
 import re
@@ -66,36 +67,64 @@ SAFE_ENV_KEYS = (
 
 # Очевидные попытки побега из Sandbox или разрушения системы.
 ESCAPE_PATTERNS = [
-    re.compile(r"(?:^|[\s;|&`(])rm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+/(?:\s|$|\*)", re.IGNORECASE),
-    re.compile(r"(?:^|[\s;|&`(])(?:mkfs|fdisk|parted|shutdown|reboot|halt|poweroff)\b", re.IGNORECASE),
-    re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),  # fork bomb
+    re.compile(r"(?:^|[\s;|&`(])rm\s+(?:-[a-zA-Z]*\s+)*-[a-zA-Z]*r[a-zA-Z]*f?\s+/(?:\s|$|\*)", re.IGNORECASE),
+    re.compile(r"(?:^|[\s;|&`(])rm\s+[^\n]*(?:--recursive|--no-preserve-root)[^\n]*\s+/(?:\s|$|\*)", re.IGNORECASE),
     re.compile(
-        r"(?:/etc/(?:shadow|sudoers|passwd)|~/\.(?:ssh|aws|gnupg|kube)|/(?:root|home/[^/\s]+)/\.(?:ssh|aws|gnupg)|/proc/self/environ|/var/run/docker\.sock)",
+        r"(?:^|[\s;|&`(])rm\s+-[a-zA-Z]*r[^\n]*\s+(?:/etc|/usr|/bin|/sbin|/lib|/boot|/dev|/proc|/sys|/root|/home|/Users|[A-Za-z]:[\\/]+Windows)\b",
         re.IGNORECASE,
     ),
-    re.compile(r"[A-Za-z]:\\Windows\\System32", re.IGNORECASE),
+    re.compile(r"(?:^|[\s;|&`(])(?:mkfs|fdisk|parted|shutdown|reboot|halt|poweroff|chroot|mount|umount)\b", re.IGNORECASE),
+    re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),  # fork bomb
+    re.compile(
+        r"(?:/(?:private/)?etc/(?:shadow|sudoers|passwd|master\.passwd)|~/\.(?:ssh|aws|gnupg|kube|netrc|npmrc)|/(?:root|home/[^/\s]+|Users/[^/\s]+)/\.(?:ssh|aws|gnupg|kube)|/proc/self/environ|/var/run/docker\.sock)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"[A-Za-z]:[\\/]+Windows[\\/]+System32", re.IGNORECASE),
     re.compile(r"(?:^|[\s;|&`(])cd\s+/(?:\s|$|;|&&)", re.IGNORECASE),
     re.compile(r"(?:^|[\s;|&`(])dd\s+if=.*\s+of=/dev/", re.IGNORECASE),
     re.compile(r"(?:curl|wget)\s+[^\n|]*\|\s*(?:ba)?sh\b", re.IGNORECASE),
-    re.compile(r"(?:^|[\s;|&`(])(?:sudo|su\s+-|chmod\s+[ugo]*\+s|chown\s+root)\b", re.IGNORECASE),
+    re.compile(r"(?:^|[\s;|&`(])(?:sudo|doas|su\s+-|chmod\s+[ugo]*\+s|chown\s+root)\b", re.IGNORECASE),
     re.compile(r"(?:/dev/tcp/|nc(?:at)?\s+[^\n]*-e\s+)", re.IGNORECASE),
 ]
 
 FORBIDDEN_EXPORT_PREFIXES = (
     "/etc",
+    "/private/etc",
     "/usr",
     "/bin",
     "/sbin",
+    "/lib",
+    "/lib64",
     "/boot",
     "/proc",
     "/sys",
     "/dev",
+    "/run",
+    "/var",
+    "/private/var",
+    "/root",
     "/System",
+    "/Library",
+    "/Applications",
     "C:\\Windows",
     "C:\\Program Files",
+    "C:\\Program Files (x86)",
+    "C:\\ProgramData",
 )
 
-FORBIDDEN_EXPORT_HOME_DIRS = {".ssh", ".gnupg", ".aws", ".kube", ".docker", ".git"}
+FORBIDDEN_EXPORT_HOME_DIRS = {
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".kube",
+    ".docker",
+    ".git",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".env",
+}
 
 MAX_OUTPUT_CHARS = 18_000
 MAX_SANDBOX_FILE_BYTES = 2_000_000
@@ -376,6 +405,20 @@ def zip_path(root: Path, rel_path: str) -> Tuple[bytes, str]:
     return buffer.getvalue(), f"{root_name}.zip"
 
 
+def _matches_forbidden_export(path_candidate: Path) -> Optional[str]:
+    cand_norm = str(path_candidate).replace("\\", "/").rstrip("/") or "/"
+    cand_low = cand_norm.lower()
+    for prefix in FORBIDDEN_EXPORT_PREFIXES:
+        pref_norm = prefix.replace("\\", "/").rstrip("/")
+        pref_low = pref_norm.lower()
+        if cand_low == pref_low or cand_low.startswith(pref_low + "/"):
+            return f"Запрещён экспорт в системную папку: {path_candidate}"
+    for part in path_candidate.parts:
+        if part.lower() in FORBIDDEN_EXPORT_HOME_DIRS:
+            return f"Запрещён экспорт в защищённый каталог учётных данных: {path_candidate}"
+    return None
+
+
 def export_path(
     root: Path,
     source_rel: str,
@@ -390,19 +433,19 @@ def export_path(
     raw_dest = str(dest_raw or "").strip()
     if not raw_dest:
         raise SandboxError("Не указана папка назначения на компьютере")
+    if "\x00" in raw_dest:
+        raise SandboxError("Недопустимый нулевой байт в пути назначения")
 
-    dest = Path(raw_dest).expanduser().resolve(strict=False)
+    dest_expanded = Path(os.path.normpath(str(Path(raw_dest).expanduser())))
+    dest = dest_expanded.resolve(strict=False)
     # Запрещаем перенос в корень диска, системные каталоги или в родителя Sandbox целиком.
-    if dest == dest.parent or str(dest) in ("/", "\\"):
+    if dest == dest.parent or str(dest) in ("/", "\\") or dest_expanded == dest_expanded.parent:
         raise SandboxError("Нельзя переносить файлы в корень файловой системы")
 
-    dest_str = str(dest)
-    for prefix in FORBIDDEN_EXPORT_PREFIXES:
-        norm_pref = prefix.rstrip("/\\")
-        if dest_str.lower() == norm_pref.lower() or dest_str.lower().startswith((norm_pref + os.sep).lower()):
-            raise SandboxError(f"Запрещён экспорт в системную папку: {dest}")
-    if any(part in FORBIDDEN_EXPORT_HOME_DIRS for part in dest.parts):
-        raise SandboxError(f"Запрещён экспорт в защищённый каталог учётных данных: {dest}")
+    for cand in (dest_expanded, dest):
+        reason = _matches_forbidden_export(cand)
+        if reason:
+            raise SandboxError(reason)
 
     root_resolved = root.resolve(strict=False)
     if _is_within_root(dest, root_resolved) and dest != root_resolved:
@@ -411,34 +454,60 @@ def export_path(
     # Если назначение — существующая папка и переносим файл, кладём внутрь под тем же именем;
     # если переносим папку и dest не заканчивается именем проекта, можно положить внутрь или в dest.
     target = dest / src.name if (src.is_file() and dest.is_dir()) else dest
+    src_resolved = src.resolve(strict=False)
+    target_resolved = target.resolve(strict=False)
+    if _is_within_root(src_resolved, target_resolved):
+        raise SandboxError("Папка назначения не может находиться внутри экспортируемого источника")
+
+    # Не перезаписываем через уже существующие симлинки на пути назначения.
+    if target.exists() and target.is_symlink():
+        raise SandboxError(f"Путь назначения является символьной ссылкой: {target}")
+
     copied_files: List[str] = []
+    verified_pairs: List[Tuple[Path, int]] = []
     total_bytes = 0
 
-    if src.is_dir():
-        target.mkdir(parents=True, exist_ok=True)
-        for item in src.rglob("*"):
-            if item.is_symlink():
-                raise SandboxError(f"Запрещён экспорт символьной ссылки: {item.name}")
-            if not _is_safe_non_escaping_entry(root_resolved, item):
-                raise SandboxError("Обнаружен выход пути за пределы Sandbox")
-            if item.is_file():
-                rel = item.relative_to(src)
-                if str(rel).startswith(".tmp"):
-                    continue
-                out_file = target / rel
-                out_file.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(item, out_file, follow_symlinks=False)
-                copied_files.append(rel.as_posix())
-                total_bytes += item.stat().st_size
-        if mode == "move":
-            shutil.rmtree(src)
-    else:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, target, follow_symlinks=False)
-        copied_files.append(src.name)
-        total_bytes = target.stat().st_size
-        if mode == "move":
-            src.unlink()
+    try:
+        if src.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            for item in src.rglob("*"):
+                if item.is_symlink():
+                    raise SandboxError(f"Запрещён экспорт символьной ссылки: {item.name}")
+                if not _is_safe_non_escaping_entry(root_resolved, item):
+                    raise SandboxError("Обнаружен выход пути за пределы Sandbox")
+                if item.is_file():
+                    rel = item.relative_to(src)
+                    if str(rel).startswith(".tmp"):
+                        continue
+                    out_file = target / rel
+                    cur_check = out_file
+                    while cur_check != target and cur_check != cur_check.parent:
+                        if cur_check.exists() and cur_check.is_symlink():
+                            raise SandboxError(f"Символьная ссылка на пути назначения запрещена: {cur_check}")
+                        cur_check = cur_check.parent
+                    out_file.parent.mkdir(parents=True, exist_ok=True)
+                    src_size = item.stat().st_size
+                    shutil.copy2(item, out_file, follow_symlinks=False)
+                    copied_files.append(rel.as_posix())
+                    verified_pairs.append((out_file, src_size))
+                    total_bytes += src_size
+            if mode == "move":
+                for out_file, expected_size in verified_pairs:
+                    if not out_file.is_file() or out_file.stat().st_size != expected_size:
+                        raise SandboxError(f"Проверка копии не пройдена для {out_file.name}; исходник сохранён")
+                shutil.rmtree(src)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            src_size = src.stat().st_size
+            shutil.copy2(src, target, follow_symlinks=False)
+            copied_files.append(src.name)
+            total_bytes = target.stat().st_size
+            if mode == "move":
+                if not target.is_file() or total_bytes != src_size:
+                    raise SandboxError(f"Проверка копии не пройдена для {src.name}; исходник сохранён")
+                src.unlink()
+    except OSError as err:
+        raise SandboxError(f"Ошибка переноса файлов из Sandbox: {err}") from err
 
     return {
         "source": relative_to_root(root, src) if src.exists() else source_rel,
@@ -458,10 +527,11 @@ def inspect_command_escape(command: str, root: Path, rel_cwd: str = ".") -> Opti
     for pattern in ESCAPE_PATTERNS:
         if pattern.search(text):
             return "Команда заблокирована защитой Sandbox (попытка доступа к системным путям или выхода за пределы песочницы)"
-    # Считаем глубину рабочей папки внутри Sandbox: больше `depth` шагов `../` — выход наружу.
+    # Считаем глубину рабочей папки внутри Sandbox: больше `depth` шагов `..` — выход наружу
+    # (включая `cd ..`, `ls ..` без завершающего слэша при depth=0).
     clean_cwd = "/".join(p for p in str(rel_cwd or ".").replace("\\", "/").split("/") if p not in ("", "."))
     depth = len(clean_cwd.split("/")) if clean_cwd else 0
-    for match in re.finditer(r"((?:\.\./|\.\.\\)+)", text):
+    for match in re.finditer(r"(?:^|[\s;|&`(\"'=])((?:\.\.(?:[/\\]|(?=[\s;|&)`\"']|$)))+)", text):
         ups = match.group(1).count("..")
         if ups > depth:
             return "Команда заблокирована защитой Sandbox (попытка выйти через .. выше корня песочницы)"
@@ -571,38 +641,203 @@ def run_subprocess_with_tree_timeout(
         return 124, (stdout_text or "").strip(), True
 
 
+MAX_BG_PROCESSES = 12
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if platform.system() == "Windows":
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+            return str(pid) in (proc.stdout or "")
+        except OSError:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_pid_tree(pid: int) -> None:
+    if pid <= 1 or pid == os.getpid():
+        return
+    try:
+        if platform.system() != "Windows":
+            pgid = os.getpgid(pid)
+            if pgid > 1 and pgid != os.getpgid(0):
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        else:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=4,
+                check=False,
+            )
+    except OSError:
+        pass
+
+
 class ProcessManager:
     """Управляет фоновыми процессами (локальными серверами проектов) внутри Sandbox."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_processes: int = MAX_BG_PROCESSES) -> None:
         self._lock = threading.Lock()
         self._procs: Dict[int, Dict[str, Any]] = {}
+        self._max_processes = max(1, int(max_processes or MAX_BG_PROCESSES))
+        self._registry_files: set[Path] = set()
         atexit.register(self.stop_all)
 
     def _terminate_proc(self, proc: subprocess.Popen[str]) -> None:
         _terminate_proc_tree(proc)
 
-    def stop(self, pid: int) -> bool:
+    def _prune_dead_locked(self) -> None:
+        dead = [pid for pid, info in self._procs.items() if info["proc"].poll() is not None]
+        for pid in dead:
+            self._procs.pop(pid, None)
+
+    def _sync_registry_locked(self, registry_path: Optional[Path] = None) -> None:
+        if registry_path is not None:
+            self._registry_files.add(registry_path)
+        for reg in list(self._registry_files):
+            try:
+                existing: List[Dict[str, Any]] = []
+                if reg.is_file():
+                    raw = json.loads(reg.read_text(encoding="utf-8") or "[]")
+                    if isinstance(raw, list):
+                        existing = [x for x in raw if isinstance(x, dict)]
+                my_pid = os.getpid()
+                kept = [
+                    x
+                    for x in existing
+                    if int(x.get("ppid") or 0) != my_pid and _is_pid_alive(int(x.get("pid") or 0))
+                ]
+                for pid, info in self._procs.items():
+                    if info.get("registry") == reg and info["proc"].poll() is None:
+                        kept.append(
+                            {
+                                "pid": pid,
+                                "ppid": my_pid,
+                                "owner": info.get("owner") or "",
+                                "command": info.get("command") or "",
+                                "cwd": info.get("cwd") or ".",
+                                "startedAt": info.get("startedAt") or "",
+                            }
+                        )
+                reg.parent.mkdir(parents=True, exist_ok=True)
+                reg.write_text(json.dumps(kept, ensure_ascii=False), encoding="utf-8")
+            except (OSError, ValueError):
+                pass
+
+    def cleanup_orphans(self, root: Path) -> int:
+        """Безопасно завершает фоновые процессы-сироты из реестра, если их родительский агент уже умер."""
+        reg = root.resolve(strict=False) / ".tmp" / ".crm_agent_procs.json"
+        if not reg.is_file():
+            return 0
+        try:
+            items = json.loads(reg.read_text(encoding="utf-8") or "[]")
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(items, list):
+            return 0
+
+        cleaned = 0
+        remaining: List[Dict[str, Any]] = []
+        my_pid = os.getpid()
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                pid = int(entry.get("pid") or 0)
+                ppid = int(entry.get("ppid") or 0)
+            except (TypeError, ValueError):
+                continue
+            if pid <= 1 or pid == my_pid or not _is_pid_alive(pid):
+                continue
+            if ppid > 0 and ppid != my_pid and not _is_pid_alive(ppid):
+                # Дополнительная проверка cmdline на Linux, чтобы избежать случайного PID-reuse.
+                can_kill = True
+                cmdline_file = Path(f"/proc/{pid}/cmdline")
+                expected_cmd = str(entry.get("command") or "").strip()
+                if cmdline_file.is_file() and expected_cmd:
+                    try:
+                        proc_cmd = cmdline_file.read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+                        first_tok = expected_cmd.split()[0]
+                        if first_tok and first_tok not in proc_cmd and "bash" not in proc_cmd and "sh" not in proc_cmd:
+                            can_kill = False
+                    except OSError:
+                        can_kill = False
+                if can_kill:
+                    _terminate_pid_tree(pid)
+                    cleaned += 1
+                    continue
+            remaining.append(entry)
+        try:
+            reg.write_text(json.dumps(remaining, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+        return cleaned
+
+    def stop(self, pid: int, *, owner: Optional[str] = None) -> bool:
         with self._lock:
-            info = self._procs.pop(pid, None)
-        if not info:
-            return False
+            info = self._procs.get(pid)
+            if not info:
+                return False
+            if owner is not None and info.get("owner") and info.get("owner") != owner:
+                return False
+            self._procs.pop(pid, None)
+            reg = info.get("registry")
+            self._sync_registry_locked(reg if isinstance(reg, Path) else None)
         self._terminate_proc(info["proc"])
         return True
 
-    def stop_all(self) -> None:
+    def stop_all(self, *, owner: Optional[str] = None) -> None:
         with self._lock:
-            entries = list(self._procs.values())
-            self._procs.clear()
+            if owner is None:
+                entries = list(self._procs.values())
+                self._procs.clear()
+            else:
+                entries = [v for v in self._procs.values() if v.get("owner") == owner]
+                for item in entries:
+                    self._procs.pop(item["pid"], None)
+            self._sync_registry_locked()
         for info in entries:
             self._terminate_proc(info["proc"])
 
-    def start(self, root: Path, command: str, rel_cwd: str = ".") -> Dict[str, Any]:
+    def start(self, root: Path, command: str, rel_cwd: str = ".", *, owner: str = "agent") -> Dict[str, Any]:
         issue = inspect_command_escape(command, root, rel_cwd)
         if issue:
             raise SandboxError(issue)
         cwd = safe_resolve(root, rel_cwd, allow_root=True)
         cwd.mkdir(parents=True, exist_ok=True)
+        self.cleanup_orphans(root)
+
+        with self._lock:
+            self._prune_dead_locked()
+            if len(self._procs) >= self._max_processes:
+                raise SandboxError(
+                    f"Достигнут лимит фоновых процессов Sandbox ({self._max_processes}). "
+                    "Остановите ненужные процессы перед запуском нового."
+                )
+
         env = sanitized_env(root, cwd)
 
         kwargs: Dict[str, Any] = {
@@ -662,9 +897,12 @@ class ProcessManager:
                 "url": url,
             }
 
+        reg_path = root.resolve(strict=False) / ".tmp" / ".crm_agent_procs.json"
         entry = {
             "pid": proc.pid,
             "proc": proc,
+            "owner": str(owner or "agent")[:120],
+            "registry": reg_path,
             "command": command[:300],
             "cwd": relative_to_root(root, cwd) if cwd != root.resolve(strict=False) else ".",
             "url": url,
@@ -673,10 +911,12 @@ class ProcessManager:
         }
         with self._lock:
             self._procs[proc.pid] = entry
+            self._sync_registry_locked(reg_path)
 
         return {
             "background": True,
             "pid": proc.pid,
+            "owner": entry["owner"],
             "cwd": entry["cwd"],
             "output": output or f"Фоновый процесс запущен (PID {proc.pid})",
             "url": url,
@@ -684,9 +924,7 @@ class ProcessManager:
 
     def list(self) -> List[Dict[str, Any]]:
         with self._lock:
-            dead = [pid for pid, info in self._procs.items() if info["proc"].poll() is not None]
-            for pid in dead:
-                self._procs.pop(pid, None)
+            self._prune_dead_locked()
             result: List[Dict[str, Any]] = []
             for pid, info in self._procs.items():
                 if not info.get("url"):
@@ -698,6 +936,7 @@ class ProcessManager:
                 port = extract_port_from_url(url)
                 result.append({
                     "pid": pid,
+                    "owner": info.get("owner") or "agent",
                     "command": info["command"],
                     "cwd": info["cwd"],
                     "url": url,
@@ -747,11 +986,13 @@ def run_command(
     process_manager: Optional[ProcessManager] = None,
     *,
     unlimited: bool = False,
+    raise_on_timeout: bool = True,
+    owner: str = "agent",
 ) -> Dict[str, Any]:
     """Выполнить bash/shell-команду строго внутри песочницы `root`."""
     if background:
         mgr = process_manager or ProcessManager()
-        return mgr.start(root, command, rel_cwd)
+        return mgr.start(root, command, rel_cwd, owner=owner)
 
     issue = inspect_command_escape(command, root, rel_cwd)
     if issue:
@@ -774,14 +1015,26 @@ def run_command(
         raise SandboxError(f"Команда оболочки не найдена: {error}") from error
 
     if timed_out:
-        raise SandboxError(
-            f"Команда превысила таймаут {safe_timeout} с. Если это сервер — запустите с background=true.\n{raw_output[:2000]}"
-        )
+        timeout_msg = (
+            f"Команда превысила таймаут {safe_timeout} с. Если это сервер — запустите с background=true.\n"
+            f"{raw_output[:2000]}"
+        ).strip()
+        if raise_on_timeout:
+            raise SandboxError(timeout_msg)
+        return {
+            "background": False,
+            "exitCode": 124,
+            "timedOut": True,
+            "cwd": relative_to_root(root, cwd) if cwd != root.resolve(strict=False) else ".",
+            "output": timeout_msg if unlimited else timeout_msg[:MAX_OUTPUT_CHARS],
+            "url": "",
+        }
 
     output = raw_output if unlimited else raw_output[:MAX_OUTPUT_CHARS]
     return {
         "background": False,
         "exitCode": exit_code,
+        "timedOut": False,
         "cwd": relative_to_root(root, cwd) if cwd != root.resolve(strict=False) else ".",
         "output": output or f"(вывод пуст, код возврата {exit_code})",
         "url": _detect_local_url(command, output),

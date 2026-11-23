@@ -91,6 +91,7 @@ def _load_operator_secrets_file() -> None:
     secrets_path = os.environ.pop("CRM_SECRETS_FILE", "").strip()
     if not secrets_path:
         return
+    loaded_ok = False
     try:
         data = json.loads(Path(secrets_path).read_text(encoding="utf-8"))
         if isinstance(data, dict):
@@ -99,13 +100,17 @@ def _load_operator_secrets_file() -> None:
                     _OPERATOR_SECRETS[k] = v
             if not DEFAULT_TOKEN and _OPERATOR_SECRETS.get("CRM_AGENT_TOKEN"):
                 DEFAULT_TOKEN = _OPERATOR_SECRETS["CRM_AGENT_TOKEN"]
-    except (OSError, ValueError):
-        pass
+            loaded_ok = True
+        else:
+            sys.stderr.write("[operator] ПРЕДУПРЕЖДЕНИЕ: CRM_SECRETS_FILE содержит некорректный формат (ожидался JSON-объект)\n")
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"[operator] ПРЕДУПРЕЖДЕНИЕ: не удалось прочитать CRM_SECRETS_FILE ({exc})\n")
     finally:
-        try:
-            Path(secrets_path).unlink(missing_ok=True)
-        except OSError:
-            pass
+        if loaded_ok:
+            try:
+                Path(secrets_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 _load_operator_secrets_file()
@@ -2235,7 +2240,8 @@ def copy_to_clipboard(text: str) -> bool:
             if shutil.which(tool[0]):
                 subprocess.run(tool, input=text.encode("utf-8"), check=True, timeout=15)
                 return True
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        log("Ошибка копирования в буфер обмена: {}".format(exc))
         return False
     return False
 
@@ -2256,8 +2262,8 @@ def read_from_clipboard() -> str:
             if shutil.which(tool[0]):
                 out = subprocess.run(tool, stdout=subprocess.PIPE, check=True, timeout=15)
                 return out.stdout.decode("utf-8", "replace")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        log("Ошибка чтения буфера обмена: {}".format(exc))
     return ""
 
 
@@ -2325,8 +2331,8 @@ def switch_keyboard_layout(target: str = "toggle") -> str:
         try:
             subprocess.run(["setxkbmap", "ru" if goal == "ru" else "us"], check=True, timeout=5)
             return "раскладка переключена на {} (setxkbmap)".format(goal.upper())
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            log("Ошибка переключения раскладки через setxkbmap: {}".format(exc))
 
     require_pyautogui()
     if system == "Darwin":
@@ -3756,15 +3762,15 @@ class Operator:
         for key in list(self._held_keys):
             try:
                 send_key_state(key, down=False)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                log("Не удалось отпустить клавишу {}: {}".format(key, exc))
             self._held_keys.discard(key)
         for btn in list(self._held_buttons):
             try:
                 if not _win32_mouse_button(btn, down=False) and pyautogui is not None:
                     pyautogui.mouseUp(button=btn)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                log("Не удалось отпустить кнопку мыши {}: {}".format(btn, exc))
             self._held_buttons.discard(btn)
 
     # ------------------------------------------------------------- цикл

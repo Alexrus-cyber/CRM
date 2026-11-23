@@ -181,8 +181,8 @@ def _windows_registry_browsers() -> List[Path]:
                                 found.append(Path(str(val).strip().strip('"')))
                     except OSError:
                         continue
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as err:  # noqa: BLE001
+        _browser_log(f"Ошибка опроса реестра Windows для поиска браузеров: {err}")
     return found
 
 
@@ -235,8 +235,8 @@ def _emit_step(
     if on_status is not None:
         try:
             on_status(text)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as err:  # noqa: BLE001
+            _browser_log(f"Сбой callback on_status: {err}")
 
 
 _BROWSER_AVAIL_LOCK = threading.Lock()
@@ -429,8 +429,8 @@ def find_browser_candidates(*, allow_subprocess: bool = True, limit: int = 8) ->
                     raw_out = out_file.read_text(encoding="utf-8", errors="ignore").strip()
                     exe = raw_out.splitlines()[-1].strip() if raw_out else ""
                     _add(exe)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as err:  # noqa: BLE001
+            _browser_log(f"Ошибка проверки Playwright Chromium: {err}")
         finally:
             if probe_dir is not None:
                 shutil.rmtree(probe_dir, ignore_errors=True)
@@ -759,7 +759,9 @@ class CDPClient:
                     raw = self._ws.recv_text()
                 except (TimeoutError, socket.timeout):
                     continue
-                except Exception:  # noqa: BLE001
+                except Exception as err:  # noqa: BLE001
+                    if not self._ws.closed:
+                        _browser_log(f"CDP reader loop завершён ({type(err).__name__}: {err})")
                     break
                 if raw is None:
                     break
@@ -790,8 +792,8 @@ class CDPClient:
         def _run() -> None:
             try:
                 self.call("Page.handleJavaScriptDialog", {"accept": True}, timeout=3.0)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as err:  # noqa: BLE001
+                _browser_log(f"Не удалось автоматически закрыть JS-диалог: {err}")
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1480,9 +1482,15 @@ def _launch_headless_chromium(
     # На Windows `--headless=new` + `--disable-gpu` без SwiftShader часто вешает Viz / `Page.captureScreenshot`,
     # поэтому на Windows сначала пробуем нативный ANGLE/D3D11 (без `--disable-gpu`), затем SwiftShader, затем `--no-sandbox`.
     if is_headless_shell:
-        base_attempts: List[Tuple[str, float, bool, bool]] = [
-            ("--headless", 9.0, needs_no_sandbox, not is_windows),
-        ]
+        if is_windows:
+            base_attempts = [
+                ("--headless", 9.0, needs_no_sandbox, False),
+                ("--headless", 9.0, True, True),
+            ]
+        else:
+            base_attempts = [
+                ("--headless", 9.0, needs_no_sandbox, True),
+            ]
     elif is_windows:
         base_attempts = [
             ("--headless=new", 12.0, needs_no_sandbox, False),
@@ -1813,8 +1821,8 @@ def _find_page_ws_url(
                                     return ws
                             finally:
                                 b_cdp.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as err:  # noqa: BLE001
+                        _browser_log(f"Fallback Target.createTarget не удался: {err}")
             except Exception as error:  # noqa: BLE001
                 last_err = str(error)
         time.sleep(0.08)
@@ -1881,6 +1889,9 @@ class BrowserSession:
         self.approved_external_origins: set[str] = set()
         self.current_url = ""
         self._screenshots_disabled = False
+        self._screenshots_disabled_at = 0.0
+        self._last_screenshot_bytes = 0
+        self._last_screenshot_suspicious = False
 
     @classmethod
     def launch(
@@ -1989,9 +2000,14 @@ class BrowserSession:
                 except BrowserError as err:
                     _check_cancelled(cancel_check)
                     last_error = err
-                    if gpu_mode is None and len(gpu_modes) > 1:
-                        # Если сам процесс уже перебрал все попытки внутри _launch_headless_chromium, не повторяем ту же тройку.
-                        break
+                    if gpu_mode is None and mode_idx + 1 < len(gpu_modes) and "swiftshader" not in str(err).lower():
+                        _emit_step(
+                            on_status,
+                            f"Запуск {Path(candidate_exe).name} не удался ({err}) — пробую принудительный SwiftShader…",
+                            trace=trace,
+                            started_at=t0,
+                        )
+                        continue
                     break
 
                 cdp: Optional[CDPClient] = None
@@ -2131,6 +2147,11 @@ class BrowserSession:
         started_at: Optional[float] = None,
     ) -> None:
         _check_cancelled(cancel_check)
+        # Новый URL может нормально рендериться даже если на предыдущей странице captureScreenshot зависал.
+        self._screenshots_disabled = False
+        self._screenshots_disabled_at = 0.0
+        self._last_screenshot_bytes = 0
+        self._last_screenshot_suspicious = False
         _emit_step(on_status, f"Открываю страницу {url}…", trace=trace, started_at=started_at)
         cdp = self.ensure_cdp()
         cdp.clear_telemetry()
@@ -2243,6 +2264,8 @@ class BrowserSession:
             _sleep_interruptible(clamped_wait / 1000.0, cancel_check)
         self.current_url = url
 
+    _SCREENSHOT_COOLDOWN_SEC = 45.0
+
     def capture_screenshot(
         self,
         *,
@@ -2253,17 +2276,48 @@ class BrowserSession:
     ) -> str:
         _check_cancelled(cancel_check)
         if self._screenshots_disabled:
-            _emit_step(
-                on_status,
-                "Скриншоты отключены для этой сессии (предыдущий вызов Page.captureScreenshot завис)",
-                trace=trace,
-                started_at=started_at,
-            )
-            return ""
+            disabled_at = float(getattr(self, "_screenshots_disabled_at", 0.0) or 0.0)
+            if disabled_at and (time.monotonic() - disabled_at) >= self._SCREENSHOT_COOLDOWN_SEC:
+                self._screenshots_disabled = False
+                self._screenshots_disabled_at = 0.0
+                _emit_step(
+                    on_status,
+                    "Сбрасываю блокировку скриншотов после паузы — пробую снова…",
+                    trace=trace,
+                    started_at=started_at,
+                )
+            else:
+                _emit_step(
+                    on_status,
+                    "Скриншоты отключены для этой сессии (предыдущий вызов Page.captureScreenshot завис)",
+                    trace=trace,
+                    started_at=started_at,
+                )
+                return ""
+        self._last_screenshot_bytes = 0
+        self._last_screenshot_suspicious = False
         attempts: List[Tuple[Dict[str, Any], float, str]] = [
             ({"format": "jpeg", "quality": 76, "fromSurface": True, "optimizeForSpeed": True}, 4.5, "fromSurface=True"),
             ({"format": "jpeg", "quality": 76, "fromSurface": False}, 3.0, "fromSurface=False"),
         ]
+        fallback_tiny: Optional[Tuple[str, int]] = None
+
+        def _finish_shot(b64_data: str, shot_elapsed_ms: float) -> str:
+            raw_len = (len(b64_data) * 3) // 4
+            size_lbl = f"{raw_len} Б" if raw_len < 1024 else f"{max(1, raw_len // 1024)} КБ"
+            is_real_img = b64_data.startswith(("/9j/", "iVBOR"))
+            suspicious = bool(is_real_img and 0 < raw_len < 2048)
+            self._last_screenshot_bytes = raw_len
+            self._last_screenshot_suspicious = suspicious
+            suffix = " (предупреждение: пустой/слишком маленький кадр)" if suspicious else ""
+            _emit_step(
+                on_status,
+                f"Скриншот получен ({size_lbl} за {shot_elapsed_ms:.0f} мс){suffix}",
+                trace=trace,
+                started_at=started_at,
+            )
+            return f"data:image/jpeg;base64,{b64_data}"
+
         try:
             cdp = self.ensure_cdp()
             for idx, (params, shot_timeout, label) in enumerate(attempts):
@@ -2281,14 +2335,22 @@ class BrowserSession:
                         res = cdp.call("Page.captureScreenshot", params, timeout=shot_timeout)
                     b64 = str(res.get("data") or "")
                     if b64:
-                        kb = max(1, (len(b64) * 3) // 4096)
-                        _emit_step(
-                            on_status,
-                            f"Скриншот получен ({kb} КБ за {(time.monotonic() - shot_t0) * 1000:.0f} мс)",
-                            trace=trace,
-                            started_at=started_at,
-                        )
-                        return f"data:image/jpeg;base64,{b64}"
+                        raw_len = (len(b64) * 3) // 4
+                        is_real_img = b64.startswith(("/9j/", "iVBOR"))
+                        if idx == 0 and is_real_img and 0 < raw_len < 2048 and self.is_alive():
+                            fallback_tiny = (b64, raw_len)
+                            _emit_step(
+                                on_status,
+                                f"Скриншот ({raw_len} Б) подозрительно мал — проверяю fallback fromSurface=False…",
+                                trace=trace,
+                                started_at=started_at,
+                            )
+                            continue
+                        if fallback_tiny is not None and raw_len <= fallback_tiny[1]:
+                            return _finish_shot(fallback_tiny[0], (time.monotonic() - shot_t0) * 1000.0)
+                        return _finish_shot(b64, (time.monotonic() - shot_t0) * 1000.0)
+                    if fallback_tiny is not None:
+                        return _finish_shot(fallback_tiny[0], (time.monotonic() - shot_t0) * 1000.0)
                     _emit_step(
                         on_status,
                         f"Page.captureScreenshot ({label}) вернул пустые данные",
@@ -2316,14 +2378,7 @@ class BrowserSession:
                             )
                             b64 = str(res.get("data") or "")
                             if b64:
-                                kb = max(1, (len(b64) * 3) // 4096)
-                                _emit_step(
-                                    on_status,
-                                    f"Скриншот получен ({kb} КБ)",
-                                    trace=trace,
-                                    started_at=started_at,
-                                )
-                                return f"data:image/jpeg;base64,{b64}"
+                                return _finish_shot(b64, (time.monotonic() - shot_t0) * 1000.0)
                             return ""
                         except BrowserError:
                             _check_cancelled(cancel_check)
@@ -2335,11 +2390,14 @@ class BrowserSession:
                     )
                     if idx == 0 and self.is_alive():
                         continue
+                    if fallback_tiny is not None:
+                        return _finish_shot(fallback_tiny[0], (time.monotonic() - shot_t0) * 1000.0)
                     raise
         except BrowserError as err:
             _check_cancelled(cancel_check)
             # Не тормозим последующие шаги в этой сессии, если captureScreenshot заблокирован/таймаутится.
             self._screenshots_disabled = True
+            self._screenshots_disabled_at = time.monotonic()
             _emit_step(
                 on_status,
                 f"Скриншот пропущен ({err}) — продолжаю без изображения",
@@ -2452,10 +2510,13 @@ class BrowserSession:
 class BrowserSessionManager:
     """Держит активные вкладки в рамках одного запуска Агента и гарантированно закрывает их."""
 
+    MAX_SESSIONS = 4
+
     def __init__(self, sandbox_root: Path = sandbox_mod.get_sandbox_root()) -> None:
         self.sandbox_root = sandbox_root
         self._lock = threading.Lock()
         self._sessions: Dict[str, BrowserSession] = {}
+        self._last_used: Dict[str, float] = {}
 
     def get_or_create(
         self,
@@ -2470,11 +2531,14 @@ class BrowserSessionManager:
     ) -> BrowserSession:
         _check_cancelled(cancel_check)
         stale: Optional[BrowserSession] = None
+        evicted: List[Tuple[str, BrowserSession]] = []
         preserved_origins: set[str] = set()
+        now = time.monotonic()
         with self._lock:
             session = self._sessions.get(session_id)
             if session is not None:
                 if session.is_alive():
+                    self._last_used[session_id] = now
                     _emit_step(
                         on_status,
                         f"Переиспользую активную сессию «{session_id}» ({session.current_url or 'about:blank'})",
@@ -2483,10 +2547,29 @@ class BrowserSessionManager:
                     )
                     return session
                 stale = self._sessions.pop(session_id, None)
+                self._last_used.pop(session_id, None)
                 preserved_origins = set(session.approved_external_origins)
+            # Ограничиваем число одновременных процессов браузера: сначала вычищаем мёртвые, затем старейшую.
+            dead_ids = [sid for sid, sess in self._sessions.items() if not sess.is_alive()]
+            for sid in dead_ids:
+                dead_sess = self._sessions.pop(sid, None)
+                self._last_used.pop(sid, None)
+                if dead_sess is not None:
+                    evicted.append((sid, dead_sess))
+            while len(self._sessions) >= self.MAX_SESSIONS:
+                # По возможности не закрываем основную сессию "default" раньше вспомогательных.
+                candidates = [sid for sid in self._sessions if sid != "default"] or list(self._sessions)
+                oldest_id = min(candidates, key=lambda sid: self._last_used.get(sid, 0.0))
+                old_sess = self._sessions.pop(oldest_id, None)
+                self._last_used.pop(oldest_id, None)
+                if old_sess is not None:
+                    evicted.append((oldest_id, old_sess))
         if stale is not None:
             _emit_step(on_status, f"Предыдущая сессия «{session_id}» завершилась — перезапускаю…", trace=trace, started_at=started_at)
             stale.close()
+        for old_sid, old_sess in evicted:
+            _emit_step(on_status, f"Закрываю вытесненную браузерную сессию «{old_sid}»…", trace=trace, started_at=started_at)
+            old_sess.close()
         try:
             sig = inspect.signature(BrowserSession.launch)
             params = sig.parameters
@@ -2508,6 +2591,7 @@ class BrowserSessionManager:
             created.approved_external_origins.update(preserved_origins)
         with self._lock:
             self._sessions[session_id] = created
+            self._last_used[session_id] = time.monotonic()
         return created
 
     def get_existing(self, session_id: str) -> Optional[BrowserSession]:
@@ -2517,6 +2601,7 @@ class BrowserSessionManager:
     def close_session(self, session_id: str) -> bool:
         with self._lock:
             session = self._sessions.pop(session_id, None)
+            self._last_used.pop(session_id, None)
         if not session:
             return False
         session.close()
@@ -2526,6 +2611,7 @@ class BrowserSessionManager:
         with self._lock:
             items = list(self._sessions.values())
             self._sessions.clear()
+            self._last_used.clear()
         for session in items:
             session.close()
 
@@ -3148,13 +3234,16 @@ def execute_browse_action(
             manager.close_session(session_id)
             emit_status(f"Сессия «{session_id}» закрыта после шага «{raw_action}»")
         preview = extra_shots[-1] if extra_shots else ""
-        events.append({
+        ev_payload: Dict[str, Any] = {
             "type": "browser_inspect",
             "action": raw_action,
             **meta,
             "trace": list(trace_log),
             **({"_images": extra_shots[:2], "preview": preview} if extra_shots else {}),
-        })
+        }
+        if extra_shots and getattr(session, "_last_screenshot_suspicious", False):
+            ev_payload["blankScreenshot"] = True
+        events.append(ev_payload)
         return report, events
     except Exception as err:
         emit_status(f"Ошибка на шаге «{raw_action}»: {err}")

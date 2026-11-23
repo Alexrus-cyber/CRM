@@ -132,9 +132,9 @@ class ClientDisconnectAndServerTests(unittest.TestCase):
                     sock.close()
                     time.sleep(0.15)
 
-                    # Обычный GET /sandbox работает и не тащит _github
+                    # Обычный GET /sandbox работает с токеном и не тащит _github
                     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
-                    conn.request("GET", "/sandbox")
+                    conn.request("GET", "/sandbox", headers={"Authorization": f"Bearer {srv._http_token}"})
                     resp = conn.getresponse()
                     body = json.loads(resp.read().decode("utf-8"))
                     conn.close()
@@ -1364,6 +1364,7 @@ class WindowsCompatibilityAndSpecTests(unittest.TestCase):
                 ).encode("utf-8")
                 sock.sendall(
                     f"POST /run HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                    f"Authorization: Bearer {srv._http_token}\r\n"
                     f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n".encode("ascii")
                     + body
                 )

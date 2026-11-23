@@ -157,13 +157,20 @@ class LanAndPreviewTests(unittest.TestCase):
             agent_mod.SANDBOX_ROOT = sb_root
             agent_mod.PROCESS_MANAGER.allowed_ports = lambda: {app_port}  # type: ignore[method-assign]
 
-            agent_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), agent_mod.Handler)
+            agent_srv = agent_mod.Server(("127.0.0.1", 0), agent_mod.Handler)
             agent_port = agent_srv.server_address[1]
             threading.Thread(target=agent_srv.serve_forever, daemon=True).start()
 
+            unauth_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+            opener.addheaders = [("Authorization", f"Bearer {agent_srv._http_token}")]
             try:
                 base = f"http://127.0.0.1:{agent_port}"
+                # 0. Без токена доступ к /sandbox/preview закрыт (401)
+                with self.assertRaises(urllib.error.HTTPError) as unauth_err:
+                    unauth_opener.open(f"{base}/sandbox/preview/plain", timeout=3)
+                self.assertEqual(unauth_err.exception.code, 401)
+
                 # 1. Directory with index.html returns 302 to .../index.html
                 try:
                     req = urllib.request.Request(

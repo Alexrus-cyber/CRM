@@ -114,6 +114,7 @@ def _load_secrets_file() -> None:
     secrets_path = os.environ.pop("CRM_SECRETS_FILE", "").strip()
     if not secrets_path:
         return
+    loaded_ok = False
     try:
         raw = Path(secrets_path).read_text(encoding="utf-8")
         data = json.loads(raw)
@@ -123,15 +124,17 @@ def _load_secrets_file() -> None:
                     _LAUNCHER_SECRETS[k] = v
             if not API_KEY and _LAUNCHER_SECRETS.get("AGENT_API_KEY"):
                 API_KEY = _LAUNCHER_SECRETS["AGENT_API_KEY"]
-    except OSError:
-        pass
-    except ValueError:
-        pass
+            loaded_ok = True
+        else:
+            sys.stderr.write("[agent] ПРЕДУПРЕЖДЕНИЕ: CRM_SECRETS_FILE содержит некорректный формат (ожидался JSON-объект)\n")
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"[agent] ПРЕДУПРЕЖДЕНИЕ: не удалось прочитать CRM_SECRETS_FILE ({exc})\n")
     finally:
-        try:
-            Path(secrets_path).unlink(missing_ok=True)
-        except OSError:
-            pass
+        if loaded_ok:
+            try:
+                Path(secrets_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 _load_secrets_file()
@@ -139,8 +142,80 @@ MAX_STEPS = _env_int("AGENT_MAX_STEPS", 500, minimum=1)
 MAX_STEPS_LIMIT = MAX_STEPS
 MAX_RUN_TOKENS = _env_int("AGENT_MAX_RUN_TOKENS", 2500000, minimum=0)
 TIMEOUT = _env_int("AGENT_TIMEOUT", 180, minimum=5)
+HEADER_TIMEOUT = _env_int("AGENT_HEADER_TIMEOUT", 60, minimum=2)
 SSE_WRITE_TIMEOUT = _env_int("AGENT_SSE_WRITE_TIMEOUT", 30, minimum=5)
 APPROVAL_TIMEOUT = _env_int("AGENT_APPROVAL_TIMEOUT", 600, minimum=10)
+AGENT_HTTP_TOKEN = (
+    _LAUNCHER_SECRETS.get("AGENT_HTTP_TOKEN") or os.environ.get("AGENT_HTTP_TOKEN", "")
+).strip()
+_RUNTIME_HTTP_TOKEN = ""
+_FALLBACK_HTTP_TOKEN = secrets.token_urlsafe(32)
+
+
+def _is_loopback_host(host: str) -> bool:
+    clean = (host or "").strip().lower().strip("[]")
+    return clean in ("127.0.0.1", "localhost", "::1", "")
+
+
+def _http_token_file_path(port: int) -> Path:
+    return Path.home() / ".crm-agent" / f"http-token-{int(port)}.json"
+
+
+def _write_http_token_file(port: int, token: str) -> Optional[Path]:
+    try:
+        token_path = _http_token_file_path(port)
+        token_dir = token_path.parent
+        token_dir.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            try:
+                os.chmod(token_dir, 0o700)
+            except OSError:
+                pass
+        payload = json.dumps(
+            {"token": token, "port": int(port), "host": HOST, "pid": os.getpid()},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if os.name == "nt":
+            token_path.write_bytes(payload)
+        else:
+            fd = os.open(str(token_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+            try:
+                os.chmod(token_path, 0o600)
+            except OSError:
+                pass
+        return token_path
+    except OSError as exc:
+        log(f"предупреждение: не удалось сохранить http-token файл: {exc}")
+        return None
+
+
+def _remove_http_token_file(token_path: Optional[Path]) -> None:
+    if token_path is None:
+        return
+    try:
+        token_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _expected_http_token(server: Any = None) -> str:
+    explicit = (
+        _LAUNCHER_SECRETS.get("AGENT_HTTP_TOKEN")
+        or os.environ.get("AGENT_HTTP_TOKEN", "")
+        or AGENT_HTTP_TOKEN
+    ).strip()
+    if explicit:
+        return explicit
+    srv_tok = str(getattr(server, "_http_token", "") or "").strip()
+    if srv_tok:
+        return srv_tok
+    if _RUNTIME_HTTP_TOKEN:
+        return _RUNTIME_HTTP_TOKEN
+    return _FALLBACK_HTTP_TOKEN
 
 WORKSPACE = _init_workspace()
 SANDBOX_ROOT = sandbox_mod.get_sandbox_root()
@@ -1317,7 +1392,7 @@ def run_tool(
             trust_level=trust,
             approval_fn=approval_fn,
             sandbox_root=sandbox_root,
-            browser_manager=None,
+            browser_manager=browser_manager,
             github_ctx=github_ctx,
             unlimited=unlimited,
             tester_ctx=tester_ctx,
@@ -1426,6 +1501,7 @@ def run_tool(
         )
 
     if name == "browse_project":
+        owns_mgr = browser_manager is None
         mgr = browser_manager or browser_inspector.BrowserSessionManager(sandbox_root=sandbox_root)
         try:
             return browser_inspector.execute_browse_action(
@@ -1438,6 +1514,9 @@ def run_tool(
             )
         except (browser_inspector.BrowserError, sandbox_mod.SandboxError) as error:
             raise AgentError(str(error), trace=getattr(error, "trace", None)) from error
+        finally:
+            if owns_mgr:
+                mgr.close_all()
 
     if name == "inspect_pc_screen":
         reason = str(args.get("reason") or "Агенту нужен снимок экрана ПК для решения задачи").strip()
@@ -2710,9 +2789,23 @@ def call_model(
             hb_thread.start()
             prev_conn_holder = getattr(_MODEL_CONN_TLS, "holder", None)
             _MODEL_CONN_TLS.holder = conn_holder
+            open_timeout = min(float(TIMEOUT), float(HEADER_TIMEOUT))
             try:
-                with _safe_model_urlopen(request, timeout=TIMEOUT) as response:
+                with _safe_model_urlopen(request, timeout=open_timeout) as response:
                     resp_holder["resp"] = response
+
+                    def _shrink_response_socket_timeout(seconds: float) -> None:
+                        try:
+                            fp = getattr(response, "fp", None)
+                            raw_fp = getattr(fp, "raw", None) or getattr(response, "raw", None)
+                            sock = getattr(raw_fp, "_sock", None)
+                            if sock is not None and hasattr(sock, "settimeout"):
+                                sock.settimeout(seconds)
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    if float(TIMEOUT) > open_timeout:
+                        _shrink_response_socket_timeout(float(TIMEOUT))
                     if not body_payload.get("stream"):
                         raw = response.read().decode("utf-8", "replace")
                         if cancel_check and cancel_check():
@@ -2762,16 +2855,6 @@ def call_model(
                             except (TypeError, ValueError):
                                 continue
                         return False
-
-                    def _shrink_response_socket_timeout(seconds: float) -> None:
-                        try:
-                            fp = getattr(response, "fp", None)
-                            raw_fp = getattr(fp, "raw", None) or getattr(response, "raw", None)
-                            sock = getattr(raw_fp, "_sock", None)
-                            if sock is not None and hasattr(sock, "settimeout"):
-                                sock.settimeout(seconds)
-                        except Exception:  # noqa: BLE001
-                            pass
 
                     try:
                         for raw_bytes in response:
@@ -3310,6 +3393,7 @@ TEXT_PROTOCOL_NOTE = """
 ответь РОВНО одним JSON-объектом в блоке ```json:
 {"tool": "...", "args": {...}}
 Основные инструменты: sandbox_create_project, sandbox_write_file, sandbox_read_file, sandbox_list, run_command, browse_project, call_tester, create_file, open_website, qa_static_review, qa_run_tests, qa_http_audit, qa_browser_audit, qa_submit_report.
+Не вставляй длинные base64-строки изображений в args — передавай пути к файлам в Sandbox или URL.
 Без пояснений вокруг. Если действие не нужно — отвечай обычным текстом.
 """
 
@@ -3531,6 +3615,7 @@ def run_tester_session(
     tester_tools = tools_for_trust(trust_level, has_github=has_github_repo, role="tester")
     local_browser_mgr = browser_manager or browser_inspector.BrowserSessionManager(sandbox_root=sandbox_root)
     owns_browser_mgr = browser_manager is None
+    tester_browser_session_id = f"tester_{run_key}"
 
     use_tools = True
     steps = 0
@@ -3841,9 +3926,12 @@ def run_tester_session(
                         },
                     )
                     try:
+                        call_args = dict(t_args) if isinstance(t_args, dict) else {}
+                        if t_name == "browse_project":
+                            call_args["session_id"] = tester_browser_session_id
                         t_res, t_events = run_tool(
                             t_name,
-                            t_args if isinstance(t_args, dict) else {},
+                            call_args,
                             trust_level=trust_level,
                             approval_fn=wrapped_tool_approval,
                             sandbox_root=sandbox_root,
@@ -4063,6 +4151,8 @@ def run_tester_session(
     finally:
         if owns_browser_mgr:
             local_browser_mgr.close_all()
+        else:
+            local_browser_mgr.close_session(tester_browser_session_id)
 
     report = qa_state.get("report") if qa_state.get("report") else None
     if not report:
@@ -4662,6 +4752,30 @@ def _render_sandbox_dir_html(rel_dir: str, directory: Path, preview_prefix: str)
 class Handler(BaseHTTPRequestHandler):
     server_version = "CrmAgent/2.0"
     protocol_version = "HTTP/1.1"
+    timeout = 30.0
+
+    def _is_authorized(self) -> bool:
+        expected = _expected_http_token(getattr(self, "server", None))
+        if not expected:
+            return False
+        auth_hdr = str(self.headers.get("Authorization") or "").strip()
+        provided = ""
+        if auth_hdr.lower().startswith("bearer "):
+            provided = auth_hdr[7:].strip()
+        if not provided:
+            provided = str(self.headers.get("X-Agent-Token") or "").strip()
+        if not provided:
+            return False
+        try:
+            return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _require_auth(self) -> bool:
+        if self._is_authorized():
+            return True
+        self._json(401, {"error": "Unauthorized: требуется токен AGENT_HTTP_TOKEN"})
+        return False
 
     def log_message(self, fmt: str, *args: Any) -> None:
         try:
@@ -4713,7 +4827,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_response(204)
             self._send_cors_headers()
-            self.send_header("Access-Control-Allow-Headers", "content-type, authorization")
+            self.send_header("Access-Control-Allow-Headers", "content-type, authorization, x-agent-token")
             self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS")
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -4907,6 +5021,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(502, {"error": f"Локальный сервер проекта на порту {port} не отвечает: {last_exc}"})
 
     def _handle_proxy_method(self, method: str) -> None:
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         if parsed.path.startswith("/sandbox/proxy/"):
             self._handle_sandbox_proxy(method, parsed.path, parsed.query)
@@ -4914,6 +5030,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "Не найдено"})
 
     def do_HEAD(self) -> None:  # noqa: N802
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/sandbox/preview" or parsed.path.startswith("/sandbox/preview/"):
             self._handle_sandbox_preview(parsed.path, send_body=False)
@@ -4960,20 +5078,26 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route in ("/", "/health"):
-            self._json(
-                200,
-                {
-                    "ok": True,
-                    "model": MODEL or None,
-                    "baseUrl": BASE_URL,
-                    "workspace": str(WORKSPACE),
-                    "sandbox": str(SANDBOX_ROOT),
-                    "browserAvailable": browser_inspector.cached_browser_available(),
-                    "tools": [tool["function"]["name"] for tool in TOOLS],
-                    "maxSteps": MAX_STEPS,
-                    "maxRunTokens": MAX_RUN_TOKENS,
-                },
-            )
+            payload: Dict[str, Any] = {
+                "ok": True,
+                "model": MODEL or None,
+                "browserAvailable": browser_inspector.cached_browser_available(),
+                "maxSteps": MAX_STEPS,
+                "maxRunTokens": MAX_RUN_TOKENS,
+            }
+            if self._is_authorized():
+                payload.update(
+                    {
+                        "baseUrl": BASE_URL,
+                        "workspace": str(WORKSPACE),
+                        "sandbox": str(SANDBOX_ROOT),
+                        "tools": [tool["function"]["name"] for tool in TOOLS],
+                    }
+                )
+            self._json(200, payload)
+            return
+
+        if not self._require_auth():
             return
 
         if route == "/sandbox":
@@ -5036,6 +5160,21 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "Не найдено"})
 
     def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._handle_post()
+        except Exception as exc:  # noqa: BLE001 — не закрываем сокет с пустым ответом (ERR_EMPTY_RESPONSE)
+            if _is_client_disconnect(exc):
+                self._client_disconnected = True
+                return
+            log(f"сбой POST {self.path}: {traceback.format_exc()}")
+            try:
+                self._json(500, {"ok": False, "error": str(exc)})
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _handle_post(self) -> None:
+        if not self._require_auth():
+            return
         parsed = urlparse(self.path)
         route = parsed.path
 
@@ -5104,6 +5243,9 @@ class Handler(BaseHTTPRequestHandler):
             if not body:
                 self._json(400, {"error": "Некорректный JSON"})
                 return
+            if body.get("confirmed") is not True:
+                self._json(400, {"error": "Требуется явное подтверждение переноса файлов из Sandbox (confirmed: true)"})
+                return
             try:
                 res = sandbox_mod.export_path(
                     SANDBOX_ROOT,
@@ -5126,8 +5268,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/sandbox/delete":
             body = self._read_json()
+            if not body:
+                self._json(400, {"error": "Некорректный JSON"})
+                return
+            if body.get("confirmed") is not True:
+                self._json(400, {"error": "Требуется явное подтверждение удаления из Sandbox (confirmed: true)"})
+                return
             try:
-                ok = sandbox_mod.delete_path(SANDBOX_ROOT, str((body or {}).get("path") or ""))
+                ok = sandbox_mod.delete_path(SANDBOX_ROOT, str(body.get("path") or ""))
             except sandbox_mod.SandboxError as error:
                 self._json(400, {"error": str(error)})
                 return
@@ -6279,6 +6427,14 @@ class Server(ThreadingHTTPServer):
             except OSError:
                 pass
         super().server_bind()
+        if not getattr(self, "_http_token", ""):
+            self._http_token = (
+                _LAUNCHER_SECRETS.get("AGENT_HTTP_TOKEN")
+                or os.environ.get("AGENT_HTTP_TOKEN", "")
+                or AGENT_HTTP_TOKEN
+                or _RUNTIME_HTTP_TOKEN
+                or secrets.token_urlsafe(32)
+            ).strip()
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         _, exc, _ = sys.exc_info()
@@ -7016,7 +7172,7 @@ def _diagnose_port_conflict(host: str, port: int) -> str:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(req, timeout=1.0) as resp:
             raw = resp.read(2048).decode("utf-8", "replace")
-            if resp.status == 200 and '"tools"' in raw and '"ok"' in raw:
+            if resp.status == 200 and '"maxSteps"' in raw and '"ok"' in raw:
                 return f"на {probe_host}:{port} уже запущен другой экземпляр CRM Agent"
             return f"на {probe_host}:{port} уже отвечает другой HTTP-сервис (HTTP {resp.status})"
     except Exception as err:  # noqa: BLE001
@@ -7024,12 +7180,21 @@ def _diagnose_port_conflict(host: str, port: int) -> str:
 
 
 def main() -> int:
+    global _RUNTIME_HTTP_TOKEN
     configure_stdio()
     parser = argparse.ArgumentParser(description="CRM AI Agent (HTTP+SSE + Sandbox)")
     parser.add_argument("--self-test", action="store_true", help="проверка инструментов и Sandbox")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
+
+    explicit_tok = (
+        _LAUNCHER_SECRETS.get("AGENT_HTTP_TOKEN")
+        or os.environ.get("AGENT_HTTP_TOKEN", "")
+        or AGENT_HTTP_TOKEN
+    ).strip()
+    if not explicit_tok and not _RUNTIME_HTTP_TOKEN:
+        _RUNTIME_HTTP_TOKEN = secrets.token_urlsafe(32)
 
     try:
         server = Server((HOST, PORT), Handler)
@@ -7041,6 +7206,13 @@ def main() -> int:
             "(например AGENT_PORT=8901 для агента и AGENT_URL=http://127.0.0.1:8901 в .env)."
         )
         return 1
+    active_token = str(getattr(server, "_http_token", "") or _expected_http_token(server))
+    token_file = _write_http_token_file(PORT, active_token)
+    if not _is_loopback_host(HOST) and not explicit_tok:
+        log(
+            "ВНИМАНИЕ: AGENT_HOST не loopback — сгенерирован случайный AGENT_HTTP_TOKEN; "
+            "для доступа с другого хоста/Docker задайте одинаковый AGENT_HTTP_TOKEN на CRM и агенте."
+        )
     log(f"слушаю http://{HOST}:{PORT} · модель: {MODEL or 'из запроса'} · база: {BASE_URL}")
     log(f"папка файлов: {WORKSPACE} · Sandbox: {SANDBOX_ROOT}")
     try:
@@ -7048,6 +7220,7 @@ def main() -> int:
     except KeyboardInterrupt:
         log("остановлен")
     finally:
+        _remove_http_token_file(token_file)
         server.server_close()
     return 0
 

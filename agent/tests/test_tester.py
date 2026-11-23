@@ -579,7 +579,10 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                 req = urllib.request.Request(
                     f"http://127.0.0.1:{port}/run",
                     data=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {srv._http_token}",
+                    },
                     method="POST",
                 )
                 with mock.patch.object(agent_mod, "call_model", side_effect=_fake_model):
@@ -657,8 +660,10 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                 }
 
             def _fake_exec(mgr, args, **_kw):
-                self.assertIsNot(mgr, agent_mgr)
+                self.assertIs(mgr, agent_mgr)
                 sid = str(args.get("session_id"))
+                self.assertNotEqual(sid, "default")
+                self.assertTrue(sid.startswith("qa_audit_"))
                 if sid not in mgr._sessions:
                     s = mock.MagicMock()
                     s.is_alive.return_value = True
@@ -876,7 +881,10 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                                 "trustLevel": "full",
                             }
                         ).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {srv._http_token}",
+                        },
                         method="POST",
                     )
                     with urllib.request.urlopen(req, timeout=10) as resp:

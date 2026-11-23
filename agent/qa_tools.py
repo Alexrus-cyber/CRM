@@ -837,7 +837,7 @@ def run_qa_tool(
     args = args or {}
     events: List[Dict[str, Any]] = []
     trust = str(trust_level or "verified").strip().lower()
-    if trust == "none":
+    if trust == "none" and name != "qa_submit_report":
         raise QaToolError("Уровень доверия «Нет доступа» запрещает QA-проверки в Sandbox.")
 
     if name == "qa_static_review":
@@ -927,6 +927,8 @@ def run_qa_tool(
                 if tester_run_key:
                     req_payload["testerRunKey"] = tester_run_key
                 decision = approval_fn(req_payload)
+                if not isinstance(decision, dict):
+                    decision = {}
                 if not decision.get("approved"):
                     msg = f"Пользователь отклонил пакетный запуск QA-проверок ({labels_str})."
                     if checks_sink is not None:
@@ -936,6 +938,8 @@ def run_qa_tool(
 
         for label, cmd in cmds_to_run:
             if trust == "verified" and not batch_approved:
+                if approval_fn is None:
+                    raise QaToolError("Требуется подтверждение пользователя для запуска тестовой команды")
                 req_payload = {
                     "kind": "bash_command",
                     "title": f"Разрешить Тестировщику запустить: {label}?",
@@ -946,6 +950,8 @@ def run_qa_tool(
                 if tester_run_key:
                     req_payload["testerRunKey"] = tester_run_key
                 decision = approval_fn(req_payload)
+                if not isinstance(decision, dict):
+                    decision = {}
                 if not decision.get("approved"):
                     msg = f"Пользователь отклонил запуск QA-команды «{cmd}»."
                     outputs.append(msg)
@@ -961,20 +967,23 @@ def run_qa_tool(
                     timeout=timeout_sec,
                     background=False,
                     unlimited=unlimited,
+                    raise_on_timeout=False,
                 )
             except sandbox_mod.SandboxError as err:
                 raise QaToolError(str(err)) from err
 
-            exit_code = int(res.get("exitCode") or 0)
+            raw_exit = res.get("exitCode")
+            exit_code = int(raw_exit) if raw_exit is not None else 0
+            timed_out = bool(res.get("timedOut"))
             out_txt = str(res.get("output") or "")
-            status = "pass" if exit_code == 0 else "fail"
+            status = "fail" if (exit_code != 0 or timed_out) else "pass"
             if checks_sink is not None:
                 checks_sink.append(
                     {
                         "name": label,
                         "tool": "qa_run_tests",
                         "status": status,
-                        "details": f"exit={exit_code}: {out_txt[:400]}",
+                        "details": (f"timeout (exit={exit_code}): " if timed_out else f"exit={exit_code}: ") + out_txt[:400],
                     }
                 )
             events.append(
@@ -983,6 +992,7 @@ def run_qa_tool(
                     "command": cmd,
                     "cwd": res.get("cwd", "."),
                     "exitCode": exit_code,
+                    "timedOut": timed_out,
                     "output": out_txt if unlimited else out_txt[:4000],
                 }
             )
@@ -1128,6 +1138,7 @@ def run_qa_tool(
 
         summary_lines: List[str] = []
         any_errors = False
+        has_blank_shot = False
         no_browser_reason = ""
         no_browser_trace: List[str] = []
         audit_session_id = f"qa_audit_{uuid.uuid4().hex[:8]}"
@@ -1181,6 +1192,12 @@ def run_qa_tool(
                 for ev in evs:
                     if (ev.get("errorsCount") or 0) > 0 or (ev.get("issuesCount") or 0) > 0:
                         any_errors = True
+                    if ev.get("blankScreenshot"):
+                        has_blank_shot = True
+                        summary_lines.append(
+                            f"⚠️ Внимание ({vp}): скриншот получился пустым/слишком маленьким — "
+                            "страница могла не отрисоваться."
+                        )
                 events.extend(evs)
                 summary_lines.append(f"=== Viewport: {vp} ===\n{txt}")
         finally:
@@ -1266,14 +1283,21 @@ def run_qa_tool(
                     pass
             return "\n".join(fallback_parts), events
 
-        chk_status = "fail" if any_errors else "pass"
+        chk_status = "fail" if any_errors else ("warn" if has_blank_shot else "pass")
+        chk_details = (
+            "Найдены ошибки в браузере/анимациях"
+            if any_errors
+            else "Предупреждение: получен пустой/слишком маленький скриншот (проверьте отрисовку)"
+            if has_blank_shot
+            else "Страница открылась без ошибок консоли и сети"
+        )
         if checks_sink is not None:
             checks_sink.append(
                 {
                     "name": "Браузерный аудит (desktop + mobile)",
                     "tool": "qa_browser_audit",
                     "status": chk_status,
-                    "details": "Найдены ошибки в браузере/анимациях" if any_errors else "Страница открылась без ошибок консоли и сети",
+                    "details": chk_details,
                 }
             )
         if on_status:

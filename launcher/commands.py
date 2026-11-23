@@ -237,6 +237,12 @@ def agent_secrets(spec: AgentSpec, settings: LaunchSettings) -> Dict[str, str]:
             out["AGENT_API_KEY"] = model["api_key"]
         elif spec.id == "custom" and truthy(settings.values_for(spec).get("pass_model_env", True)):
             out["AGENT_API_KEY"] = model["api_key"]
+    if spec.id == "chat_agent":
+        http_token = str(
+            settings.values_for(spec).get("http_token") or os.environ.get("AGENT_HTTP_TOKEN") or ""
+        ).strip()
+        if http_token:
+            out["AGENT_HTTP_TOKEN"] = http_token
     if spec.id == "operator":
         values = settings.values_for(spec)
         profile_op = settings.crm_profile.get("operator") if isinstance(settings.crm_profile, dict) else None

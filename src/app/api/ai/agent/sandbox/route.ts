@@ -78,6 +78,7 @@ export async function POST(req: Request) {
         source?: string;
         destination?: string;
         mode?: string;
+        confirmed?: boolean;
         pid?: number;
         path?: string;
         fileName?: string;
@@ -90,6 +91,12 @@ export async function POST(req: Request) {
   let payload: Record<string, unknown> = {};
 
   if (action === "export") {
+    if (body?.confirmed !== true) {
+      return Response.json(
+        { error: "Требуется явное подтверждение переноса файлов из Sandbox (confirmed: true)" },
+        { status: 400 },
+      );
+    }
     path = "/sandbox/export";
     payload = {
       source: String(body?.source ?? ""),
@@ -101,8 +108,14 @@ export async function POST(req: Request) {
     path = "/sandbox/stop";
     payload = { pid: Number(body?.pid ?? 0) };
   } else if (action === "delete") {
+    if (body?.confirmed !== true) {
+      return Response.json(
+        { error: "Требуется явное подтверждение удаления из Sandbox (confirmed: true)" },
+        { status: 400 },
+      );
+    }
     path = "/sandbox/delete";
-    payload = { path: String(body?.path ?? "") };
+    payload = { path: String(body?.path ?? ""), confirmed: true };
   } else if (action === "write_transcript") {
     path = "/sandbox/transcript";
     payload = {

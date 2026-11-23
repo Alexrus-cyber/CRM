@@ -337,6 +337,28 @@ def _zip_bytes(files: Dict[str, str]) -> bytes:
     return buffer.getvalue()
 
 
+def _sanitize_zip_member_name(raw_name: Any) -> str:
+    raw = str(raw_name or "").strip()
+    if not raw:
+        return "файл.txt"
+    if "\x00" in raw:
+        raise FileForgeError("Недопустимый нулевой байт в имени файла внутри ZIP")
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", "", raw)
+    if re.match(r"^[A-Za-z]:", cleaned) or cleaned.startswith(("\\\\", "//")):
+        raise FileForgeError(f"Запрещён абсолютный или сетевой путь в ZIP-архиве: {raw}")
+    normalized = re.sub(r"[\\/]+", "/", cleaned).lstrip("/")
+    segments: List[str] = []
+    for part in normalized.split("/"):
+        if not part or part == ".":
+            continue
+        if part == ".." or ".." in part.split(".") and part.strip(".") == "":
+            raise FileForgeError(f"Запрещён выход за пределы каталога (..) в ZIP-архиве: {raw}")
+        segments.append(part)
+    if not segments:
+        return "файл.txt"
+    return "/".join(segments)[:240]
+
+
 def _zip(content: str) -> bytes:
     try:
         payload = json.loads(content)
@@ -349,10 +371,20 @@ def _zip(content: str) -> bytes:
         raise FileForgeError("В ZIP нечего складывать: нужен список files")
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        seen_names: set[str] = set()
         for item in items[:50]:
             if not isinstance(item, dict):
                 continue
-            name = re.sub(r"[\\/]+", "/", str(item.get("name") or "файл.txt")).lstrip("/")
+            name = _sanitize_zip_member_name(item.get("name") or "файл.txt")
+            if name in seen_names:
+                stem, dot, ext = name.rpartition(".")
+                base = stem if dot else name
+                suffix = f".{ext}" if dot else ""
+                idx = 2
+                while f"{base}_{idx}{suffix}" in seen_names:
+                    idx += 1
+                name = f"{base}_{idx}{suffix}"
+            seen_names.add(name)
             data = item.get("content", "")
             info = zipfile.ZipInfo(name, ZIP_STAMP)
             info.compress_type = zipfile.ZIP_DEFLATED
