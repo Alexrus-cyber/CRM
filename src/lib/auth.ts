@@ -1,5 +1,5 @@
 import { cache } from "react";
-import { cookies } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { randomBytes, scrypt, scryptSync, timingSafeEqual } from "crypto";
 import type { Role } from "@/db/schema";
@@ -98,6 +98,68 @@ export async function verifyUserTotp(userId: number, code: string): Promise<bool
   return verifyTotpCode(secret, code);
 }
 
+export function resolveRequestOrigin(req: Request): string {
+  const url = new URL(req.url);
+  const rawProto = (req.headers.get("x-forwarded-proto") ?? "").split(",")[0]?.trim().toLowerCase();
+  const proto = rawProto === "https" || rawProto === "http" ? rawProto : "";
+  const fwdHost = (req.headers.get("x-forwarded-host") ?? "").split(",")[0]?.trim() ?? "";
+  const directHost = (req.headers.get("host") ?? "").trim();
+  const pickHost = (candidate: string) =>
+    candidate && !/[\s/@\\]/.test(candidate) ? candidate : "";
+  const safeHost = pickHost(fwdHost) || (url.hostname === "0.0.0.0" || url.hostname === "::" ? pickHost(directHost) : "");
+  if (safeHost) {
+    return `${proto || url.protocol.replace(":", "")}://${safeHost}`;
+  }
+  if (proto) {
+    const fallbackHost = pickHost(directHost) || url.host;
+    return `${proto}://${fallbackHost}`;
+  }
+  return url.origin;
+}
+
+export async function shouldUseSecureCookie(reqHeaders?: Headers, reqUrl?: string): Promise<boolean> {
+  const override = (process.env.CRM_COOKIE_SECURE ?? "").trim().toLowerCase();
+  if (override === "1" || override === "true") return true;
+  if (override === "0" || override === "false") return false;
+
+  let hdrs: Headers | null = reqHeaders ?? null;
+  if (!hdrs) {
+    try {
+      hdrs = await headers();
+    } catch {
+      hdrs = null;
+    }
+  }
+
+  if (hdrs) {
+    const fwdProto = (hdrs.get("x-forwarded-proto") ?? "").split(",")[0]?.trim().toLowerCase();
+    if (fwdProto === "https") return true;
+    if (fwdProto === "http") return false;
+
+    if ((hdrs.get("x-forwarded-ssl") ?? "").trim().toLowerCase() === "on") return true;
+
+    const forwarded = hdrs.get("forwarded") ?? "";
+    const protoMatch = forwarded.match(/proto=(https?)/i);
+    if (protoMatch) return protoMatch[1]!.toLowerCase() === "https";
+
+    const originOrRef = (hdrs.get("origin") ?? hdrs.get("referer") ?? "").trim().toLowerCase();
+    if (originOrRef.startsWith("https://")) return true;
+    if (originOrRef.startsWith("http://")) return false;
+  }
+
+  if (reqUrl) {
+    const lower = reqUrl.trim().toLowerCase();
+    if (lower.startsWith("https://")) return true;
+    if (lower.startsWith("http://")) return false;
+  }
+
+  if (hdrs?.get("host")) {
+    return false;
+  }
+
+  return (process.env.CRM_PUBLIC_URL ?? "").trim().toLowerCase().startsWith("https://");
+}
+
 export async function createSession(
   userId: number,
   meta?: { label?: string; userAgent?: string; ip?: string },
@@ -106,10 +168,11 @@ export async function createSession(
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400000);
   await insertSession(token, userId, expiresAt.toISOString(), meta);
   const store = await cookies();
+  const secure = await shouldUseSecureCookie();
   store.set(SESSION_COOKIE, token, {
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure,
     expires: expiresAt,
     path: "/",
   });

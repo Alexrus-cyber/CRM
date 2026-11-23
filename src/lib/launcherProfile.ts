@@ -18,6 +18,15 @@ import {
 } from "@/lib/aiPolicy";
 import { ROLE_LABELS } from "@/lib/utils";
 
+function isLoopbackOriginUrl(raw: string): boolean {
+  try {
+    const host = new URL(raw).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "0.0.0.0" || host.endsWith(".localhost");
+  } catch {
+    return false;
+  }
+}
+
 export async function buildLauncherProfile(
   user: UserLite,
   fallbackOrigin: string,
@@ -45,7 +54,11 @@ export async function buildLauncherProfile(
       connections = [conn];
     }
     if (conn.serverUrl) {
-      operatorServerUrl = conn.serverUrl;
+      // Не подменяем LAN/удалённый адрес CRM старым localhost из локальной разработки.
+      operatorServerUrl =
+        fallbackOrigin && !isLoopbackOriginUrl(fallbackOrigin) && isLoopbackOriginUrl(conn.serverUrl)
+          ? fallbackOrigin
+          : conn.serverUrl;
     }
     const tokens = await listAgentTokens(user.id, conn.id);
     const preferred = tokens.find((t) => t.name === "CRM Launcher") ?? tokens[0] ?? null;

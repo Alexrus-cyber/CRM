@@ -653,9 +653,17 @@ describe("вкладка «Агент»", () => {
     fireEvent.click(screen.getByRole("tab", { name: /Sandbox и Оператор/i }));
     expect(await screen.findByText(/Проекты: landing-site, crm-widget/)).toBeTruthy();
 
+    const quickLink = screen.getByRole("link", { name: /Открыть landing-site/i });
+    expect(quickLink.getAttribute("href")).toBe("/api/ai/agent/sandbox/preview/landing-site");
+
     fireEvent.click(screen.getByRole("button", { name: /Sandbox \(2\)/i }));
     expect(await screen.findByText("landing-site (4 ф.)")).toBeTruthy();
     expect(screen.getByText("crm-widget (2 ф.)")).toBeTruthy();
+
+    const previewBtns = screen.getAllByRole("button", { name: /^превью$/i });
+    fireEvent.click(previewBtns[0]!);
+    const iframe = await screen.findByTitle("Превью landing-site");
+    expect(iframe.getAttribute("src")).toBe("/api/ai/agent/sandbox/preview/landing-site");
   });
 
   it("показывает запрос разрешения внизу справа и передаёт снимок экрана от Оператора в Агента", async () => {

@@ -112,6 +112,7 @@ type AgentAction = {
     | "open_url"
     | "command_result"
     | "sandbox_file"
+    | "sandbox_update"
     | "project_created"
     | "sandbox_export"
     | "operator_plan"
@@ -126,7 +127,11 @@ type AgentAction = {
     | "tester_minor_decision"
     | "qa_check";
   action?: string;
+  kind?: string;
   url?: string;
+  previewUrl?: string;
+  port?: number | null;
+  background?: boolean;
   title?: string;
   viewport?: string;
   label?: string;
@@ -278,15 +283,73 @@ type PendingApproval = {
   };
 };
 
-type SandboxProject = { name: string; files?: number };
+type SandboxProject = { name: string; files?: number; hasIndex?: boolean };
 
 type SandboxState = {
   available: boolean;
   root?: string;
   projects: SandboxProject[];
   items: Array<{ path: string; isDir: boolean; size: number }>;
-  processes: Array<{ pid: number; command: string; cwd: string; alive: boolean }>;
+  processes: Array<{
+    pid: number;
+    command: string;
+    cwd: string;
+    url?: string;
+    port?: number | null;
+    alive: boolean;
+  }>;
 };
+
+function isLocalOrLanUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    if (!host) return false;
+    if (
+      host === "127.0.0.1" ||
+      host === "localhost" ||
+      host === "::1" ||
+      host === "0.0.0.0" ||
+      host.endsWith(".localhost") ||
+      host.endsWith(".local") ||
+      host.endsWith(".lan") ||
+      host === "host.docker.internal"
+    ) {
+      return true;
+    }
+    if (/^10\./.test(host) || /^192\.168\./.test(host)) return true;
+    const m172 = host.match(/^172\.(\d+)\./);
+    if (m172 && Number(m172[1]) >= 16 && Number(m172[1]) <= 31) return true;
+    if (/^(fc|fd)[0-9a-f]{2}:/i.test(host)) return true;
+    return !host.includes(".");
+  } catch {
+    return false;
+  }
+}
+
+function extractPortFromLocalUrl(raw?: string): number | null {
+  if (!raw) return null;
+  const match = raw.trim().match(/^https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\]):(\d{1,5})(?:[/?#]|$)/i);
+  if (!match) return null;
+  const port = Number(match[1]);
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+}
+
+function toSandboxProxyUrl(rawUrl?: string, explicitPort?: number | null): string | null {
+  if (rawUrl && rawUrl.startsWith("/api/ai/agent/sandbox/")) return rawUrl;
+  const port = explicitPort ?? extractPortFromLocalUrl(rawUrl);
+  if (!port) return null;
+  if (rawUrl) {
+    try {
+      const u = new URL(rawUrl);
+      const tail = u.pathname === "/" ? "" : u.pathname;
+      return `/api/ai/agent/sandbox/proxy/${port}${tail}${u.search}${u.hash}`;
+    } catch {
+      /* fallback below */
+    }
+  }
+  return `/api/ai/agent/sandbox/proxy/${port}`;
+}
 
 function normalizeSandboxState(raw: unknown): SandboxState {
   const src = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
@@ -302,7 +365,12 @@ function normalizeSandboxState(raw: unknown): SandboxState {
         const name = String(obj.name ?? obj.project ?? obj.path ?? "").trim();
         if (!name) return null;
         const files = typeof obj.files === "number" && Number.isFinite(obj.files) ? obj.files : undefined;
-        return files !== undefined ? { name, files } : { name };
+        const hasIndex = typeof obj.hasIndex === "boolean" ? obj.hasIndex : undefined;
+        return {
+          name,
+          ...(files !== undefined ? { files } : {}),
+          ...(hasIndex !== undefined ? { hasIndex } : {}),
+        };
       }
       return null;
     })
@@ -321,12 +389,21 @@ function normalizeSandboxState(raw: unknown): SandboxState {
   const rawProcs = Array.isArray(src.processes) ? src.processes : [];
   const processes = rawProcs
     .filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object"))
-    .map((obj) => ({
-      pid: Number(obj.pid ?? 0) || 0,
-      command: String(obj.command ?? ""),
-      cwd: String(obj.cwd ?? "."),
-      alive: Boolean(obj.alive),
-    }))
+    .map((obj) => {
+      const url = obj.url ? String(obj.url) : undefined;
+      const port =
+        typeof obj.port === "number" && Number.isFinite(obj.port)
+          ? obj.port
+          : extractPortFromLocalUrl(url);
+      return {
+        pid: Number(obj.pid ?? 0) || 0,
+        command: String(obj.command ?? ""),
+        cwd: String(obj.cwd ?? "."),
+        url,
+        port,
+        alive: obj.alive === undefined ? true : Boolean(obj.alive),
+      };
+    })
     .filter((p) => p.pid > 0);
 
   return {
@@ -571,6 +648,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   // Песочница Sandbox и экспорт на ПК.
   const [sandbox, setSandbox] = useState<SandboxState | null>(null);
   const [sandboxOpen, setSandboxOpen] = useState(false);
+  const [sandboxPreview, setSandboxPreview] = useState<{ title: string; url: string } | null>(null);
   const [exportSource, setExportSource] = useState(".");
   const [exportDest, setExportDest] = useState("");
   const [exportMode, setExportMode] = useState<"copy" | "move">("copy");
@@ -2679,9 +2757,15 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               assistantDraft.files.push(file);
               patch((t) => ({ ...t, files: [...t.files, file] }));
             } else if (data.type === "open_url") {
+              const proxied = toSandboxProxyUrl(
+                String(data.url ?? ""),
+                typeof data.port === "number" ? data.port : null,
+              );
+              const openTarget = proxied ?? String(data.url ?? "");
               const action: AgentAction = {
                 type: "open_url",
-                url: String(data.url ?? ""),
+                url: openTarget,
+                port: typeof data.port === "number" ? data.port : undefined,
                 label: String(data.label ?? data.url ?? ""),
                 autoplay: Boolean(data.autoplay),
               };
@@ -2692,6 +2776,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               const action: AgentAction = {
                 type: String(data.type ?? "command_result") as AgentAction["type"],
                 action: data.action ? String(data.action) : undefined,
+                kind: data.kind ? String(data.kind) : undefined,
                 label: String(
                   data.label ??
                     data.title ??
@@ -2704,6 +2789,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                     "",
                 ),
                 url: data.url ? String(data.url) : undefined,
+                previewUrl: data.previewUrl ? String(data.previewUrl) : undefined,
+                port: typeof data.port === "number" ? data.port : undefined,
+                background: typeof data.background === "boolean" ? data.background : undefined,
                 title: data.title ? String(data.title) : undefined,
                 viewport: data.viewport ? String(data.viewport) : undefined,
                 command: data.command ? String(data.command) : undefined,
@@ -2862,7 +2950,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const normalized = settings.baseUrl.replace(/\/+$/, "");
   const activeProvider =
     PROVIDERS.find((provider) => provider.baseUrl && provider.baseUrl === normalized)?.id ?? "custom";
-  const remoteApi = !/^https?:\/\/(127\.0\.0\.1|localhost)/.test(normalized);
+  const remoteApi = Boolean(normalized) && !isLocalOrLanUrl(normalized);
 
   const applyProvider = (id: string) => {
     const provider = PROVIDERS.find((item) => item.id === id);
@@ -3503,7 +3591,77 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             Проекты: {sandbox?.projects?.length ? sandbox.projects.map((p) => p.name).join(", ") : "пока пусто"} · процессов:{" "}
             {sandbox?.processes?.filter((p) => p.alive).length ?? 0}
           </p>
+          {((sandbox?.projects?.length ?? 0) > 0 || sandbox?.processes?.some((p) => p.alive)) && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px]">
+              {sandbox?.projects?.map((proj) => (
+                <a
+                  key={`quick-proj-${proj.name}`}
+                  href={`/api/ai/agent/sandbox/preview/${encodeURIComponent(proj.name)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title="Открыть проект Sandbox в браузере (работает и в LAN)"
+                  className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-1.5 py-0.5 text-accent2 hover:border-accent/50 hover:underline"
+                >
+                  Открыть {proj.name}
+                  <ExternalLink size={10} />
+                </a>
+              ))}
+              {sandbox?.processes
+                ?.filter((p) => p.alive)
+                .map((proc) => {
+                  const proxyUrl = toSandboxProxyUrl(proc.url, proc.port);
+                  if (!proxyUrl) return null;
+                  return (
+                    <a
+                      key={`quick-proc-${proc.pid}`}
+                      href={proxyUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-emerald-400 hover:bg-emerald-500/20"
+                    >
+                      Сервер :{proc.port ?? extractPortFromLocalUrl(proc.url)}
+                      <ExternalLink size={10} />
+                    </a>
+                  );
+                })}
+            </div>
+          )}
         </div>
+
+      {/* Встроенное превью проекта Sandbox прямо в CRM */}
+      {sandboxPreview && (
+        <div className="space-y-2 rounded-2xl border border-accent/40 bg-card p-3 text-[11px]">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5 font-semibold text-text">
+              <Compass size={13} className="text-accent2" />
+              Превью Sandbox: {sandboxPreview.title}
+            </span>
+            <div className="flex items-center gap-2">
+              <a
+                href={sandboxPreview.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 rounded-lg border border-accent/40 bg-accent/10 px-2 py-1 text-[10px] font-medium text-accent2 hover:bg-accent/20"
+              >
+                <ExternalLink size={11} /> Открыть в новой вкладке
+              </a>
+              <button
+                type="button"
+                onClick={() => setSandboxPreview(null)}
+                className="rounded-lg border border-border bg-card2 px-2 py-1 text-[10px] text-muted hover:text-text"
+              >
+                Закрыть
+              </button>
+            </div>
+          </div>
+          <iframe
+            title={`Превью ${sandboxPreview.title}`}
+            src={sandboxPreview.url}
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+            className="h-[420px] w-full rounded-xl border border-border bg-white"
+          />
+        </div>
+      )}
 
       {/* Панель Sandbox и переноса файлов наружу */}
       {sandboxOpen && (
@@ -3531,30 +3689,48 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
 
           {sandbox?.projects && sandbox.projects.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
-              {sandbox.projects.map((proj) => (
-                <div
-                  key={proj.name}
-                  className="flex items-center gap-1.5 rounded-lg border border-border bg-card2 px-2 py-1 text-[10px]"
-                >
-                  <span className="font-medium text-text">
-                    {proj.name}
-                    {typeof proj.files === "number" ? ` (${proj.files} ф.)` : ""}
-                  </span>
-                  <a
-                    href={`/api/ai/agent/sandbox?download=${encodeURIComponent(proj.name)}`}
-                    className="text-emerald-500 hover:underline"
+              {sandbox.projects.map((proj) => {
+                const previewUrl = `/api/ai/agent/sandbox/preview/${encodeURIComponent(proj.name)}`;
+                return (
+                  <div
+                    key={proj.name}
+                    className="flex items-center gap-1.5 rounded-lg border border-border bg-card2 px-2 py-1 text-[10px]"
                   >
-                    ZIP
-                  </a>
-                  <button
-                    type="button"
-                    onClick={() => setExportSource(proj.name)}
-                    className="text-accent2 hover:underline"
-                  >
-                    экспорт
-                  </button>
-                </div>
-              ))}
+                    <span className="font-medium text-text">
+                      {proj.name}
+                      {typeof proj.files === "number" ? ` (${proj.files} ф.)` : ""}
+                    </span>
+                    <a
+                      href={previewUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-0.5 font-medium text-accent2 hover:underline"
+                    >
+                      <ExternalLink size={10} /> Открыть
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() => setSandboxPreview({ title: proj.name, url: previewUrl })}
+                      className="text-sky-400 hover:underline"
+                    >
+                      превью
+                    </button>
+                    <a
+                      href={`/api/ai/agent/sandbox?download=${encodeURIComponent(proj.name)}`}
+                      className="text-emerald-500 hover:underline"
+                    >
+                      ZIP
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() => setExportSource(proj.name)}
+                      className="text-muted hover:text-text hover:underline"
+                    >
+                      экспорт
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           )}
 
@@ -3576,24 +3752,48 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               <p className="text-[10px] font-medium text-text">Фоновые процессы в Sandbox:</p>
               {sandbox.processes
                 .filter((p) => p.alive)
-                .map((proc) => (
-                  <div
-                    key={proc.pid}
-                    className="flex items-center justify-between gap-2 rounded-lg border border-border bg-card2 px-2 py-1 text-[10px]"
-                  >
-                    <span className="truncate font-mono">
-                      PID {proc.pid}: {proc.command}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => void stopSandboxProcess(proc.pid)}
-                      disabled={sandboxBusy}
-                      className="flex items-center gap-1 rounded border border-red-500/40 bg-red-500/10 px-1.5 py-0.5 text-red-500"
+                .map((proc) => {
+                  const proxyUrl = toSandboxProxyUrl(proc.url, proc.port);
+                  return (
+                    <div
+                      key={proc.pid}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-card2 px-2 py-1 text-[10px]"
                     >
-                      <Square size={10} /> Стоп
-                    </button>
-                  </div>
-                ))}
+                      <span className="min-w-0 flex-1 truncate font-mono">
+                        PID {proc.pid}: {proc.command}
+                      </span>
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        {proxyUrl && (
+                          <>
+                            <a
+                              href={proxyUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 font-medium text-emerald-400 hover:bg-emerald-500/20"
+                            >
+                              <ExternalLink size={10} /> Открыть
+                            </a>
+                            <button
+                              type="button"
+                              onClick={() => setSandboxPreview({ title: `Процесс :${proc.port ?? proc.pid}`, url: proxyUrl })}
+                              className="rounded border border-sky-500/40 bg-sky-500/10 px-1.5 py-0.5 text-sky-400 hover:bg-sky-500/20"
+                            >
+                              Превью
+                            </button>
+                          </>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => void stopSandboxProcess(proc.pid)}
+                          disabled={sandboxBusy}
+                          className="flex items-center gap-1 rounded border border-red-500/40 bg-red-500/10 px-1.5 py-0.5 text-red-500"
+                        >
+                          <Square size={10} /> Стоп
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
             </div>
           )}
 
@@ -4189,33 +4389,45 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
 
                   {turn.actions.map((action, index) => {
                     if (action.type === "open_url" && action.url) {
+                      const openTarget = toSandboxProxyUrl(action.url, action.port) ?? action.url;
                       return (
                         <a
-                          key={`${action.url}-${index}`}
-                          href={action.url}
+                          key={`${openTarget}-${index}`}
+                          href={openTarget}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="flex items-center gap-2 rounded-xl border border-accent/40 bg-accent/10 px-2.5 py-2 font-medium text-accent2 transition hover:bg-accent/20"
                         >
                           {action.autoplay ? <PlayCircle size={14} /> : <ExternalLink size={14} />}
-                          <span className="min-w-0 flex-1 truncate">{action.label}</span>
+                          <span className="min-w-0 flex-1 truncate">{action.label || openTarget}</span>
                           <span className="text-[10px] text-muted">открыть</span>
                         </a>
                       );
                     }
                     if (action.type === "command_result") {
+                      const cmdProxyUrl = action.previewUrl || toSandboxProxyUrl(action.url, action.port);
                       return (
                         <div
                           key={`cmd-${index}`}
                           className="rounded-xl border border-border bg-card px-2.5 py-2 text-[11px]"
                         >
-                          <p className="flex items-center gap-1.5 font-mono font-medium text-text">
-                            <Terminal size={12} className="text-accent2" />
-                            {action.command}
-                            {action.exitCode !== undefined && action.exitCode !== null && (
-                              <span className="ml-auto text-[10px] text-muted">код {action.exitCode}</span>
+                          <div className="flex flex-wrap items-center gap-1.5 font-mono font-medium text-text">
+                            <Terminal size={12} className="shrink-0 text-accent2" />
+                            <span className="min-w-0 flex-1 truncate">{action.command}</span>
+                            {cmdProxyUrl && (
+                              <a
+                                href={cmdProxyUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex shrink-0 items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 font-sans text-[10px] text-emerald-400 hover:bg-emerald-500/20"
+                              >
+                                <ExternalLink size={10} /> Открыть
+                              </a>
                             )}
-                          </p>
+                            {action.exitCode !== undefined && action.exitCode !== null && (
+                              <span className="text-[10px] text-muted">код {action.exitCode}</span>
+                            )}
+                          </div>
                           {action.output && (
                             <pre className="mt-1 max-h-32 overflow-auto rounded bg-card2 px-2 py-1 text-[10px] text-muted">
                               {action.output}
@@ -4534,6 +4746,13 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                         </div>
                       );
                     }
+                    const fallbackPreview =
+                      action.previewUrl ||
+                      (action.type === "sandbox_update" || action.type === "project_created"
+                        ? action.project || action.path
+                          ? `/api/ai/agent/sandbox/preview/${encodeURIComponent((action.project || action.path || "").split("/")[0] || "")}`
+                          : undefined
+                        : undefined);
                     return (
                       <div
                         key={`act-${index}`}
@@ -4541,11 +4760,25 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                       >
                         <FolderOutput size={13} className="shrink-0 text-emerald-500" />
                         <span className="min-w-0 flex-1 truncate">
-                          {action.type === "project_created" && `Проект создан в Sandbox: ${action.project}`}
+                          {(action.type === "project_created" || (action.type === "sandbox_update" && action.kind === "project")) &&
+                            `Проект в Sandbox: ${action.project || action.path}`}
+                          {action.type === "sandbox_update" &&
+                            action.kind !== "project" &&
+                            `Sandbox (${action.kind === "dir" ? "папка" : "файл"}): ${action.path}`}
                           {action.type === "sandbox_file" && `Файл в Sandbox: ${action.path}`}
                           {action.type === "sandbox_export" &&
                             `Экспорт (${action.filesCount ?? 0} файлов): ${action.source} → ${action.destination}`}
                         </span>
+                        {fallbackPreview && (
+                          <a
+                            href={fallbackPreview}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex shrink-0 items-center gap-1 rounded-md border border-accent/40 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent2 hover:bg-accent/20"
+                          >
+                            <ExternalLink size={10} /> Открыть
+                          </a>
+                        )}
                       </div>
                     );
                   })}

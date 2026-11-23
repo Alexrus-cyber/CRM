@@ -28,6 +28,7 @@ import base64
 import contextlib
 import errno
 import hmac
+import html
 import http.client
 import ipaddress
 import json
@@ -233,16 +234,74 @@ def assert_safe_ai_url(raw_url: str) -> str:
     return url
 
 
+def _is_local_or_lan_host(host: str) -> bool:
+    clean = (host or "").strip().lower().strip("[]").rstrip(".")
+    if not clean:
+        return False
+    if clean in ("127.0.0.1", "localhost", "::1", "0.0.0.0") or clean.endswith(".localhost"):
+        return True
+    if "%" in clean:
+        clean = clean.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(clean)
+        if ip.is_unspecified or ip.is_link_local or ip.is_multicast:
+            return False
+        if ip.is_loopback or ip.is_private:
+            return clean != "fd00:ec2::254"
+        return isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        pass
+    if clean in ("host.docker.internal", "gateway.docker.internal"):
+        return True
+    return clean.endswith((".local", ".lan", ".home", ".home.arpa", ".internal")) or (
+        "." not in clean and len(clean) <= 63
+    )
+
+
+def _loopback_url_candidates(url: str) -> List[str]:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").strip().lower().strip("[]")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return [url]
+    port_part = f":{parsed.port}" if parsed.port else ""
+    out: List[str] = [url]
+    for alt in ("127.0.0.1", "localhost", "[::1]"):
+        raw_alt = alt.strip("[]")
+        if raw_alt == host:
+            continue
+        out.append(parsed._replace(netloc=f"{alt}{port_part}").geturl())
+    return out
+
+
 def _safe_model_urlopen(request: urllib.request.Request, timeout: int = TIMEOUT) -> Any:
-    if urllib.request.urlopen is _ORIG_URLOPEN:
+    use_custom = urllib.request.urlopen is _ORIG_URLOPEN
+    try:
+        host = (urlparse(request.full_url).hostname or "").strip().lower().strip("[]")
+    except Exception:  # noqa: BLE001
+        host = ""
+    opener = _NO_REDIRECT_LOCAL_OPENER if _is_local_or_lan_host(host) else _NO_REDIRECT_OPENER
+    candidates = _loopback_url_candidates(request.full_url)
+    last_err: Optional[Exception] = None
+    for idx, cand_url in enumerate(candidates):
+        req_i = request
+        if idx > 0:
+            req_i = urllib.request.Request(
+                cand_url,
+                data=request.data,
+                headers=dict(request.header_items()),
+                method=request.get_method(),
+            )
         try:
-            host = (urlparse(request.full_url).hostname or "").strip().lower().strip("[]")
-        except Exception:  # noqa: BLE001
-            host = ""
-        if host in ("127.0.0.1", "localhost", "::1") or host.endswith(".localhost"):
-            return _NO_REDIRECT_LOCAL_OPENER.open(request, timeout=timeout)
-        return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
-    return urllib.request.urlopen(request, timeout=timeout)
+            if use_custom:
+                return opener.open(req_i, timeout=timeout)
+            return urllib.request.urlopen(req_i, timeout=timeout)
+        except urllib.error.URLError as exc:
+            last_err = exc
+            if idx + 1 >= len(candidates) or isinstance(exc, urllib.error.HTTPError):
+                raise
+    if last_err is not None:
+        raise last_err
+    raise urllib.error.URLError("Не удалось подключиться к модели")
 
 SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CRM). Общайся по-русски, кратко и по делу.
 
@@ -1460,17 +1519,20 @@ def run_tool(
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
 
+        preview_url = f"/api/ai/agent/sandbox/preview/{urllib.parse.quote(project, safe='/')}"
         events.append(
             {
                 "type": "sandbox_update",
                 "path": project,
                 "kind": "project",
                 "filesCount": len(created_files),
+                "previewUrl": preview_url,
             }
         )
         return (
             f"Проект «{project}» создан в Sandbox: папок {len(created_dirs)}, "
-            f"файлов {len(created_files)} ({', '.join(created_files[:15])}).",
+            f"файлов {len(created_files)} ({', '.join(created_files[:15])}). "
+            f"Предпросмотр в CRM: {preview_url}",
             events,
         )
 
@@ -1553,6 +1615,9 @@ def run_tool(
             raise AgentError(str(error)) from error
 
         raw_out = str(res.get("output") or "")
+        local_url = str(res.get("url") or "")
+        detected_port = sandbox_mod.extract_port_from_url(local_url)
+        proxy_url = f"/api/ai/agent/sandbox/proxy/{detected_port}" if detected_port else ""
         events.append(
             {
                 "type": "command_result",
@@ -1560,24 +1625,27 @@ def run_tool(
                 "cwd": res.get("cwd", "."),
                 "background": bool(res.get("background")),
                 "pid": res.get("pid"),
+                "port": detected_port,
                 "exitCode": res.get("exitCode"),
                 "output": raw_out if unlimited else raw_out[:4000],
-                "url": res.get("url") or "",
+                "url": local_url,
+                "previewUrl": proxy_url,
             }
         )
-        if res.get("url"):
+        if local_url:
             events.append(
                 {
                     "type": "open_url",
-                    "url": res["url"],
-                    "label": f"Запущенный проект ({res['url']})",
+                    "url": proxy_url or local_url,
+                    "localUrl": local_url,
+                    "label": f"Открыть запущенный проект ({local_url})",
                     "autoplay": False,
                 }
             )
         if res.get("background"):
             return (
                 f"Фоновый процесс запущен (PID {res.get('pid')}) в Sandbox/{res.get('cwd')}.\n"
-                + (f"Адрес: {res['url']}\n" if res.get("url") else "")
+                + (f"Адрес: {local_url}" + (f" (в CRM/сети: {proxy_url})" if proxy_url else "") + "\n" if local_url else "")
                 + f"Лог:\n{res.get('output')}",
                 events,
             )
@@ -3601,15 +3669,119 @@ def _allowed_cors_origin(origin: Optional[str]) -> Optional[str]:
         "https://localhost:3000",
         "https://127.0.0.1:3000",
     }
-    crm_server = os.environ.get("CRM_SERVER", "").strip().rstrip("/")
-    if crm_server:
-        allowed.add(crm_server)
+    for env_key in ("CRM_SERVER_URL", "CRM_SERVER"):
+        crm_server = os.environ.get(env_key, "").strip().rstrip("/")
+        if crm_server:
+            allowed.add(crm_server)
     extra = os.environ.get("AGENT_ALLOWED_ORIGINS", "")
     for item in extra.split(","):
         item_clean = item.strip().rstrip("/")
         if item_clean:
             allowed.add(item_clean)
-    return clean if clean in allowed else None
+    if clean in allowed:
+        return clean
+    try:
+        parsed = urlparse(clean)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    host = parsed.hostname.strip().lower().strip("[]")
+    if host in ("127.0.0.1", "localhost", "::1") or host.endswith(".localhost"):
+        return clean
+    agent_host = (os.environ.get("AGENT_HOST") or HOST or "127.0.0.1").strip().lower().strip("[]")
+    # Если агент намеренно поднят не только на loopback (0.0.0.0 / LAN), разрешаем локальную сеть.
+    if agent_host not in ("127.0.0.1", "localhost", "::1") and _is_local_or_lan_host(host):
+        return clean
+    return None
+
+
+_PREVIEW_MIME_OVERRIDES: Dict[str, str] = {
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".mjs": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".ico": "image/x-icon",
+    ".wasm": "application/wasm",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".xml": "application/xml; charset=utf-8",
+}
+
+
+def _preview_mime_for(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in _PREVIEW_MIME_OVERRIDES:
+        return _PREVIEW_MIME_OVERRIDES[ext]
+    guessed, _ = mimetypes.guess_type(path.name)
+    return guessed or "application/octet-stream"
+
+
+def _render_sandbox_dir_html(rel_dir: str, directory: Path, preview_prefix: str) -> bytes:
+    clean_rel = rel_dir.strip("/")
+    prefix_clean = preview_prefix.rstrip("/")
+    base_href = prefix_clean + "/" + (urllib.parse.quote(clean_rel, safe="/") + "/" if clean_rel else "")
+    title = f"Sandbox/{clean_rel}" if clean_rel else "Sandbox — проекты"
+    entries: List[Tuple[bool, str, int]] = []
+    try:
+        children = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except OSError:
+        children = []
+    for child in children:
+        if child.name.startswith(".tmp") or (not clean_rel and child.name.startswith(".")):
+            continue
+        is_dir = child.is_dir()
+        try:
+            size = 0 if is_dir else child.stat().st_size
+        except OSError:
+            size = 0
+        entries.append((is_dir, child.name, size))
+
+    rows: List[str] = []
+    if clean_rel:
+        parent_rel = "/".join(clean_rel.split("/")[:-1])
+        parent_href = prefix_clean + ("/" + urllib.parse.quote(parent_rel, safe="/") if parent_rel else "")
+        rows.append(f'<li><a href="{html.escape(parent_href, quote=True)}">⬆️ .. (наверх)</a></li>')
+    for is_dir, name, size in entries:
+        href = base_href + urllib.parse.quote(name)
+        icon = "📁" if is_dir else "📄"
+        meta = "папка" if is_dir else f"{size} Б"
+        rows.append(
+            f'<li><a href="{html.escape(href, quote=True)}">{icon} {html.escape(name)}</a>'
+            f'<span class="meta">{html.escape(meta)}</span></li>'
+        )
+    if not rows:
+        rows.append('<li class="empty">Папка пуста</li>')
+
+    doc = (
+        "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
+        f"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        f"<title>{html.escape(title)}</title>"
+        "<style>"
+        "body{margin:0;padding:24px;font:14px/1.5 system-ui,-apple-system,sans-serif;background:#0f1218;color:#e6edf3;}"
+        "main{max-width:780px;margin:0 auto;}"
+        "h1{font-size:18px;margin:0 0 14px;color:#fff;}"
+        "ul{list-style:none;padding:0;margin:0;border:1px solid #262c38;border-radius:10px;overflow:hidden;background:#161b22;}"
+        "li{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid #222834;}"
+        "li:last-child{border-bottom:none;}"
+        "a{color:#79c0ff;text-decoration:none;word-break:break-all;}a:hover{text-decoration:underline;}"
+        ".meta,.empty{color:#8b949e;font-size:12px;}"
+        "</style></head><body><main>"
+        f"<h1>{html.escape(title)}</h1>"
+        f"<ul>{''.join(rows)}</ul>"
+        "</main></body></html>"
+    )
+    return doc.encode("utf-8")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3667,7 +3839,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(204)
             self._send_cors_headers()
             self.send_header("Access-Control-Allow-Headers", "content-type, authorization")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS")
             self.send_header("Content-Length", "0")
             self.end_headers()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
@@ -3675,6 +3847,212 @@ class Handler(BaseHTTPRequestHandler):
                 self._client_disconnected = True
                 return
             raise
+
+    def _send_bytes(self, status: int, content_type: str, data: bytes, *, extra_headers: Optional[Dict[str, str]] = None, send_body: bool = True) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, v)
+            self._send_cors_headers()
+            self.end_headers()
+            if send_body and data:
+                self.wfile.write(data)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
+            if _is_client_disconnect(exc):
+                self._client_disconnected = True
+                return
+            raise
+
+    def _handle_sandbox_preview(self, parsed_path: str, *, send_body: bool = True) -> None:
+        prefix_hdr = (self.headers.get("X-Sandbox-Prefix") or "/sandbox/preview").strip()
+        if not prefix_hdr.startswith("/") or "\r" in prefix_hdr or "\n" in prefix_hdr:
+            prefix_hdr = "/sandbox/preview"
+        rest = parsed_path[len("/sandbox/preview"):]
+        rel_raw = urllib.parse.unquote(rest.lstrip("/"))
+        parts = [p for p in rel_raw.split("/") if p]
+        if any(p == ".." or p.startswith(".tmp") for p in parts):
+            self._json(403, {"error": "Доступ к служебной папке запрещён"})
+            return
+
+        if not parts:
+            html_bytes = _render_sandbox_dir_html("", SANDBOX_ROOT, prefix_hdr)
+            self._send_bytes(200, "text/html; charset=utf-8", html_bytes, send_body=send_body)
+            return
+
+        try:
+            target = sandbox_mod.safe_resolve(SANDBOX_ROOT, rel_raw, allow_root=True)
+        except sandbox_mod.SandboxError as error:
+            self._json(403, {"error": str(error)})
+            return
+
+        # Если запросили /sandbox/preview/<project>/assets/..., а сборка лежит в dist|build|public|out:
+        if not target.exists() and len(parts) >= 2:
+            proj_name = parts[0]
+            sub_rest = "/".join(parts[1:])
+            for build_dir in ("dist", "build", "public", "out"):
+                try:
+                    cand = sandbox_mod.safe_resolve(SANDBOX_ROOT, f"{proj_name}/{build_dir}/{sub_rest}", allow_root=False)
+                except sandbox_mod.SandboxError:
+                    continue
+                if cand.is_file():
+                    target = cand
+                    break
+
+        if not target.exists():
+            self._json(404, {"error": f"Файл или проект не найден в Sandbox: {rel_raw}"})
+            return
+
+        if target.is_dir():
+            entry_file: Optional[Path] = None
+            if (target / "index.html").is_file():
+                entry_file = target / "index.html"
+            else:
+                for build_dir in ("dist", "build", "public", "out"):
+                    cand = target / build_dir / "index.html"
+                    if cand.is_file():
+                        entry_file = cand
+                        break
+            if entry_file is not None:
+                # Редирект без trailing slash на /.../index.html, чтобы Next.js не делал 308,
+                # а относительные ссылки (style.css, ./app.js, fetch('data.json')) работали нативно.
+                if send_body:
+                    location = prefix_hdr.rstrip("/") + "/" + urllib.parse.quote(rel_raw, safe="/") + "/index.html"
+                    self.send_response(302)
+                    self.send_header("Location", location)
+                    self.send_header("Content-Length", "0")
+                    self._send_cors_headers()
+                    self.end_headers()
+                    return
+                target = entry_file
+            else:
+                html_bytes = _render_sandbox_dir_html(rel_raw, target, prefix_hdr)
+                self._send_bytes(200, "text/html; charset=utf-8", html_bytes, send_body=send_body)
+                return
+
+        if not target.is_file():
+            self._json(404, {"error": "Файл не найден"})
+            return
+
+        max_preview_bytes = 25 * 1024 * 1024
+        try:
+            file_size = target.stat().st_size
+            if file_size > max_preview_bytes:
+                self._json(413, {"error": "Файл слишком большой для предпросмотра (>25 МБ)"})
+                return
+            data = target.read_bytes() if send_body else b""
+        except OSError as exc:
+            self._json(500, {"error": f"Не удалось прочитать файл: {exc}"})
+            return
+
+        self._send_bytes(200, _preview_mime_for(target), data, send_body=send_body)
+
+    def _handle_sandbox_proxy(self, method: str, parsed_path: str, query: str) -> None:
+        rest = parsed_path[len("/sandbox/proxy/"):]
+        port_part, _, sub_path = rest.partition("/")
+        if not port_part.isdigit():
+            self._json(400, {"error": "Некорректный порт процесса Sandbox"})
+            return
+        port = int(port_part)
+        if port < 1 or port > 65535 or port not in PROCESS_MANAGER.allowed_ports():
+            self._json(403, {"error": "Порт не относится к активному процессу Sandbox"})
+            return
+
+        req_body: Optional[bytes] = None
+        if method in ("POST", "PUT", "PATCH", "DELETE"):
+            try:
+                content_len = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                content_len = 0
+            if content_len < 0 or content_len > MAX_HTTP_BODY_BYTES:
+                self._json(413, {"error": "Слишком большое тело запроса"})
+                return
+            req_body = self.rfile.read(content_len) if content_len > 0 else b""
+
+        fwd_headers: Dict[str, str] = {"Accept-Encoding": "identity"}
+        for key in ("Accept", "Content-Type", "User-Agent", "Range", "If-None-Match", "If-Modified-Since"):
+            val = self.headers.get(key)
+            if val:
+                fwd_headers[key] = val
+
+        target_path = "/" + sub_path
+        if query:
+            target_path += "?" + query
+
+        upstream_resp = None
+        last_exc: Optional[Exception] = None
+        for host in ("127.0.0.1", "::1", "localhost"):
+            conn = None
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=20)
+                conn.request(method, target_path, body=req_body, headers=fwd_headers)
+                upstream_resp = conn.getresponse()
+                resp_body = upstream_resp.read(25 * 1024 * 1024) if method != "HEAD" else b""
+                resp_status = int(upstream_resp.status)
+                resp_headers = list(upstream_resp.getheaders())
+                conn.close()
+
+                try:
+                    self.send_response(resp_status)
+                    has_ct = False
+                    for hk, hv in resp_headers:
+                        low = hk.lower()
+                        if low in ("transfer-encoding", "connection", "keep-alive", "content-length", "content-security-policy", "x-frame-options"):
+                            continue
+                        if low == "content-type":
+                            has_ct = True
+                        self.send_header(hk, hv)
+                    if not has_ct:
+                        self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(resp_body)))
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self._send_cors_headers()
+                    self.end_headers()
+                    if method != "HEAD" and resp_body:
+                        self.wfile.write(resp_body)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
+                    if _is_client_disconnect(exc):
+                        self._client_disconnected = True
+                        return
+                    raise
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
+        self._json(502, {"error": f"Локальный сервер проекта на порту {port} не отвечает: {last_exc}"})
+
+    def _handle_proxy_method(self, method: str) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/sandbox/proxy/"):
+            self._handle_sandbox_proxy(method, parsed.path, parsed.query)
+            return
+        self._json(404, {"error": "Не найдено"})
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path == "/sandbox/preview" or parsed.path.startswith("/sandbox/preview/"):
+            self._handle_sandbox_preview(parsed.path, send_body=False)
+            return
+        self._handle_proxy_method("HEAD")
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._handle_proxy_method("PUT")
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._handle_proxy_method("PATCH")
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._handle_proxy_method("DELETE")
 
     def do_GET(self) -> None:  # noqa: N802
         try:
@@ -3772,10 +4150,23 @@ class Handler(BaseHTTPRequestHandler):
                 raise
             return
 
+        if route == "/sandbox/preview" or route.startswith("/sandbox/preview/"):
+            self._handle_sandbox_preview(route, send_body=True)
+            return
+
+        if route.startswith("/sandbox/proxy/"):
+            self._handle_sandbox_proxy("GET", route, parsed.query)
+            return
+
         self._json(404, {"error": "Не найдено"})
 
     def do_POST(self) -> None:  # noqa: N802
-        route = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        route = parsed.path
+
+        if route.startswith("/sandbox/proxy/"):
+            self._handle_sandbox_proxy("POST", route, parsed.query)
+            return
 
         if route == "/approve":
             body = self._read_json()

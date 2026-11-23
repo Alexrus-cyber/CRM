@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import secrets
@@ -47,8 +48,32 @@ _NO_REDIRECT_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHand
 
 
 def _is_loopback_host(host: str) -> bool:
-    clean = (host or "").strip().lower().strip("[]")
+    clean = (host or "").strip().lower().strip("[]").rstrip(".")
     return clean in ("localhost", "127.0.0.1", "::1") or clean.endswith(".localhost")
+
+
+def _is_local_or_lan_host(host: str) -> bool:
+    clean = (host or "").strip().lower().strip("[]").rstrip(".")
+    if not clean:
+        return False
+    if _is_loopback_host(clean):
+        return True
+    if "%" in clean:
+        clean = clean.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(clean)
+        if ip.is_unspecified or ip.is_link_local or ip.is_multicast:
+            return False
+        if ip.is_loopback or ip.is_private:
+            return clean != "fd00:ec2::254"
+        return isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        pass
+    if clean in ("host.docker.internal", "gateway.docker.internal"):
+        return True
+    return clean.endswith((".local", ".lan", ".home", ".home.arpa", ".internal")) or (
+        "." not in clean and len(clean) <= 63
+    )
 
 
 def normalize_server_url(raw: str) -> str:
@@ -58,7 +83,7 @@ def normalize_server_url(raw: str) -> str:
     if not (url.startswith("http://") or url.startswith("https://")):
         host_part = url.split("/", 1)[0]
         host_only = host_part[1:].split("]", 1)[0] if host_part.startswith("[") else host_part.split(":", 1)[0]
-        scheme = "http://" if _is_loopback_host(host_only) else "https://"
+        scheme = "http://" if _is_local_or_lan_host(host_only) else "https://"
         url = scheme + url
     return url.rstrip("/")
 
@@ -66,10 +91,10 @@ def normalize_server_url(raw: str) -> str:
 def _assert_safe_crm_transport(url: str) -> None:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise CrmClientError("Некорректный URL CRM (нужен http:// для localhost или https://)")
+        raise CrmClientError("Некорректный URL CRM (нужен http:// для локальной сети / localhost или https://)")
     host = parsed.hostname or ""
-    if parsed.scheme == "http" and not _is_loopback_host(host) and os.environ.get("CRM_LAUNCHER_ALLOW_HTTP") != "1":
-        raise CrmClientError("Для удалённого сервера CRM требуется HTTPS (http:// разрешён только для localhost)")
+    if parsed.scheme == "http" and not _is_local_or_lan_host(host) and os.environ.get("CRM_LAUNCHER_ALLOW_HTTP") != "1":
+        raise CrmClientError("Для удалённого сервера CRM требуется HTTPS (http:// разрешён только для localhost и локальной сети)")
 
 
 def _request_json(
@@ -90,7 +115,7 @@ def _request_json(
 
     try:
         host = urllib.parse.urlparse(url).hostname or ""
-        opener = _NO_REDIRECT_LOCAL_OPENER if _is_loopback_host(host) else _NO_REDIRECT_OPENER
+        opener = _NO_REDIRECT_LOCAL_OPENER if _is_local_or_lan_host(host) else _NO_REDIRECT_OPENER
         ctx = (
             opener.open(req, timeout=timeout)
             if urllib.request.urlopen is _ORIG_URLOPEN

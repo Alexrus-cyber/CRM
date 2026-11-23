@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import ipaddress
 import json
 import random
 import os
@@ -2603,12 +2604,44 @@ _NO_REDIRECT_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHand
 _ORIG_OP_URLOPEN = urllib.request.urlopen
 
 
-def _is_loopback_target(url: str) -> bool:
+def _is_local_or_lan_target(url: str) -> bool:
     try:
-        host = (urllib.parse.urlparse(str(url or "").strip()).hostname or "").strip().lower().strip("[]")
+        host = (urllib.parse.urlparse(str(url or "").strip()).hostname or "").strip().lower().strip("[]").rstrip(".")
     except ValueError:
         return False
-    return host in ("127.0.0.1", "localhost", "::1") or host.endswith(".localhost")
+    if not host:
+        return False
+    if host in ("127.0.0.1", "localhost", "::1", "0.0.0.0") or host.endswith(".localhost"):
+        return True
+    if "%" in host:
+        host = host.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_unspecified or ip.is_link_local or ip.is_multicast:
+            return False
+        if ip.is_loopback or ip.is_private:
+            return host != "fd00:ec2::254"
+        return isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        pass
+    if host in ("host.docker.internal", "gateway.docker.internal"):
+        return True
+    return host.endswith((".local", ".lan", ".home", ".home.arpa", ".internal")) or ("." not in host and len(host) <= 63)
+
+
+def _loopback_url_candidates(url: str) -> List[str]:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").strip().lower().strip("[]")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return [url]
+    port_part = f":{parsed.port}" if parsed.port else ""
+    out: List[str] = [url]
+    for alt in ("127.0.0.1", "localhost", "[::1]"):
+        raw_alt = alt.strip("[]")
+        if raw_alt == host:
+            continue
+        out.append(parsed._replace(netloc=f"{alt}{port_part}").geturl())
+    return out
 
 
 def _assert_safe_http_target(url: str) -> None:
@@ -2639,10 +2672,31 @@ class Http:
         self.key_hint = key_hint
 
     def _open(self, request: urllib.request.Request, timeout: int) -> Any:
-        if urllib.request.urlopen is _ORIG_OP_URLOPEN:
-            opener = _NO_REDIRECT_LOCAL_OPENER if _is_loopback_target(request.full_url) else _NO_REDIRECT_OPENER
-            return opener.open(request, timeout=timeout)
-        return urllib.request.urlopen(request, timeout=timeout)
+        use_custom = urllib.request.urlopen is _ORIG_OP_URLOPEN
+        is_local = _is_local_or_lan_target(request.full_url)
+        opener = _NO_REDIRECT_LOCAL_OPENER if is_local else _NO_REDIRECT_OPENER
+        candidates = _loopback_url_candidates(request.full_url)
+        last_err: Optional[Exception] = None
+        for idx, cand_url in enumerate(candidates):
+            req_i = request
+            if idx > 0:
+                req_i = urllib.request.Request(
+                    cand_url,
+                    data=request.data,
+                    headers=dict(request.header_items()),
+                    method=request.get_method(),
+                )
+            try:
+                if use_custom:
+                    return opener.open(req_i, timeout=timeout)
+                return urllib.request.urlopen(req_i, timeout=timeout)
+            except urllib.error.URLError as exc:
+                last_err = exc
+                if idx + 1 >= len(candidates) or isinstance(exc, urllib.error.HTTPError):
+                    raise
+        if last_err is not None:
+            raise last_err
+        raise urllib.error.URLError("Не удалось выполнить HTTP-запрос")
 
     def call(self, method: str, path: str, payload: Optional[dict] = None,
              timeout: int = 180, headers: Optional[Dict[str, str]] = None) -> dict:

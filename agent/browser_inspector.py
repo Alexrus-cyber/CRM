@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import os
@@ -65,8 +66,28 @@ class BrowserError(RuntimeError):
 
 def is_local_url(url: str) -> bool:
     parsed = urllib.parse.urlparse(str(url or "").strip())
-    host = (parsed.hostname or "").lower()
-    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+    host = (parsed.hostname or "").strip().lower().strip("[]").rstrip(".")
+    if not host:
+        return False
+    if host in ("127.0.0.1", "localhost", "::1", "0.0.0.0") or host.endswith(".localhost"):
+        return True
+    if "%" in host:
+        host = host.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_unspecified or ip.is_link_local or ip.is_multicast:
+            return False
+        if ip.is_loopback or ip.is_private:
+            return host != "fd00:ec2::254"
+        return isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        pass
+    if host in ("host.docker.internal", "gateway.docker.internal"):
+        return True
+    return (
+        host.endswith((".local", ".lan", ".home", ".home.arpa", ".internal"))
+        or ("." not in host and len(host) <= 63)
+    )
 
 
 def validate_browser_url(raw_url: str) -> str:
@@ -177,7 +198,14 @@ def cached_browser_available(ttl_seconds: float = 60.0) -> bool:
 
 def find_browser_executable(*, allow_subprocess: bool = True) -> Optional[str]:
     """Ищет установленный Chromium / Chrome / Edge (включая реестр Windows и кеш Playwright)."""
-    for env_key in ("AGENT_BROWSER_PATH", "CHROME_PATH", "CHROMIUM_PATH"):
+    for env_key in (
+        "AGENT_BROWSER_PATH",
+        "CHROME_PATH",
+        "CHROME_BIN",
+        "CHROMIUM_PATH",
+        "EDGE_PATH",
+        "PUPPETEER_EXECUTABLE_PATH",
+    ):
         raw = str(os.environ.get(env_key) or "").strip().strip('"')
         if raw and _safe_is_file(Path(raw)):
             return str(Path(raw))
@@ -360,9 +388,12 @@ class StaticSandboxServer:
             serve_dir = resolved
             default_file = "/"
             if not (serve_dir / "index.html").is_file():
-                for candidate_sub in ("dist/index.html", "build/index.html", "public/index.html", "out/index.html"):
-                    if (serve_dir / candidate_sub).is_file():
-                        default_file = "/" + candidate_sub
+                for sub_name in ("dist", "build", "public", "out"):
+                    sub_dir = resolved / sub_name
+                    if (sub_dir / "index.html").is_file():
+                        # Отдаём собранный бандл от его корня, чтобы /assets/... и /favicon.ico резолвились корректно.
+                        serve_dir = sub_dir
+                        default_file = "/index.html"
                         break
                 else:
                     html_files = sorted(p.name for p in serve_dir.glob("*.html") if p.is_file())
@@ -385,7 +416,8 @@ class StaticSandboxServer:
 
     def close(self) -> None:
         try:
-            self.httpd.shutdown()
+            if self._thread.is_alive():
+                self.httpd.shutdown()
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -422,9 +454,10 @@ class _WebSocketClient:
         if parsed.query:
             path += "?" + parsed.query
         key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        host_hdr = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
         req = (
             f"GET {path} HTTP/1.1\r\n"
-            f"Host: {parsed.hostname}:{parsed.port}\r\n"
+            f"Host: {host_hdr}:{parsed.port}\r\n"
             f"Upgrade: websocket\r\n"
             f"Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\n"
@@ -458,7 +491,8 @@ class _WebSocketClient:
         self._sock.settimeout(10.0)
 
     def _read_exact(self, n: int, *, continuation: bool = False) -> bytes:
-        deadline = time.monotonic() + (20.0 if continuation else 12.0)
+        mid_frame = bool(continuation or self._buf or n > 2)
+        deadline = time.monotonic() + (20.0 if mid_frame else 10.0)
         while len(self._buf) < n:
             if self.closed:
                 raise EOFError("WebSocket closed")
@@ -467,9 +501,10 @@ class _WebSocketClient:
             except TimeoutError:
                 if self.closed:
                     raise EOFError("WebSocket closed") from None
-                # Если уже начали собирать сообщение или читаем тело фрейма — ждём в пределах общего дедлайна.
-                if (continuation or self._buf or n > 2) and time.monotonic() < deadline:
-                    continue
+                if mid_frame:
+                    if time.monotonic() < deadline:
+                        continue
+                    raise EOFError("WebSocket frame timeout") from None
                 raise
             if not chunk:
                 raise EOFError("WebSocket closed")
@@ -547,9 +582,18 @@ class _WebSocketClient:
                     return out
 
     def close(self) -> None:
+        was_closed = self.closed
         self.closed = True
+        if not was_closed:
+            try:
+                self._sock.settimeout(0.5)
+                mask_key = secrets.token_bytes(4)
+                with self._write_lock:
+                    self._sock.sendall(bytes([0x88, 0x80]) + mask_key)
+            except Exception:  # noqa: BLE001
+                pass
         try:
-            self._send_frame(0x8, b"")
+            self._sock.shutdown(socket.SHUT_RDWR)
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -573,35 +617,44 @@ class CDPClient:
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
 
+    def _wake_pending(self) -> None:
+        with self._lock:
+            for slot in self._pending.values():
+                slot["event"].set()
+
     def _reader_loop(self) -> None:
-        while not self._ws.closed:
-            try:
-                raw = self._ws.recv_text()
-            except TimeoutError:
-                continue
-            except Exception:  # noqa: BLE001
-                break
-            if raw is None:
-                break
-            if not raw:
-                continue
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
+        try:
+            while not self._ws.closed:
+                try:
+                    raw = self._ws.recv_text()
+                except TimeoutError:
+                    continue
+                except Exception:  # noqa: BLE001
+                    break
+                if raw is None:
+                    break
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
 
-            msg_id = msg.get("id")
-            if isinstance(msg_id, int):
-                with self._lock:
-                    slot = self._pending.get(msg_id)
-                    if slot is not None:
-                        slot["msg"] = msg
-                        slot["event"].set()
-                continue
+                msg_id = msg.get("id")
+                if isinstance(msg_id, int):
+                    with self._lock:
+                        slot = self._pending.get(msg_id)
+                        if slot is not None:
+                            slot["msg"] = msg
+                            slot["event"].set()
+                    continue
 
-            method = str(msg.get("method") or "")
-            params = msg.get("params") or {}
-            self._handle_event(method, params)
+                method = str(msg.get("method") or "")
+                params = msg.get("params") or {}
+                self._handle_event(method, params)
+        finally:
+            self._ws.closed = True
+            self._wake_pending()
 
         self._ws.closed = True
         with self._lock:
@@ -753,6 +806,7 @@ class CDPClient:
 
     def close(self) -> None:
         self._ws.close()
+        self._wake_pending()
 
 
 # --------------------------------------------------------------------------
@@ -1084,14 +1138,26 @@ def _kill_proc_tree(proc: Optional[subprocess.Popen[Any]]) -> None:
 
 
 def _launch_headless_chromium(executable: str, width: int, height: int) -> Tuple[subprocess.Popen[str], Path, int]:
-    """Запускает headless Chromium; при залипании/сбое `--headless=new` пробует классический `--headless`."""
-    attempts = (
-        ("--headless=new", 11.0),
-        ("--headless", 8.0),
-    )
+    """Запускает headless Chromium; при сбое пробует классический `--headless` и `--no-sandbox` на Linux."""
+    is_headless_shell = "headless" in Path(executable).name.lower()
+    is_root = platform.system() != "Windows" and hasattr(os, "geteuid") and os.geteuid() == 0
+
+    if is_headless_shell:
+        base_attempts: List[Tuple[str, float, bool]] = [
+            ("--headless", 10.0, is_root),
+        ]
+    else:
+        base_attempts = [
+            ("--headless=new", 11.0, is_root),
+            ("--headless", 8.0, is_root),
+        ]
+    if platform.system() != "Windows" and not is_root:
+        # Fallback для контейнеров / Linux без user namespaces / AppArmor.
+        base_attempts.append(("--headless" if is_headless_shell else "--headless=new", 10.0, True))
+
     last_error: Optional[Exception] = None
 
-    for headless_flag, startup_timeout in attempts:
+    for headless_flag, startup_timeout, use_no_sandbox in base_attempts:
         user_data = Path(tempfile.mkdtemp(prefix="crm-browser-"))
         cmd = [
             executable,
@@ -1120,8 +1186,8 @@ def _launch_headless_chromium(executable: str, width: int, height: int) -> Tuple
             "--mute-audio",
             "about:blank",
         ]
-        if platform.system() != "Windows" and hasattr(os, "geteuid") and os.geteuid() == 0:
-            cmd.append("--no-sandbox")
+        if use_no_sandbox:
+            cmd.extend(["--no-sandbox", "--disable-setuid-sandbox"])
 
         popen_kwargs: Dict[str, Any] = {
             "stdin": subprocess.DEVNULL,
@@ -1148,7 +1214,7 @@ def _launch_headless_chromium(executable: str, width: int, height: int) -> Tuple
             try:
                 for line in p.stderr:
                     lines.append(line.strip())
-                    m = re.search(r"DevTools listening on ws://[^:]+:(\d+)/", line)
+                    m = re.search(r"DevTools listening on ws://(?:\[[^\]]+\]|[^:]+):(\d+)/", line)
                     if m and not holder["port"]:
                         holder["port"] = int(m.group(1))
                     if len(lines) > 40:
@@ -1190,33 +1256,58 @@ def _launch_headless_chromium(executable: str, width: int, height: int) -> Tuple
     raise BrowserError("Таймаут запуска headless-браузера CDP")
 
 
-def _find_page_ws_url(port: int) -> str:
+def _find_page_ws_url(port: int, user_data_dir: Optional[Path] = None) -> str:
     deadline = time.monotonic() + 7.0
     last_err = ""
     tried_new_tab = False
+    hosts = ("127.0.0.1", "[::1]")
     while time.monotonic() < deadline:
-        try:
-            with _LOCAL_OPENER.open(f"http://127.0.0.1:{port}/json/list", timeout=2) as resp:
-                targets = json.loads(resp.read().decode("utf-8"))
-            for item in targets:
-                if item.get("type") == "page" and item.get("webSocketDebuggerUrl"):
-                    return str(item["webSocketDebuggerUrl"])
-            if not tried_new_tab:
-                tried_new_tab = True
-                for method in ("PUT", "GET"):
+        for host in hosts:
+            try:
+                with _LOCAL_OPENER.open(f"http://{host}:{port}/json/list", timeout=2) as resp:
+                    targets = json.loads(resp.read().decode("utf-8"))
+                for item in targets:
+                    if item.get("type") == "page" and item.get("webSocketDebuggerUrl"):
+                        return str(item["webSocketDebuggerUrl"])
+                if not tried_new_tab:
+                    tried_new_tab = True
+                    for method in ("PUT", "GET"):
+                        try:
+                            req = urllib.request.Request(
+                                f"http://{host}:{port}/json/new?about:blank",
+                                method=method,
+                            )
+                            with _LOCAL_OPENER.open(req, timeout=2) as new_resp:
+                                created = json.loads(new_resp.read().decode("utf-8"))
+                            if isinstance(created, dict) and created.get("webSocketDebuggerUrl"):
+                                return str(created["webSocketDebuggerUrl"])
+                        except Exception:  # noqa: BLE001
+                            continue
+                    # Fallback через browser WebSocket (`Target.createTarget`) для сборок без `/json/new`.
                     try:
-                        req = urllib.request.Request(
-                            f"http://127.0.0.1:{port}/json/new?about:blank",
-                            method=method,
-                        )
-                        with _LOCAL_OPENER.open(req, timeout=2) as new_resp:
-                            created = json.loads(new_resp.read().decode("utf-8"))
-                        if isinstance(created, dict) and created.get("webSocketDebuggerUrl"):
-                            return str(created["webSocketDebuggerUrl"])
+                        browser_ws = ""
+                        try:
+                            with _LOCAL_OPENER.open(f"http://{host}:{port}/json/version", timeout=2) as v_resp:
+                                v_info = json.loads(v_resp.read().decode("utf-8"))
+                            browser_ws = str(v_info.get("webSocketDebuggerUrl") or "")
+                        except Exception:  # noqa: BLE001
+                            if user_data_dir and (user_data_dir / "DevToolsActivePort").is_file():
+                                lines = (user_data_dir / "DevToolsActivePort").read_text(encoding="utf-8", errors="ignore").splitlines()
+                                if len(lines) >= 2 and lines[1].strip():
+                                    browser_ws = f"ws://{host}:{port}{lines[1].strip()}"
+                        if browser_ws:
+                            b_cdp = CDPClient(browser_ws)
+                            try:
+                                res = b_cdp.call("Target.createTarget", {"url": "about:blank"}, timeout=3.0)
+                                target_id = str(res.get("targetId") or "")
+                                if target_id:
+                                    return f"ws://{host}:{port}/devtools/page/{target_id}"
+                            finally:
+                                b_cdp.close()
                     except Exception:  # noqa: BLE001
-                        continue
-        except Exception as error:  # noqa: BLE001
-            last_err = str(error)
+                        pass
+            except Exception as error:  # noqa: BLE001
+                last_err = str(error)
         time.sleep(0.1)
     raise BrowserError(f"Не удалось получить вкладку CDP на порту {port}: {last_err}")
 
@@ -1272,7 +1363,7 @@ class BrowserSession:
             )
         proc, user_data, port = _launch_headless_chromium(exe, width, height)
         try:
-            ws_url = _find_page_ws_url(port)
+            ws_url = _find_page_ws_url(port, user_data_dir=user_data)
             cdp = CDPClient(ws_url)
             cdp.call("Page.enable", timeout=10.0)
             cdp.call("Runtime.enable", timeout=10.0)

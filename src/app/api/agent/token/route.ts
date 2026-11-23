@@ -5,7 +5,7 @@ import {
   listAgentConnections,
 } from "@/db/repo";
 import { hasOperatorAccess } from "@/lib/aiPolicy";
-import { getCurrentUser } from "@/lib/auth";
+import { getCurrentUser, resolveRequestOrigin } from "@/lib/auth";
 import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 
 /**
@@ -51,7 +51,7 @@ export async function POST(req: Request) {
   const targetConn =
     conns.find((c) => c.isDefault) ??
     conns[0] ??
-    (await createAgentConnection(me.id, "Основной CRM", new URL(req.url).origin));
+    (await createAgentConnection(me.id, "Основной CRM", resolveRequestOrigin(req)));
 
   const created = await createAgentConnectionToken(me.id, targetConn.id, "Основной токен");
   if (!created) {

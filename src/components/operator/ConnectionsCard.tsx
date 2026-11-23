@@ -100,7 +100,8 @@ export function ConnectionsCard({
   const [notice, setNotice] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [newName, setNewName] = useState("");
-  const [newServer, setNewServer] = useState(defaultServer);
+  const [newServerOverride, setNewServerOverride] = useState<string | null>(null);
+  const effectiveNewServer = newServerOverride ?? defaultServer;
   const [tokenName, setTokenName] = useState("");
   const [freshToken, setFreshToken] = useState<{ id: number; token: string; name: string } | null>(null);
   const [activeToken, setActiveToken] = useState<{ id: number; token: string; name: string } | null>(null);
@@ -212,7 +213,7 @@ export function ConnectionsCard({
       const res = await fetch("/api/agent/connections", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, serverUrl: newServer.trim() || defaultServer }),
+        body: JSON.stringify({ name, serverUrl: effectiveNewServer.trim() || defaultServer }),
       });
       const data = (await res.json().catch(() => ({}))) as { connection?: AgentConnection; error?: string };
       if (!res.ok || !data.connection) {
@@ -222,7 +223,7 @@ export function ConnectionsCard({
       setConnections((prev) => [...prev, data.connection as AgentConnection]);
       await selectConnection(data.connection.id);
       setNewName("");
-      setNewServer(defaultServer);
+      setNewServerOverride(null);
       setCreateOpen(false);
       flash(`Подключение «${data.connection.name}» создано`);
     } finally {
@@ -386,8 +387,8 @@ export function ConnectionsCard({
         <label>
           <span className="block text-[10px] uppercase tracking-wide text-muted">Адрес CRM</span>
           <Input
-            value={newServer}
-            onChange={(event) => setNewServer(event.target.value)}
+            value={effectiveNewServer}
+            onChange={(event) => setNewServerOverride(event.target.value)}
             placeholder={defaultServer}
             className="mt-1 h-9 text-xs"
             spellCheck={false}

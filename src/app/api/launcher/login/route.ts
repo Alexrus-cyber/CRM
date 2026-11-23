@@ -1,5 +1,5 @@
 import { findUserAuthByEmail, getUser } from "@/db/repo";
-import { createLauncherSession, verifyPasswordAsync, verifyUserTotp } from "@/lib/auth";
+import { createLauncherSession, resolveRequestOrigin, verifyPasswordAsync, verifyUserTotp } from "@/lib/auth";
 import { buildLauncherProfile } from "@/lib/launcherProfile";
 import {
   checkLoginRateLimit,
@@ -66,7 +66,7 @@ export async function POST(req: Request) {
   const origin =
     typeof parsed.data.serverUrl === "string" && /^https?:\/\//i.test(parsed.data.serverUrl.trim())
       ? parsed.data.serverUrl.trim().replace(/\/+$/, "")
-      : new URL(req.url).origin;
+      : resolveRequestOrigin(req);
 
   const [session, profile] = await Promise.all([
     createLauncherSession(user.id, { label: "Десктоп-лаунчер", userAgent, ip }),

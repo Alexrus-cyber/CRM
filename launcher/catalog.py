@@ -152,7 +152,8 @@ CHAT_AGENT = AgentSpec(
     open_url="http://127.0.0.1:{port}/",
     color="#22a06b",
     fields=(
-        Field("host", "Адрес прослушивания", "text", "127.0.0.1"),
+        Field("host", "Адрес прослушивания", "text", "127.0.0.1",
+              hint="127.0.0.1 — только этот ПК; 0.0.0.0 — доступ из локальной сети (LAN / Docker)"),
         Field("port", "Порт", "int", 8899),
         Field("max_steps", "Предел шагов на задачу", "int", 500),
         Field("trust_level", "Уровень доверия ИИ", "choice", "verified", choices=TRUST_LEVELS),

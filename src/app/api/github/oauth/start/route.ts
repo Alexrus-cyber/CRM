@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 import { hasAgentAccess } from "@/lib/aiPolicy";
-import { getCurrentUser } from "@/lib/auth";
+import { getCurrentUser, resolveRequestOrigin, shouldUseSecureCookie } from "@/lib/auth";
 import { encryptSecret } from "@/lib/crypto";
 import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 
@@ -37,8 +37,9 @@ export async function GET(req: Request) {
   }
 
   const url = new URL(req.url);
+  const origin = resolveRequestOrigin(req);
   const redirectUri =
-    process.env.GITHUB_OAUTH_REDIRECT_URI || `${url.origin}/api/github/oauth/callback`;
+    process.env.GITHUB_OAUTH_REDIRECT_URI || `${origin}/api/github/oauth/callback`;
   const state = randomBytes(24).toString("hex");
   const codeVerifier = randomBytes(32).toString("base64url");
   const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
@@ -57,7 +58,7 @@ export async function GET(req: Request) {
   jar.set("crm_gh_oauth_state", encryptedState, {
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure: await shouldUseSecureCookie(req.headers, req.url),
     path: "/",
     maxAge: 600,
   });
