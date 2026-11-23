@@ -28,6 +28,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
@@ -1129,6 +1130,7 @@ def run_qa_tool(
         any_errors = False
         no_browser_reason = ""
         no_browser_trace: List[str] = []
+        audit_session_id = f"qa_audit_{uuid.uuid4().hex[:8]}"
         try:
             for vp in ("desktop", "mobile"):
                 if cancel_check and cancel_check():
@@ -1146,7 +1148,7 @@ def run_qa_tool(
                     "action": "open" if vp == "desktop" else "resize",
                     "viewport": vp,
                     "wait_ms": wait_ms,
-                    "session_id": "qa_audit",
+                    "session_id": audit_session_id,
                     "capture_screenshot": True,
                 }
                 if vp == "desktop":
@@ -1182,8 +1184,18 @@ def run_qa_tool(
                 events.extend(evs)
                 summary_lines.append(f"=== Viewport: {vp} ===\n{txt}")
         finally:
-            if owns_mgr:
-                mgr.close_all()
+            closed_audit = False
+            try:
+                if owns_mgr:
+                    mgr.close_all()
+                    closed_audit = True
+                else:
+                    closed_audit = mgr.close_session(audit_session_id)
+            finally:
+                if closed_audit:
+                    browser_inspector._browser_log(
+                        f"qa_browser_audit завершил осмотр (сессия «{audit_session_id}» закрыта)"
+                    )
 
         if no_browser_reason:
             # Fallback: без установленного Chromium проверяем проект через HTTP + статический анализ, не ломая QA-цикл.
@@ -1247,6 +1259,11 @@ def run_qa_tool(
                     "trace": no_browser_trace,
                 }
             )
+            if on_status:
+                try:
+                    on_status("Браузерный QA-аудит (fallback HTTP/статика) завершён — передаю отчёт…")
+                except Exception:  # noqa: BLE001
+                    pass
             return "\n".join(fallback_parts), events
 
         chk_status = "fail" if any_errors else "pass"
@@ -1259,6 +1276,11 @@ def run_qa_tool(
                     "details": "Найдены ошибки в браузере/анимациях" if any_errors else "Страница открылась без ошибок консоли и сети",
                 }
             )
+        if on_status:
+            try:
+                on_status("Браузерный QA-аудит (desktop + mobile) завершён — сессия закрыта, передаю отчёт…")
+            except Exception:  # noqa: BLE001
+                pass
         return "\n\n".join(summary_lines), events
 
     if name == "qa_submit_report":

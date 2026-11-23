@@ -329,7 +329,10 @@ SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CR
      (`document.getAnimations()`, CSS transition/animation, замер кадров до и после ожидания
      через `inspect_animations`);
    - когда пользователь просит «зайди на проект и посмотри, что не так, какие анимации не работают,
-     почему не нажимается кнопка / ломается вёрстка» — используй `browse_project` интерактивно шаг за шагом!
+     почему не нажимается кнопка / ломается вёрстка» — используй `browse_project` интерактивно шаг за шагом;
+   - как только получил нужные результаты осмотра и дальнейшие действия в браузере не требуются, не делай
+     лишних повторных проверок: закрой вкладку (`browse_project(action="close")` или `close_after=true` на
+     последнем шаге) и сразу переходи к итоговому ответу пользователю.
 7. Совместная работа с Настольным Оператором экрана:
    - formulate_operator_task — превратить просьбу пользователя (работа в программах, на экране,
      или управление персонажем в игре) в чёткое пошаговое задание для Оператора с подходящим
@@ -419,8 +422,9 @@ TESTER_SYSTEM_PROMPT = """Ты — независимый QA-инженер (п�
 1. Сначала изучи проект в Sandbox (`sandbox_list`, чтение ключевых файлов, `qa_static_review`).
 2. Проведи реальные проверки по типу проекта:
    - запусти тесты/компиляцию через `qa_run_tests` или `run_command`;
-   - если это веб-приложение/сайт или API — проверь маршруты через `qa_http_audit` и интерфейс через `qa_browser_audit` / `browse_project`.
+   - если это веб-приложение/сайт или API — проверь маршруты через `qa_http_audit` и интерфейс через `qa_browser_audit` (закрывает сессию браузера сам сразу после проверки) или `browse_project` (по окончании осмотра закрой сессию через `action='close'` / `close_after=true`).
    НИКОГДА не выдумывай результаты тестов, которые реально не запускал!
+   Получив отчёт от `qa_browser_audit` / `browse_project`, не повторяй осмотр впустую — сразу переходи к следующим проверкам или к `qa_submit_report`.
 3. Чётко классифицируй КАЖДЫЙ найденный дефект:
    - `critical_issues` — критические ошибки: синтаксические/рантайм-ошибки, падающие тесты, сломанная логика,
      битые файлы/ресурсы, 5xx/4xx ошибки на рабочих роутах, неработающие кнопки, уязвимости безопасности;
@@ -678,7 +682,8 @@ BROWSER_TOOLS = [
                 "Интерактивно зайти на веб-проект в реальном изолированном браузере и проверить что не так: "
                 "визуальный вид (скриншот), анимации и переходы (document.getAnimations(), CSS keyframes, "
                 "застрявшие opacity:0, замер движения между кадрами), клики, hover, скролл, адаптивность "
-                "(desktop/mobile), ошибки JS-консоли и сети. Сессия сохраняется между шагами вызова."
+                "(desktop/mobile), ошибки JS-консоли и сети. Сессия сохраняется между шагами вызова; "
+                "когда осмотр закончен, закрой её через action='close' или передай close_after=true на последнем шаге."
             ),
             "parameters": {
                 "type": "object",
@@ -741,6 +746,10 @@ BROWSER_TOOLS = [
                     "capture_screenshot": {
                         "type": "boolean",
                         "description": "Приложить свежий скриншот (по умолчанию true)",
+                    },
+                    "close_after": {
+                        "type": "boolean",
+                        "description": "Закрыть браузерную сессию сразу после завершения этого шага",
                     },
                 },
                 "required": ["action"],
@@ -1234,7 +1243,7 @@ def run_tool(
             trust_level=trust,
             approval_fn=approval_fn,
             sandbox_root=sandbox_root,
-            browser_manager=browser_manager,
+            browser_manager=None,
             github_ctx=github_ctx,
             unlimited=unlimited,
             tester_ctx=tester_ctx,
@@ -2171,6 +2180,81 @@ def _strip_old_images(messages: List[Dict[str, Any]], keep_last_n: int = 1) -> L
             texts.append("[предыдущее изображение скрыто для экономии контекста]")
         messages[idx]["content"] = "\n".join(texts) if texts else "[изображение скрыто]"
     return messages
+
+
+def _count_message_images(messages: List[Dict[str, Any]]) -> int:
+    total = 0
+    for msg in messages:
+        parts = msg.get("content")
+        if isinstance(parts, list):
+            total += sum(1 for p in parts if isinstance(p, dict) and p.get("type") == "image_url")
+    return total
+
+
+def _trim_images_per_message(messages: List[Dict[str, Any]], max_images: int = 1) -> List[Dict[str, Any]]:
+    cap = max(0, int(max_images))
+    for msg in messages:
+        parts = msg.get("content")
+        if not isinstance(parts, list):
+            continue
+        img_seen = 0
+        kept: List[Any] = []
+        for p in parts:
+            if isinstance(p, dict) and p.get("type") == "image_url":
+                img_seen += 1
+                if img_seen <= cap:
+                    kept.append(p)
+            else:
+                kept.append(p)
+        if img_seen > cap:
+            msg["content"] = kept if kept else "[изображения скрыты]"
+    return messages
+
+
+def _is_multi_image_limit_error(detail: str) -> bool:
+    d = str(detail or "").lower()
+    return any(
+        tok in d
+        for tok in (
+            "at most 1",
+            "only 1 image",
+            "single image",
+            "max_images",
+            "too many images",
+            "multiple images",
+            "more than 1 image",
+            "image limit",
+            "exceeded image",
+            "max image",
+        )
+    )
+
+
+def _is_vision_rejection_error(detail: str) -> bool:
+    d = str(detail or "").lower()
+    return any(
+        tok in d
+        for tok in (
+            "image",
+            "vision",
+            "modality",
+            "multimodal",
+            "mmproj",
+            "content must be a string",
+            "expected string",
+            "expected a string",
+            "string, got",
+            "cannot convert array",
+            "unsupported content",
+            "only text",
+            "text-only",
+            "text only",
+            "does not support media",
+            "413",
+            "payload too large",
+            "request entity too large",
+        )
+    )
 
 
 def _compact_system_prompt(sys_text: str, target_chars: int) -> str:
@@ -3142,6 +3226,7 @@ def run_tester_session(
     force_no_tools_next = False
     empty_reply_nudges = 0
     allow_tester_images = True
+    max_tester_images_per_step = 3
     cancel_check = ctx.get("cancel_check")
 
     def _tester_approval_wrapper(req: Dict[str, Any]) -> Dict[str, Any]:
@@ -3211,8 +3296,13 @@ def run_tester_session(
                     tester_messages[:] = call_state["compacted_messages"]
                 raw_err = str(error)
                 detail = raw_err.lower()
-                has_imgs = any(isinstance(m.get("content"), list) for m in tester_messages)
-                if has_imgs and ("image" in detail or "vision" in detail or "modality" in detail):
+                img_count = _count_message_images(tester_messages)
+                if img_count > 1 and _is_multi_image_limit_error(detail):
+                    max_tester_images_per_step = 1
+                    _trim_images_per_message(tester_messages, max_images=1)
+                    _emit("tester_status", {"runKey": run_key, "text": "Тестировщик: оставляю 1 скриншот для модели…"})
+                    continue
+                if img_count > 0 and _is_vision_rejection_error(detail):
                     allow_tester_images = False
                     _strip_old_images(tester_messages, keep_last_n=0)
                     _emit("tester_status", {"runKey": run_key, "text": "Тестировщик: модель без vision — продолжаю по тексту…"})
@@ -3441,8 +3531,27 @@ def run_tester_session(
                             }
                         )
                     else:
-                        tester_actions.append(ev)
+                        tester_actions.append(
+                            {k: v for k, v in ev.items() if k != "preview"}
+                            if isinstance(ev, dict)
+                            else ev
+                        )
                         _emit("tester_action", {"runKey": run_key, "action": ev})
+
+                if is_browser_tool:
+                    browser_inspector._browser_log(
+                        f"Инструмент {t_name} завершён — передаю отчёт Тестировщику (шаг {steps})"
+                    )
+                    _emit(
+                        "tester_status",
+                        {
+                            "runKey": run_key,
+                            "text": f"BrowserInspector завершил шаг ({t_name}) — передаю данные Тестировщику…",
+                            "source": "browser_inspector",
+                            "tool": t_name,
+                            "done": True,
+                        },
+                    )
 
                 cid = str(call.get("id") or f"tcall_{steps}_{idx}")
                 assistant_calls.append(
@@ -3482,7 +3591,7 @@ def run_tester_session(
                     "Используй полученные данные, измени параметры или вызови qa_submit_report.]"
                 )
 
-            img_slice = captured_imgs[:3] if allow_tester_images else []
+            img_slice = captured_imgs[:max_tester_images_per_step] if allow_tester_images else []
             if img_slice:
                 _strip_old_images(tester_messages, keep_last_n=0)
             if use_tools:
@@ -4980,6 +5089,8 @@ class Handler(BaseHTTPRequestHandler):
         repeat_sig_count = 0
         force_no_tools_next = False
         direct_empty_reply_nudges = 0
+        allow_agent_images = True
+        max_agent_images_per_step = 6 if unlimited_role else 3
         try:
             raw_token_cap = int(body.get("maxRunTokens") or 0)
         except (TypeError, ValueError):
@@ -5039,10 +5150,19 @@ class Handler(BaseHTTPRequestHandler):
                         messages[:] = call_state["compacted_messages"]
                     raw_err = str(error)
                     detail = raw_err.lower()
-                    if has_multimodal_images() and ("image" in detail or "vision" in detail or "modality" in detail):
+                    img_count = _count_message_images(messages)
+                    if img_count > 1 and _is_multi_image_limit_error(detail):
+                        log("модель принимает только 1 изображение за шаг — оставляю последний скриншот")
+                        self.write(sse({"text": "Оставляю 1 скриншот для модели…"}, "status"))
+                        max_agent_images_per_step = 1
+                        _trim_images_per_message(messages, max_images=1)
+                        continue
+                    if (has_multimodal_images() or img_count > 0) and _is_vision_rejection_error(detail):
                         log("модель не принимает картинки — читаю только текст вложений")
                         self.write(sse({"text": "Модель не принимает картинки — читаю текстовое описание"}, "status"))
+                        allow_agent_images = False
                         strip_images()
+                        _strip_old_images(messages, keep_last_n=0)
                         images = []
                         continue
                     if use_tools and (
@@ -5274,8 +5394,29 @@ class Handler(BaseHTTPRequestHandler):
                         else:
                             actions += 1
                             if agent_role == "tester":
-                                direct_actions_log.append(event)
+                                direct_actions_log.append(
+                                    {k: v for k, v in event.items() if k != "preview"}
+                                    if isinstance(event, dict)
+                                    else event
+                                )
                         self.write(sse(event, "action"))
+
+                    if is_browser_tool:
+                        target_label = "Тестировщику" if agent_role == "tester" else "Агенту"
+                        browser_inspector._browser_log(
+                            f"Инструмент {name} завершён — передаю отчёт {target_label} (шаг {steps})"
+                        )
+                        self.write(
+                            sse(
+                                {
+                                    "text": f"BrowserInspector завершил шаг ({name}) — передаю данные {target_label}…",
+                                    "source": "browser_inspector",
+                                    "tool": name,
+                                    "done": True,
+                                },
+                                "status",
+                            )
+                        )
 
                     call_id = str(call.get("id") or f"call_{steps}_{index}")
                     assistant_calls.append(
@@ -5333,7 +5474,9 @@ class Handler(BaseHTTPRequestHandler):
                     if has_browser_images
                     else "Снимок экрана ПК, переданный Оператором после разрешения пользователя:"
                 )
-                screen_slice = captured_screen_images[:6] if unlimited_role else captured_screen_images[:3]
+                screen_slice = (
+                    captured_screen_images[:max_agent_images_per_step] if allow_agent_images else []
+                )
                 if screen_slice:
                     # Не накапливаем десятки устаревших скриншотов в истории шагов — оставляем свежие.
                     _strip_old_images(messages, keep_last_n=0)

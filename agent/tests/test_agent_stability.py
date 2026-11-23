@@ -1108,6 +1108,192 @@ class WindowsCompatibilityAndSpecTests(unittest.TestCase):
         ):
             self.assertIn(key, bundle.SAFE_CHILD_ENV_KEYS)
 
+    def test_qa_browser_audit_always_closes_session_when_external_manager_passed(self) -> None:
+        import qa_tools
+        import sandbox as sandbox_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            sandbox_mod.write_file(root, "app/index.html", "<!doctype html><h1>Hi</h1>")
+            mgr = browser_inspector.BrowserSessionManager(sandbox_root=root)
+            preexisting = mock.MagicMock()
+            preexisting.is_alive.return_value = True
+            mgr._sessions["agent_keep"] = preexisting
+
+            seen_session_ids: list[str] = []
+            closed_session_ids: list[str] = []
+            statuses: list[str] = []
+
+            def fake_exec(m, args, **_kw):
+                sid = str(args.get("session_id"))
+                seen_session_ids.append(sid)
+                if sid not in m._sessions:
+                    sess = mock.MagicMock()
+                    sess.is_alive.return_value = True
+                    m._sessions[sid] = sess
+                act = str(args.get("action"))
+                return f"Осмотр ({act}): OK", [
+                    {
+                        "type": "browser_inspect",
+                        "action": act,
+                        "viewport": "1440×900" if act == "open" else "390×844",
+                        "errorsCount": 0,
+                        "issuesCount": 0,
+                        "_images": ["data:image/jpeg;base64,AAA"],
+                        "preview": "data:image/jpeg;base64,AAA",
+                    }
+                ]
+
+            orig_close_session = mgr.close_session
+
+            def spy_close_session(sid: str) -> bool:
+                closed_session_ids.append(sid)
+                return orig_close_session(sid)
+
+            checks_sink: list[dict] = []
+            with (
+                mock.patch.object(browser_inspector, "execute_browse_action", side_effect=fake_exec),
+                mock.patch.object(mgr, "close_session", side_effect=spy_close_session),
+            ):
+                txt, evs = qa_tools.run_qa_tool(
+                    "qa_browser_audit",
+                    {"sandbox_project": "app"},
+                    trust_level="verified",
+                    sandbox_root=root,
+                    browser_manager=mgr,
+                    checks_sink=checks_sink,
+                    on_status=statuses.append,
+                )
+
+            self.assertEqual(len(seen_session_ids), 2)
+            self.assertEqual(seen_session_ids[0], seen_session_ids[1])
+            audit_sid = seen_session_ids[0]
+            self.assertIn(audit_sid, closed_session_ids)
+            # Сессия самого аудита закрыта, а сторонняя сессия Агента осталась нетронутой.
+            self.assertNotIn(audit_sid, mgr._sessions)
+            self.assertIn("agent_keep", mgr._sessions)
+            self.assertTrue(any("завершён" in s and "передаю отчёт" in s for s in statuses))
+            self.assertIn("Viewport: desktop", txt)
+            self.assertIn("Viewport: mobile", txt)
+            self.assertEqual(len(evs), 2)
+
+    def test_run_agent_emits_browser_done_handoff_and_handles_multimodal_rejection(self) -> None:
+        sse_frames: list[str] = []
+
+        class CollectingWriter:
+            def write(self, data: bytes) -> int:
+                sse_frames.append(data.decode("utf-8", errors="replace"))
+                return len(data)
+
+            def flush(self) -> None:
+                pass
+
+        h = agent_mod.Handler.__new__(agent_mod.Handler)
+        h.wfile = CollectingWriter()  # type: ignore[assignment]
+        h._client_disconnected = False
+
+        calls: list[list[dict]] = []
+
+        def fake_call_model(_base_url, _api_key, _model, messages, *_args, **_kwargs):
+            calls.append(json.loads(json.dumps(messages)))
+            step_idx = len(calls)
+            if step_idx == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_b_click",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "browse_project",
+                                            "arguments": json.dumps({"action": "click", "text": "Войти"}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            if step_idx == 2:
+                # Имитируем ошибку не-vision модели с формулировкой без слов image/vision.
+                raise agent_mod.AgentError("HTTP 400: content must be a string (mmproj not loaded)")
+            return {"choices": [{"message": {"role": "assistant", "content": "Клик проверен, проблем нет."}}]}
+
+        def fake_browse(_mgr, _args, **_kw):
+            return "Интерактивный осмотр проекта (click): OK", [
+                {
+                    "type": "browser_inspect",
+                    "action": "click",
+                    "url": "http://127.0.0.1:8123",
+                    "summary": "анимаций: 20, проблем: 0, ошибок: 0",
+                    "_images": ["data:image/jpeg;base64,AAA"],
+                    "preview": "data:image/jpeg;base64,AAA",
+                }
+            ]
+
+        with (
+            mock.patch.object(agent_mod, "call_model", side_effect=fake_call_model),
+            mock.patch.object(browser_inspector, "execute_browse_action", side_effect=fake_browse),
+            mock.patch.object(browser_inspector, "_browser_log") as log_mock,
+        ):
+            h.run_agent(
+                {
+                    "messages": [{"role": "user", "content": "проверь клик"}],
+                    "model": "text-only-model",
+                    "baseUrl": "http://127.0.0.1:8888/v1",
+                    "trustLevel": "verified",
+                }
+            )
+
+        joined = "".join(sse_frames)
+        self.assertIn('"done": true', joined)
+        self.assertIn("Клик проверен, проблем нет.", joined)
+        self.assertTrue(any("передаю отчёт Агенту" in str(c.args[0]) for c in log_mock.call_args_list))
+        # На 3-м вызове картинки уже вырезаны после ошибки mmproj/content must be a string.
+        self.assertEqual(agent_mod._count_message_images(calls[-1]), 0)
+
+    def test_execute_browse_action_close_after_closes_session_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = browser_inspector.BrowserSessionManager(sandbox_root=Path(tmp))
+            fake_sess = mock.MagicMock()
+            fake_sess.is_alive.return_value = True
+            fake_sess.width = 1440
+            fake_sess.height = 900
+            fake_sess.current_url = "http://127.0.0.1:8123/"
+            fake_sess.audit.return_value = {
+                "dom": {
+                    "url": "http://127.0.0.1:8123/",
+                    "title": "Test",
+                    "viewport": {"width": 1440, "height": 900},
+                    "scroll": {"x": 0, "y": 0, "width": 1440, "height": 900},
+                    "issues": [],
+                    "webAnimations": [],
+                    "cssAnimatedElements": [],
+                    "interactive": [],
+                    "keyframes": [],
+                    "reducedMotion": False,
+                },
+                "telemetry": {"consoleMessages": [], "pageErrors": [], "failedRequests": []},
+            }
+            fake_sess.capture_screenshot.return_value = ""
+            mgr._sessions["s1"] = fake_sess
+
+            statuses: list[str] = []
+            report, _evs = browser_inspector.execute_browse_action(
+                mgr,
+                {"action": "click", "x": 10, "y": 10, "session_id": "s1", "close_after": True, "wait_ms": 0},
+                trust_level="verified",
+                on_status=statuses.append,
+            )
+            self.assertIn("Интерактивный осмотр проекта (click)", report)
+            self.assertNotIn("s1", mgr._sessions)
+            fake_sess.close.assert_called_once()
+            self.assertTrue(any("закрыта после шага «click»" in s for s in statuses))
+
 
 if __name__ == "__main__":
     unittest.main()

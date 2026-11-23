@@ -77,6 +77,32 @@ export type TesterChatMessage = {
   error?: string;
 };
 
+export type LiveTesterActionItem = {
+  type: string;
+  label?: string;
+  command?: string;
+  url?: string;
+  action?: string;
+  viewport?: string;
+  summary?: string;
+  error?: string;
+  errorsCount?: number;
+  issuesCount?: number;
+  animationsCount?: number;
+};
+
+export function formatLiveTesterAction(act: LiveTesterActionItem): string {
+  if (act.type === "browser_inspect") {
+    const scope = act.action ? ` (${act.action}${act.viewport ? ` · ${act.viewport}` : ""})` : "";
+    if (act.error) {
+      return `Сбой BrowserInspector${scope}: ${act.error}`;
+    }
+    const detail = act.summary || act.url || "осмотр завершён";
+    return `Осмотр проекта${scope}: ${detail}`;
+  }
+  return act.label || act.command || act.url || act.type;
+}
+
 export type LiveTesterState = {
   runKey: string;
   runId?: number;
@@ -88,7 +114,7 @@ export type LiveTesterState = {
   reasoning: string;
   content: string;
   browserLog?: string[];
-  actions: Array<{ type: string; label?: string; command?: string; url?: string }>;
+  actions: LiveTesterActionItem[];
 };
 
 const STATUS_META: Record<
@@ -329,9 +355,17 @@ export function TesterPanel({
               {liveTester.actions.slice(-8).map((act, idx) => (
                 <span
                   key={`${act.type}-${idx}`}
-                  className="rounded-md border border-border bg-card px-2 py-0.5 text-[10px] text-muted"
+                  className={cn(
+                    "max-w-full truncate rounded-md border px-2 py-0.5 text-[10px]",
+                    act.error
+                      ? "border-red-500/40 bg-red-500/10 text-red-300"
+                      : act.type === "browser_inspect"
+                        ? "border-cyan-500/35 bg-cyan-500/10 text-cyan-300"
+                        : "border-border bg-card text-muted",
+                  )}
+                  title={formatLiveTesterAction(act)}
                 >
-                  {act.label || act.command || act.url || act.type}
+                  {formatLiveTesterAction(act)}
                 </span>
               ))}
             </div>
