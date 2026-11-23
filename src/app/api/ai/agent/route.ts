@@ -13,6 +13,7 @@ import {
   type TesterRunStatus,
 } from "@/db/repo";
 import { AGENT_START_HINT, fetchAgent, resolveSafeAgentUrl } from "@/lib/agentConfig";
+import { createAgentSseProxyStream } from "@/lib/agentSseProxy";
 import { registerAgentApproval } from "@/lib/agentApprovals";
 import { hasAgentAccess } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
@@ -460,9 +461,6 @@ export async function POST(req: Request) {
     estimateTokens(githubRagContext) +
     attachments.reduce((sum, a) => sum + estimateTokens(a.text), 0);
   const upstreamReader = upstream.body.getReader();
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  let sseBuffer = "";
   let textLatest = "";
   let reasoningLatest = "";
   let reportedPrompt = 0;
@@ -651,49 +649,17 @@ export async function POST(req: Request) {
     return `${frame}\n\n`;
   };
 
-  const transformChunk = async (chunkText: string, controller: ReadableStreamDefaultController<Uint8Array>) => {
-    sseBuffer += chunkText.replace(/\r\n/g, "\n");
-    let sep = sseBuffer.indexOf("\n\n");
-    while (sep !== -1) {
-      const frame = sseBuffer.slice(0, sep);
-      sseBuffer = sseBuffer.slice(sep + 2);
-      sep = sseBuffer.indexOf("\n\n");
-      if (frame.trim()) {
-        controller.enqueue(encoder.encode(await processFrame(frame)));
-      }
-    }
-  };
-
-  const trackedStream = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        const { value, done } = await upstreamReader.read();
-        if (done) {
-          await transformChunk(decoder.decode(), controller);
-          if (sseBuffer.trim()) {
-            controller.enqueue(encoder.encode(await processFrame(sseBuffer)));
-            sseBuffer = "";
-          }
-          await flushUsage();
-          controller.close();
-          return;
-        }
-        await transformChunk(decoder.decode(value, { stream: true }), controller);
-      } catch (err) {
-        await flushUsage();
-        controller.error(err);
-      }
-    },
-    async cancel() {
-      await upstreamReader.cancel().catch(() => undefined);
-      await flushUsage();
-    },
+  const trackedStream = createAgentSseProxyStream({
+    upstreamReader,
+    processFrame,
+    onDone: flushUsage,
+    reqSignal: req.signal,
   });
 
   return new Response(trackedStream, {
     headers: {
       "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-store, no-transform",
+      "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
     },

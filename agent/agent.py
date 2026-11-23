@@ -3580,6 +3580,8 @@ def run_tester_session(
 
     try:
         while steps < steps_cap:
+            if callable(cancel_check) and cancel_check():
+                raise BrokenPipeError("Клиент закрыл соединение")
             if tester_token_cap > 0 and tester_usage_total >= tester_token_cap:
                 run_error = f"Достигнут предохранитель расхода токенов Тестировщика ({tester_token_cap})."
                 break
@@ -3639,8 +3641,7 @@ def run_tester_session(
                     cancel_check=cancel_check if callable(cancel_check) else None,
                 )
             except BrokenPipeError:
-                run_error = "Клиент закрыл соединение"
-                break
+                raise
             except AgentError as error:
                 if call_state.get("max_context"):
                     discovered_max_context = int(call_state["max_context"])
@@ -3976,6 +3977,9 @@ def run_tester_session(
                     }
                     tester_actions.append(synth_ev)
                     _emit("tester_action", {"runKey": run_key, "action": synth_ev})
+
+                if callable(cancel_check) and cancel_check():
+                    raise BrokenPipeError("Клиент закрыл соединение")
 
                 if is_browser_tool:
                     browser_inspector._browser_log(

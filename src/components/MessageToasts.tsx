@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MessageSquare, X } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
+import { subscribeAppEvents } from "@/lib/clientEvents";
 import { cn } from "@/lib/utils";
 
 /**
@@ -77,7 +78,6 @@ export function MessageToasts({ userId }: { userId: number }) {
 
   useEffect(() => {
     let disposed = false;
-    let source: EventSource | null = null;
     const pendingTimers = timers.current;
     let lastId = 0;
     let interval: number | null = null;
@@ -95,12 +95,11 @@ export function MessageToasts({ userId }: { userId: number }) {
     };
     void baseline();
 
-    // 2. Мгновенный канал.
-    try {
-      source = new EventSource("/api/events");
-      source.addEventListener("update", (event) => {
+    // 2. Мгновенный канал (общий для вкладки).
+    const unsubscribe = subscribeAppEvents({
+      onUpdate: (raw) => {
         try {
-          const data = JSON.parse((event as MessageEvent<string>).data) as {
+          const data = JSON.parse(raw) as {
             scope?: string;
             chat?: Toast & { at?: number };
           };
@@ -126,10 +125,8 @@ export function MessageToasts({ userId }: { userId: number }) {
         } catch {
           /* некорректный пакет — игнорируем */
         }
-      });
-    } catch {
-      source = null;
-    }
+      },
+    });
 
     // 3. Страховочный опрос.
     const poll = async () => {
@@ -177,7 +174,7 @@ export function MessageToasts({ userId }: { userId: number }) {
     return () => {
       disposed = true;
       document.removeEventListener("visibilitychange", onVisible);
-      source?.close();
+      unsubscribe();
       if (interval !== null) window.clearInterval(interval);
       for (const timer of pendingTimers.values()) window.clearTimeout(timer);
       pendingTimers.clear();

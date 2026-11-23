@@ -1615,6 +1615,92 @@ class WindowsCompatibilityAndSpecTests(unittest.TestCase):
         finally:
             agent_mod._MODEL_CONN_TLS.holder = prev_holder
 
+    def test_run_tester_session_propagates_broken_pipe_without_post_disconnect_emit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            sandbox_mod.write_file(root, "app/index.html", "<h1>App</h1>")
+
+            emitted: list[str] = []
+            approvals_called = 0
+            cancelled = {"flag": False}
+
+            def _fake_approval(req: dict[str, object]) -> dict[str, object]:
+                nonlocal approvals_called
+                approvals_called += 1
+                return {"approved": False, "note": str(req.get("title") or "")}
+
+            # 1) Отмена прямо на шаге call_model (BrokenPipeError должен пробрасываться наверх)
+            def _disconnected_model(*_a: object, **_kw: object) -> dict[str, object]:
+                raise BrokenPipeError("client gone")
+
+            with mock.patch.object(agent_mod, "call_model", side_effect=_disconnected_model):
+                with self.assertRaises(BrokenPipeError):
+                    agent_mod.run_tester_session(
+                        summary="Проверка",
+                        sandbox_project="app",
+                        trust_level="verified",
+                        approval_fn=_fake_approval,
+                        sandbox_root=root,
+                        tester_ctx={
+                            "emit_sse": lambda ev, _data: emitted.append(ev),
+                            "base_url": "http://127.0.0.1:8888/v1",
+                            "api_key": "",
+                            "model": "m",
+                            "params": {},
+                            "cancel_check": lambda: cancelled["flag"],
+                        },
+                    )
+            self.assertNotIn("tester_done", emitted)
+            self.assertEqual(approvals_called, 0)
+
+            # 2) Клиент отключился во время run_tool -> сразу BrokenPipeError без второго шага и tester_done
+            emitted.clear()
+            cancelled["flag"] = False
+
+            def _tool_then_disconnect(*_a: object, **_kw: object) -> dict[str, object]:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "tc1",
+                                        "function": {"name": "qa_list_files", "arguments": '{"sandbox_project":"app"}'},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+
+            def _run_tool_flip_cancel(*_a: object, **_kw: object) -> tuple[str, list[dict[str, object]]]:
+                cancelled["flag"] = True
+                return "ok", []
+
+            with (
+                mock.patch.object(agent_mod, "call_model", side_effect=_tool_then_disconnect),
+                mock.patch.object(agent_mod, "run_tool", side_effect=_run_tool_flip_cancel),
+            ):
+                with self.assertRaises(BrokenPipeError):
+                    agent_mod.run_tester_session(
+                        summary="Проверка",
+                        sandbox_project="app",
+                        trust_level="verified",
+                        approval_fn=_fake_approval,
+                        sandbox_root=root,
+                        tester_ctx={
+                            "emit_sse": lambda ev, _data: emitted.append(ev),
+                            "base_url": "http://127.0.0.1:8888/v1",
+                            "api_key": "",
+                            "model": "m",
+                            "params": {},
+                            "cancel_check": lambda: cancelled["flag"],
+                        },
+                    )
+            self.assertNotIn("tester_done", emitted)
+            self.assertEqual(approvals_called, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

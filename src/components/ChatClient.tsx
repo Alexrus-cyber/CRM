@@ -25,6 +25,7 @@ import {
 import type { Role } from "@/db/schema";
 import type { UserLite } from "@/lib/data";
 import { AVATAR_COLORS, cn, formatDate, formatTime, dateToStr } from "@/lib/utils";
+import { subscribeAppEvents } from "@/lib/clientEvents";
 import { Avatar, Badge, Button, Field, Input, Modal, Textarea } from "./ui";
 import { LoadMore, useProgressiveList } from "./lazy";
 
@@ -428,14 +429,12 @@ export function ChatClient({
     return () => clearInterval(timer);
   }, [load]);
 
-  // Мгновенные обновления через SSE `/api/events`.
+  // Мгновенные обновления через общий SSE-канал `/api/events`.
   useEffect(() => {
-    let source: EventSource | null = null;
-    try {
-      source = new EventSource("/api/events");
-      source.addEventListener("update", (event) => {
+    return subscribeAppEvents({
+      onUpdate: (raw) => {
         try {
-          const payload = JSON.parse((event as MessageEvent<string>).data) as { scope?: string };
+          const payload = JSON.parse(raw) as { scope?: string };
           if (payload.scope === "chat") {
             if (!contextRef.current) void load(false);
             void refreshUnread();
@@ -446,11 +445,8 @@ export function ChatClient({
         } catch {
           /* игнор */
         }
-      });
-    } catch {
-      source = null;
-    }
-    return () => source?.close();
+      },
+    });
   }, [load, refreshMetadata, refreshUnread]);
 
   useEffect(() => {
