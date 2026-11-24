@@ -636,7 +636,7 @@ class BrowserInspectorAllActionsTests(unittest.TestCase):
 
 class CodeQaAndTesterToolsTests(unittest.TestCase):
     def test_all_14_code_tools(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=(os.name == "nt")) as tmp:
             root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
             proj = root / "proj"
             (proj / "src" / "app" / "api" / "ping").mkdir(parents=True)
@@ -667,11 +667,13 @@ class CodeQaAndTesterToolsTests(unittest.TestCase):
             )
 
             # Инициализируем git для git_history
-            subprocess.run(["git", "init"], cwd=proj, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=proj, check=True)
-            subprocess.run(["git", "config", "user.name", "Test"], cwd=proj, check=True)
-            subprocess.run(["git", "add", "."], cwd=proj, check=True)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=proj, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "-c", "core.fsmonitor=false", "init"], cwd=proj, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "-c", "core.fsmonitor=false", "config", "core.fsmonitor", "false"], cwd=proj, check=True)
+            subprocess.run(["git", "-c", "core.fsmonitor=false", "config", "gc.auto", "0"], cwd=proj, check=True)
+            subprocess.run(["git", "-c", "core.fsmonitor=false", "config", "user.email", "t@example.com"], cwd=proj, check=True)
+            subprocess.run(["git", "-c", "core.fsmonitor=false", "config", "user.name", "Test"], cwd=proj, check=True)
+            subprocess.run(["git", "-c", "core.fsmonitor=false", "add", "."], cwd=proj, check=True)
+            subprocess.run(["git", "-c", "core.fsmonitor=false", "commit", "-m", "init"], cwd=proj, check=True, stdout=subprocess.DEVNULL)
 
             run_state: Dict[str, Any] = {}
             common = {"sandbox_project": "proj"}

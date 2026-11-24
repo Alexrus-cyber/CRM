@@ -3528,22 +3528,29 @@ class Operator:
             timeout = max(1, min(180, int(action.get("timeout") or 60)))
             raw_cwd = str(action.get("cwd") or "").strip()
             if raw_cwd and raw_cwd != "." and Path(raw_cwd).is_dir():
-                argv = (
-                    sandbox_mod._shell_argv(cmd)
-                    if sandbox_mod is not None and hasattr(sandbox_mod, "_shell_argv")
-                    else (["cmd", "/c", cmd] if platform.system() == "Windows" else ["/bin/sh", "-c", cmd])
-                )
+                if sandbox_mod is not None and hasattr(sandbox_mod, "_shell_argv"):
+                    argv: Any = sandbox_mod._shell_argv(cmd)
+                elif platform.system() == "Windows":
+                    comspec = (os.environ.get("COMSPEC") or "cmd.exe").strip() or "cmd.exe"
+                    if " " in comspec and not (comspec.startswith('"') and comspec.endswith('"')):
+                        comspec = f'"{comspec}"'
+                    argv = f'{comspec} /s /c "{cmd}"'
+                else:
+                    argv = ["/bin/sh", "-c", cmd]
+                run_kw: Dict[str, Any] = {
+                    "cwd": str(Path(raw_cwd)),
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "text": True,
+                    "encoding": "utf-8",
+                    "errors": "replace",
+                    "timeout": timeout,
+                }
+                if platform.system() == "Windows":
+                    run_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 try:
-                    proc = subprocess.run(
-                        argv,
-                        cwd=str(Path(raw_cwd)),
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=timeout,
-                    )
+                    proc = subprocess.run(argv, **run_kw)
                 except subprocess.TimeoutExpired as error:
                     raise AgentError("Команда на ПК превысила таймаут {} с".format(timeout)) from error
                 out = (proc.stdout or "").strip()[:500] or "(вывод пуст)"
