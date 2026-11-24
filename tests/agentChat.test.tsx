@@ -1130,6 +1130,92 @@ describe("вкладка «Агент»", () => {
     expect(await screen.findByText(/Субагент завершил перенесённую задачу\./i)).toBeTruthy();
   });
 
+  it("P1-2: показывает ошибку, если subagent_done пришёл со статусом error, и нейтрально сообщает о ротации", async () => {
+    conversations = [
+      { id: 1, kind: "agent", title: "Основной чат", messagesCount: 0, updatedAt: "2026-11-17T10:00:00.000Z" },
+    ];
+    const encoder = new TextEncoder();
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `event: subagent_start\ndata: ${JSON.stringify({
+                runKey: "r-err",
+                subagentSlug: "coder",
+                subagentName: "Кодер",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: subagent_done\ndata: ${JSON.stringify({
+                runKey: "r-err",
+                subagentName: "Кодер",
+                status: "rotated",
+                rotatedToNewChat: true,
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: subagent_done\ndata: ${JSON.stringify({
+                runKey: "r-err-2",
+                subagentName: "Кодер",
+                status: "error",
+                error: "соединение закрыто до завершения",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Собери проект" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    expect(await screen.findByText(/контекст перенесён в новый чат/i)).toBeTruthy();
+    expect(await screen.findByText(/соединение закрыто до завершения/i)).toBeTruthy();
+  });
+
+  it("P1-2: обрабатывает SSE-событие subagent_error и показывает текст ошибки", async () => {
+    conversations = [
+      { id: 1, kind: "agent", title: "Основной чат", messagesCount: 0, updatedAt: "2026-11-17T10:00:00.000Z" },
+    ];
+    const encoder = new TextEncoder();
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `event: subagent_error\ndata: ${JSON.stringify({
+                runKey: "r-crash",
+                subagentName: "Стили",
+                status: "error",
+                message: "Превышен лимит времени сеанса субагента",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Свёрстай шапку" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    expect(await screen.findByText(/Превышен лимит времени сеанса субагента/i)).toBeTruthy();
+  });
+
   it("показывает карточку live-actor-card субагента во вкладке «Чат», парсит CRLF SSE и корректно останавливает запрос кнопкой «Остановить»", async () => {
     const encoder = new TextEncoder();
     let aborted = false;

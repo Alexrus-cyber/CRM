@@ -81,7 +81,11 @@ export type SubagentRun = {
   sandboxProject: string;
   inputSummary: string;
   outputSummary: string;
-  status: "running" | "completed" | "handoff" | "blocked" | "error";
+  /**
+   * `rotated` — автоперенос контекста в новый чат (НЕ передача задачи другому субагенту),
+   * `cancelled` — запуск остановлен пользователем.
+   */
+  status: "running" | "completed" | "handoff" | "rotated" | "cancelled" | "blocked" | "error";
   requestedCalleeSlug: string;
   requestedCalleeTask: string;
   actionsCount: number;

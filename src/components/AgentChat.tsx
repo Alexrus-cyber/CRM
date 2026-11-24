@@ -207,6 +207,17 @@ type AgentAction = {
   handoffVia?: string;
 };
 
+/** P1-2: человекочитаемые статусы запусков субагента. `rotated` — НЕ передача задачи. */
+const SUBAGENT_RUN_STATUS_LABELS: Record<string, string> = {
+  running: "Выполняется",
+  completed: "Готово",
+  handoff: "Передача",
+  rotated: "Перенос в новый чат",
+  cancelled: "Отменён",
+  blocked: "Заблокирован",
+  error: "Ошибка",
+};
+
 type Turn = {
   id: string;
   role: "user" | "assistant";
@@ -2622,6 +2633,18 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             setSubagentRefreshKey((k) => k + 1);
             setLiveStatusActor("agent_llm");
             const doneName = String(data.subagentName ?? "Субагент");
+            // P1-2: раньше из subagent_done читался только usage, поэтому упавший запуск
+            // выглядел успешным. Теперь статус и причина видны пользователю.
+            const doneStatus = String(data.status ?? "completed");
+            const doneStatusLabel = SUBAGENT_RUN_STATUS_LABELS[doneStatus] ?? doneStatus;
+            if (doneStatus === "error" || doneStatus === "blocked" || doneStatus === "cancelled") {
+              const reason = String(data.error ?? data.outputSummary ?? "").trim();
+              setError(
+                `Субагент «${doneName}» — ${doneStatusLabel.toLowerCase()}${reason ? `: ${reason}` : ""}`,
+              );
+            } else if (doneStatus === "rotated") {
+              setNotice(`Субагент «${doneName}»: контекст перенесён в новый чат`);
+            }
             setActiveLiveActor((prev) => ({
               kind: "orchestrator",
               name: "Оркестратор",
@@ -2632,6 +2655,11 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               content: "",
               overseerVerdict: prev?.overseerVerdict ?? null,
             }));
+          } else if (event === "subagent_error") {
+            const errName = String(data.subagentName ?? "Субагент");
+            const errMessage = String(data.message ?? data.error ?? "выполнение прервано");
+            setSubagentRefreshKey((k) => k + 1);
+            setError(`Ошибка субагента «${errName}»: ${errMessage}`);
           } else if (event === "overseer_start") {
             setActiveLiveActor((prev) => {
               if (prev?.kind !== "overseer") {
