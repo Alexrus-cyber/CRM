@@ -11,6 +11,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -66,24 +67,40 @@ class SubagentOrchestratorTests(unittest.TestCase):
         self.assertFalse(agent_mod._is_callee_allowed({"slug": "a", "id": 1}, {"slug": "b", "id": 1}))
 
     def test_tools_for_trust_subagent_excludes_orchestrator_only_tools(self):
-        sub_names = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", role="subagent")}
+        sub_restricted = {
+            t["function"]["name"]
+            for t in agent_mod.tools_for_trust("full", role="subagent", subagent_tool_profile="restricted")
+        }
+        sub_full = {
+            t["function"]["name"]
+            for t in agent_mod.tools_for_trust("full", role="subagent", subagent_tool_profile="full")
+        }
         agent_names = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", role="agent")}
-        tester_names = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", role="tester")}
-        self.assertIn("report_to_orchestrator", sub_names)
-        self.assertIn("request_subagent", sub_names)
-        self.assertIn("list_tester_reports", sub_names)
-        self.assertNotIn("call_subagent", sub_names)
-        # browser_inspector и браузер доступны только Тестировщику и Оркестратору, но НЕ субагенту
-        self.assertNotIn("browse_project", sub_names)
-        self.assertNotIn("qa_browser_audit", sub_names)
-        self.assertNotIn("open_website", sub_names)
-        self.assertNotIn("play_youtube", sub_names)
-        self.assertNotIn("call_tester", sub_names)
+        self.assertIn("report_to_orchestrator", sub_restricted)
+        self.assertIn("request_subagent", sub_restricted)
+        self.assertNotIn("call_subagent", sub_restricted)
+        self.assertNotIn("list_tester_reports", sub_restricted)
+        # Профиль restricted запрещает браузер и внешние сайты, но оставляет файлы/код/команды
+        self.assertNotIn("browse_project", sub_restricted)
+        self.assertNotIn("qa_browser_audit", sub_restricted)
+        self.assertNotIn("open_website", sub_restricted)
+        self.assertNotIn("play_youtube", sub_restricted)
+        self.assertNotIn("call_tester", sub_restricted)
+        # Профиль full открывает субагенту браузер и QA-аудит, сохраняя защиту от call_subagent
+        self.assertIn("browse_project", sub_full)
+        self.assertIn("qa_browser_audit", sub_full)
+        self.assertIn("open_website", sub_full)
+        self.assertIn("report_to_orchestrator", sub_full)
+        self.assertNotIn("qa_submit_report", sub_full)
+        self.assertNotIn("call_subagent", sub_full)
+        self.assertNotIn("call_tester", sub_full)
+        # Оркестратор имеет call_subagent и list_subagents, но не имеет удалённых инструментов Тестировщика
         self.assertIn("browse_project", agent_names)
-        self.assertIn("browse_project", tester_names)
-        self.assertIn("qa_browser_audit", tester_names)
         self.assertIn("call_subagent", agent_names)
         self.assertIn("list_subagents", agent_names)
+        self.assertNotIn("call_tester", agent_names)
+        self.assertNotIn("list_tester_reports", agent_names)
+        self.assertNotIn("confirm_minor_fixes", agent_names)
 
     def test_run_subagent_gates_orchestrator_call_when_locked(self):
         result = agent_mod.run_subagent_session(
@@ -413,93 +430,207 @@ class SubagentRestrictionsAndTesterOrderTests(unittest.TestCase):
                 self.assertIn("PID 1234", orch_txt)
                 self.assertTrue(any(e.get("type") == "open_url" for e in orch_evs))
 
-    def test_subagent_fixes_blocked_until_tester_report_then_allowed(self):
+    def test_subagent_fixes_not_blocked_and_shared_files_and_chat_rotation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
             agent_mod.sandbox_mod.mkdir(root, "shop")
-            tester_ctx = {"session_reports": [], "recent_reports": []}
+            events: list[tuple[str, dict]] = []
             sub_ctx = {
                 "base_url": "http://orch.local/v1",
                 "api_key": "k",
                 "model": "m",
+                "emit_sse": lambda ev, data: events.append((ev, data)),
                 "subagents": [
-                    {"id": 1, "slug": "dev", "name": "Разработчик", "orchestratorCanCall": True},
-                    {"id": 2, "slug": "fixer", "name": "Фиксер", "orchestratorCanCall": True},
+                    {"id": 1, "slug": "designer", "name": "Дизайнер", "orchestratorCanCall": True, "toolProfile": "restricted"},
+                    {"id": 2, "slug": "fixer", "name": "Фиксер", "orchestratorCanCall": True, "toolProfile": "full"},
                 ],
-                "tester_ctx": tester_ctx,
+                "shared_files": [],
+                "handoff_steps": 3,
                 "written_projects": set(),
                 "subagent_runs_by_project": {},
             }
-            tester_ctx["subagent_ctx_ref"] = sub_ctx
 
-            model_calls = []
+            # 1. Фиксер НЕ блокируется никаким отчётом встроенного Тестировщика и получает вложения макетов из Sandbox
+            agent_mod.sandbox_mod.write_file(root, "_shared_files/design-spec.md", "# Палитра\nPrimary: #10b981\n")
+            step_calls = 0
 
-            def _fake_model(*args, **kwargs):
-                model_calls.append(1)
+            def _fake_model(base, key, model, messages, *_a, **_kw):
+                nonlocal step_calls
+                step_calls += 1
+                user_text = str(messages[1]["content"]) if len(messages) > 1 else ""
+                self.assertIn("_shared_files/design-spec.md", user_text)
+                self.assertIn("#10b981", user_text)
+                if step_calls <= 3:
+                    # 3 шага чтения -> при достижении handoff_steps=3 срабатывает автоперенос в новый чат
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": f"s_{step_calls}",
+                                            "function": {"name": "sandbox_list", "arguments": '{"path":"shop"}'},
+                                        }
+                                    ],
+                                }
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+                    }
+                if step_calls == 4:
+                    # Вызов для генерации саммари перед ротацией чата
+                    return {
+                        "choices": [{"message": {"content": "Изучил дизайн #10b981 и структуру shop.", "tool_calls": []}}],
+                        "usage": {"prompt_tokens": 15, "completion_tokens": 10, "total_tokens": 25},
+                    }
+                # Шаг 5 уже в НОВОМ чате субагента
+                self.assertIn("ПРОДОЛЖЕНИЕ ЗАДАЧИ В НОВОМ ЧАТЕ", user_text)
+                self.assertIn("Изучил дизайн #10b981", user_text)
                 return {
-                    "choices": [{"message": {"content": "Исправление внесено.", "tool_calls": []}}],
-                    "usage": {"total_tokens": 10},
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "s_final",
+                                        "function": {
+                                            "name": "report_to_orchestrator",
+                                            "arguments": '{"status":"completed","summary":"Исправлено по дизайн-макету","files_attached":["_shared_files/design-spec.md"]}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 25, "completion_tokens": 15, "total_tokens": 40},
                 }
 
             real_model = agent_mod.call_model
             agent_mod.call_model = _fake_model
             try:
-                # 1. До отчёта Тестировщика запрос на исправление багов блокируется без вызова модели
-                blocked = agent_mod.run_subagent_session(
+                res = agent_mod.run_subagent_session(
                     target_ref="fixer",
-                    summary="Проект shop собран, но есть ошибка.",
-                    task="Исправь баги и почини форму заказа",
+                    summary="Проект shop готов к правкам по макету",
+                    task="Исправь кнопки по дизайн-спеке",
                     sandbox_project="shop",
+                    attachments=["_shared_files/design-spec.md"],
                     caller_kind="orchestrator",
                     trust_level="full",
                     sandbox_root=root,
-                    tester_ctx=tester_ctx,
                     subagent_ctx=sub_ctx,
                 )
-                self.assertIn("ТОЛЬКО ПОСЛЕ", blocked["agentText"])
-                self.assertIn("call_tester", blocked["agentText"])
-                self.assertEqual(len(model_calls), 0)
-
-                # 2. Первичная разработка (не исправление) разрешена до Тестировщика
-                created = agent_mod.run_subagent_session(
-                    target_ref="dev",
-                    summary="Новый проект интернет-магазина",
-                    task="Создай каркас каталога товаров",
-                    sandbox_project="shop",
-                    caller_kind="orchestrator",
-                    trust_level="full",
-                    sandbox_root=root,
-                    tester_ctx=tester_ctx,
-                    subagent_ctx=sub_ctx,
-                )
-                self.assertIn("Исправление внесено.", created["agentText"])
-                self.assertEqual(len(model_calls), 1)
-
-                # 3. После отчёта Тестировщика исправления субагентами разрешаются
-                tester_ctx["session_reports"].insert(
-                    0,
-                    {
-                        "runKey": "qa-1",
-                        "sandboxProject": "shop",
-                        "status": "critical_issues",
-                        "criticalIssues": [{"title": "404"}],
-                    },
-                )
-                allowed = agent_mod.run_subagent_session(
-                    target_ref="fixer",
-                    summary="Отчёт Тестировщика qa-1: ошибка 404 на форме.",
-                    task="Исправь баги из отчёта Тестировщика",
-                    sandbox_project="shop",
-                    caller_kind="orchestrator",
-                    trust_level="full",
-                    sandbox_root=root,
-                    tester_ctx=tester_ctx,
-                    subagent_ctx=sub_ctx,
-                )
-                self.assertIn("Исправление внесено.", allowed["agentText"])
-                self.assertEqual(len(model_calls), 2)
             finally:
                 agent_mod.call_model = real_model
+
+            self.assertIn("Исправлено по дизайн-макету", res["agentText"])
+            self.assertIn("переходов в новый чат: 1", res["agentText"])
+            self.assertTrue(any(ev == "subagent_chat_rotated" for ev, _ in events))
+            rot_ev = next(d for ev, d in events if ev == "subagent_chat_rotated")
+            self.assertEqual(rot_ev["stepsCompleted"], 3)
+            self.assertIn("Изучил дизайн #10b981", rot_ev["summary"])
+            starts = [d for ev, d in events if ev == "subagent_start"]
+            self.assertEqual(len(starts), 2)
+            self.assertTrue(starts[1].get("isContinuation"))
+            self.assertEqual(starts[1].get("continuationFromRunKey"), starts[0]["runKey"])
+            done_events = [d for ev, d in events if ev == "subagent_done"]
+            self.assertEqual(len(done_events), 2)
+            self.assertTrue(done_events[0].get("rotatedToNewChat"))
+            self.assertEqual(done_events[1]["status"], "completed")
+            # Shared files зарегистрированы для передачи между агентами
+            self.assertTrue(
+                any(
+                    isinstance(item, dict) and item.get("sandboxPath") == "_shared_files/design-spec.md"
+                    for item in sub_ctx["shared_files"]
+                )
+            )
+            # Проверка: toolProfile="restricted" блокирует browse_project на уровне run_tool
+            with self.assertRaises(agent_mod.AgentError):
+                agent_mod.run_tool(
+                    "browse_project",
+                    {"action": "open", "sandbox_project": "shop"},
+                    trust_level="full",
+                    sandbox_root=root,
+                    caller_info={"agentKind": "subagent", "toolProfile": "restricted"},
+                )
+
+    def test_direct_subagent_handoff_new_chat_emits_summary_when_steps_reach_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sb_root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            agent_mod.sandbox_mod.write_file(sb_root, "app/index.html", "<h1>Hi</h1>")
+            prev_sb = agent_mod.SANDBOX_ROOT
+            agent_mod.SANDBOX_ROOT = sb_root
+            srv = agent_mod.Server(("127.0.0.1", 0), agent_mod.Handler)
+            port = srv.server_address[1]
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            import json as _json
+            import urllib.request as _req
+
+            call_idx = 0
+
+            def _fake_model(*_a, **_kw):
+                nonlocal call_idx
+                call_idx += 1
+                if call_idx <= 2:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": f"d_{call_idx}",
+                                            "function": {"name": "sandbox_list", "arguments": '{"path":"app"}'},
+                                        }
+                                    ],
+                                }
+                            }
+                        ],
+                        "usage": {"total_tokens": 12},
+                    }
+                if call_idx == 3:
+                    return {
+                        "choices": [{"message": {"content": "Саммари для нового чата субагента.", "tool_calls": []}}],
+                        "usage": {"total_tokens": 8},
+                    }
+                return {
+                    "choices": [{"message": {"content": "Ответ", "tool_calls": []}}],
+                    "usage": {"total_tokens": 5},
+                }
+
+            orig_threshold = agent_mod.SUBAGENT_HANDOFF_STEPS
+            agent_mod.SUBAGENT_HANDOFF_STEPS = 2
+            real_model = agent_mod.call_model
+            agent_mod.call_model = _fake_model
+            try:
+                payload = _json.dumps(
+                    {
+                        "agentRole": "subagent",
+                        "subagent": {"id": 9, "slug": "dev", "name": "Dev", "toolProfile": "restricted"},
+                        "sandboxProject": "app",
+                        "messages": [{"role": "user", "content": "Проверь app"}],
+                        "trustLevel": "full",
+                        "settings": {"baseUrl": "http://127.0.0.1:9999/v1", "model": "m"},
+                    }
+                ).encode("utf-8")
+                req = _req.Request(
+                    f"http://127.0.0.1:{port}/run",
+                    data=payload,
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {srv._http_token}"},
+                    method="POST",
+                )
+                with _req.urlopen(req, timeout=10) as resp:
+                    raw = resp.read().decode("utf-8")
+                self.assertIn("event: subagent_handoff_new_chat", raw)
+                self.assertIn("Саммари для нового чата субагента.", raw)
+            finally:
+                agent_mod.SUBAGENT_HANDOFF_STEPS = orig_threshold
+                agent_mod.call_model = real_model
+                agent_mod.SANDBOX_ROOT = prev_sb
+                srv.shutdown()
+                srv.server_close()
 
 
 if __name__ == "__main__":

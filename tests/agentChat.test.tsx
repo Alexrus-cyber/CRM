@@ -903,7 +903,6 @@ describe("вкладка «Агент»", () => {
       "Модель и генерация",
       "Доверие и RAG",
       "Sandbox и Оператор",
-      "Тестировщик",
       "Субагенты",
       "Чат",
     ]);
@@ -984,118 +983,136 @@ describe("вкладка «Агент»", () => {
     enableLiveOperatorMock = false;
   });
 
-  it("синхронизирует модель с подвкладкой «Тестировщик», отображает отдельный QA-чат, отчёт и одобрение мелких правок", async () => {
-    testerRunsMock = [
-      {
-        id: 11,
-        userId: 1,
-        agentConversationId: 1,
-        testerConversationId: 50,
-        sandboxProject: "landing-site",
-        title: "QA: landing-site",
-        summary: "Найдена 1 мелкая проблема верстки",
-        status: "minor_issues",
-        criticalIssues: [],
-        minorIssues: [
-          {
-            title: "Отступ на мобильном экране",
-            description: "Увеличить padding-x до 16px",
-            file: "src/index.css",
-            severity: "minor",
-          },
-        ],
-        checksRun: [{ name: "qa_static_review", status: "pass", details: "OK" }],
-        minorDecision: "pending",
-        model: "gpt-4o-mini",
-        promptTokens: 120,
-        completionTokens: 80,
-        totalTokens: 200,
-        createdAt: "2026-11-17T10:05:00.000Z",
-        finishedAt: "2026-11-17T10:05:10.000Z",
-      },
-    ];
+  it("отображает архивный tester_report из истории только для чтения и не показывает вкладку «Тестировщик»", async () => {
     conversations = [
-      { id: 1, kind: "agent", title: "Основной чат", messagesCount: 0, updatedAt: "2026-11-17T10:00:00.000Z" },
-      { id: 50, kind: "tester", title: "QA: landing-site", messagesCount: 2, updatedAt: "2026-11-17T10:05:10.000Z" },
+      { id: 1, kind: "agent", title: "Исторический чат", messagesCount: 2, updatedAt: "2026-11-17T10:00:00.000Z" },
     ];
-    messagesByConv[50] = [
+    messagesByConv[1] = [
       { id: 501, role: "user", content: "Проверь landing-site" },
-      { id: 502, role: "assistant", content: "Итог: minor_issues" },
+      {
+        id: 502,
+        role: "assistant",
+        content: "Отчёт сохранён в истории.",
+        actions: [
+          {
+            type: "tester_report" as unknown as "open_url",
+            url: "",
+            label: "Отчёт",
+            sandboxProject: "landing-site",
+            reportSummary: "Найдена 1 мелкая проблема верстки",
+            criticalCount: 0,
+            minorCount: 1,
+            totalTokens: 200,
+          } as unknown as { type: "open_url"; url: string; label: string },
+        ],
+      },
     ];
 
     render(<AgentChat userName="Тест" />);
-    // Меняем модель на вкладке Агента — она должна синхронизироваться в индикаторе Тестировщика
-    fireEvent.click(screen.getByRole("tab", { name: /Модель и генерация/i }));
-    const modelInput = screen.getByLabelText("Модель");
-    fireEvent.change(modelInput, { target: { value: "qwen2.5-coder:32b" } });
-
-    fireEvent.click(screen.getByRole("tab", { name: /Тестировщик/i }));
-    expect(await screen.findByText(/Модель синхронизирована с Агентом: qwen2\.5-coder:32b/i)).toBeTruthy();
-    expect(screen.getByText(/Токены QA-чата: 200/)).toBeTruthy();
-    expect(screen.getByText("Отступ на мобильном экране")).toBeTruthy();
-
-    // Подтверждаем мелкие исправления прямо из панели Тестировщика
-    fireEvent.click(screen.getByRole("button", { name: /Внести изменения/i }));
-    await waitFor(() =>
-      expect(testerDecisionsSent).toEqual([{ runId: 11, decision: "approved" }]),
-    );
+    expect(screen.queryByRole("tab", { name: /Тестировщик/i })).toBeNull();
+    expect(await screen.findByText(/Отчёт Тестировщика · landing-site/i)).toBeTruthy();
+    expect(screen.getByText(/Найдена 1 мелкая проблема верстки/i)).toBeTruthy();
+    expect(screen.getByText(/Архивный отчёт \(история\)/i)).toBeTruthy();
   });
 
-  it("обрабатывает SSE-события tester_run / approval_required (tester_minor_fixes) / tester_done в основном чате Агента", async () => {
+  it("сохраняет вложения в рамках сессии с fromHistory=true, отображает чипы «в сессии» и sandboxPath", async () => {
+    conversations = [
+      { id: 1, kind: "agent", title: "Основной чат", messagesCount: 1, updatedAt: "2026-11-17T10:00:00.000Z" },
+    ];
+    messagesByConv[1] = [
+      {
+        id: 700,
+        role: "user",
+        content: "Исходный макет",
+        attachments: [
+          {
+            name: "old-mock.png",
+            size: 512,
+            sandboxPath: "_shared_files/old-mock.png",
+          } as unknown as { name: string; size: number },
+        ],
+      },
+    ];
+    sseReply = [
+      'event: text\ndata: {"text":"Дизайн учтён."}\n\n',
+      'event: done\ndata: {"steps":1,"files":0,"actions":0}\n\n',
+    ].join("");
+
+    render(<AgentChat userName="Тест" />);
+    expect(await screen.findByText("_shared_files/old-mock.png")).toBeTruthy();
+
+    const fileInput = screen.getByLabelText("Приложить файлы для анализа") as HTMLInputElement;
+    const specFile = new File(["# Дизайн-токен\naccent: #10b981"], "design-spec.md", {
+      type: "text/markdown",
+    });
+    Object.defineProperty(fileInput, "files", { value: [specFile], configurable: true });
+    fireEvent.change(fileInput);
+    expect(await screen.findByText(/design-spec\.md/)).toBeTruthy();
+
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Передай макет субагенту" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    expect(await screen.findByText(/Дизайн учтён\./i)).toBeTruthy();
+    expect(sent[0]?.attachments?.[0]).toMatchObject({
+      name: "design-spec.md",
+      fromHistory: false,
+    });
+    // После отправки файл остаётся доступным в текущей сессии (чип «в сессии»)
+    expect(await screen.findByText(/в сессии/i)).toBeTruthy();
+
+    // Повторное сообщение в той же сессии автоматически прикрепляет сессионный файл с fromHistory: true
+    fireEvent.change(chatBox, { target: { value: "Уточни цвета кнопки" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    await waitFor(() => expect(sent.length).toBe(2));
+    expect(sent[1]?.attachments?.[0]).toMatchObject({
+      name: "design-spec.md",
+      fromHistory: true,
+    });
+  });
+
+  it("обрабатывает SSE-события subagent_start / subagent_chat_rotated / subagent_done и рендерит карточку переноса чата", async () => {
     conversations = [
       { id: 1, kind: "agent", title: "Основной чат", messagesCount: 0, updatedAt: "2026-11-17T10:00:00.000Z" },
     ];
-    const testerRunObj = {
-      id: 22,
-      userId: 1,
-      agentConversationId: 1,
-      testerConversationId: 60,
-      sandboxProject: "crm-widget",
-      title: "QA: crm-widget",
-      summary: "Обнаружена 1 мелкая ошибка отступа",
-      status: "minor_issues",
-      criticalIssues: [],
-      minorIssues: [{ title: "Шрифт заголовка", description: "Слишком тонкий", file: "index.html", severity: "minor" }],
-      checksRun: [{ name: "qa_static_review", status: "pass", details: "OK" }],
-      minorDecision: "pending",
-      model: "o3-mini",
-      promptTokens: 50,
-      completionTokens: 40,
-      totalTokens: 90,
-      createdAt: "2026-11-17T10:06:00.000Z",
-      finishedAt: "2026-11-17T10:06:05.000Z",
-    };
-
     const encoder = new TextEncoder();
     sseResponder = () => {
       const stream = new ReadableStream({
-        async start(controller) {
+        start(controller) {
           controller.enqueue(
             encoder.encode(
-              `event: tester_run\ndata: ${JSON.stringify({ runKey: "r1", runId: 22, testerConversationId: 60, conversation: { id: 60, kind: "tester", title: "QA: crm-widget", messagesCount: 1, updatedAt: "2026-11-17T10:06:00.000Z" }, run: { ...testerRunObj, status: "running", minorIssues: [], totalTokens: 0 } })}\n\n`,
+              `event: subagent_start\ndata: ${JSON.stringify({
+                runKey: "r-sub-1",
+                subagentSlug: "coder",
+                subagentName: "Кодер",
+                subagentColor: "#8b5cf6",
+                tier: 1,
+                routingMode: "linear",
+                model: "o3-mini",
+              })}\n\n`,
             ),
           );
           controller.enqueue(
             encoder.encode(
-              `event: approval_required\ndata: ${JSON.stringify({ approvalId: "apr-minor-1", kind: "tester_minor_fixes", title: "Мелкие замечания по crm-widget", description: "Решить судьбу мелких правок", sandboxProject: "crm-widget", testerRunId: 22, testerConversationId: 60, minorIssues: testerRunObj.minorIssues })}\n\n`,
-            ),
-          );
-          while (approvalsSent.length === 0) {
-            await new Promise((r) => setTimeout(r, 10));
-          }
-          controller.enqueue(
-            encoder.encode(
-              `event: action\ndata: ${JSON.stringify({ type: "tester_report", label: "Отчёт Тестировщика: crm-widget", sandboxProject: "crm-widget", testerConversationId: 60, status: "minor_issues", reportSummary: "Обнаружена 1 мелкая ошибка отступа", criticalCount: 0, minorCount: 1, totalTokens: 90 })}\n\n`,
+              `event: subagent_chat_rotated\ndata: ${JSON.stringify({
+                previousRunKey: "r-sub-1",
+                newRunKey: "r-sub-2",
+                subagentName: "Кодер",
+                steps: 300,
+                summary: "Собран бэкенд, осталось подключить UI.",
+              })}\n\n`,
             ),
           );
           controller.enqueue(
             encoder.encode(
-              `event: tester_done\ndata: ${JSON.stringify({ runKey: "r1", runId: 22, testerConversationId: 60, run: testerRunObj })}\n\n`,
+              `event: subagent_done\ndata: ${JSON.stringify({
+                runKey: "r-sub-2",
+                subagentName: "Кодер",
+              })}\n\n`,
             ),
           );
-          controller.enqueue(
-            encoder.encode('event: text\ndata: {"text":"Тестировщик завершил проверку crm-widget."}\n\n'),
-          );
+          controller.enqueue(encoder.encode('event: text\ndata: {"text":"Субагент завершил перенесённую задачу."}\n\n'));
           controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
           controller.close();
         },
@@ -1105,83 +1122,15 @@ describe("вкладка «Агент»", () => {
 
     render(<AgentChat userName="Тест" />);
     const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
-    fireEvent.change(chatBox, { target: { value: "Протестируй crm-widget" } });
+    fireEvent.change(chatBox, { target: { value: "Собери большой проект" } });
     fireEvent.click(screen.getByText("Запустить"));
 
-    // Появляется карточка подтверждения мелких замечаний
-    expect(await screen.findByText("Мелкие замечания по crm-widget")).toBeTruthy();
-    expect(screen.getByText("Шрифт заголовка")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /Внести мелкие изменения/i }));
-
-    await waitFor(() => expect(approvalsSent.length).toBe(1));
-    expect(approvalsSent[0]).toMatchObject({ approvalId: "apr-minor-1", approved: true });
-    await waitFor(() =>
-      expect(testerDecisionsSent).toContainEqual({ runId: 22, decision: "approved" }),
-    );
-    expect(await screen.findByText(/Отчёт Тестировщика · crm-widget/i)).toBeTruthy();
+    expect(await screen.findByText(/Чат субагента «Кодер» перенесён в новую сессию \(300 шагов\)/i)).toBeTruthy();
+    expect(screen.getByText(/Собран бэкенд, осталось подключить UI\./i)).toBeTruthy();
+    expect(await screen.findByText(/Субагент завершил перенесённую задачу\./i)).toBeTruthy();
   });
 
-  it("позволяет запустить Тестировщика напрямую из отдельной вкладки с общими настройками модели", async () => {
-    sseResponder = () => {
-      // Имитируем серверную запись отчёта в QA-чат №1 (который создаст клиент при первом запуске)
-      const convId = nextConvId - 1;
-      messagesByConv[convId] = [
-        ...(messagesByConv[convId] ?? []),
-        { id: nextMsgId++, role: "assistant", content: "Проверка завершена успешно, багов не найдено." },
-      ];
-      testerRunsMock = [
-        {
-          id: 33,
-          userId: 1,
-          agentConversationId: null,
-          testerConversationId: convId,
-          sandboxProject: "landing-site",
-          summary: "Проверь сайт",
-          status: "passed",
-          reportSummary: "OK",
-          criticalIssues: [],
-          minorIssues: [],
-          checksRun: [],
-          minorDecision: "not_needed",
-          promptTokens: 40,
-          completionTokens: 20,
-          totalTokens: 60,
-          model: "o3-mini",
-          createdAt: "2026-11-17T10:10:00.000Z",
-          updatedAt: "2026-11-17T10:10:05.000Z",
-        },
-      ];
-      const body = [
-        `event: tester_run\ndata: ${JSON.stringify({ runKey: "direct", runId: 33, testerConversationId: convId })}\n\n`,
-        'event: text\ndata: {"text":"Проверка завершена успешно, багов не найдено."}\n\n',
-        `event: tester_done\ndata: ${JSON.stringify({ runKey: "direct", runId: 33, testerConversationId: convId, run: testerRunsMock[0] })}\n\n`,
-        "event: done\ndata: {}\n\n",
-      ].join("");
-      return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
-    };
-
-    render(<AgentChat userName="Тест" />);
-    fireEvent.click(screen.getByRole("tab", { name: /Модель и генерация/i }));
-    fireEvent.change(screen.getByLabelText("Модель"), { target: { value: "o3-mini" } });
-
-    fireEvent.click(screen.getByRole("tab", { name: /Тестировщик/i }));
-    const projectSelect = (await screen.findByLabelText(/Проект Sandbox/i)) as HTMLSelectElement;
-    fireEvent.change(projectSelect, { target: { value: "landing-site" } });
-
-    const testerInput = screen.getByLabelText("Задача для Тестировщика");
-    fireEvent.change(testerInput, { target: { value: "Проверь адаптивность и ссылки" } });
-    fireEvent.click(screen.getByRole("button", { name: /Проверить проект/i }));
-
-    await waitFor(() => expect(sent.length).toBe(1));
-    expect(sent[0]).toMatchObject({
-      agentRole: "tester",
-      sandboxProject: "landing-site",
-      settings: { model: "o3-mini" },
-    });
-    expect(await screen.findByText(/Проверка завершена успешно, багов не найдено\./i)).toBeTruthy();
-  });
-
-  it("показывает карточку liveTester прямо во вкладке «Чат», парсит CRLF SSE и корректно останавливает запрос кнопкой «Остановить»", async () => {
+  it("показывает карточку live-actor-card субагента во вкладке «Чат», парсит CRLF SSE и корректно останавливает запрос кнопкой «Остановить»", async () => {
     const encoder = new TextEncoder();
     let aborted = false;
 
@@ -1190,23 +1139,24 @@ describe("вкладка «Агент»", () => {
         start(controller) {
           controller.enqueue(
             encoder.encode(
-              `event: tester_run\r\ndata: ${JSON.stringify({
+              `event: subagent_start\r\ndata: ${JSON.stringify({
                 runKey: "rk-ui",
-                runId: 55,
-                testerConversationId: 1,
-                sandboxProject: "shop-demo",
-                summary: "Аудит магазина",
+                subagentSlug: "qa",
+                subagentName: "QA Агент",
+                subagentColor: "#06b6d4",
+                tier: 1,
+                routingMode: "linear",
+                model: "o3-mini",
               })}\r\n\r\n`,
             ),
           );
           controller.enqueue(
             encoder.encode(
-              `event: tester_status\r\ndata: ${JSON.stringify({ runKey: "rk-ui", text: "Проверяю вёрстку и кнопки…" })}\r\n\r\n`,
-            ),
-          );
-          controller.enqueue(
-            encoder.encode(
-              `event: tester_action\r\ndata: ${JSON.stringify({ runKey: "rk-ui", action: { type: "qa_check", label: "HTTP-аудит /" } })}\r\n\r\n`,
+              `event: subagent_status\r\ndata: ${JSON.stringify({
+                runKey: "rk-ui",
+                subagentName: "QA Агент",
+                text: "Проверяю вёрстку и кнопки…",
+              })}\r\n\r\n`,
             ),
           );
           init?.signal?.addEventListener("abort", () => {
@@ -1227,11 +1177,9 @@ describe("вкладка «Агент»", () => {
     fireEvent.change(chatBox, { target: { value: "Создай и проверь shop-demo" } });
     fireEvent.click(screen.getByText("Запустить"));
 
-    // На активной вкладке «Чат» видна живая карточка Тестировщика и кнопка «Остановить»
-    expect(await screen.findByText(/Тестировщик · shop-demo/i)).toBeTruthy();
+    const liveCard = await screen.findByTestId("live-actor-card");
+    expect(liveCard.textContent).toContain("Субагент · QA Агент");
     expect((await screen.findAllByText(/Проверяю вёрстку и кнопки…/i)).length).toBeGreaterThanOrEqual(2);
-    expect(screen.getAllByText(/HTTP-аудит \//i).length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByRole("button", { name: /Открыть Тестировщик/i })).toBeTruthy();
 
     const stopBtn = screen.getByRole("button", { name: /Остановить/i });
     fireEvent.click(stopBtn);
@@ -1250,7 +1198,7 @@ describe("вкладка «Агент»", () => {
     expect(await screen.findByText(/Поток ответа от агента оборвался без завершения/i)).toBeTruthy();
   });
 
-  it("обновляет статус liveTester, когда Тестировщик ждёт подтверждения на сайте", async () => {
+  it("обновляет статус live-actor-card, когда субагент ждёт подтверждения на сайте", async () => {
     const encoder = new TextEncoder();
     const streamCtrl: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
 
@@ -1260,20 +1208,20 @@ describe("вкладка «Агент»", () => {
           streamCtrl.current = controller;
           controller.enqueue(
             encoder.encode(
-              `event: tester_run\ndata: ${JSON.stringify({
+              `event: subagent_start\ndata: ${JSON.stringify({
                 runKey: "rk-apr",
-                runId: 77,
-                testerConversationId: 1,
-                sandboxProject: "qa-proj",
-                summary: "Запуск тестов",
+                subagentSlug: "qa-proj-sub",
+                subagentName: "QA Проекта",
+                model: "o3-mini",
               })}\n\n`,
             ),
           );
           controller.enqueue(
             encoder.encode(
-              `event: tester_reasoning\ndata: ${JSON.stringify({
+              `event: subagent_reasoning\ndata: ${JSON.stringify({
                 runKey: "rk-apr",
-                text: "Рассуждения завершены, запускаю qa_run_tests",
+                subagentName: "QA Проекта",
+                text: "Рассуждения завершены, запускаю npm test",
               })}\n\n`,
             ),
           );
@@ -1282,9 +1230,8 @@ describe("вкладка «Агент»", () => {
               `event: approval_required\ndata: ${JSON.stringify({
                 approvalId: "apr-qa-1",
                 kind: "bash_command",
-                title: "Разрешить Тестировщику запустить тесты?",
+                title: "Разрешить субагенту запустить тесты?",
                 command: "npm test",
-                testerRunKey: "rk-apr",
               })}\n\n`,
             ),
           );
@@ -1298,12 +1245,11 @@ describe("вкладка «Агент»", () => {
     fireEvent.change(chatBox, { target: { value: "Проверь qa-proj" } });
     fireEvent.click(screen.getByText("Запустить"));
 
-    expect(await screen.findByText(/Тестировщик · qa-proj/i)).toBeTruthy();
-    expect((await screen.findAllByText(/Тестировщик ждёт вашего подтверждения на сайте…/i)).length).toBeGreaterThanOrEqual(2);
+    const liveCard = await screen.findByTestId("live-actor-card");
+    expect(liveCard.textContent).toContain("Ждёт подтверждения: Разрешить субагенту запустить тесты?");
 
     fireEvent.click(screen.getByRole("button", { name: /^Разрешить$/i }));
     await waitFor(() => expect(approvalsSent.length).toBe(1));
-    expect((await screen.findAllByText(/Тестировщик: продолжаю проверку…/i)).length).toBeGreaterThanOrEqual(2);
 
     streamCtrl.current?.enqueue(encoder.encode('event: text\ndata: {"text":"Проверка завершена."}\n\n'));
     streamCtrl.current?.enqueue(encoder.encode('event: done\ndata: {"steps":1,"files":0,"actions":0}\n\n'));
@@ -1377,7 +1323,7 @@ describe("вкладка «Агент»", () => {
     expect(screen.queryByText(/Ход BrowserInspector/i)).toBeNull();
   });
 
-  it("убирает живую плашку BrowserInspector сразу после handoff (done: true) и показывает формат осмотра у Тестировщика", async () => {
+  it("убирает живую плашку BrowserInspector сразу после done: true при осмотре субагентом с полными инструментами и разбирает CRLF SSE", async () => {
     const encoder = new TextEncoder();
     const streamCtrl: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
 
@@ -1387,23 +1333,23 @@ describe("вкладка «Агент»", () => {
           streamCtrl.current = controller;
           controller.enqueue(
             encoder.encode(
-              `event: tester_run\ndata: ${JSON.stringify({
+              `event: subagent_start\r\ndata: ${JSON.stringify({
                 runKey: "run-br-1",
-                runId: 77,
-                testerConversationId: 2,
-                sandboxProject: "landing",
+                subagentSlug: "qa-full",
+                subagentName: "QA Браузер",
                 model: "gpt-test",
-              })}\n\n`,
+              })}\r\n\r\n`,
             ),
           );
           controller.enqueue(
             encoder.encode(
-              `event: tester_status\ndata: ${JSON.stringify({
+              `event: subagent_status\r\ndata: ${JSON.stringify({
                 runKey: "run-br-1",
+                subagentName: "QA Браузер",
                 text: "Осмотр «resize» завершён за 0.92 с (анимаций: 20, проблем: 0, ошибок: 0)",
                 source: "browser_inspector",
                 tool: "qa_browser_audit",
-              })}\n\n`,
+              })}\r\n\r\n`,
             ),
           );
         },
@@ -1413,108 +1359,18 @@ describe("вкладка «Агент»", () => {
 
     render(<AgentChat userName="Тест" />);
     const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
-    fireEvent.change(chatBox, { target: { value: "Проверь проект тестировщиком" } });
+    fireEvent.change(chatBox, { target: { value: "Проверь проект субагентом" } });
     fireEvent.click(screen.getByText("Запустить"));
 
-    expect((await screen.findAllByText(/Ход BrowserInspector/i)).length).toBeGreaterThanOrEqual(1);
+    expect(await screen.findByText(/Ход BrowserInspector/i)).toBeTruthy();
     expect(screen.getAllByText(/Осмотр «resize» завершён/i).length).toBeGreaterThanOrEqual(2);
 
     streamCtrl.current?.enqueue(
       encoder.encode(
-        `event: tester_action\ndata: ${JSON.stringify({
+        `event: subagent_status\r\ndata: ${JSON.stringify({
           runKey: "run-br-1",
-          action: {
-            type: "browser_inspect",
-            action: "resize",
-            viewport: "390×844",
-            url: "http://127.0.0.1:4444/",
-            summary: "анимаций: 20, проблем: 0, ошибок: 0",
-          },
-        })}\n\n`,
-      ),
-    );
-    streamCtrl.current?.enqueue(
-      encoder.encode(
-        `event: tester_status\ndata: ${JSON.stringify({
-          runKey: "run-br-1",
-          text: "BrowserInspector завершил шаг (qa_browser_audit) — передаю данные Тестировщику…",
-          source: "browser_inspector",
-          tool: "qa_browser_audit",
-          done: true,
-        })}\n\n`,
-      ),
-    );
-
-    expect(
-      (await screen.findAllByText(/Осмотр проекта \(resize · 390×844\): анимаций: 20, проблем: 0, ошибок: 0/i)).length,
-    ).toBeGreaterThanOrEqual(2);
-    await waitFor(() => {
-      expect(screen.queryAllByText(/Ход BrowserInspector/i).length).toBe(0);
-    });
-
-    streamCtrl.current?.enqueue(encoder.encode('event: text\ndata: {"text":"Проверка завершена."}\n\n'));
-    streamCtrl.current?.enqueue(encoder.encode('event: done\ndata: {"steps":1,"files":0,"actions":0}\n\n'));
-    streamCtrl.current?.close();
-    expect(await screen.findByText(/Проверка завершена\./i)).toBeTruthy();
-  });
-
-  it("корректно разбирает CRLF SSE и завершает BrowserInspector при прямом запуске Тестировщика", async () => {
-    const encoder = new TextEncoder();
-    const streamCtrl: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
-
-    sseResponder = () => {
-      const stream = new ReadableStream({
-        start(controller) {
-          streamCtrl.current = controller;
-          controller.enqueue(
-            encoder.encode(
-              `event: tester_run\r\ndata: ${JSON.stringify({
-                runKey: "direct-1",
-                runId: 88,
-                testerConversationId: 2,
-                sandboxProject: "landing",
-                model: "gpt-test",
-              })}\r\n\r\n`,
-            ),
-          );
-          controller.enqueue(
-            encoder.encode(
-              `event: status\r\ndata: ${JSON.stringify({
-                text: "Осмотр «resize» завершён за 0.92 с (анимаций: 20, проблем: 0, ошибок: 0)",
-                source: "browser_inspector",
-                tool: "qa_browser_audit",
-              })}\r\n\r\n`,
-            ),
-          );
-        },
-      });
-      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
-    };
-
-    render(<AgentChat userName="Тест" />);
-    const testerTab = await screen.findByRole("button", { name: /Тестировщик/i });
-    fireEvent.click(testerTab);
-
-    const promptInput = await screen.findByLabelText(/Задача для Тестировщика/i);
-    fireEvent.change(promptInput, { target: { value: "Проверь адаптивность landing" } });
-    fireEvent.click(screen.getByRole("button", { name: /Проверить проект/i }));
-
-    expect(await screen.findByText(/Ход BrowserInspector/i)).toBeTruthy();
-
-    streamCtrl.current?.enqueue(
-      encoder.encode(
-        `event: action\r\ndata: ${JSON.stringify({
-          type: "browser_inspect",
-          action: "resize",
-          viewport: "390×844",
-          summary: "анимаций: 20, проблем: 0, ошибок: 0",
-        })}\r\n\r\n`,
-      ),
-    );
-    streamCtrl.current?.enqueue(
-      encoder.encode(
-        `event: status\r\ndata: ${JSON.stringify({
-          text: "BrowserInspector завершил шаг — передаю данные Тестировщику…",
+          subagentName: "QA Браузер",
+          text: "BrowserInspector завершил шаг (qa_browser_audit) — передаю данные субагенту «QA Браузер»…",
           source: "browser_inspector",
           tool: "qa_browser_audit",
           done: true,
@@ -1522,24 +1378,17 @@ describe("вкладка «Агент»", () => {
       ),
     );
 
-    expect(
-      await screen.findByText(/Осмотр проекта \(resize · 390×844\): анимаций: 20, проблем: 0, ошибок: 0/i),
-    ).toBeTruthy();
     await waitFor(() => {
       expect(screen.queryByText(/Ход BrowserInspector/i)).toBeNull();
     });
 
-    streamCtrl.current?.enqueue(encoder.encode('event: text\r\ndata: {"text":"Прямая проверка выполнена."}\r\n\r\n'));
-    streamCtrl.current?.enqueue(encoder.encode('event: done\r\ndata: {"steps":1,"files":0,"actions":1}\r\n\r\n'));
+    streamCtrl.current?.enqueue(encoder.encode('event: text\r\ndata: {"text":"Проверка завершена."}\r\n\r\n'));
+    streamCtrl.current?.enqueue(encoder.encode('event: done\r\ndata: {"steps":1,"files":0,"actions":0}\r\n\r\n'));
     streamCtrl.current?.close();
-    expect(await screen.findByText(/Прямая проверка выполнена\./i)).toBeTruthy();
-    // После завершения liveTester история сообщения сохраняет и показывает выполненное действие осмотра!
-    expect(
-      await screen.findByText(/Осмотр проекта \(resize · 390×844\): анимаций: 20, проблем: 0, ошибок: 0/i),
-    ).toBeTruthy();
+    expect(await screen.findByText(/Проверка завершена\./i)).toBeTruthy();
   });
 
-  it("показывает полные мысли и все действия Тестировщика без обрезки, чётко различает активного исполнителя и обновляет tester_tool по callId", async () => {
+  it("показывает полные мысли субагента в live-actor-card и итоговую карточку отчёта субагента", async () => {
     const encoder = new TextEncoder();
     const streamCtrl: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
 
@@ -1549,85 +1398,26 @@ describe("вкладка «Агент»", () => {
           streamCtrl.current = controller;
           controller.enqueue(
             encoder.encode(
-              `event: tester_run\ndata: ${JSON.stringify({
+              `event: subagent_start\ndata: ${JSON.stringify({
                 runKey: "rk-full",
-                runId: 91,
-                testerConversationId: 2,
-                sandboxProject: "crm-ui",
+                subagentSlug: "crm-qa",
+                subagentName: "Аудитор CRM",
+                subagentColor: "#06b6d4",
+                tier: 1,
+                routingMode: "linear",
                 model: "qwen3",
               })}\n\n`,
             ),
           );
           controller.enqueue(
             encoder.encode(
-              `event: tester_status\ndata: ${JSON.stringify({
+              `event: subagent_reasoning\ndata: ${JSON.stringify({
                 runKey: "rk-full",
-                text: "Тестировщик: шаг 1 — жду ответ модели…",
-                actor: "tester_llm",
-                source: "tester_llm",
-                step: 1,
+                subagentName: "Аудитор CRM",
+                text: "Шаг 1: проверяю структуру.\n\nШаг 2: проверяю все эндпоинты.\n\nУникальная_концовка_мысли_шага_3",
               })}\n\n`,
             ),
           );
-          controller.enqueue(
-            encoder.encode(
-              `event: tester_reasoning\ndata: ${JSON.stringify({
-                runKey: "rk-full",
-                text: "Шаг 1: проверяю структуру.\n\nШаг 2: проверяю все эндпоинты без обрезки строки.\n\nУникальная_концовка_мысли_шага_3",
-              })}\n\n`,
-            ),
-          );
-          controller.enqueue(
-            encoder.encode(
-              `event: tester_action\ndata: ${JSON.stringify({
-                runKey: "rk-full",
-                action: {
-                  type: "tester_tool",
-                  callId: "c_0",
-                  step: 1,
-                  tool: "sandbox_list",
-                  label: "Список файлов Sandbox: crm-ui",
-                  status: "running",
-                },
-              })}\n\n`,
-            ),
-          );
-          controller.enqueue(
-            encoder.encode(
-              `event: tester_action\ndata: ${JSON.stringify({
-                runKey: "rk-full",
-                action: {
-                  type: "tester_tool",
-                  callId: "c_0",
-                  step: 1,
-                  tool: "sandbox_list",
-                  label: "Список файлов Sandbox: crm-ui",
-                  status: "ok",
-                  summary: "12 файлов",
-                  durationMs: 14,
-                },
-              })}\n\n`,
-            ),
-          );
-          for (let i = 1; i <= 9; i++) {
-            controller.enqueue(
-              encoder.encode(
-                `event: tester_action\ndata: ${JSON.stringify({
-                  runKey: "rk-full",
-                  action: {
-                    type: "tester_tool",
-                    callId: `c_${i}`,
-                    step: 2,
-                    tool: "sandbox_read_file",
-                    label: `Чтение файла: crm-ui/part_${i}.ts`,
-                    status: "ok",
-                    summary: `строк: ${i * 10}`,
-                    durationMs: 5,
-                  },
-                })}\n\n`,
-              ),
-            );
-          }
         },
       });
       return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
@@ -1638,39 +1428,25 @@ describe("вкладка «Агент»", () => {
     fireEvent.change(chatBox, { target: { value: "Создай и проверь crm-ui" } });
     fireEvent.click(screen.getByText("Запустить"));
 
-    // Основной Агент не показывает спиннер «агент думает…», а чётко сообщает, что ждёт Тестировщика
-    expect(await screen.findByText(/Основной Агент передал проверку Тестировщику и ждёт отчёт/i)).toBeTruthy();
-    expect(screen.queryByText(/агент думает…/i)).toBeNull();
+    const liveCard = await screen.findByTestId("live-actor-card");
+    expect(liveCard.textContent).toContain("Субагент · Аудитор CRM");
+    expect(await screen.findByText(/Уникальная_концовка_мысли_шага_3/i)).toBeTruthy();
 
-    // Виден индикатор активного исполнителя и полные размышления шага 3 (без line-clamp-3)
-    expect((await screen.findAllByText(/Тестировщик · модель \(шаг 1\)/i)).length).toBeGreaterThanOrEqual(2);
-    expect((await screen.findAllByText(/Уникальная_концовка_мысли_шага_3/i)).length).toBeGreaterThanOrEqual(2);
-
-    // Заглушка running обновилась в готовое действие (без дубля), и показаны ВСЕ 10 действий (включая #1 и #9)
-    expect(screen.queryByText(/выполняется…/i)).toBeNull();
-    expect((await screen.findAllByText(/Действия Тестировщика \(10\)/i)).length).toBeGreaterThanOrEqual(2);
-    expect(screen.getAllByText(/Список файлов Sandbox: crm-ui — 12 файлов/i).length).toBeGreaterThanOrEqual(2);
-    expect(screen.getAllByText(/Чтение файла: crm-ui\/part_9\.ts/i).length).toBeGreaterThanOrEqual(2);
-
-    // Переключение исполнителя на BrowserInspector отображается явно
     streamCtrl.current?.enqueue(
       encoder.encode(
-        `event: tester_status\ndata: ${JSON.stringify({
-          runKey: "rk-full",
-          text: "Открываю страницу http://127.0.0.1:4100/…",
-          source: "browser_inspector",
-          actor: "browser_inspector",
-          tool: "qa_browser_audit",
-          step: 3,
+        `event: action\ndata: ${JSON.stringify({
+          type: "subagent_report",
+          subagentName: "Аудитор CRM",
+          sandboxProject: "crm-ui",
+          reportSummary: "Все 10 проверок пройдены без критических ошибок.",
         })}\n\n`,
       ),
     );
-    expect((await screen.findAllByText(/BrowserInspector работает/i)).length).toBeGreaterThanOrEqual(2);
-
     streamCtrl.current?.enqueue(encoder.encode('event: text\ndata: {"text":"Анализ завершён."}\n\n'));
-    streamCtrl.current?.enqueue(encoder.encode('event: done\ndata: {"steps":1,"files":0,"actions":0}\n\n'));
+    streamCtrl.current?.enqueue(encoder.encode('event: done\ndata: {"steps":1,"files":0,"actions":1}\n\n'));
     streamCtrl.current?.close();
     expect(await screen.findByText(/Анализ завершён\./i)).toBeTruthy();
+    expect(screen.getByText(/Все 10 проверок пройдены без критических ошибок\./i)).toBeTruthy();
   });
 
   it("показывает ошибку при обрыве потока после частичного ответа без done и читает финальный кадр на EOF", async () => {

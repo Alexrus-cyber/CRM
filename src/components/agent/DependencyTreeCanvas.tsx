@@ -35,15 +35,26 @@ export type DependencyTreeNodePayload = {
   parentSubagentId?: number | null;
   orchestratorCanCall?: boolean;
   allowedCallees?: string[];
+  posX?: number | null;
+  posY?: number | null;
+};
+
+export type OrchestratorPosition = {
+  x: number | null;
+  y: number | null;
 };
 
 type Props = {
   subagents: Subagent[];
   orchestratorModel?: string;
+  orchestratorPos?: OrchestratorPosition | null;
   maxActive: number;
   routingMode?: SubagentRoutingMode;
   onChangeRoutingMode?: (mode: SubagentRoutingMode) => Promise<void>;
-  onSave: (nodes: DependencyTreeNodePayload[]) => Promise<void>;
+  onSave: (
+    nodes: DependencyTreeNodePayload[],
+    orchestratorPos?: OrchestratorPosition,
+  ) => Promise<void>;
   onCreateNew?: () => void;
   onEditSubagent?: (subagent: Subagent) => void;
   onOpenChat?: (subagentId: number) => void;
@@ -179,6 +190,7 @@ type EdgeInfo = {
 export function DependencyTreeCanvas({
   subagents,
   orchestratorModel,
+  orchestratorPos,
   maxActive,
   routingMode = "linear",
   onChangeRoutingMode,
@@ -190,7 +202,19 @@ export function DependencyTreeCanvas({
 }: Props) {
   const uid = useId().replace(/:/g, "");
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const suppressClickRef = useRef(false);
   const [overrides, setOverrides] = useState<Record<number, Partial<TreeNodeDraft>>>({});
+  const [orchPosOverride, setOrchPosOverride] = useState<OrchestratorPosition | undefined>(undefined);
+  const [dragState, setDragState] = useState<{
+    nodeId: number | "orchestrator";
+    startClientX: number;
+    startClientY: number;
+    originX: number;
+    originY: number;
+    pointerOffsetX: number;
+    pointerOffsetY: number;
+    moved: boolean;
+  } | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<number | "orchestrator" | null>(() =>
     subagents[0]?.id ?? "orchestrator",
   );
@@ -202,6 +226,14 @@ export function DependencyTreeCanvas({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedToast, setSavedToast] = useState<string | null>(null);
+
+  const effectiveOrchPos = useMemo<OrchestratorPosition>(() => {
+    if (orchPosOverride !== undefined) return orchPosOverride;
+    return {
+      x: orchestratorPos?.x ?? null,
+      y: orchestratorPos?.y ?? null,
+    };
+  }, [orchPosOverride, orchestratorPos]);
 
   const draftById = useMemo<Record<number, TreeNodeDraft>>(() => {
     const out: Record<number, TreeNodeDraft> = {};
@@ -215,12 +247,19 @@ export function DependencyTreeCanvas({
           ov?.allowedCalleesText !== undefined
             ? ov.allowedCalleesText
             : (s.allowedCallees && s.allowedCallees.length > 0 ? s.allowedCallees : ["*"]).join(", "),
+        posX: ov?.posX !== undefined ? ov.posX : (s.posX ?? null),
+        posY: ov?.posY !== undefined ? ov.posY : (s.posY ?? null),
       };
     }
     return out;
   }, [subagents, overrides]);
 
   const isDirty = useMemo(() => {
+    const baseOrchX = orchestratorPos?.x ?? null;
+    const baseOrchY = orchestratorPos?.y ?? null;
+    if (effectiveOrchPos.x !== baseOrchX || effectiveOrchPos.y !== baseOrchY) {
+      return true;
+    }
     for (const s of subagents) {
       const d = draftById[s.id];
       if (!d) continue;
@@ -229,13 +268,23 @@ export function DependencyTreeCanvas({
         d.isActive !== s.isActive ||
         d.parentSubagentId !== s.parentSubagentId ||
         d.orchestratorCanCall !== s.orchestratorCanCall ||
-        d.allowedCalleesText.trim() !== baseCallees.trim()
+        d.allowedCalleesText.trim() !== baseCallees.trim() ||
+        (d.posX ?? null) !== (s.posX ?? null) ||
+        (d.posY ?? null) !== (s.posY ?? null)
       ) {
         return true;
       }
     }
     return false;
-  }, [subagents, draftById]);
+  }, [subagents, draftById, effectiveOrchPos, orchestratorPos]);
+
+  const hasCustomPositions = useMemo(() => {
+    if (effectiveOrchPos.x !== null || effectiveOrchPos.y !== null) return true;
+    return subagents.some((s) => {
+      const d = draftById[s.id];
+      return d && (d.posX !== null || d.posY !== null);
+    });
+  }, [effectiveOrchPos, subagents, draftById]);
 
   const updateDraft = (id: number, patch: Partial<TreeNodeDraft>) => {
     setSavedToast(null);
@@ -251,8 +300,27 @@ export function DependencyTreeCanvas({
 
   const resetDraft = () => {
     setOverrides({});
+    setOrchPosOverride(undefined);
     setError(null);
     setSavedToast(null);
+  };
+
+  const resetFreeLayout = () => {
+    setSavedToast(null);
+    setError(null);
+    setOrchPosOverride({ x: null, y: null });
+    setOverrides((prev) => {
+      const next = { ...prev };
+      for (const s of subagents) {
+        next[s.id] = {
+          ...next[s.id],
+          posX: null,
+          posY: null,
+        };
+      }
+      return next;
+    });
+    setSavedToast("Узлы возвращены в авто-раскладку (нажмите «Сохранить дерево», чтобы зафиксировать)");
   };
 
   const activeCount = useMemo(
@@ -312,18 +380,24 @@ export function DependencyTreeCanvas({
     }
 
     const maxCols = Math.max(3, ...tiersRaw.map((row) => row.length));
-    const width = Math.max(960, maxCols * 185 + 210);
-    const rootX = width / 2;
-    const rootY = 104;
+    const baseWidth = Math.max(960, maxCols * 185 + 210);
+    const autoRootX = baseWidth / 2;
+    const autoRootY = 104;
+    const rootX =
+      typeof effectiveOrchPos.x === "number" && Number.isFinite(effectiveOrchPos.x)
+        ? effectiveOrchPos.x
+        : autoRootX;
+    const rootY =
+      typeof effectiveOrchPos.y === "number" && Number.isFinite(effectiveOrchPos.y)
+        ? effectiveOrchPos.y
+        : autoRootY;
     const tierGap = 136;
-    const firstTierY = rootY + 132;
+    const firstTierY = autoRootY + 132;
     const lastTierY = firstTierY + Math.max(0, maxTier - 1) * tierGap;
-    const terminalY = lastTierY + 148;
-    const height = terminalY + 46;
 
     const nodesMap = new Map<number, LayoutNode>();
 
-    // Выравниваем каждый уровень с учётом X родителя для чистых переплетений кабелей
+    // Выравниваем каждый уровень с учётом X родителя, затем применяем ручные координаты (если заданы)
     tiersRaw.forEach((row, tierIdx) => {
       const tierNum = tierIdx + 1;
       const sortedRow = [...row].sort((a, b) => {
@@ -345,11 +419,11 @@ export function DependencyTreeCanvas({
         return a.id - b.id;
       });
 
-      const usableWidth = width - 190;
+      const usableWidth = baseWidth - 190;
       const count = sortedRow.length;
       const step = count <= 1 ? 0 : Math.min(220, usableWidth / Math.max(count - 1, 1));
-      const startX = rootX - ((count - 1) * step) / 2;
-      const y = firstTierY + tierIdx * tierGap;
+      const startX = autoRootX - ((count - 1) * step) / 2;
+      const autoY = firstTierY + tierIdx * tierGap;
 
       sortedRow.forEach((s, idx) => {
         const d = draftById[s.id]!;
@@ -360,12 +434,15 @@ export function DependencyTreeCanvas({
             ? "orchestrator"
             : null;
         const activeChildren = (childrenMap.get(s.id) ?? []).filter((cid) => draftById[cid]?.isActive);
+        const autoX = count === 1 ? autoRootX : startX + idx * step;
+        const nodeX = typeof d.posX === "number" && Number.isFinite(d.posX) ? d.posX : autoX;
+        const nodeY = typeof d.posY === "number" && Number.isFinite(d.posY) ? d.posY : autoY;
         nodesMap.set(s.id, {
           subagent: s,
           draft: d,
           tier: tierNum,
-          x: count === 1 ? rootX : startX + idx * step,
-          y,
+          x: nodeX,
+          y: nodeY,
           parentNodeId,
           manualDetached: !hasValidParent && !d.orchestratorCanCall,
           isLeaf: activeChildren.length === 0,
@@ -374,6 +451,19 @@ export function DependencyTreeCanvas({
     });
 
     const nodes = Array.from(nodesMap.values());
+    const maxNodeY = nodes.length > 0 ? Math.max(...nodes.map((n) => n.y)) : firstTierY;
+    const terminalY = Math.max(lastTierY + 148, maxNodeY + 132);
+    const baseHeight = terminalY + 46;
+
+    const allXCoords = [rootX, ...nodes.map((n) => n.x)];
+    const allYCoords = [rootY, ...nodes.map((n) => n.y)];
+    const viewMinX = Math.min(0, ...allXCoords.map((x) => x - 115));
+    const viewMaxX = Math.max(baseWidth, ...allXCoords.map((x) => x + 115));
+    const viewMinY = Math.min(0, ...allYCoords.map((y) => y - 80));
+    const viewMaxY = Math.max(baseHeight, ...allYCoords.map((y) => y + 100));
+    const width = viewMaxX - viewMinX;
+    const height = viewMaxY - viewMinY;
+
     const edges: EdgeInfo[] = [];
 
     for (const node of nodes) {
@@ -443,8 +533,8 @@ export function DependencyTreeCanvas({
     const strandsPerNode = fanSourceNodes.length <= 4 ? 5 : 4;
     const totalPads = fanSourceNodes.length * strandsPerNode;
     if (totalPads > 0) {
-      const padMargin = 72;
-      const padSpan = width - padMargin * 2;
+      const padMargin = viewMinX + 72;
+      const padSpan = width - 144;
       const padStep = totalPads > 1 ? padSpan / (totalPads - 1) : 0;
       let padCounter = 0;
       const sortedFans = [...fanSourceNodes].sort((a, b) => a.x - b.x);
@@ -469,6 +559,11 @@ export function DependencyTreeCanvas({
     return {
       width,
       height,
+      viewMinX,
+      viewMinY,
+      viewMaxX,
+      viewMaxY,
+      baseWidth,
       rootX,
       rootY,
       terminalY,
@@ -478,7 +573,7 @@ export function DependencyTreeCanvas({
       terminalPads,
       maxTier,
     };
-  }, [subagents, draftById]);
+  }, [subagents, draftById, effectiveOrchPos]);
 
   // Перекрёстные связи (allowedCallees / handoff) от выбранного или всех узлов
   const handoffArcs = useMemo(() => {
@@ -634,13 +729,79 @@ export function DependencyTreeCanvas({
     }
   };
 
-  const handleSvgPointerMove = (e: ReactPointerEvent<SVGSVGElement>) => {
-    if (connectFrom === null || !svgRef.current) return;
+  const clientToSvg = (clientX: number, clientY: number): { x: number; y: number } | null => {
+    if (!svgRef.current) return null;
     const rect = svgRef.current.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const x = ((e.clientX - rect.left) / rect.width) * layout.width;
-    const y = ((e.clientY - rect.top) / rect.height) * layout.height;
-    setCursorSvgPos({ x, y });
+    if (!rect.width || !rect.height) return null;
+    const x = layout.viewMinX + ((clientX - rect.left) / rect.width) * layout.width;
+    const y = layout.viewMinY + ((clientY - rect.top) / rect.height) * layout.height;
+    return { x, y };
+  };
+
+  const startNodeDrag = (
+    e: ReactPointerEvent<SVGGElement>,
+    nodeId: number | "orchestrator",
+    originX: number,
+    originY: number,
+  ) => {
+    if (connectFrom !== null || e.button !== 0) return;
+    const pt = clientToSvg(e.clientX, e.clientY);
+    if (!pt) return;
+    e.stopPropagation();
+    try {
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+    } catch {
+      /* noop */
+    }
+    setDragState({
+      nodeId,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      originX,
+      originY,
+      pointerOffsetX: originX - pt.x,
+      pointerOffsetY: originY - pt.y,
+      moved: false,
+    });
+  };
+
+  const handleSvgPointerMove = (e: ReactPointerEvent<SVGSVGElement>) => {
+    const pt = clientToSvg(e.clientX, e.clientY);
+    if (!pt) return;
+
+    if (dragState) {
+      const dist = Math.hypot(e.clientX - dragState.startClientX, e.clientY - dragState.startClientY);
+      if (dragState.moved || dist > 5) {
+        const nextX = Math.round(pt.x + dragState.pointerOffsetX);
+        const nextY = Math.round(pt.y + dragState.pointerOffsetY);
+        if (!dragState.moved) {
+          setDragState((prev) => (prev ? { ...prev, moved: true } : null));
+        }
+        if (dragState.nodeId === "orchestrator") {
+          setSavedToast(null);
+          setError(null);
+          setOrchPosOverride({ x: nextX, y: nextY });
+        } else {
+          updateDraft(dragState.nodeId, { posX: nextX, posY: nextY });
+        }
+      }
+      return;
+    }
+
+    if (connectFrom !== null) {
+      setCursorSvgPos(pt);
+    }
+  };
+
+  const handleSvgPointerUp = () => {
+    if (!dragState) return;
+    if (dragState.moved) {
+      suppressClickRef.current = true;
+      setTimeout(() => {
+        suppressClickRef.current = false;
+      }, 0);
+    }
+    setDragState(null);
   };
 
   const connectSourcePoint = useMemo(() => {
@@ -669,11 +830,14 @@ export function DependencyTreeCanvas({
           parentSubagentId: d.parentSubagentId,
           orchestratorCanCall: d.orchestratorCanCall,
           allowedCallees: parseCalleesList(d.allowedCalleesText),
+          posX: d.posX ?? null,
+          posY: d.posY ?? null,
         };
       });
-      await onSave(payload);
+      await onSave(payload, effectiveOrchPos);
       setOverrides({});
-      setSavedToast("Топология дерева сохранена");
+      setOrchPosOverride(undefined);
+      setSavedToast("Топология дерева и позиции узлов сохранены");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Не удалось сохранить дерево");
     } finally {
@@ -698,7 +862,7 @@ export function DependencyTreeCanvas({
           )}
         </span>
       }
-      subtitle="Интерактивная нейронная топология: нажмите на любой шестиугольник, чтобы перенастроить связи, родителя, handoff-вызовы и активность."
+      subtitle="Интерактивная нейронная топология: перетаскивайте узлы по холсту в любое место или нажмите на шестиугольник, чтобы перенастроить связи и активность."
       action={
         <div className="flex flex-wrap items-center gap-1.5">
           {onChangeRoutingMode && (
@@ -736,6 +900,17 @@ export function DependencyTreeCanvas({
                 По уровням
               </button>
             </div>
+          )}
+          {hasCustomPositions && (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={resetFreeLayout}
+              title="Вернуть все узлы к автоматической древовидной раскладке"
+            >
+              <RotateCcw size={12} />
+              Сбросить раскладку
+            </Button>
           )}
           {subagents.length > 0 && (
             <Button
@@ -845,9 +1020,14 @@ export function DependencyTreeCanvas({
             ref={svgRef}
             role="img"
             aria-label="Схема зависимостей Оркестратора и субагентов"
-            viewBox={`0 0 ${layout.width} ${layout.height}`}
+            viewBox={`${layout.viewMinX} ${layout.viewMinY} ${layout.width} ${layout.height}`}
             onPointerMove={handleSvgPointerMove}
-            onPointerLeave={() => setCursorSvgPos(null)}
+            onPointerUp={handleSvgPointerUp}
+            onPointerCancel={handleSvgPointerUp}
+            onPointerLeave={() => {
+              setCursorSvgPos(null);
+              if (dragState) handleSvgPointerUp();
+            }}
             onKeyDown={(e) => {
               if (e.key === "Escape" && connectFrom !== null) {
                 e.preventDefault();
@@ -856,6 +1036,7 @@ export function DependencyTreeCanvas({
             }}
             className={cn(
               "block select-none transition-all duration-300",
+              dragState && "cursor-grabbing",
               connectFrom !== null && "cursor-crosshair",
               zoomed ? "min-w-[1180px] w-[130%]" : "w-full min-w-[680px]",
             )}
@@ -934,14 +1115,20 @@ export function DependencyTreeCanvas({
             </defs>
 
             {/* 1. Подложка blueprint-сетки */}
-            <rect width={layout.width} height={layout.height} fill={`url(#${uid}-grid-major)`} />
+            <rect
+              x={layout.viewMinX}
+              y={layout.viewMinY}
+              width={layout.width}
+              height={layout.height}
+              fill={`url(#${uid}-grid-major)`}
+            />
 
             {/* 2. Боковая техно-телеметрия HUD как на референсе */}
             <g opacity="0.72" pointerEvents="none">
               {/* Левая рамка телеметрии */}
               <rect
-                x="24"
-                y="22"
+                x={layout.viewMinX + 24}
+                y={layout.viewMinY + 22}
                 width="172"
                 height="94"
                 rx="6"
@@ -949,23 +1136,23 @@ export function DependencyTreeCanvas({
                 stroke="rgba(34,211,238,0.22)"
                 strokeWidth="1"
               />
-              <text x="36" y="42" fill="#38bdf8" fontSize="9.5" fontFamily="monospace" fontWeight="700">
+              <text x={layout.viewMinX + 36} y={layout.viewMinY + 42} fill="#38bdf8" fontSize="9.5" fontFamily="monospace" fontWeight="700">
                 TOPOLOGY // NEURAL GRID
               </text>
-              <text x="36" y="60" fill="#94a3b8" fontSize="8.5" fontFamily="monospace">
+              <text x={layout.viewMinX + 36} y={layout.viewMinY + 60} fill="#94a3b8" fontSize="8.5" fontFamily="monospace">
                 NODES: {subagents.length} · ACTIVE: {activeCount}/{maxActive}
               </text>
-              <text x="36" y="75" fill="#94a3b8" fontSize="8.5" fontFamily="monospace">
+              <text x={layout.viewMinX + 36} y={layout.viewMinY + 75} fill="#94a3b8" fontSize="8.5" fontFamily="monospace">
                 DIRECT ORCH: {orchestratorDirectCount} · TIERS: {layout.maxTier}
               </text>
-              <text x="36" y="96" fill="#22d3ee" fontSize="8" fontFamily="monospace" opacity="0.65">
+              <text x={layout.viewMinX + 36} y={layout.viewMinY + 96} fill="#22d3ee" fontSize="8" fontFamily="monospace" opacity="0.65">
                 01011001 11001010 00101110
               </text>
 
               {/* Правая рамка телеметрии */}
               <rect
-                x={layout.width - 196}
-                y="22"
+                x={layout.viewMaxX - 196}
+                y={layout.viewMinY + 22}
                 width="172"
                 height="94"
                 rx="6"
@@ -974,8 +1161,8 @@ export function DependencyTreeCanvas({
                 strokeWidth="1"
               />
               <text
-                x={layout.width - 184}
-                y="42"
+                x={layout.viewMaxX - 184}
+                y={layout.viewMinY + 42}
                 fill="#fb923c"
                 fontSize="9.5"
                 fontFamily="monospace"
@@ -983,26 +1170,26 @@ export function DependencyTreeCanvas({
               >
                 ORCHESTRATOR CORE
               </text>
-              <text x={layout.width - 184} y="60" fill="#cbd5e1" fontSize="8.5" fontFamily="monospace">
+              <text x={layout.viewMaxX - 184} y={layout.viewMinY + 60} fill="#cbd5e1" fontSize="8.5" fontFamily="monospace">
                 MODEL: {(orchestratorModel || "default").slice(0, 18)}
               </text>
-              <text x={layout.width - 184} y="75" fill="#94a3b8" fontSize="8.5" fontFamily="monospace">
+              <text x={layout.viewMaxX - 184} y={layout.viewMinY + 75} fill="#94a3b8" fontSize="8.5" fontFamily="monospace">
                 CUSTOM API: {subagents.filter((s) => s.unlockApi).length} · LOCKED:{" "}
                 {subagents.filter((s) => !s.unlockApi).length}
               </text>
-              <text x={layout.width - 184} y="96" fill="#38bdf8" fontSize="8" fontFamily="monospace" opacity="0.7">
-                ISOLATED SUB-CHATS // READY
+              <text x={layout.viewMaxX - 184} y={layout.viewMinY + 96} fill="#38bdf8" fontSize="8" fontFamily="monospace" opacity="0.7">
+                FREE DRAG TOPOLOGY // READY
               </text>
 
               {/* Ортогональные PCB-шины по флангам схемы */}
               <path
-                d={`M 48 145 L 118 145 L 146 173 L 146 ${layout.terminalY - 40} L 122 ${layout.terminalY - 16} L 68 ${layout.terminalY - 16}`}
+                d={`M ${layout.viewMinX + 48} ${layout.viewMinY + 145} L ${layout.viewMinX + 118} ${layout.viewMinY + 145} L ${layout.viewMinX + 146} ${layout.viewMinY + 173} L ${layout.viewMinX + 146} ${layout.terminalY - 40} L ${layout.viewMinX + 122} ${layout.terminalY - 16} L ${layout.viewMinX + 68} ${layout.terminalY - 16}`}
                 fill="none"
                 stroke="rgba(34,211,238,0.18)"
                 strokeWidth="1.2"
               />
               <path
-                d={`M ${layout.width - 48} 145 L ${layout.width - 118} 145 L ${layout.width - 146} 173 L ${layout.width - 146} ${layout.terminalY - 40} L ${layout.width - 122} ${layout.terminalY - 16} L ${layout.width - 68} ${layout.terminalY - 16}`}
+                d={`M ${layout.viewMaxX - 48} ${layout.viewMinY + 145} L ${layout.viewMaxX - 118} ${layout.viewMinY + 145} L ${layout.viewMaxX - 146} ${layout.viewMinY + 173} L ${layout.viewMaxX - 146} ${layout.terminalY - 40} L ${layout.viewMaxX - 122} ${layout.terminalY - 16} L ${layout.viewMaxX - 68} ${layout.terminalY - 16}`}
                 fill="none"
                 stroke="rgba(34,211,238,0.18)"
                 strokeWidth="1.2"
@@ -1031,7 +1218,7 @@ export function DependencyTreeCanvas({
               {[-28, -17, -7, 0, 7, 17, 28].map((dx, i) => {
                 const startX = layout.rootX + dx * 2.1;
                 const endX = layout.rootX + dx * 0.65;
-                const d = `M ${startX} 0 C ${startX} 34, ${endX} 36, ${endX} ${layout.rootY - 38}`;
+                const d = `M ${startX} ${layout.viewMinY} C ${startX} ${layout.viewMinY + 34}, ${endX} ${Math.max(layout.viewMinY + 36, layout.rootY - 68)}, ${endX} ${layout.rootY - 38}`;
                 return (
                   <path
                     key={`top-stream-${i}`}
@@ -1269,12 +1456,14 @@ export function DependencyTreeCanvas({
               </g>
             )}
 
-            {/* 8. Главный узел (Оркестратор) сверху по центру */}
+            {/* 8. Главный узел (Оркестратор) сверху по центру — свободно перетаскивается мышью */}
             <g
               role="button"
               tabIndex={0}
               aria-label="Узел Оркестратор (Главный Агент)"
+              onPointerDown={(e) => startNodeDrag(e, "orchestrator", layout.rootX, layout.rootY)}
               onClick={() => {
+                if (suppressClickRef.current) return;
                 if (connectFrom !== null) cancelConnect();
                 else setSelectedNodeId("orchestrator");
               }}
@@ -1285,7 +1474,10 @@ export function DependencyTreeCanvas({
                   else setSelectedNodeId("orchestrator");
                 }
               }}
-              className="cursor-pointer focus:outline-none"
+              className={cn(
+                "focus:outline-none",
+                connectFrom !== null ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing",
+              )}
             >
               {(effectiveSelectedId === "orchestrator" || connectFrom === "orchestrator") && (
                 <polygon
@@ -1338,6 +1530,7 @@ export function DependencyTreeCanvas({
                   role="button"
                   tabIndex={0}
                   aria-label="Провести связь от Оркестратора"
+                  onPointerDown={(e) => e.stopPropagation()}
                   onClick={(e) => {
                     e.stopPropagation();
                     if (connectFrom === "orchestrator") cancelConnect();
@@ -1389,7 +1582,9 @@ export function DependencyTreeCanvas({
                   role="button"
                   tabIndex={0}
                   aria-label={isConnectTarget ? `Соединить с субагентом ${s.name}` : `Субагент ${s.name}`}
+                  onPointerDown={(e) => startNodeDrag(e, s.id, node.x, node.y)}
                   onClick={() => {
+                    if (suppressClickRef.current) return;
                     if (connectFrom !== null) {
                       connectTargetNode(s.id);
                     } else {
@@ -1406,7 +1601,10 @@ export function DependencyTreeCanvas({
                       }
                     }
                   }}
-                  className="cursor-pointer focus:outline-none"
+                  className={cn(
+                    "focus:outline-none",
+                    connectFrom !== null ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing",
+                  )}
                 >
                   {(isSelected || isConnectSource || isConnectTarget) && (
                     <polygon
@@ -1455,6 +1653,7 @@ export function DependencyTreeCanvas({
                     role="button"
                     tabIndex={0}
                     aria-label={`Провести связь от субагента ${s.name}`}
+                    onPointerDown={(e) => e.stopPropagation()}
                     onClick={(e) => {
                       e.stopPropagation();
                       if (connectFrom === s.id) cancelConnect();
@@ -1565,7 +1764,7 @@ export function DependencyTreeCanvas({
             </span>
           </div>
           <span className="font-mono text-[10px] text-cyan-400/80">
-            Кликните по любому узлу для настройки
+            Перетаскивайте узлы мышью или кликните по узлу для настройки
           </span>
         </div>
       </div>
@@ -1665,8 +1864,27 @@ export function DependencyTreeCanvas({
                       {s.unlockApi ? <Unlock size={10} /> : <Lock size={10} />}
                       {s.unlockApi ? (s.model || "Свой API") : "API Оркестратора"}
                     </Badge>
+                    <Badge
+                      className={
+                        s.toolProfile === "full"
+                          ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-400"
+                          : "border-border bg-card text-muted"
+                      }
+                    >
+                      {s.toolProfile === "full" ? "Полные инструменты" : "Урезанные"}
+                    </Badge>
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5">
+                    {(d.posX !== null || d.posY !== null) && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => updateDraft(s.id, { posX: null, posY: null })}
+                        title="Вернуть этот узел в авто-раскладку"
+                      >
+                        <RotateCcw size={12} /> Позиция по умолчанию
+                      </Button>
+                    )}
                     <Button
                       size="sm"
                       variant={connectFrom === s.id ? "primary" : "secondary"}

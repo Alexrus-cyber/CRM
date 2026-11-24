@@ -243,6 +243,8 @@ export const aiUserSettings = pgTable("ai_user_settings", {
   overseerModel: text("overseer_model").notNull().default(""),
   overseerApiKeyEncrypted: text("overseer_api_key_encrypted").notNull().default(""),
   overseerApiKeyHint: text("overseer_api_key_hint").notNull().default(""),
+  orchestratorPosX: real("orchestrator_pos_x"),
+  orchestratorPosY: real("orchestrator_pos_y"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -724,6 +726,9 @@ export const agentSubagents = pgTable(
     parentSubagentId: integer("parent_subagent_id"),
     orchestratorCanCall: boolean("orchestrator_can_call").notNull().default(true),
     allowedCallees: text("allowed_callees").notNull().default('["*"]'),
+    toolProfile: text("tool_profile").notNull().default("restricted"),
+    posX: real("pos_x"),
+    posY: real("pos_y"),
     unlockApi: boolean("unlock_api").notNull().default(false),
     provider: text("provider").notNull().default("custom"),
     baseUrl: text("base_url").notNull().default(""),

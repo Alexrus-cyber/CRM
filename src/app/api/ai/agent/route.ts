@@ -11,7 +11,6 @@ import {
   listActiveSubagentsWithSecrets,
   listRagChunks,
   listSubagentRuns,
-  listTesterRuns,
   recordAgentUsage,
   searchRagChunks,
   updateTesterMinorDecision,
@@ -111,7 +110,14 @@ export async function GET(req: Request) {
 }
 
 type IncomingMessage = { role?: string; content?: string };
-type IncomingAttachment = { name?: string; text?: string; note?: string; image?: string };
+type IncomingAttachment = {
+  name?: string;
+  text?: string;
+  note?: string;
+  image?: string;
+  sandboxPath?: string;
+  fromHistory?: boolean;
+};
 
 export async function POST(req: Request) {
   const me = await getCurrentUser();
@@ -208,17 +214,22 @@ export async function POST(req: Request) {
 
   const rawAttachments = (body?.attachments ?? []).filter((item) => item && typeof item === "object");
   const attachments = (unlimitedAi ? rawAttachments : rawAttachments.slice(0, 8)).map((item) => {
+    const rawItem = item as IncomingAttachment & { fromHistory?: unknown };
     const image =
-      typeof item.image === "string" && item.image.startsWith("data:image/")
+      typeof rawItem.image === "string" && rawItem.image.startsWith("data:image/")
         ? unlimitedAi
-          ? item.image
-          : item.image.slice(0, 6_000_000)
+          ? rawItem.image
+          : rawItem.image.slice(0, 6_000_000)
         : "";
+    const sandboxPath =
+      typeof rawItem.sandboxPath === "string" ? rawItem.sandboxPath.trim().slice(0, 300) : "";
     return {
-      name: String(item.name ?? "файл").slice(0, 240),
-      note: String(item.note ?? "").slice(0, 240),
-      text: unlimitedAi ? String(item.text ?? "") : String(item.text ?? "").slice(0, 120_000),
+      name: String(rawItem.name ?? "файл").slice(0, 240),
+      note: String(rawItem.note ?? "").slice(0, 240),
+      text: unlimitedAi ? String(rawItem.text ?? "") : String(rawItem.text ?? "").slice(0, 120_000),
       ...(image ? { image } : {}),
+      ...(sandboxPath ? { sandboxPath } : {}),
+      ...(rawItem.fromHistory ? { fromHistory: true } : {}),
     };
   });
 
@@ -465,6 +476,7 @@ export async function POST(req: Request) {
       parentSubagentId: sub.parentSubagentId,
       orchestratorCanCall: sub.orchestratorCanCall,
       allowedCallees: sub.allowedCallees,
+      toolProfile: sub.toolProfile,
       unlockApi: sub.unlockApi,
       customApi,
     });
@@ -556,27 +568,9 @@ export async function POST(req: Request) {
   };
 
   const modelName = payload.settings.model || "";
-  const [recentTesterReports, recentSubagentReports] = await Promise.all([
+  const recentSubagentReports =
     agentRole === "agent"
-      ? listTesterRuns(me.id, 4)
-          .then((rows) =>
-            rows.map((r) => ({
-              id: r.id,
-              testerConversationId: r.testerConversationId,
-              sandboxProject: r.sandboxProject,
-              status: r.status,
-              reportSummary: r.reportSummary.slice(0, 1200),
-              criticalIssues: r.criticalIssues.slice(0, 10),
-              minorIssues: r.minorIssues.slice(0, 10),
-              minorDecision: r.minorDecision,
-              totalTokens: r.totalTokens,
-              updatedAt: r.updatedAt,
-            })),
-          )
-          .catch(() => [])
-      : Promise.resolve([]),
-    agentRole === "agent"
-      ? listSubagentRuns(me.id, { limit: 10 })
+      ? await listSubagentRuns(me.id, { limit: 10 })
           .then((rows) =>
             rows.map((r) => ({
               id: r.id,
@@ -596,8 +590,7 @@ export async function POST(req: Request) {
             })),
           )
           .catch(() => [])
-      : Promise.resolve([]),
-  ]);
+      : [];
 
   const fullPayload = {
     ...payload,
@@ -616,6 +609,7 @@ export async function POST(req: Request) {
             description: targetSubagent.description,
             systemPrompt: targetSubagent.systemPrompt,
             allowedCallees: targetSubagent.allowedCallees,
+            toolProfile: targetSubagent.toolProfile,
             unlockApi: targetSubagent.unlockApi,
             usedCustomApi: directSubagentUsedCustomApi,
           },
@@ -623,7 +617,6 @@ export async function POST(req: Request) {
       : {}),
     context: {
       ...payload.context,
-      ...(recentTesterReports.length > 0 ? { recentTesterReports } : {}),
       ...(recentSubagentReports.length > 0 ? { recentSubagentReports } : {}),
     },
   };
@@ -737,14 +730,15 @@ export async function POST(req: Request) {
             const rawCaller = String(parsed.callerKind ?? "orchestrator");
             const callerKind: SubagentCallerKind =
               rawCaller === "subagent" || rawCaller === "user" ? rawCaller : "orchestrator";
+            const isNewSubChat = Boolean(parsed.forceNewChat || parsed.isContinuation);
             const created = await createSubagentRunWithConversation({
               userId: me.id,
               subagentId: parsedSubId,
               agentConversationId,
               existingConversationId:
-                agentRole === "subagent" ? subagentConversationId : null,
+                agentRole === "subagent" && !isNewSubChat ? subagentConversationId : null,
               skipInitialMessage:
-                agentRole === "subagent" && Boolean(subagentConversationId),
+                agentRole === "subagent" && !isNewSubChat && Boolean(subagentConversationId),
               callerKind,
               callerSubagentId:
                 Number.isFinite(Number(parsed.callerSubagentId)) && Number(parsed.callerSubagentId) > 0
@@ -774,6 +768,8 @@ export async function POST(req: Request) {
               subagentConversationId: created.conversation.id,
               tier: typeof parsed.tier === "number" ? parsed.tier : undefined,
               routingMode: typeof parsed.routingMode === "string" ? parsed.routingMode : undefined,
+              toolProfile: typeof parsed.toolProfile === "string" ? parsed.toolProfile : undefined,
+              isContinuation: Boolean(parsed.isContinuation),
               callerKind: created.run.callerKind,
               callerSubagentName: typeof parsed.callerSubagentName === "string" ? parsed.callerSubagentName : "",
               sandboxProject: created.run.sandboxProject,
@@ -806,7 +802,9 @@ export async function POST(req: Request) {
         ev === "subagent_reasoning" ||
         ev === "subagent_text" ||
         ev === "subagent_action" ||
-        ev === "subagent_handoff"
+        ev === "subagent_handoff" ||
+        ev === "subagent_chat_rotated" ||
+        ev === "subagent_handoff_new_chat"
       ) {
         const runKey = String(parsed.runKey ?? "default");
         const mappedSub = activeSubagentRuns.get(runKey);

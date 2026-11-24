@@ -16,6 +16,7 @@ import {
   MessageSquare,
   MessageSquarePlus,
   Network,
+  Paperclip,
   Pencil,
   Plus,
   RefreshCw,
@@ -26,10 +27,16 @@ import {
   Square,
   Trash2,
   Unlock,
+  Wrench,
   X,
 } from "lucide-react";
 import { ApprovalToast } from "../ApprovalToast";
 import { LiveReasoningBox } from "../LiveReasoningBox";
+import {
+  formatFileSize,
+  readOperatorFiles,
+  type OperatorAttachment,
+} from "../operator/files";
 import {
   Badge,
   Button,
@@ -46,6 +53,7 @@ import { cn } from "@/lib/utils";
 import {
   DependencyTreeCanvas,
   type DependencyTreeNodePayload,
+  type OrchestratorPosition,
 } from "./DependencyTreeCanvas";
 import {
   formatTokensCount,
@@ -59,6 +67,7 @@ import {
   type SubagentMessage,
   type SubagentRoutingMode,
   type SubagentRun,
+  type SubagentToolProfile,
 } from "./subagentTypes";
 
 export type {
@@ -114,6 +123,7 @@ const EMPTY_FORM: SubagentFormState = {
   parentSubagentId: null,
   orchestratorCanCall: true,
   allowedCalleesText: "*",
+  toolProfile: "restricted",
   unlockApi: false,
   provider: "local",
   baseUrl: "",
@@ -212,6 +222,7 @@ export function SubagentsPanel({
     activeCount: 0,
   });
   const [routingMode, setRoutingMode] = useState<SubagentRoutingMode>("linear");
+  const [orchestratorPos, setOrchestratorPos] = useState<OrchestratorPosition>({ x: null, y: null });
   const [overseer, setOverseer] = useState<OverseerConfig>(DEFAULT_OVERSEER);
   const [overseerSyncKey, setOverseerSyncKey] = useState(0);
   const [showOverseer, setShowOverseer] = useState(false);
@@ -274,6 +285,7 @@ export function SubagentsPanel({
           conversations?: SubagentConversation[];
           limits?: SubagentLimits;
           routingMode?: SubagentRoutingMode;
+          orchestratorPos?: OrchestratorPosition | null;
           overseer?: Partial<OverseerConfig>;
         };
         if (controller.signal.aborted || !mountedRef.current) return;
@@ -289,6 +301,10 @@ export function SubagentsPanel({
         };
         const nextRouting: SubagentRoutingMode =
           data.routingMode === "layered" ? "layered" : "linear";
+        const nextOrchPos: OrchestratorPosition = {
+          x: typeof data.orchestratorPos?.x === "number" ? data.orchestratorPos.x : null,
+          y: typeof data.orchestratorPos?.y === "number" ? data.orchestratorPos.y : null,
+        };
         const nextOverseer: OverseerConfig = {
           ...DEFAULT_OVERSEER,
           ...(data.overseer ?? {}),
@@ -301,6 +317,7 @@ export function SubagentsPanel({
         setConversations(nextConvs);
         setLimits(nextLimits);
         setRoutingMode(nextRouting);
+        setOrchestratorPos(nextOrchPos);
         setOverseer(nextOverseer);
         setOverseerSyncKey((k) => k + 1);
         setError(null);
@@ -366,6 +383,7 @@ export function SubagentsPanel({
         parentSubagentId: form.parentSubagentId ?? null,
         orchestratorCanCall: form.orchestratorCanCall,
         allowedCallees: allowedCallees.length > 0 ? allowedCallees : ["*"],
+        toolProfile: (form.toolProfile === "full" ? "full" : "restricted") as SubagentToolProfile,
         unlockApi: Boolean(form.unlockApi),
         provider: form.provider,
         baseUrl: form.baseUrl,
@@ -427,12 +445,16 @@ export function SubagentsPanel({
   );
 
   const saveTree = useCallback(
-    async (nodes: DependencyTreeNodePayload[]) => {
+    async (nodes: DependencyTreeNodePayload[], nextOrchPos?: OrchestratorPosition) => {
       setError(null);
       const res = await fetch("/api/agent/subagents", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ nodes, routingMode }),
+        body: JSON.stringify({
+          nodes,
+          routingMode,
+          ...(nextOrchPos !== undefined ? { orchestratorPos: nextOrchPos } : {}),
+        }),
       });
       if (!res.ok) {
         const d = (await res.json().catch(() => ({}))) as { error?: string };
@@ -641,6 +663,7 @@ export function SubagentsPanel({
           orchestratorModel={orchestratorModelLabel}
           maxActive={limits.maxActive}
           routingMode={routingMode}
+          orchestratorPos={orchestratorPos}
           onChangeRoutingMode={changeRoutingMode}
           onSave={saveTree}
           onCreateNew={limits.totalCount < limits.maxStored ? openNewForm : undefined}
@@ -729,6 +752,16 @@ export function SubagentsPanel({
                       >
                         {s.unlockApi ? <Unlock size={10} /> : <Lock size={10} />}
                         {s.unlockApi ? (s.model.trim() || "Свой API") : "API Орк."}
+                      </Badge>
+                      <Badge
+                        className={
+                          s.toolProfile === "full"
+                            ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-400"
+                            : "border-border bg-card2 text-muted"
+                        }
+                      >
+                        <Wrench size={10} />
+                        {s.toolProfile === "full" ? "Полные инструменты" : "Урезанные"}
                       </Badge>
                     </div>
 
@@ -1104,6 +1137,28 @@ function SubagentFormEditor({
           </div>
 
           <div className="grid gap-3 md:grid-cols-2">
+            <Field label="Профиль инструментов">
+              <Select
+                aria-label="Профиль инструментов субагента"
+                value={form.toolProfile === "full" ? "full" : "restricted"}
+                onChange={(e) =>
+                  set("toolProfile", e.target.value === "full" ? "full" : "restricted")
+                }
+              >
+                <option value="restricted">
+                  Урезанные (без браузерного инспектора — быстро, без лишних трат)
+                </option>
+                <option value="full">
+                  Полные (с браузерным инспектором и QA-инструментами)
+                </option>
+              </Select>
+              <p className="mt-1 text-[11px] text-muted">
+                {form.toolProfile === "full"
+                  ? "Субагенту доступны browse_project, qa_browser_audit и запуск headless-браузера."
+                  : "Без инструментов браузера (browse_project / qa_browser_audit), меньше контекста и нагрузки."}
+              </p>
+            </Field>
+
             <Field label="Родительский субагент">
               <Select
                 value={form.parentSubagentId ?? ""}
@@ -1397,7 +1452,7 @@ function OverseerConfigCard({
           </Badge>
         </span>
       }
-      subtitle="Контролирует все потенциально опасные действия Оркестратора, субагентов и Тестировщика (побег из Sandbox, утечка секретов, команды ПК, экспорт, сеть) — работает даже при полном доверии."
+      subtitle="Контролирует все потенциально опасные действия Оркестратора и субагентов (побег из Sandbox, утечка секретов, команды ПК, экспорт, сеть) — работает даже при полном доверии."
       action={
         <Button size="sm" variant="ghost" onClick={onClose}>
           <X size={14} /> Свернуть
@@ -1626,7 +1681,10 @@ function SubagentChatViewer({
   const [messages, setMessages] = useState<SubagentMessage[]>([]);
   const [loadingConv, setLoadingConv] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
+  const [handoffNotice, setHandoffNotice] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  const [attachments, setAttachments] = useState<OperatorAttachment[]>([]);
+  const [sessionAttachments, setSessionAttachments] = useState<OperatorAttachment[]>([]);
   const [running, setRunning] = useState(false);
   const [live, setLive] = useState<{
     reasoning: string;
@@ -1654,7 +1712,9 @@ function SubagentChatViewer({
   const [tokenUsage, setTokenUsage] = useState<{ prompt: number; completion: number; total: number } | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const convAbortRef = useRef<AbortController | null>(null);
+  const streamRunningRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const loadConversation = useCallback(
     async (convId: number) => {
@@ -1692,7 +1752,7 @@ function SubagentChatViewer({
   );
 
   useEffect(() => {
-    if (!activeConvId) return;
+    if (!activeConvId || streamRunningRef.current) return;
     let alive = true;
     const ctrl = new AbortController();
     fetch(
@@ -1808,42 +1868,130 @@ function SubagentChatViewer({
     }
   };
 
-  const send = async () => {
-    const prompt = draft.trim();
-    if (!prompt || !sub || running) return;
-    const history = [
-      ...messages.map((m) => ({ role: m.role, content: m.content })),
-      { role: "user", content: prompt },
-    ];
+  const attachFiles = async (fileList: FileList | File[]) => {
+    const { files: next, errors } = await readOperatorFiles(attachments, fileList);
+    if (errors.length > 0) setChatError(errors.join(". "));
+    if (next.length > 0) {
+      setAttachments((prev) => [...prev, ...next].slice(0, 8));
+    }
+  };
+
+  const runSubagentTurn = async (
+    promptText: string,
+    opts?: {
+      convIdOverride?: number | null;
+      attachmentsOverride?: OperatorAttachment[];
+      sessionAttachmentsOverride?: OperatorAttachment[];
+      historyOverride?: Array<{ role: string; content: string }>;
+      handoffDepth?: number;
+    },
+  ): Promise<void> => {
+    const prompt = promptText.trim();
+    if (!prompt || !sub) return;
+    const handoffDepth = opts?.handoffDepth ?? 0;
+    const currentAttachments = opts?.attachmentsOverride ?? attachments;
+    const targetConvId =
+      opts?.convIdOverride !== undefined ? opts.convIdOverride : activeConvId;
+
+    // Собираем вложения для модели: свежие + файлы дизайна/контекста из текущей сессии
+    const mergedSession = [...(opts?.sessionAttachmentsOverride ?? sessionAttachments)];
+    for (const att of currentAttachments) {
+      if (!mergedSession.some((x) => x.name === att.name && x.size === att.size)) {
+        mergedSession.push(att);
+      }
+    }
+    const nextSessionAttachments = mergedSession.slice(-10);
+    if (currentAttachments.length > 0 || opts?.sessionAttachmentsOverride) {
+      setSessionAttachments(nextSessionAttachments);
+    }
+
+    const freshKeys = new Set(currentAttachments.map((a) => `${a.name}:${a.size}`));
+    const historySessionPayload = mergedSession
+      .filter((a) => !freshKeys.has(`${a.name}:${a.size}`))
+      .map((a) => ({
+        name: a.name,
+        mime: a.mime,
+        size: a.size,
+        text: a.text,
+        note: a.note,
+        data: a.data,
+        ...(a.image ? { image: a.image } : {}),
+        fromHistory: true,
+      }));
+    const freshPayload = currentAttachments.map((a) => ({
+      name: a.name,
+      mime: a.mime,
+      size: a.size,
+      text: a.text,
+      note: a.note,
+      data: a.data,
+      ...(a.image ? { image: a.image } : {}),
+      fromHistory: false,
+    }));
+    const attachmentsPayload = [...freshPayload, ...historySessionPayload].slice(0, 12);
+
+    const historyBase =
+      opts?.historyOverride ?? messages.map((m) => ({ role: m.role, content: m.content }));
+    const history = [...historyBase, { role: "user", content: prompt }];
+
+    const uiAttachments = currentAttachments.map((a) => ({
+      name: a.name,
+      mime: a.mime,
+      size: a.size,
+      note: a.note,
+      ...(a.image ? { image: a.image } : {}),
+    }));
+
     setMessages((m) => [
       ...m,
       {
-        id: -Date.now(),
-        conversationId: activeConvId ?? -1,
+        id: -Date.now() - handoffDepth,
+        conversationId: targetConvId ?? -1,
         role: "user",
         content: prompt,
         reasoning: "",
-        attachments: [],
+        attachments: uiAttachments,
         actions: [],
         files: [],
         error: "",
         createdAt: new Date().toISOString(),
       },
     ]);
-    setDraft("");
+    if (!opts?.attachmentsOverride) setAttachments([]);
+    if (!opts?.convIdOverride) setDraft("");
     setChatError(null);
     setRunning(true);
     setLive({
       reasoning: "",
       text: "",
-      status: "Запуск субагента…",
+      status: handoffDepth > 0 ? "Продолжение в новом чате…" : "Запуск субагента…",
       actorLabel: sub.name,
       overseerReasoning: "",
     });
 
+    // Сохраняем сообщение пользователя в БД, если чат уже существует (при создании с нуля его сохранит subagent_start)
+    if (targetConvId) {
+      void fetch(`/api/agent/conversations/${targetConvId}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          role: "user",
+          content: prompt,
+          attachments: currentAttachments.map((a) => ({
+            name: a.name,
+            mime: a.mime,
+            size: a.size,
+            note: a.note,
+          })),
+        }),
+      }).catch(() => undefined);
+    }
+
     const ctrl = new AbortController();
     streamAbortRef.current = ctrl;
-    let resolvedConvId: number | null = activeConvId;
+    streamRunningRef.current = true;
+    let resolvedConvId: number | null = targetConvId;
+    let pendingHandoff: { summary: string; continuationPrompt: string; steps: number } | null = null;
 
     try {
       const res = await fetch("/api/ai/agent", {
@@ -1860,11 +2008,13 @@ function SubagentChatViewer({
             description: sub.description,
             systemPrompt: sub.systemPrompt,
             allowedCallees: sub.allowedCallees,
+            toolProfile: sub.toolProfile ?? "restricted",
             unlockApi: sub.unlockApi,
             usedCustomApi: sub.unlockApi,
           },
-          ...(activeConvId ? { subagentConversationId: activeConvId } : {}),
+          ...(targetConvId ? { subagentConversationId: targetConvId } : {}),
           messages: history,
+          attachments: attachmentsPayload,
           settings: {
             baseUrl: settings.baseUrl,
             model: settings.model,
@@ -1898,6 +2048,7 @@ function SubagentChatViewer({
             parentSubagentId: s.parentSubagentId,
             orchestratorCanCall: s.orchestratorCanCall,
             allowedCallees: s.allowedCallees,
+            toolProfile: s.toolProfile ?? "restricted",
             unlockApi: s.unlockApi,
           })),
         }),
@@ -1941,6 +2092,20 @@ function SubagentChatViewer({
           setLive((l) => ({ ...l, text: String(data.text ?? "") }));
         } else if (ev === "subagent_status") {
           setLive((l) => ({ ...l, actorLabel: sub.name, status: String(data.text ?? "") }));
+        } else if (ev === "subagent_chat_rotated") {
+          setHandoffNotice(
+            `Чат субагента автоматически перенесён в новую сессию (${Number(data.steps ?? 300)} шагов). Контекст сжат в summary.`,
+          );
+        } else if (ev === "subagent_handoff_new_chat") {
+          const summary = String(data.summary ?? "").trim();
+          const continuationPrompt = String(data.continuationPrompt ?? "").trim();
+          const steps = Number(data.steps ?? 300) || 300;
+          if (continuationPrompt) {
+            pendingHandoff = { summary, continuationPrompt, steps };
+          }
+          setHandoffNotice(
+            `Достигнут лимит шагов (${steps}). Сохранено summary и открывается новый чат для продолжения…`,
+          );
         } else if (ev === "overseer_start" || ev === "overseer_status") {
           setLive((l) => ({
             ...l,
@@ -2000,10 +2165,40 @@ function SubagentChatViewer({
 
       setLive({ reasoning: "", text: "", status: "", actorLabel: "", overseerReasoning: "" });
       setSubApproval(null);
-      if (resolvedConvId && resolvedConvId !== activeConvId) {
+      if (resolvedConvId && resolvedConvId !== targetConvId) {
         setSelectedConvId(resolvedConvId);
       }
       onChanged();
+
+      if (pendingHandoff && !ctrl.signal.aborted && handoffDepth < 3) {
+        const handoffInfo: { summary: string; continuationPrompt: string; steps: number } =
+          pendingHandoff;
+        const convRes = await fetch("/api/agent/conversations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            kind: "subagent",
+            subagentId,
+            title: `${sub.name}: Продолжение #${handoffDepth + 1}`,
+          }),
+        });
+        if (convRes.ok) {
+          const convData = (await convRes.json()) as { conversation: SubagentConversation };
+          setSelectedConvId(convData.conversation.id);
+          setMessages([]);
+          setTokenUsage(null);
+          onChanged();
+          await runSubagentTurn(handoffInfo.continuationPrompt, {
+            convIdOverride: convData.conversation.id,
+            attachmentsOverride: [],
+            sessionAttachmentsOverride: nextSessionAttachments,
+            historyOverride: [],
+            handoffDepth: handoffDepth + 1,
+          });
+          return;
+        }
+      }
+
       if (resolvedConvId) {
         await loadConversation(resolvedConvId);
       }
@@ -2014,8 +2209,14 @@ function SubagentChatViewer({
       setLive({ reasoning: "", text: "", status: "", actorLabel: "", overseerReasoning: "" });
       setSubApproval(null);
     } finally {
+      streamRunningRef.current = false;
       setRunning(false);
     }
+  };
+
+  const send = async () => {
+    if (!draft.trim() || !sub || running) return;
+    await runSubagentTurn(draft);
   };
 
   return (
@@ -2043,6 +2244,16 @@ function SubagentChatViewer({
             {sub?.unlockApi
               ? sub.model.trim() || "Свой API"
               : `API Оркестратора (${settings.model.trim() || "по умолчанию"})`}
+          </Badge>
+          <Badge
+            className={
+              sub?.toolProfile === "full"
+                ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-400"
+                : "border-border bg-card2 text-muted"
+            }
+          >
+            <Wrench size={10} />
+            {sub?.toolProfile === "full" ? "Полные инструменты" : "Урезанные"}
           </Badge>
         </span>
       }
@@ -2117,6 +2328,22 @@ function SubagentChatViewer({
         </div>
       )}
 
+      {handoffNotice && (
+        <div className="mb-2.5 flex items-center justify-between gap-2 rounded-xl border border-violet-500/40 bg-violet-500/10 px-3 py-2 text-xs text-violet-300">
+          <span className="inline-flex items-center gap-1.5">
+            <Sparkles size={13} className="shrink-0" />
+            {handoffNotice}
+          </span>
+          <button
+            type="button"
+            onClick={() => setHandoffNotice(null)}
+            className="text-[11px] opacity-75 hover:opacity-100"
+          >
+            Скрыть
+          </button>
+        </div>
+      )}
+
       {/* Лента сообщений */}
       <div
         ref={scrollRef}
@@ -2132,37 +2359,93 @@ function SubagentChatViewer({
             Сообщений нет. Напишите субагенту напрямую — задача выполнится в его собственном изолированном контексте.
           </p>
         )}
-        {messages.map((m) => (
-          <div
-            key={m.id}
-            className={cn(
-              "rounded-xl border p-3 text-xs",
-              m.role === "user"
-                ? "border-accent/30 bg-accent/10"
-                : "border-border bg-card",
-            )}
-          >
-            <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-medium text-muted">
-              <span>{m.role === "user" ? "Вы" : sub?.name ?? "Субагент"}</span>
-            </div>
-            {m.reasoning && (
-              <div className="mb-2 rounded-lg border border-border/80 bg-card2/70 p-2">
-                <div className="mb-1 flex items-center gap-1 text-[10px] font-medium text-muted">
-                  <Brain size={11} className="text-accent2" /> Размышления
+        {messages.map((m) => {
+          const normalizedAttachments = (Array.isArray(m.attachments) ? m.attachments : []).map(
+            (att) => (typeof att === "string" ? { name: att } : att),
+          );
+          const rotationActions = (Array.isArray(m.actions) ? m.actions : []).filter(
+            (act): act is { type: string; summary?: string; steps?: number } =>
+              typeof act === "object" &&
+              act !== null &&
+              (act.type === "subagent_chat_rotated" || act.type === "subagent_handoff_new_chat"),
+          );
+
+          return (
+            <div
+              key={m.id}
+              className={cn(
+                "rounded-xl border p-3 text-xs",
+                m.role === "user"
+                  ? "border-accent/30 bg-accent/10"
+                  : "border-border bg-card",
+              )}
+            >
+              <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-medium text-muted">
+                <span>{m.role === "user" ? "Вы" : sub?.name ?? "Субагент"}</span>
+              </div>
+              {m.reasoning && (
+                <div className="mb-2 rounded-lg border border-border/80 bg-card2/70 p-2">
+                  <div className="mb-1 flex items-center gap-1 text-[10px] font-medium text-muted">
+                    <Brain size={11} className="text-accent2" /> Размышления
+                  </div>
+                  <pre className="max-h-36 overflow-y-auto whitespace-pre-wrap font-mono text-[11px] text-muted">
+                    {m.reasoning}
+                  </pre>
                 </div>
-                <pre className="max-h-36 overflow-y-auto whitespace-pre-wrap font-mono text-[11px] text-muted">
-                  {m.reasoning}
-                </pre>
-              </div>
-            )}
-            <div className="whitespace-pre-wrap leading-relaxed text-text">{m.content}</div>
-            {m.error && (
-              <div className="mt-2 rounded-lg border border-red-500/35 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-red-400">
-                {m.error}
-              </div>
-            )}
-          </div>
-        ))}
+              )}
+              {normalizedAttachments.length > 0 && (
+                <div className="mb-2 flex flex-wrap gap-1.5">
+                  {normalizedAttachments.map((att, idx) => (
+                    <div
+                      key={`${att.name}-${idx}`}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card2/80 px-2 py-1 text-[11px] text-text"
+                    >
+                      {att.image && (
+                        /* eslint-disable-next-line @next/next/no-img-element */
+                        <img
+                          src={att.image}
+                          alt={att.name}
+                          className="h-6 w-6 rounded object-cover"
+                        />
+                      )}
+                      <Paperclip size={11} className="text-cyan-400" />
+                      <span className="max-w-[180px] truncate font-medium">{att.name}</span>
+                      {typeof att.size === "number" && att.size > 0 && (
+                        <span className="text-[10px] text-muted">{formatFileSize(att.size)}</span>
+                      )}
+                      {att.sandboxPath && (
+                        <code className="rounded bg-card px-1 text-[10px] text-cyan-300">
+                          {att.sandboxPath}
+                        </code>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {rotationActions.map((act, idx) => (
+                <div
+                  key={`rot-${idx}`}
+                  className="mb-2 rounded-lg border border-violet-500/35 bg-violet-500/10 px-2.5 py-1.5 text-[11px] text-violet-200"
+                >
+                  <div className="font-semibold">
+                    Перенос в новый чат ({act.steps ?? 300} шагов)
+                  </div>
+                  {act.summary && (
+                    <p className="mt-0.5 whitespace-pre-wrap text-[10px] text-violet-300/90">
+                      {act.summary}
+                    </p>
+                  )}
+                </div>
+              ))}
+              <div className="whitespace-pre-wrap leading-relaxed text-text">{m.content}</div>
+              {m.error && (
+                <div className="mt-2 rounded-lg border border-red-500/35 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-red-400">
+                  {m.error}
+                </div>
+              )}
+            </div>
+          );
+        })}
         {running && (
           <div className="space-y-2 rounded-xl border border-cyan-500/35 bg-card p-3 text-xs">
             <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-medium text-cyan-400">
@@ -2237,8 +2520,84 @@ function SubagentChatViewer({
         </ApprovalToast>
       )}
 
+      {/* Прикреплённые файлы / макеты дизайна (доступны субагенту и сохраняются в сессии) */}
+      {(attachments.length > 0 || sessionAttachments.length > 0) && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-1.5 rounded-xl border border-border bg-card2/60 p-2">
+          {attachments.map((att, idx) => (
+            <span
+              key={`new-${att.name}-${idx}`}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2 py-1 text-[11px] text-cyan-200"
+            >
+              {att.image && (
+                /* eslint-disable-next-line @next/next/no-img-element */
+                <img src={att.image} alt={att.name} className="h-4 w-4 rounded object-cover" />
+              )}
+              <Paperclip size={11} />
+              <span className="max-w-[150px] truncate">{att.name}</span>
+              <span className="text-[10px] opacity-70">{formatFileSize(att.size)}</span>
+              <button
+                type="button"
+                onClick={() => setAttachments((prev) => prev.filter((_, i) => i !== idx))}
+                aria-label={`Убрать вложение ${att.name}`}
+                className="text-muted hover:text-text"
+              >
+                <X size={11} />
+              </button>
+            </span>
+          ))}
+          {sessionAttachments
+            .filter((sa) => !attachments.some((a) => a.name === sa.name && a.size === sa.size))
+            .map((sa, idx) => (
+              <span
+                key={`hist-${sa.name}-${idx}`}
+                className="inline-flex items-center gap-1 rounded-lg border border-border bg-card px-2 py-1 text-[11px] text-muted"
+                title="Файл дизайна/контекста из предыдущего сообщения будет передан в _shared_files"
+              >
+                <Paperclip size={10} />
+                <span className="max-w-[140px] truncate">{sa.name}</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSessionAttachments((prev) =>
+                      prev.filter((x) => !(x.name === sa.name && x.size === sa.size)),
+                    )
+                  }
+                  aria-label={`Удалить из памяти сессии ${sa.name}`}
+                  className="hover:text-text"
+                >
+                  <X size={10} />
+                </button>
+              </span>
+            ))}
+        </div>
+      )}
+
       {/* Поле отправки */}
       <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          aria-label="Файлы для субагента"
+          className="hidden"
+          onChange={(e) => {
+            if (e.target.files?.length) {
+              void attachFiles(e.target.files);
+              e.target.value = "";
+            }
+          }}
+        />
+        <Button
+          type="button"
+          size="md"
+          variant="secondary"
+          disabled={running}
+          onClick={() => fileInputRef.current?.click()}
+          title="Прикрепить файлы, скриншоты или макеты дизайна (доступны субагентам в _shared_files)"
+          aria-label="Прикрепить файл для субагента"
+        >
+          <Paperclip size={14} />
+        </Button>
         <Textarea
           value={draft}
           onChange={(e) => setDraft(e.target.value)}

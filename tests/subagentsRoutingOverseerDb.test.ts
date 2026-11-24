@@ -73,4 +73,46 @@ describe("SQLite DB + миграция 0006 для routingMode и Надсмот
     expect(cleared.overseer.hasApiKey).toBe(false);
     expect(cleared.overseer.apiKeyHint).toBe("");
   });
+
+  it("миграция 0007: хранит toolProfile, posX/posY узлов и orchestratorPos", async () => {
+    const sub = await subagentsRepo.createSubagent(userId, {
+      name: "Дизайнер",
+      toolProfile: "full",
+      posX: 420,
+      posY: 185,
+    });
+    expect(sub.toolProfile).toBe("full");
+    expect(sub.posX).toBe(420);
+    expect(sub.posY).toBe(185);
+
+    const updated = await subagentsRepo.updateSubagent(userId, sub.id, {
+      toolProfile: "restricted",
+    });
+    expect(updated?.toolProfile).toBe("restricted");
+
+    await subagentsRepo.updateSubagentsDependencyTree(userId, [
+      {
+        id: sub.id,
+        isActive: true,
+        parentSubagentId: null,
+        orchestratorCanCall: true,
+        allowedCallees: ["*"],
+        posX: 510,
+        posY: 260,
+      },
+    ]);
+    await subagentsRepo.upsertAgentOrchestrationConfig(userId, {
+      orchestratorPosX: 180,
+      orchestratorPosY: 95,
+    });
+
+    const list = await subagentsRepo.listSubagentsPublic(userId);
+    const reloaded = list.find((s) => s.id === sub.id);
+    expect(reloaded?.posX).toBe(510);
+    expect(reloaded?.posY).toBe(260);
+
+    const cfg = await subagentsRepo.getAgentOrchestrationConfigPublic(userId);
+    expect(cfg.orchestratorPosX).toBe(180);
+    expect(cfg.orchestratorPosY).toBe(95);
+  });
 });
