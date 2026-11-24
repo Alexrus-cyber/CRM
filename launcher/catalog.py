@@ -155,7 +155,7 @@ CHAT_AGENT = AgentSpec(
         Field("host", "Адрес прослушивания", "text", "127.0.0.1",
               hint="127.0.0.1 — только этот ПК; 0.0.0.0 — доступ из локальной сети (LAN / Docker)"),
         Field("port", "Порт", "int", 8899),
-        Field("max_steps", "Предел шагов на задачу", "int", 500),
+        Field("max_steps", "Предел шагов на задачу (0 — без лимита)", "int", 0),
         Field("trust_level", "Уровень доверия ИИ", "choice", "verified", choices=TRUST_LEVELS),
         Field("workspace", "Папка для файлов агента", "folder", ""),
         Field("open_browser", "Открыть адрес после запуска", "bool", True),

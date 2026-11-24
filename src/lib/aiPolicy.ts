@@ -10,18 +10,17 @@
  * | Роль            | Чат, токенов | В месяц     | Шагов агента | RAG | Раздумья            |
  * | --------------- | ------------ | ----------- | ------------ | --- | ------------------- |
  * | Главный админ   | без лимита   | без лимита  | без лимита   | да  | любые               |
- * | Администратор   | 1 000 000    | без лимита  | до 500       | да  | любые               |
- * | Разработчик     | 1 000 000    | 5 000 000   | до 500       | да  | любые               |
- * | Менеджер        | 1 000 000    | 1 500 000   | до 500       | нет | без / коротко       |
- * | Консультант     | 1 000 000    | 500 000     | до 500       | нет | без / коротко       |
- * | Сотрудник       | 1 000 000    | 500 000     | до 500       | нет | без / коротко       |
+ * | Администратор   | 1 000 000    | без лимита  | без лимита   | да  | любые               |
+ * | Разработчик     | 1 000 000    | 5 000 000   | без лимита   | да  | любые               |
+ * | Менеджер        | 1 000 000    | 1 500 000   | без лимита   | нет | без / коротко       |
+ * | Консультант     | 1 000 000    | 500 000     | без лимита   | нет | без / коротко       |
+ * | Сотрудник       | 1 000 000    | 500 000     | без лимита   | нет | без / коротко       |
  *
  * Месячный лимит администратор может расширить конкретному сотруднику на
  * текущий месяц (таблица `ai_quota_overrides`) — это не меняет роль.
  */
 import type { Role } from "@/db/schema";
 import type { ReasoningMode } from "./ai";
-import { AGENT_MAX_STEPS } from "./genParams";
 import {
   canViewAgentUsage,
   hasAgentAccess,
@@ -35,7 +34,7 @@ export type AiRolePolicy = {
   perChatTokens: number | null;
   /** Месячный лимит; null — без ограничения. */
   monthlyTokens: number | null;
-  /** Предел шагов агента/оператора; null — без ограничения. */
+  /** Предел шагов агента, субагентов и оператора; null — без ограничения для всех ролей. */
   maxSteps: number | null;
   /** Доступна ли RAG-папка. */
   rag: boolean;
@@ -69,50 +68,50 @@ export const AI_ROLE_POLICY: Record<Role, AiRolePolicy> = {
     role: "admin",
     perChatTokens: 1_000_000,
     monthlyTokens: null,
-    maxSteps: AGENT_MAX_STEPS,
+    maxSteps: null,
     rag: true,
     reasoning: FULL_REASONING,
-    summary: "Полный доступ: любые режимы раздумий и RAG, до 1 млн на чат и до 500 шагов, без месячного лимита",
+    summary: "Полный доступ: любые режимы раздумий и RAG, до 1 млн на чат, шаги без лимита и без месячного лимита",
     chatsUnlimited: true,
   },
   developer: {
     role: "developer",
     perChatTokens: 1_000_000,
     monthlyTokens: 5_000_000,
-    maxSteps: AGENT_MAX_STEPS,
+    maxSteps: null,
     rag: true,
     reasoning: FULL_REASONING,
-    summary: "Полный доступ: любые режимы и RAG, до 1 млн на чат, 5 млн в месяц и до 500 шагов",
+    summary: "Полный доступ: любые режимы и RAG, до 1 млн на чат, 5 млн в месяц и шаги без лимита",
     chatsUnlimited: true,
   },
   manager: {
     role: "manager",
     perChatTokens: 1_000_000,
     monthlyTokens: 1_500_000,
-    maxSteps: AGENT_MAX_STEPS,
+    maxSteps: null,
     rag: false,
     reasoning: LIGHT_REASONING,
-    summary: "Раздумья только «без» или «коротко», RAG выключен, 1,5 млн токенов в месяц и до 500 шагов",
+    summary: "Раздумья только «без» или «коротко», RAG выключен, 1,5 млн токенов в месяц и шаги без лимита",
     chatsUnlimited: true,
   },
   consultant: {
     role: "consultant",
     perChatTokens: 1_000_000,
     monthlyTokens: 500_000,
-    maxSteps: AGENT_MAX_STEPS,
+    maxSteps: null,
     rag: false,
     reasoning: LIGHT_REASONING,
-    summary: "Раздумья только «без» или «коротко», RAG выключен, 500 тыс. токенов в месяц и до 500 шагов",
+    summary: "Раздумья только «без» или «коротко», RAG выключен, 500 тыс. токенов в месяц и шаги без лимита",
     chatsUnlimited: true,
   },
   user: {
     role: "user",
     perChatTokens: 1_000_000,
     monthlyTokens: 500_000,
-    maxSteps: AGENT_MAX_STEPS,
+    maxSteps: null,
     rag: false,
     reasoning: LIGHT_REASONING,
-    summary: "Раздумья только «без» или «коротко», RAG выключен, 500 тыс. токенов в месяц и до 500 шагов",
+    summary: "Раздумья только «без» или «коротко», RAG выключен, 500 тыс. токенов в месяц и шаги без лимита",
     chatsUnlimited: true,
   },
 };
@@ -141,7 +140,7 @@ export function chatTokensLeft(chat: { tokensTotal: number }, policy: AiRolePoli
   return Math.max(policy.perChatTokens - chat.tokensTotal, 0);
 }
 
-/** Предел шагов агента/оператора для роли (`null` у главного администратора, `500` у остальных). */
+/** Предел шагов агента/субагентов/оператора для роли (`null` — без лимита для всех ролей). */
 export function roleStepLimit(role: Role): number | null {
   return (AI_ROLE_POLICY[role] ?? AI_ROLE_POLICY.user).maxSteps;
 }

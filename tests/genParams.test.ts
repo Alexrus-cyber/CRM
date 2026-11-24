@@ -39,24 +39,26 @@ describe("настройки раздумий и генерации", () => {
     expect(normalizeParams({ maxTokens: null }, { unlimited: true }).maxTokens).toBeNull();
   });
 
-  it("различает безлимитный super_admin и потолок 500 шагов для остальных ролей (включая admin)", () => {
+  it("шаги без лимита для всех ролей: 0/null/undefined = без лимита, положительное число без потолка", () => {
+    // Все роли имеют безлимитные шаги.
     expect(isUnlimitedStepsRole("super_admin")).toBe(true);
-    expect(isUnlimitedStepsRole("admin")).toBe(false);
-    expect(isUnlimitedStepsRole("manager")).toBe(false);
+    expect(isUnlimitedStepsRole("admin")).toBe(true);
+    expect(isUnlimitedStepsRole("manager")).toBe(true);
 
     expect(maxStepsCapForRole("super_admin")).toBeNull();
-    expect(maxStepsCapForRole("admin")).toBe(AGENT_MAX_STEPS);
-    expect(maxStepsCapForRole("employee")).toBe(AGENT_MAX_STEPS);
+    expect(maxStepsCapForRole("admin")).toBeNull();
+    expect(maxStepsCapForRole("employee")).toBeNull();
 
-    // super_admin: 0 = без лимита, произвольное положительное число не режется потолком 500/2000
+    // 0 / null / undefined -> без лимита (0)
     expect(resolveStepsForRole("super_admin", 0, 0)).toBe(0);
     expect(resolveStepsForRole("super_admin", undefined, 0)).toBe(0);
-    expect(resolveStepsForRole("super_admin", 5000, 0)).toBe(5000);
+    expect(resolveStepsForRole("admin", 0, 15)).toBe(0);
+    expect(resolveStepsForRole("admin", null, 15)).toBe(0);
 
-    // admin и рядовые роли: жёсткий предел 500 шагов и запрет 0 (безлимита)
-    expect(resolveStepsForRole("admin", 0, 15)).toBe(15);
-    expect(resolveStepsForRole("admin", 5000, 15)).toBe(AGENT_MAX_STEPS);
+    // любое положительное число принимается без потолка для всех ролей
+    expect(resolveStepsForRole("super_admin", 5000, 0)).toBe(5000);
+    expect(resolveStepsForRole("admin", 5000, 15)).toBe(5000);
     expect(resolveStepsForRole("admin", 120, 15)).toBe(120);
-    expect(resolveStepsForRole("developer", 999, 15)).toBe(AGENT_MAX_STEPS);
+    expect(resolveStepsForRole("developer", 999, 15)).toBe(999);
   });
 });

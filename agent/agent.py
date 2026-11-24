@@ -138,9 +138,9 @@ def _load_secrets_file() -> None:
 
 
 _load_secrets_file()
-MAX_STEPS = _env_int("AGENT_MAX_STEPS", 500, minimum=1)
+MAX_STEPS = _env_int("AGENT_MAX_STEPS", 0, minimum=0)
 MAX_STEPS_LIMIT = MAX_STEPS
-MAX_RUN_TOKENS = _env_int("AGENT_MAX_RUN_TOKENS", 2500000, minimum=0)
+MAX_RUN_TOKENS = _env_int("AGENT_MAX_RUN_TOKENS", 0, minimum=0)
 TIMEOUT = _env_int("AGENT_TIMEOUT", 180, minimum=5)
 HEADER_TIMEOUT = _env_int("AGENT_HEADER_TIMEOUT", 60, minimum=2)
 SSE_WRITE_TIMEOUT = _env_int("AGENT_SSE_WRITE_TIMEOUT", 30, minimum=5)
@@ -520,6 +520,17 @@ SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CR
      если критических не было, `call_tester` уже спросит решение человека; если же сначала
      исправлялись критические ошибки, перед правкой мелких ОБЯЗАТЕЛЬНО вызови `confirm_minor_fixes`,
      чтобы спросить человека, нужно ли вносить эти изменения. Без согласия человека мелкие правки не вноси.
+11. Оркестратор и пользовательские Субагенты (`call_subagent`, `list_subagents`):
+   - Ты выступаешь как **Главный Агент — Оркестратор**.
+   - Если у пользователя подключены активные субагенты (до 10 активных из до 50 в базе), разбивай крупные
+     или специализированные задачи между ними согласно дереву зависимостей!
+   - Каждый вызов `call_subagent(subagent=..., summary=..., task=..., sandbox_project=...)` запускает
+     субагента в ЕГО СОБСТВЕННОМ НОВОМ ЧАТЕ (чтобы не тянуть длинную историю и тратить минимум токенов
+     на контекст и раздумья), при этом субагенту открыт общий доступ к проекту в Sandbox/GitHub и ко всем Tools!
+   - При каждом вызове субагента ОБЯЗАТЕЛЬНО формируй подробное `summary` (что уже сделано, какие файлы
+     проекта созданы/изменены, что нужно сделать дальше).
+   - Если субагент по завершении работы передаёт запрос Оркестратору вызвать следующего субагента
+     (по дереву зависимостей), изучи его `summary` и вызови нужного субагента через `call_subagent`.
 
 Правила безопасности и поведения:
 - Создавая проект или сайт, ВСЕГДА сначала собирай структуру папок и файлов в Sandbox через
@@ -583,6 +594,16 @@ TESTER_SYSTEM_PROMPT = """Ты — независимый QA-инженер (п�
    чтобы твой ответ и вердикт гарантированно попали в базу данных и вернулись Агенту.
 5. Не правь код самостоятельно, если ты запущен на проверку — твоя задача проверить, найти все недостатки,
    указать их и вернуть точный отчёт Агенту для исправления.
+"""
+
+SUBAGENT_BASE_SYSTEM_PROMPT = """Ты — специализированный пользовательский Субагент внутри CRM (Nova CRM), работающий под управлением Главного Агента — Оркестратора.
+Ты запущен в СВОЁМ НОВОМ ИЗОЛИРОВАННОМ ЧАТЕ, чтобы тратить минимум токенов на контекст и раздумья, при этом у тебя есть полный доступ к общему проекту в Sandbox/GitHub от главного Агента и ко ВСЕМ инструментам (Tools): Sandbox, анализ и редактирование кода, команды/тесты, браузерный инспектор, QA-проверки, файлы, GitHub и Оператор.
+
+Правила работы Субагента:
+1. Действуй строго в рамках переданной подзадачи и своего системного промпта. Общайся по-русски, чётко и по делу.
+2. Опирайся на входное `summary` от Оркестратора (или предыдущего субагента) и работай непосредственно с общими файлами проекта в Sandbox (`sandbox_list`, `sandbox_read_file`, `sandbox_write_file`, `code_search`, `run_command` и др.).
+3. Если по ходу работы требуется подключить другого субагента из дерева зависимостей — вызови `request_subagent(target_subagent=..., summary=..., next_task=..., sandbox_project=...)`, обязательно сформировав подробное `summary` своих действий и того, что нужно сделать дальше.
+4. По завершении своей подзадачи вызови `report_to_orchestrator(summary=..., status=..., files_touched=..., request_next_subagent=..., next_task=...)`, чтобы Оркестратор получил точное `summary` выполненных действий, список затронутых файлов и понимал следующие шаги.
 """
 
 BASE_TOOLS = [
@@ -1058,12 +1079,144 @@ TESTER_ORCHESTRATION_TOOLS = [
     },
 ]
 
+SUBAGENT_ORCHESTRATION_TOOLS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "call_subagent",
+            "description": (
+                "Вызвать активного пользовательского субагента из дерева зависимостей Оркестратора. "
+                "Субагент запускается в собственном НОВОМ изолированном чате (экономия токенов на раздумья и контекст), "
+                "получает полный доступ ко всем Tools и общему проекту в Sandbox/GitHub, выполняет подзадачу "
+                "и возвращает структурированное summary обратно Оркестратору."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subagent": {
+                        "type": "string",
+                        "description": "Slug, имя или ID активного субагента (например 'backend-dev' или 'Архитектор').",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": (
+                            "Обязательное summary для субагента: что уже сделано в проекте, ключевые файлы/архитектура "
+                            "и контекст предыдущих шагов, чтобы субагент сразу понял задачу без перечитывания всего чата."
+                        ),
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "Конкретное задание, которое должен выполнить этот субагент.",
+                    },
+                    "sandbox_project": {
+                        "type": "string",
+                        "description": "Папка общего проекта внутри Sandbox (например 'landing-app' или '.').",
+                    },
+                },
+                "required": ["subagent", "summary"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_subagents",
+            "description": (
+                "Показать список активных субагентов пользователя (до 10 активных), дерево зависимостей "
+                "(кто кого может вызывать), режим API каждого субагента и недавние summary запусков."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+]
+
+SUBAGENT_HANDOFF_TOOLS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "request_subagent",
+            "description": (
+                "Попросить Главного Агента (Оркестратора) вызвать другого активного субагента по дереву зависимостей. "
+                "Передай обязательное summary своих действий и next_task (что должен сделать целевой субагент). "
+                "Оркестратор проверит дерево зависимостей, запустит целевого субагента в новом чате с общим доступом к Sandbox-проекту "
+                "и вернёт тебе его итоговое summary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_subagent": {
+                        "type": "string",
+                        "description": "Slug, имя или ID целевого субагента.",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Summary выполненных тобой действий, изменённых файлов и важных деталей для другого субагента и Оркестратора.",
+                    },
+                    "next_task": {
+                        "type": "string",
+                        "description": "Чёткое задание, что именно должен сделать вызываемый субагент.",
+                    },
+                    "sandbox_project": {
+                        "type": "string",
+                        "description": "Папка общего проекта в Sandbox (по умолчанию текущая папка проекта).",
+                    },
+                },
+                "required": ["target_subagent", "summary", "next_task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "report_to_orchestrator",
+            "description": (
+                "Завершить свою подзадачу и передать итоговое summary Главному Агенту (Оркестратору). "
+                "При необходимости можно также указать request_next_subagent и next_task, чтобы попросить Оркестратора "
+                "передать эстафету следующему субагенту."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Подробное, но ёмкое summary: какие действия выполнены, какие файлы изменены и что нужно делать дальше.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["completed", "handoff", "blocked"],
+                        "description": "Статус выполнения подзадачи.",
+                    },
+                    "files_touched": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Список созданных или изменённых файлов в Sandbox/GitHub.",
+                    },
+                    "request_next_subagent": {
+                        "type": "string",
+                        "description": "Необязательно: slug или имя другого субагента, которого ты просишь Оркестратора вызвать дальше.",
+                    },
+                    "next_task": {
+                        "type": "string",
+                        "description": "Необязательно: задача для следующего субагента или рекомендация Оркестратору.",
+                    },
+                },
+                "required": ["summary"],
+            },
+        },
+    },
+]
+
 TOOLS = (
     BASE_TOOLS
     + SANDBOX_TOOLS
     + BROWSER_TOOLS
     + OPERATOR_TOOLS
     + TESTER_ORCHESTRATION_TOOLS
+    + SUBAGENT_ORCHESTRATION_TOOLS
+    + SUBAGENT_HANDOFF_TOOLS
     + qa_tools.QA_TOOLS
     + code_tools.CODE_READ_TOOLS
     + code_tools.CODE_EXEC_TOOLS
@@ -1175,6 +1328,19 @@ def normalize_trust(raw: Any) -> str:
     return "verified"
 
 
+def _dedupe_tools(tool_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for item in tool_list:
+        fn = (item.get("function") or {}) if isinstance(item, dict) else {}
+        t_name = str(fn.get("name") or "")
+        if not t_name or t_name in seen:
+            continue
+        seen.add(t_name)
+        out.append(item)
+    return out
+
+
 def tools_for_trust(
     trust_level: str,
     *,
@@ -1185,6 +1351,36 @@ def tools_for_trust(
     gh_write = list(github_tools.GITHUB_WRITE_TOOLS) if (has_github and trust_level != "none") else []
     code_read = list(code_tools.CODE_READ_TOOLS)
     code_exec = list(code_tools.CODE_EXEC_TOOLS) if trust_level != "none" else []
+    if role == "subagent":
+        # Все Tools доступны субагенту (с учётом уровня доверия) + инструменты вызова через Оркестратора и сдачи summary.
+        if trust_level == "none":
+            submit_only = [t for t in qa_tools.QA_TOOLS if t["function"]["name"] == "qa_submit_report"]
+            safe_orch = [
+                t
+                for t in TESTER_ORCHESTRATION_TOOLS
+                if t["function"]["name"] in ("confirm_minor_fixes", "list_tester_reports")
+            ]
+            return _dedupe_tools(
+                list(BASE_TOOLS)
+                + gh_read
+                + code_read
+                + submit_only
+                + safe_orch
+                + list(SUBAGENT_HANDOFF_TOOLS)
+            )
+        return _dedupe_tools(
+            list(BASE_TOOLS)
+            + list(SANDBOX_TOOLS)
+            + list(BROWSER_TOOLS)
+            + list(OPERATOR_TOOLS)
+            + gh_read
+            + gh_write
+            + code_read
+            + code_exec
+            + list(qa_tools.QA_TOOLS)
+            + list(TESTER_ORCHESTRATION_TOOLS)
+            + list(SUBAGENT_HANDOFF_TOOLS)
+        )
     if role == "tester":
         if trust_level == "none":
             submit_only = [t for t in qa_tools.QA_TOOLS if t["function"]["name"] == "qa_submit_report"]
@@ -1206,7 +1402,12 @@ def tools_for_trust(
             for t in TESTER_ORCHESTRATION_TOOLS
             if t["function"]["name"] in ("confirm_minor_fixes", "list_tester_reports")
         ]
-        return list(BASE_TOOLS) + gh_read + code_read + safe_orch
+        safe_sub = [
+            t
+            for t in SUBAGENT_ORCHESTRATION_TOOLS
+            if t["function"]["name"] in ("list_subagents", "call_subagent")
+        ]
+        return list(BASE_TOOLS) + gh_read + code_read + safe_orch + safe_sub
     return (
         list(BASE_TOOLS)
         + list(SANDBOX_TOOLS)
@@ -1217,6 +1418,7 @@ def tools_for_trust(
         + code_read
         + code_exec
         + list(TESTER_ORCHESTRATION_TOOLS)
+        + list(SUBAGENT_ORCHESTRATION_TOOLS)
     )
 
 
@@ -1257,6 +1459,8 @@ def run_tool(
     github_ctx: Optional[Dict[str, Any]] = None,
     unlimited: bool = False,
     tester_ctx: Optional[Dict[str, Any]] = None,
+    subagent_ctx: Optional[Dict[str, Any]] = None,
+    subagent_state: Optional[Dict[str, Any]] = None,
     qa_state: Optional[Dict[str, Any]] = None,
     run_state: Optional[Dict[str, Any]] = None,
     on_status: Optional[Any] = None,
@@ -1400,6 +1604,130 @@ def run_tool(
         events.extend(session_result.get("agentEvents") or [])
         return str(session_result.get("agentText") or "Проверка Тестировщиком завершена."), events
 
+    if name == "list_subagents":
+        s_ctx = subagent_ctx or {}
+        sub_list = s_ctx.get("subagents") or []
+        recent_sub = s_ctx.get("recent_reports") or []
+        if not isinstance(sub_list, list) or not sub_list:
+            return (
+                "У пользователя сейчас нет активных пользовательских субагентов. "
+                "Их можно создать и активировать во вкладке «Субагенты» (до 10 активных, до 50 в базе).",
+                events,
+            )
+        tree_txt = build_orchestrator_subagents_prompt(sub_list, recent_sub)
+        return tree_txt, events
+
+    if name == "call_subagent":
+        target_ref = str(args.get("subagent") or "").strip()
+        summary_txt = str(args.get("summary") or "").strip()
+        task_txt = str(args.get("task") or "").strip()
+        sandbox_proj = str(args.get("sandbox_project") or ".").strip() or "."
+        if not target_ref:
+            raise AgentError("Укажите subagent (slug, имя или ID активного субагента)")
+        if not summary_txt:
+            raise AgentError("Передайте обязательное summary для субагента, чтобы он знал контекст и задачи")
+        if sandbox_proj != ".":
+            try:
+                sandbox_mod.safe_resolve(sandbox_root, sandbox_proj, allow_root=True)
+            except sandbox_mod.SandboxError as error:
+                raise AgentError(str(error)) from error
+        sub_res = run_subagent_session(
+            target_ref=target_ref,
+            summary=summary_txt,
+            task=task_txt,
+            sandbox_project=sandbox_proj,
+            caller_kind="orchestrator",
+            caller_subagent=None,
+            trust_level=trust,
+            approval_fn=approval_fn,
+            sandbox_root=sandbox_root,
+            browser_manager=browser_manager,
+            github_ctx=github_ctx,
+            unlimited=unlimited,
+            tester_ctx=tester_ctx,
+            subagent_ctx=subagent_ctx,
+        )
+        events.extend(sub_res.get("agentEvents") or [])
+        return str(sub_res.get("agentText") or "Субагент завершил работу."), events
+
+    if name == "request_subagent":
+        target_ref = str(args.get("target_subagent") or "").strip()
+        summary_txt = str(args.get("summary") or "").strip()
+        next_task_txt = str(args.get("next_task") or "").strip()
+        default_proj = str((subagent_state or {}).get("sandboxProject") or ".").strip() or "."
+        sandbox_proj = str(args.get("sandbox_project") or default_proj).strip() or default_proj
+        if not target_ref:
+            raise AgentError("Укажите target_subagent (slug, имя или ID целевого субагента)")
+        if not summary_txt:
+            raise AgentError("Передайте обязательное summary выполненных действий для передачи через Оркестратора")
+        if not next_task_txt:
+            raise AgentError("Укажите next_task — что должен сделать целевой субагент")
+        caller_meta = (subagent_state or {}).get("subagent") if isinstance(subagent_state, dict) else None
+        sub_res = run_subagent_session(
+            target_ref=target_ref,
+            summary=summary_txt,
+            task=next_task_txt,
+            sandbox_project=sandbox_proj,
+            caller_kind="subagent",
+            caller_subagent=caller_meta if isinstance(caller_meta, dict) else None,
+            trust_level=trust,
+            approval_fn=approval_fn,
+            sandbox_root=sandbox_root,
+            browser_manager=browser_manager,
+            github_ctx=github_ctx,
+            unlimited=unlimited,
+            tester_ctx=tester_ctx,
+            subagent_ctx=subagent_ctx,
+        )
+        events.extend(sub_res.get("agentEvents") or [])
+        return str(sub_res.get("agentText") or "Целевой субагент завершил работу."), events
+
+    if name == "report_to_orchestrator":
+        summary_txt = str(args.get("summary") or "").strip()
+        if not summary_txt:
+            raise AgentError("Укажите summary в report_to_orchestrator")
+        raw_status = str(args.get("status") or "completed").strip().lower()
+        rep_status = raw_status if raw_status in ("completed", "handoff", "blocked") else "completed"
+        raw_files = args.get("files_touched")
+        touched = (
+            [str(f).strip() for f in raw_files if str(f).strip()][:80]
+            if isinstance(raw_files, list)
+            else []
+        )
+        req_next = str(args.get("request_next_subagent") or "").strip()
+        req_task = str(args.get("next_task") or "").strip()
+        if req_next and rep_status == "completed":
+            rep_status = "handoff"
+        report_obj = {
+            "summary": summary_txt,
+            "status": rep_status,
+            "filesTouched": touched,
+            "requestNextSubagent": req_next,
+            "nextTask": req_task,
+        }
+        if isinstance(subagent_state, dict):
+            subagent_state["report"] = report_obj
+        events.append(
+            {
+                "type": "subagent_report",
+                "status": rep_status,
+                "reportSummary": summary_txt[:1000],
+                "summary": summary_txt[:1000],
+                "requestedCalleeSlug": req_next,
+                "requestedCalleeTask": req_task[:500],
+                "label": (
+                    f"Summary передано Оркестратору → запрос вызова «{req_next}»"
+                    if req_next
+                    else "Summary передано Оркестратору"
+                ),
+            }
+        )
+        return (
+            "Summary успешно сформировано и передано Главному Агенту (Оркестратору)."
+            + (f" Запрос на вызов субагента «{req_next}» зафиксирован." if req_next else ""),
+            events,
+        )
+
     if name in github_tools.ALL_GITHUB_TOOL_NAMES:
         try:
             return github_tools.run_github_tool(
@@ -1470,7 +1798,7 @@ def run_tool(
         try:
             raw_steps = args.get("max_steps")
             parsed_steps = int(raw_steps) if raw_steps is not None and raw_steps != "" else (50 if mode == "game" else 30)
-            op_steps = max(0, parsed_steps) if unlimited else max(5, min(500, parsed_steps))
+            op_steps = max(0, parsed_steps)
         except (TypeError, ValueError):
             op_steps = 30
         coach_mode = "agent" if args.get("coach_after_each_step", True) else "after_step"
@@ -1583,7 +1911,7 @@ def run_tool(
         try:
             raw_steps = args.get("max_steps")
             parsed_steps = int(raw_steps) if raw_steps is not None and raw_steps != "" else (50 if mode == "game" else 30)
-            op_steps = (max(0, parsed_steps) if unlimited else max(5, min(500, parsed_steps)))
+            op_steps = max(0, parsed_steps)
         except (TypeError, ValueError):
             op_steps = 30
         coach_after = bool(args.get("coach_after_each_step", True))
@@ -3526,6 +3854,14 @@ def _format_tool_target_label(name: str, args: Optional[Dict[str, Any]]) -> str:
         return f"BrowserInspector ({act})" + (f": {target[:70]}" if target else "")
     if name == "run_command":
         return f"Команда: {str(a.get('command') or '').strip()[:80]}"
+    if name == "call_subagent":
+        return f"Вызов субагента: {str(a.get('subagent') or '—').strip()[:60]}"
+    if name == "list_subagents":
+        return "Дерево зависимостей и активные субагенты"
+    if name == "request_subagent":
+        return f"Запрос Оркестратору → субагент «{str(a.get('target_subagent') or '—').strip()[:50]}»"
+    if name == "report_to_orchestrator":
+        return "Передача итогового summary Оркестратору"
     return name
 
 
@@ -3559,7 +3895,7 @@ def run_tester_session(
     params = ctx.get("params") if isinstance(ctx.get("params"), dict) else {}
     emit_sse = ctx.get("emit_sse")
     discovered_max_context = int(ctx.get("discovered_max_context") or 0)
-    steps_cap = int(ctx.get("tester_max_steps") or 24)
+    steps_cap = int(ctx.get("tester_max_steps") or 0)
     has_github_repo = bool(
         github_ctx
         and str(github_ctx.get("token") or "").strip()
@@ -3669,7 +4005,7 @@ def run_tester_session(
     wrapped_tool_approval = _tester_approval_wrapper if approval_fn is not None else None
 
     try:
-        while steps < steps_cap:
+        while steps_cap == 0 or steps < steps_cap:
             if callable(cancel_check) and cancel_check():
                 raise BrokenPipeError("Клиент закрыл соединение")
             if tester_token_cap > 0 and tester_usage_total >= tester_token_cap:
@@ -3818,7 +4154,7 @@ def run_tester_session(
                     and not qa_state.get("report")
                     and reasoning
                     and empty_reply_nudges < 1
-                    and steps < steps_cap
+                    and (steps_cap == 0 or steps < steps_cap)
                 ):
                     empty_reply_nudges += 1
                     _emit(
@@ -4164,7 +4500,7 @@ def run_tester_session(
         if not tester_final_text and not run_error:
             checks_list = qa_state.get("checks") or []
             fallback_bits: List[str] = []
-            if steps >= steps_cap:
+            if steps_cap > 0 and steps >= steps_cap:
                 if checks_list:
                     fallback_bits.append(
                         f"Достигнут лимит шагов Тестировщика ({steps_cap}) до явного qa_submit_report; итоги выполненных проверок:"
@@ -4330,6 +4666,981 @@ def run_tester_session(
         "agentText": "\n".join(lines),
         "agentEvents": [agent_event],
         "done": {**done_payload, "minorDecision": minor_decision},
+    }
+
+
+def _find_subagent_in_list(
+    subagents: List[Dict[str, Any]], ref: Any
+) -> Optional[Dict[str, Any]]:
+    needle = str(ref or "").strip().lower()
+    if not needle:
+        return None
+    for s in subagents:
+        if not isinstance(s, dict):
+            continue
+        if (
+            str(s.get("slug") or "").strip().lower() == needle
+            or str(s.get("id") or "").strip().lower() == needle
+            or str(s.get("name") or "").strip().lower() == needle
+        ):
+            return s
+    for s in subagents:
+        if not isinstance(s, dict):
+            continue
+        name_l = str(s.get("name") or "").strip().lower()
+        slug_l = str(s.get("slug") or "").strip().lower()
+        if needle in name_l or needle in slug_l:
+            return s
+    return None
+
+
+def _is_callee_allowed(caller: Dict[str, Any], target: Dict[str, Any]) -> bool:
+    if caller.get("id") and target.get("id") and caller.get("id") == target.get("id"):
+        return False
+    raw_allowed = caller.get("allowedCallees")
+    if not isinstance(raw_allowed, list):
+        return True
+    norm = {str(x or "").strip().lower() for x in raw_allowed if str(x or "").strip()}
+    if "*" in norm:
+        return True
+    if not norm:
+        return False
+    candidates = {
+        str(target.get("slug") or "").strip().lower(),
+        str(target.get("id") or "").strip().lower(),
+        str(target.get("name") or "").strip().lower(),
+    }
+    candidates.discard("")
+    return bool(norm & candidates)
+
+
+def build_orchestrator_subagents_prompt(
+    subagents: List[Dict[str, Any]],
+    recent_reports: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    clean_subs = [s for s in subagents if isinstance(s, dict)]
+    if not clean_subs:
+        return ""
+    by_id: Dict[int, Dict[str, Any]] = {}
+    children_map: Dict[Optional[int], List[Dict[str, Any]]] = {None: []}
+    for s in clean_subs:
+        sid = int(s.get("id") or 0)
+        if sid > 0:
+            by_id[sid] = s
+            children_map.setdefault(sid, [])
+    for s in clean_subs:
+        pid_raw = s.get("parentSubagentId")
+        pid = int(pid_raw) if isinstance(pid_raw, (int, float)) and int(pid_raw) in by_id else None
+        children_map.setdefault(pid, []).append(s)
+
+    lines: List[str] = [
+        f"ДЕРЕВО ЗАВИСИМОСТЕЙ: Главный Агент (Оркестратор) ↔ Активные Субагенты ({len(clean_subs)}/10 активных):",
+        "Корень: [Оркестратор (Главный Агент)]",
+    ]
+
+    visited: set[int] = set()
+
+    def _render_branch(parent_id: Optional[int], depth: int) -> None:
+        for node in children_map.get(parent_id, []):
+            nid = int(node.get("id") or 0)
+            if nid in visited:
+                continue
+            if nid:
+                visited.add(nid)
+            indent = "  " * depth + "└─ "
+            orch_direct = (
+                "вызов Оркестратором: ДА"
+                if node.get("orchestratorCanCall", True)
+                else "вызов только по цепочке родителя"
+            )
+            allowed = node.get("allowedCallees")
+            if isinstance(allowed, list):
+                if "*" in allowed:
+                    callee_txt = "может просить Оркестратора вызвать: любых активных (*)"
+                elif not allowed:
+                    callee_txt = "возвращает summary только Оркестратору"
+                else:
+                    callee_txt = f"может просить Оркестратора вызвать: {', '.join(str(x) for x in allowed)}"
+            else:
+                callee_txt = "может просить Оркестратора вызвать: любых активных (*)"
+            api_unlocked = bool(node.get("unlockApi")) and bool((node.get("customApi") or {}).get("unlocked"))
+            custom_model = str((node.get("customApi") or {}).get("model") or "")
+            api_txt = f"Своё API ({custom_model or 'custom'})" if api_unlocked else "API Оркестратора"
+            role_part = f" — {node.get('roleTitle')}" if node.get("roleTitle") else ""
+            desc_part = f" | {str(node.get('description') or '')[:160]}" if node.get("description") else ""
+            lines.append(
+                f"{indent}Субагент «{node.get('name')}» (slug: `{node.get('slug')}`, id={nid}{role_part}) "
+                f"[{orch_direct}; {callee_txt}; {api_txt}]{desc_part}"
+            )
+            if nid:
+                _render_branch(nid, depth + 1)
+
+    _render_branch(None, 1)
+    for leftover in clean_subs:
+        lid = int(leftover.get("id") or 0)
+        if lid and lid not in visited:
+            _render_branch(leftover.get("parentSubagentId"), 1)
+
+    lines.append(
+        "\nКак работать Оркестратору с субагентами:\n"
+        "- Вызывай `call_subagent(subagent='<slug>', summary='...', task='...', sandbox_project='...')`, "
+        "чтобы делегировать подзадачи в отдельный свежий чат субагента с общим доступом к Sandbox/GitHub (экономия токенов на раздумья).\n"
+        "- В `summary` ВСЕГДА указывай: что уже сделано, какие файлы проекта созданы/затронуты и что конкретно нужно сделать субагенту.\n"
+        "- Соблюдай дерево зависимостей: напрямую вызывай субагентов с `вызов Оркестратором: ДА`, а дочерних — после или по запросу их родительского субагента."
+    )
+
+    if recent_reports:
+        rep_lines: List[str] = []
+        for r in recent_reports[:5]:
+            if not isinstance(r, dict):
+                continue
+            nxt = (
+                f" → запросил субагента `{r.get('requestedCalleeSlug')}`"
+                if r.get("requestedCalleeSlug")
+                else ""
+            )
+            rep_lines.append(
+                f"- Запуск #{r.get('id', '?')} «{r.get('subagentName') or r.get('subagentSlug') or 'субагент'}» "
+                f"({r.get('sandboxProject') or '.'}, статус={r.get('status')}){nxt}: "
+                f"{str(r.get('outputSummary') or '')[:220]}"
+            )
+        if rep_lines:
+            lines.append("\nНедавние summary субагентов из БД:\n" + "\n".join(rep_lines))
+
+    return "\n".join(lines)
+
+
+def _build_subagent_system_prompt(
+    *,
+    subagent: Dict[str, Any],
+    all_subagents: List[Dict[str, Any]],
+    trust_level: str,
+    sandbox_root: Path,
+    sandbox_project: str,
+    github_ctx: Optional[Dict[str, Any]] = None,
+) -> str:
+    trust_notes = {
+        "full": "Уровень доверия: ПОЛНЫЙ ДОСТУП.",
+        "verified": "Уровень доверия: С ПРОВЕРКОЙ ДАННЫХ (команды и действия на ПК согласуются на сайте).",
+        "none": "Уровень доверия: НЕТ ДОСТУПА К КОМПЬЮТЕРУ (только безопасные инструменты и чтение).",
+    }
+    name = str(subagent.get("name") or "Субагент")
+    slug = str(subagent.get("slug") or "subagent")
+    role_title = str(subagent.get("roleTitle") or "").strip()
+    description = str(subagent.get("description") or "").strip()
+    custom_prompt = str(subagent.get("systemPrompt") or "").strip()
+
+    parts: List[str] = [
+        SUBAGENT_BASE_SYSTEM_PROMPT.strip(),
+        f"\nТвой профиль субагента: «{name}» (slug: `{slug}`)" + (f" · Роль: {role_title}" if role_title else ""),
+    ]
+    if description:
+        parts.append(f"Описание твоей зоны ответственности: {description}")
+    if custom_prompt:
+        parts.append(f"\nСистемный промпт субагента (строго соблюдай эти правила):\n{custom_prompt}")
+
+    parts.append(
+        f"\n{trust_notes.get(trust_level, trust_notes['verified'])}\n"
+        f"Общий корень Sandbox от главного Агента: {sandbox_root}\n"
+        f"Целевой проект в Sandbox: {sandbox_project or '.'}"
+    )
+
+    if github_ctx and str(github_ctx.get("owner") or "").strip() and str(github_ctx.get("repo") or "").strip():
+        gh_owner = str(github_ctx.get("owner") or "")
+        gh_repo = str(github_ctx.get("repo") or "")
+        gh_branch = str(github_ctx.get("branch") or "main")
+        gh_uid = int(github_ctx.get("userId") or 0)
+        rel_ws = f"_github/u{gh_uid}/{github_tools._slug(gh_owner)}__{github_tools._slug(gh_repo)}"
+        parts.append(f"Подключён общий GitHub-репозиторий: {gh_owner}/{gh_repo}@{gh_branch} (клон в Sandbox: {rel_ws}).")
+
+    peers = [
+        s
+        for s in all_subagents
+        if isinstance(s, dict)
+        and str(s.get("slug") or "") != slug
+        and _is_callee_allowed(subagent, s)
+    ]
+    if peers:
+        peer_lines = [
+            f"- `{p.get('slug')}` («{p.get('name')}»{': ' + str(p.get('roleTitle')) if p.get('roleTitle') else ''})"
+            + (f" — {str(p.get('description'))[:120]}" if p.get("description") else "")
+            for p in peers
+        ]
+        parts.append(
+            "\nДоступные тебе субагенты в дереве зависимостей (можешь попросить Оркестратора вызвать через `request_subagent` "
+            "или указать в `report_to_orchestrator` с обязательным `summary`):\n"
+            + "\n".join(peer_lines)
+        )
+    else:
+        parts.append(
+            "\nПо дереву зависимостей ты не вызываешь других субагентов напрямую — по завершении работы передай подробное `summary` Оркестратору через `report_to_orchestrator`."
+        )
+
+    parts.append("Лимита шагов нет — выполняй все необходимые действия качественно и экономно по токенам.")
+    return "\n".join(parts)
+
+
+def run_subagent_session(
+    *,
+    target_ref: str,
+    summary: str,
+    task: str = "",
+    sandbox_project: str = ".",
+    caller_kind: str = "orchestrator",
+    caller_subagent: Optional[Dict[str, Any]] = None,
+    trust_level: str = "verified",
+    approval_fn: Optional[Any] = None,
+    sandbox_root: Path = SANDBOX_ROOT,
+    browser_manager: Optional[browser_inspector.BrowserSessionManager] = None,
+    github_ctx: Optional[Dict[str, Any]] = None,
+    unlimited: bool = True,
+    tester_ctx: Optional[Dict[str, Any]] = None,
+    subagent_ctx: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Запускает выбранного активного субагента в ЕГО НОВОМ ИЗОЛИРОВАННОМ ЧАТЕ с общим доступом к Sandbox/GitHub.
+    Соблюдает дерево зависимостей и приоритет заблокированного API Оркестратора (своё API только при unlockApi=True).
+    """
+    ctx = subagent_ctx or {}
+    subagents_list: List[Dict[str, Any]] = [
+        s for s in (ctx.get("subagents") or []) if isinstance(s, dict)
+    ]
+    emit_sse = ctx.get("emit_sse")
+
+    def _emit(ev_name: str, payload: Dict[str, Any]) -> None:
+        if callable(emit_sse):
+            emit_sse(ev_name, payload)
+
+    target = _find_subagent_in_list(subagents_list, target_ref)
+    if target is None:
+        available_names = ", ".join(
+            f"{s.get('name')} (`{s.get('slug')}`)" for s in subagents_list
+        ) or "нет активных субагентов"
+        return {
+            "agentText": (
+                f"Субагент «{target_ref}» не найден среди активных субагентов. "
+                f"Доступные активные субагенты: {available_names}."
+            ),
+            "agentEvents": [],
+        }
+
+    chain_depth = int(ctx.get("chain_depth") or 0)
+    if chain_depth >= 10:
+        return {
+            "agentText": (
+                f"Цепочка вызовов субагентов достигла глубины {chain_depth}. "
+                f"Передай текущее summary обратно Главному Агенту (Оркестратору) без дальнейшей рекурсии."
+            ),
+            "agentEvents": [],
+        }
+
+    # Проверка правил дерева зависимостей «Оркестратор ↔ Субагенты».
+    if caller_kind == "orchestrator" and not target.get("orchestratorCanCall", True):
+        parent_id = target.get("parentSubagentId")
+        parent_node = next(
+            (s for s in subagents_list if s.get("id") == parent_id), None
+        )
+        parent_hint = (
+            f"сначала вызови родительского субагента «{parent_node.get('name')}» (`{parent_node.get('slug')}`)"
+            if parent_node
+            else "включи прямой вызов Оркестратором в дереве зависимостей"
+        )
+        return {
+            "agentText": (
+                f"По дереву зависимостей субагент «{target.get('name')}» (`{target.get('slug')}`) "
+                f"не вызывается Оркестратором напрямую — {parent_hint}."
+            ),
+            "agentEvents": [],
+        }
+
+    if caller_kind == "subagent" and isinstance(caller_subagent, dict):
+        if not _is_callee_allowed(caller_subagent, target):
+            return {
+                "agentText": (
+                    f"По дереву зависимостей субагенту «{caller_subagent.get('name')}» не разрешено вызывать "
+                    f"субагента «{target.get('name')}» (`{target.get('slug')}`). "
+                    f"Заверши работу через `report_to_orchestrator(summary=..., request_next_subagent='{target.get('slug')}', next_task=...)`, "
+                    "чтобы решение принял Главный Агент (Оркестратор)."
+                ),
+                "agentEvents": [],
+            }
+
+    # Приоритет заблокированного API Агента (Оркестратора):
+    # если галочка unlockApi НЕ стоит, строго берётся API Оркестратора!
+    orch_base_url = str(ctx.get("base_url") or BASE_URL)
+    orch_api_key = str(ctx.get("api_key") or API_KEY)
+    orch_model = str(ctx.get("model") or MODEL)
+    orch_params = dict(ctx.get("params")) if isinstance(ctx.get("params"), dict) else {}
+
+    custom_api = target.get("customApi") if isinstance(target.get("customApi"), dict) else {}
+    api_unlocked = bool(target.get("unlockApi")) and bool(custom_api.get("unlocked"))
+    if api_unlocked:
+        raw_sub_url = str(custom_api.get("baseUrl") or orch_base_url).strip()
+        sub_base_url = assert_safe_ai_url(raw_sub_url) if raw_sub_url else orch_base_url
+        sub_api_key = str(
+            custom_api.get("apiKey")
+            if custom_api.get("apiKey") is not None
+            else orch_api_key
+        )
+        sub_model = str(custom_api.get("model") or orch_model)
+        sub_params = dict(orch_params)
+        r_mode = str(custom_api.get("reasoningMode") or "default").strip().lower()
+        if r_mode and r_mode != "default":
+            sub_params["reasoning"] = r_mode
+        used_custom_api = True
+    else:
+        sub_base_url = orch_base_url
+        sub_api_key = orch_api_key
+        sub_model = orch_model
+        sub_params = dict(orch_params)
+        used_custom_api = False
+
+    discovered_max_context = int(ctx.get("discovered_max_context") or 0)
+    steps_cap = int(ctx.get("subagent_max_steps") or 0)  # 0 = без лимита шагов!
+    cancel_check = ctx.get("cancel_check")
+
+    has_github_repo = bool(
+        github_ctx
+        and str(github_ctx.get("token") or "").strip()
+        and str(github_ctx.get("owner") or "").strip()
+        and str(github_ctx.get("repo") or "").strip()
+    )
+
+    run_key = uuid.uuid4().hex[:12]
+    proj_clean = str(sandbox_project or ".").strip() or "."
+    sub_id = int(target.get("id") or 0)
+    sub_slug = str(target.get("slug") or "subagent")
+    sub_name = str(target.get("name") or sub_slug)
+    sub_color = str(target.get("color") or "#8b5cf6")
+    caller_sub_id = int(caller_subagent.get("id") or 0) if isinstance(caller_subagent, dict) else 0
+    caller_sub_name = str(caller_subagent.get("name") or "") if isinstance(caller_subagent, dict) else ""
+
+    if caller_kind == "subagent" and caller_sub_name:
+        _emit(
+            "subagent_handoff",
+            {
+                "runKey": run_key,
+                "fromSubagentId": caller_sub_id or None,
+                "fromSubagentName": caller_sub_name,
+                "toSubagentId": sub_id,
+                "toSubagentSlug": sub_slug,
+                "toSubagentName": sub_name,
+                "via": "orchestrator",
+                "summary": summary[:1200],
+                "nextTask": task[:800],
+                "sandboxProject": proj_clean,
+            },
+        )
+
+    log(
+        f"Субагент [{run_key}] «{sub_name}» ({sub_slug}) старт: "
+        f"caller={caller_kind}, project={proj_clean}, model={sub_model or MODEL}, customApi={used_custom_api}"
+    )
+
+    _emit(
+        "subagent_start",
+        {
+            "runKey": run_key,
+            "subagentId": sub_id,
+            "subagentSlug": sub_slug,
+            "subagentName": sub_name,
+            "subagentColor": sub_color,
+            "callerKind": caller_kind,
+            "callerSubagentId": caller_sub_id or None,
+            "callerSubagentName": caller_sub_name,
+            "sandboxProject": proj_clean,
+            "summary": summary,
+            "task": task,
+            "model": sub_model or MODEL,
+            "usedCustomApi": used_custom_api,
+        },
+    )
+
+    sub_system = _build_subagent_system_prompt(
+        subagent=target,
+        all_subagents=subagents_list,
+        trust_level=trust_level,
+        sandbox_root=sandbox_root,
+        sandbox_project=proj_clean,
+        github_ctx=github_ctx if has_github_repo else None,
+    )
+    tree_preview = _build_sandbox_tree_preview(sandbox_root, proj_clean)
+    caller_label = (
+        f"субагента «{caller_sub_name}» через Главного Агента (Оркестратора)"
+        if caller_kind == "subagent" and caller_sub_name
+        else "Главного Агента — Оркестратора"
+    )
+    handoff_parts = [
+        f"Подзадача от {caller_label} по общему проекту в Sandbox: «{proj_clean}».",
+        f"\nSummary контекста и выполненных действий:\n{summary}",
+    ]
+    if task:
+        handoff_parts.append(f"\nЧто нужно сделать тебе («{sub_name}»):\n{task}")
+    handoff_parts.append(f"\nТекущее содержимое общего проекта Sandbox/{proj_clean}:\n{tree_preview}")
+    handoff_parts.append(
+        "\nВыполни подзадачу, используя доступные инструменты, а в конце обязательно вызови "
+        "`report_to_orchestrator(summary=..., status=..., files_touched=...)`, чтобы передать чёткое summary Оркестратору."
+    )
+
+    # Изолированный новый чат субагента — минимум токенов на историю и раздумья!
+    sub_messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": sub_system},
+        {"role": "user", "content": "\n".join(handoff_parts)},
+    ]
+
+    sub_state: Dict[str, Any] = {
+        "subagent": target,
+        "sandboxProject": proj_clean,
+        "report": None,
+        "runKey": run_key,
+    }
+    sub_qa_state: Dict[str, Any] = {"report": {}, "checks": [], "runKey": run_key}
+    sub_run_state: Dict[str, Any] = {}
+    sub_tools = tools_for_trust(trust_level, has_github=has_github_repo, role="subagent")
+    local_browser_mgr = browser_manager or browser_inspector.BrowserSessionManager(sandbox_root=sandbox_root)
+    owns_browser_mgr = browser_manager is None
+    sub_browser_session_id = f"subagent_{run_key}"
+
+    nested_subagent_ctx: Dict[str, Any] = {
+        **ctx,
+        "chain_depth": chain_depth + 1,
+    }
+
+    use_tools = True
+    steps = 0
+    sub_final_text = ""
+    sub_thinking = ""
+    sub_usage_prompt = 0
+    sub_usage_completion = 0
+    sub_usage_total = 0
+    sub_actions: List[Dict[str, Any]] = []
+    sub_files: List[Dict[str, Any]] = []
+    auto_touched_files: List[str] = []
+    run_error = ""
+    last_tool_sig = ""
+    repeat_sig_count = 0
+    force_no_tools_next = False
+    empty_reply_nudges = 0
+    allow_sub_images = True
+    max_sub_images_per_step = 3
+
+    def _sub_approval_wrapper(req: Dict[str, Any]) -> Dict[str, Any]:
+        if approval_fn is None:
+            return {"approved": False, "note": "Требуется подтверждение на сайте"}
+        enriched_req = {**req, "subagentRunKey": run_key}
+        _emit(
+            "subagent_status",
+            {
+                "runKey": run_key,
+                "subagentId": sub_id,
+                "subagentName": sub_name,
+                "text": f"Субагент «{sub_name}» ждёт подтверждения на сайте…",
+                "source": "approval",
+                "actor": "approval",
+            },
+        )
+        try:
+            return approval_fn(enriched_req)
+        finally:
+            _emit(
+                "subagent_status",
+                {
+                    "runKey": run_key,
+                    "subagentId": sub_id,
+                    "subagentName": sub_name,
+                    "text": f"Субагент «{sub_name}»: продолжаю работу…",
+                    "source": "subagent",
+                    "actor": "subagent",
+                },
+            )
+
+    wrapped_approval = _sub_approval_wrapper if approval_fn is not None else None
+
+    try:
+        while steps_cap == 0 or steps < steps_cap:
+            if callable(cancel_check) and cancel_check():
+                raise BrokenPipeError("Клиент закрыл соединение")
+            steps += 1
+            _emit(
+                "subagent_status",
+                {
+                    "runKey": run_key,
+                    "subagentId": sub_id,
+                    "subagentName": sub_name,
+                    "text": f"Субагент «{sub_name}»: шаг {steps} — запрос к модели ({sub_model or MODEL})…",
+                    "source": "subagent_llm",
+                    "actor": "subagent_llm",
+                    "step": steps,
+                },
+            )
+
+            def _on_sub_reasoning(piece: str) -> None:
+                combined = ((sub_thinking + "\n\n" if sub_thinking else "") + piece).strip()
+                if combined:
+                    _emit(
+                        "subagent_reasoning",
+                        {"runKey": run_key, "subagentId": sub_id, "text": combined, "step": steps},
+                    )
+
+            def _on_sub_content(piece: str) -> None:
+                cleaned = piece.strip()
+                if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
+                    _emit(
+                        "subagent_text",
+                        {"runKey": run_key, "subagentId": sub_id, "text": cleaned, "step": steps},
+                    )
+
+            use_tools_for_step = use_tools and not force_no_tools_next
+            force_no_tools_next = False
+            call_state: Dict[str, Any] = {}
+            try:
+                data = call_model(
+                    sub_base_url,
+                    sub_api_key,
+                    sub_model,
+                    sub_messages,
+                    sub_tools if use_tools_for_step else None,
+                    sub_params,
+                    on_reasoning=_on_sub_reasoning,
+                    on_text=_on_sub_content,
+                    on_status=lambda msg_s: _emit(
+                        "subagent_status",
+                        {
+                            "runKey": run_key,
+                            "subagentId": sub_id,
+                            "subagentName": sub_name,
+                            "text": f"Субагент «{sub_name}» (шаг {steps}): {msg_s}",
+                            "source": "subagent_llm",
+                            "actor": "subagent_llm",
+                            "step": steps,
+                        },
+                    ),
+                    context_limit=discovered_max_context,
+                    state_out=call_state,
+                    cancel_check=cancel_check if callable(cancel_check) else None,
+                )
+            except BrokenPipeError:
+                raise
+            except AgentError as err:
+                if call_state.get("max_context"):
+                    discovered_max_context = int(call_state["max_context"])
+                if call_state.get("compacted_messages"):
+                    sub_messages[:] = call_state["compacted_messages"]
+                err_s = str(err)
+                detail = err_s.lower()
+                img_count = _count_message_images(sub_messages)
+                if img_count > 1 and _is_multi_image_limit_error(detail):
+                    max_sub_images_per_step = 1
+                    _trim_images_per_message(sub_messages, max_images=1)
+                    continue
+                if img_count > 0 and _is_vision_rejection_error(detail):
+                    allow_sub_images = False
+                    _strip_old_images(sub_messages, keep_last_n=0)
+                    continue
+                if use_tools and (
+                    _parse_context_overflow_error(err_s) is not None
+                    or (_parse_max_tokens_limit_error(err_s) is None and ("tools" in detail or "400" in detail))
+                ):
+                    use_tools = False
+                    sub_messages[0]["content"] = sub_messages[0].get("content", sub_system) + TEXT_PROTOCOL_NOTE
+                    continue
+                run_error = err_s
+                break
+
+            if call_state.get("max_context"):
+                discovered_max_context = int(call_state["max_context"])
+            if call_state.get("compacted_messages"):
+                sub_messages[:] = call_state["compacted_messages"]
+
+            choices = data.get("choices") or []
+            if not choices:
+                run_error = f"Модель субагента «{sub_name}» вернула пустой ответ"
+                break
+            message = choices[0].get("message") or {}
+            raw_content = str(message.get("content") or "")
+            step_reason = str(
+                message.get("reasoning_content") or message.get("reasoning") or ""
+            ).strip()
+            clean_content, inline_think = _split_inline_think(raw_content)
+            content = clean_content if (inline_think or "<think>" in raw_content.lower()) else raw_content
+            combined_reason = "\n\n".join(x for x in (step_reason, inline_think) if x).strip()
+            step_u = extract_usage(
+                data,
+                _messages_char_len(sub_messages),
+                len(content) + len(combined_reason),
+            )
+            sub_usage_prompt += int(step_u.get("prompt") or 0)
+            sub_usage_completion += int(step_u.get("completion") or 0)
+            sub_usage_total += int(step_u.get("total") or 0)
+            if combined_reason:
+                sub_thinking = (sub_thinking + "\n\n" + combined_reason).strip()
+                _emit(
+                    "subagent_reasoning",
+                    {"runKey": run_key, "subagentId": sub_id, "text": sub_thinking},
+                )
+
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls and not use_tools:
+                parsed_tc = parse_text_tool_call(content)
+                if parsed_tc:
+                    t_n, t_a = parsed_tc
+                    tool_calls = [
+                        {
+                            "id": f"sub_txt_{steps}",
+                            "function": {"name": t_n, "arguments": json.dumps(t_a, ensure_ascii=False)},
+                        }
+                    ]
+                    content = ""
+            elif not tool_calls and use_tools:
+                parsed_tc = parse_text_tool_call(content)
+                if parsed_tc:
+                    t_n, t_a = parsed_tc
+                    valid_names = {t["function"]["name"] for t in sub_tools}
+                    if t_n in valid_names:
+                        tool_calls = [
+                            {
+                                "id": f"sub_inline_{steps}",
+                                "function": {"name": t_n, "arguments": json.dumps(t_a, ensure_ascii=False)},
+                            }
+                        ]
+                        content = ""
+
+            if not tool_calls:
+                if not content.strip() and empty_reply_nudges < 2:
+                    empty_reply_nudges += 1
+                    sub_messages.append({"role": "assistant", "content": ""})
+                    sub_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Ты вернул пустой ответ. Заверши задачу и передай краткое итоговое summary "
+                                "через `report_to_orchestrator(summary=..., status='completed')` или текстом."
+                            ),
+                        }
+                    )
+                    continue
+                sub_final_text = content.strip()
+                if sub_final_text:
+                    _emit("subagent_text", {"runKey": run_key, "subagentId": sub_id, "text": sub_final_text})
+                break
+
+            call_results: List[Dict[str, Any]] = []
+            assistant_calls: List[Dict[str, Any]] = []
+            captured_imgs: List[Dict[str, Any]] = []
+
+            for idx, tc in enumerate(tool_calls):
+                if callable(cancel_check) and cancel_check():
+                    raise BrokenPipeError("Клиент закрыл соединение")
+                fn = tc.get("function") or {}
+                t_name = str(fn.get("name") or "")
+                raw_a = fn.get("arguments") or "{}"
+                t_args = raw_a if isinstance(raw_a, dict) else (_parse_json_dict_relaxed(str(raw_a)) or {})
+                if not isinstance(t_args, dict):
+                    t_args = {}
+                if t_name == "browse_project" and not t_args.get("session_id"):
+                    t_args = {**t_args, "session_id": sub_browser_session_id}
+
+                # Автоучёт затронутых файлов проекта
+                if t_name in ("sandbox_write_file", "github_write_file", "github_edit_file") and t_args.get("path"):
+                    auto_touched_files.append(str(t_args["path"]))
+                elif t_name == "sandbox_create_project" and isinstance(t_args.get("files"), list):
+                    proj_prefix = str(t_args.get("project_name") or "").strip()
+                    for f_obj in t_args["files"]:
+                        if isinstance(f_obj, dict) and f_obj.get("path"):
+                            p_str = f"{proj_prefix}/{f_obj['path']}" if proj_prefix else str(f_obj["path"])
+                            auto_touched_files.append(p_str)
+
+                cid = str(tc.get("id") or f"sub_call_{steps}_{idx}")
+                tool_label = _format_tool_target_label(t_name, t_args)
+                is_browser_tool = t_name in ("browse_project", "qa_browser_audit")
+                t_started = time.monotonic()
+                t_failed = False
+
+                _emit(
+                    "subagent_status",
+                    {
+                        "runKey": run_key,
+                        "subagentId": sub_id,
+                        "subagentName": sub_name,
+                        "text": f"Субагент «{sub_name}» (шаг {steps}): {tool_label}…",
+                        "source": "browser_inspector" if is_browser_tool else "subagent_tool",
+                        "actor": "browser_inspector" if is_browser_tool else "subagent",
+                        "tool": t_name,
+                        "step": steps,
+                    },
+                )
+                _emit(
+                    "subagent_action",
+                    {
+                        "runKey": run_key,
+                        "subagentId": sub_id,
+                        "action": {
+                            "type": "subagent_tool",
+                            "callId": cid,
+                            "step": steps,
+                            "tool": t_name,
+                            "label": tool_label,
+                            "status": "running",
+                        },
+                    },
+                )
+
+                def _on_sub_tool_status(msg_text: str) -> None:
+                    if not msg_text:
+                        return
+                    _emit(
+                        "subagent_status",
+                        {
+                            "runKey": run_key,
+                            "subagentId": sub_id,
+                            "subagentName": sub_name,
+                            "text": f"Субагент «{sub_name}»: {msg_text}",
+                            "source": "browser_inspector" if is_browser_tool else "subagent_tool",
+                            "actor": "browser_inspector" if is_browser_tool else "subagent",
+                            "tool": t_name,
+                            "step": steps,
+                        },
+                    )
+
+                try:
+                    t_res, t_events = run_tool(
+                        t_name,
+                        t_args,
+                        trust_level=trust_level,
+                        approval_fn=wrapped_approval,
+                        sandbox_root=sandbox_root,
+                        browser_manager=local_browser_mgr,
+                        github_ctx=github_ctx,
+                        unlimited=unlimited,
+                        tester_ctx=tester_ctx,
+                        subagent_ctx=nested_subagent_ctx,
+                        subagent_state=sub_state,
+                        qa_state=sub_qa_state,
+                        run_state=sub_run_state,
+                        on_status=_on_sub_tool_status,
+                        cancel_check=cancel_check,
+                    )
+                except AgentError as error:
+                    t_failed = True
+                    t_res, t_events = f"Ошибка инструмента {t_name}: {error}", []
+                except BrokenPipeError:
+                    raise
+                except Exception as error:  # noqa: BLE001
+                    t_failed = True
+                    log(f"сбой инструмента субагента {t_name}: {traceback.format_exc()}")
+                    t_res, t_events = f"Внутренний сбой инструмента {t_name}: {error}", []
+
+                elapsed_ms = int((time.monotonic() - t_started) * 1000)
+                emitted_non_file = False
+                for ev in t_events:
+                    img = ev.pop("_image", None)
+                    if isinstance(img, str) and img.startswith("data:image/"):
+                        captured_imgs.append({"type": "image_url", "image_url": {"url": img}})
+                    imgs = ev.pop("_images", None)
+                    if isinstance(imgs, list):
+                        for item_img in imgs[:3]:
+                            if isinstance(item_img, str) and item_img.startswith("data:image/"):
+                                captured_imgs.append({"type": "image_url", "image_url": {"url": item_img}})
+                    if ev.get("type") == "file":
+                        sub_files.append(
+                            {
+                                "name": ev.get("name", "файл"),
+                                "mime": ev.get("mime", "text/plain"),
+                                "size": int(ev.get("size") or 0),
+                            }
+                        )
+                    else:
+                        emitted_non_file = True
+                        enriched = (
+                            {
+                                **ev,
+                                "callId": cid,
+                                "step": steps,
+                                "tool": ev.get("tool") or t_name,
+                                "durationMs": elapsed_ms,
+                            }
+                            if isinstance(ev, dict)
+                            else ev
+                        )
+                        sub_actions.append(
+                            {k: v for k, v in enriched.items() if k != "preview"}
+                            if isinstance(enriched, dict)
+                            else enriched
+                        )
+                        _emit("subagent_action", {"runKey": run_key, "subagentId": sub_id, "action": enriched})
+
+                if not emitted_non_file:
+                    synth_ev: Dict[str, Any] = {
+                        "type": "subagent_tool",
+                        "callId": cid,
+                        "step": steps,
+                        "tool": t_name,
+                        "label": tool_label,
+                        "status": "error" if t_failed else "ok",
+                        "summary": _summarize_tool_output(t_res, is_error=t_failed),
+                        "durationMs": elapsed_ms,
+                        **({"error": _summarize_tool_output(t_res, is_error=True)} if t_failed else {}),
+                    }
+                    sub_actions.append(synth_ev)
+                    _emit("subagent_action", {"runKey": run_key, "subagentId": sub_id, "action": synth_ev})
+
+                assistant_calls.append(
+                    {
+                        "id": cid,
+                        "type": "function",
+                        "function": {"name": t_name, "arguments": json.dumps(t_args, ensure_ascii=False)},
+                    }
+                )
+                if isinstance(t_res, str) and len(t_res) > 40_000:
+                    t_res = _shrink_text_head_tail(t_res, 40_000)
+                call_results.append({"role": "tool", "tool_call_id": cid, "content": t_res})
+
+            if sub_state.get("report"):
+                rep_d = sub_state["report"]
+                if not sub_final_text:
+                    sub_final_text = content.strip() or str(rep_d.get("summary") or "").strip()
+                break
+
+            cur_sig = _tool_call_signature(assistant_calls)
+            if cur_sig and cur_sig == last_tool_sig:
+                repeat_sig_count += 1
+            else:
+                last_tool_sig = cur_sig
+                repeat_sig_count = 1
+            if repeat_sig_count >= 4 and call_results:
+                call_results[-1]["content"] = (
+                    str(call_results[-1].get("content") or "")
+                    + "\n\n[СИСТЕМА: Одинаковый вызов инструментов повторился 4 раза подряд. "
+                    "Сформируй итоговое summary текстом.]"
+                )
+                force_no_tools_next = True
+
+            img_slice = captured_imgs[:max_sub_images_per_step] if allow_sub_images else []
+            if img_slice:
+                _strip_old_images(sub_messages, keep_last_n=0)
+            if use_tools:
+                sub_messages.append({"role": "assistant", "content": content, "tool_calls": assistant_calls})
+                sub_messages.extend(call_results)
+                if img_slice:
+                    sub_messages.append(
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "Скриншоты осмотра проекта:"}, *img_slice],
+                        }
+                    )
+            else:
+                sub_messages.append({"role": "assistant", "content": content or "Выполняю шаг."})
+                res_txt = "Результаты инструментов:\n" + "\n".join(x["content"] for x in call_results)
+                sub_messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": res_txt}, *img_slice] if img_slice else res_txt,
+                    }
+                )
+    finally:
+        if owns_browser_mgr:
+            local_browser_mgr.close_all()
+        else:
+            local_browser_mgr.close_session(sub_browser_session_id)
+
+    rep_final = sub_state.get("report") if isinstance(sub_state.get("report"), dict) else {}
+    output_summary = str(rep_final.get("summary") or sub_final_text or "").strip()
+    if not output_summary:
+        if run_error:
+            output_summary = f"Ошибка во время выполнения субагента «{sub_name}»: {run_error}"
+        elif sub_actions:
+            output_summary = (
+                f"Субагент «{sub_name}» выполнил действий: {len(sub_actions)}"
+                + (f" (файлы: {', '.join(dict.fromkeys(auto_touched_files))})" if auto_touched_files else "")
+                + "."
+            )
+        else:
+            output_summary = f"Субагент «{sub_name}» завершил работу."
+
+    all_touched = list(
+        dict.fromkeys(
+            [*(rep_final.get("filesTouched") or []), *auto_touched_files]
+        )
+    )[:80]
+    req_next_slug = str(rep_final.get("requestNextSubagent") or "").strip()
+    req_next_task = str(rep_final.get("nextTask") or "").strip()
+    final_status = (
+        "error"
+        if (run_error and not rep_final)
+        else str(rep_final.get("status") or ("handoff" if req_next_slug else "completed"))
+    )
+
+    usage_out = {
+        "prompt": sub_usage_prompt,
+        "completion": sub_usage_completion,
+        "total": sub_usage_total,
+        "model": sub_model or MODEL,
+    }
+
+    done_payload = {
+        "runKey": run_key,
+        "subagentId": sub_id,
+        "subagentSlug": sub_slug,
+        "subagentName": sub_name,
+        "subagentColor": sub_color,
+        "sandboxProject": proj_clean,
+        "status": final_status,
+        "outputSummary": output_summary,
+        "requestedCalleeSlug": req_next_slug,
+        "requestedCalleeTask": req_next_task,
+        "filesTouched": all_touched,
+        "model": sub_model or MODEL,
+        "usedCustomApi": used_custom_api,
+        "fullResponse": sub_final_text or output_summary,
+        "reasoning": sub_thinking,
+        "actions": sub_actions[:120],
+        "files": sub_files[:30],
+        "error": run_error,
+        "usage": usage_out,
+    }
+    _emit("subagent_done", done_payload)
+
+    out_lines = [
+        f"Отчёт (Summary) от субагента «{sub_name}» (slug: `{sub_slug}`, отдельный чат, токенов: {sub_usage_total}, "
+        f"{'своё API: ' + (sub_model or MODEL) if used_custom_api else 'API Оркестратора'}):",
+        f"Статус: {final_status} · Проект в Sandbox: {proj_clean}",
+        f"Summary действий субагента:\n{output_summary}",
+    ]
+    if all_touched:
+        out_lines.append(f"Затронутые файлы проекта: {', '.join(all_touched)}")
+    if req_next_slug:
+        out_lines.append(
+            f"\n[ЗАПРОС К ОРКЕСТРАТОРУ ОТ СУБАГЕНТА «{sub_name}»]: "
+            f"просит вызвать следующего субагента `{req_next_slug}`"
+            + (f" со следующей задачей: {req_next_task}" if req_next_task else "")
+            + ". Передай ему это summary через `call_subagent`, если считаешь нужным."
+        )
+
+    agent_card = {
+        "type": "subagent_report",
+        "runKey": run_key,
+        "subagentRunKey": run_key,
+        "subagentId": sub_id,
+        "subagentSlug": sub_slug,
+        "subagentName": sub_name,
+        "subagentColor": sub_color,
+        "sandboxProject": proj_clean,
+        "status": final_status,
+        "reportSummary": output_summary[:1000],
+        "summary": output_summary[:1000],
+        "requestedCalleeSlug": req_next_slug,
+        "requestedCalleeTask": req_next_task[:500],
+        "filesTouched": all_touched[:20],
+        "totalTokens": sub_usage_total,
+        "model": sub_model or MODEL,
+        "usedCustomApi": used_custom_api,
+        "label": f"Субагент «{sub_name}»: {proj_clean} ({final_status})",
+    }
+
+    return {
+        "agentText": "\n".join(out_lines),
+        "agentEvents": [agent_card],
+        "done": done_payload,
     }
 
 
@@ -4615,18 +5926,16 @@ def coach_operator_step(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def resolve_steps_limit(raw_steps: Any, unlimited: bool = False) -> int:
-    """Вычислить лимит шагов: для главного админа (unlimited=True) 0 = без лимита и нет потолка 500."""
+    """Вычислить лимит шагов: лимит снят для всех ролей (0 = без лимита, >0 = без потолка)."""
     try:
         parsed = int(raw_steps) if raw_steps is not None and raw_steps != "" else None
     except (TypeError, ValueError):
         parsed = None
-    if unlimited:
-        if parsed is None or parsed <= 0:
-            return 0
-        return parsed
     if parsed is None or parsed <= 0:
-        return MAX_STEPS
-    return max(1, min(MAX_STEPS_LIMIT, parsed))
+        return 0 if unlimited else MAX_STEPS
+    if not unlimited and MAX_STEPS_LIMIT > 0:
+        return max(1, min(MAX_STEPS_LIMIT, parsed))
+    return max(1, parsed)
 
 
 def _allowed_cors_origin(origin: Optional[str]) -> Optional[str]:
@@ -5497,14 +6806,52 @@ class Handler(BaseHTTPRequestHandler):
         trust_level = normalize_trust(body.get("trustLevel"))
         unlimited_role = bool(body.get("unlimited"))
         steps_limit = resolve_steps_limit(body.get("maxSteps"), unlimited_role)
-        agent_role = "tester" if str(body.get("agentRole") or "").strip().lower() == "tester" else "agent"
+        raw_role = str(body.get("agentRole") or "").strip().lower()
+        agent_role = (
+            "tester"
+            if raw_role == "tester"
+            else ("subagent" if raw_role == "subagent" else "agent")
+        )
         sandbox_project_arg = str(body.get("sandboxProject") or ".").strip() or "."
+        raw_subagents = body.get("subagents")
+        subagents_list: List[Dict[str, Any]] = (
+            [dict(s) for s in raw_subagents if isinstance(s, dict)]
+            if isinstance(raw_subagents, list)
+            else []
+        )
+        active_subagent_meta: Optional[Dict[str, Any]] = (
+            dict(body.get("activeSubagent"))
+            if isinstance(body.get("activeSubagent"), dict)
+            else None
+        )
+        orch_settings = (
+            body.get("orchestratorSettings")
+            if isinstance(body.get("orchestratorSettings"), dict)
+            else settings
+        )
+        orch_base_url = assert_safe_ai_url(str(orch_settings.get("baseUrl") or base_url))
+        orch_api_key = str(orch_settings.get("apiKey") or api_key)
+        orch_model = str(orch_settings.get("model") or model)
 
         incoming = body.get("messages") or []
         if not isinstance(incoming, list) or not incoming:
             raise AgentError("Пустой запрос: нет сообщений")
 
-        system = TESTER_SYSTEM_PROMPT if agent_role == "tester" else SYSTEM_PROMPT
+        if agent_role == "tester":
+            system = TESTER_SYSTEM_PROMPT
+        elif agent_role == "subagent":
+            system = SUBAGENT_BASE_SYSTEM_PROMPT
+            if active_subagent_meta:
+                system += (
+                    f"\nТвой профиль субагента: «{active_subagent_meta.get('name')}» "
+                    f"(slug: `{active_subagent_meta.get('slug')}`)"
+                )
+                if active_subagent_meta.get("roleTitle"):
+                    system += f" · Роль: {active_subagent_meta.get('roleTitle')}"
+                if active_subagent_meta.get("description"):
+                    system += f"\nЗона ответственности: {active_subagent_meta.get('description')}"
+        else:
+            system = SYSTEM_PROMPT
         trust_notes = {
             "full": "Уровень доверия: ПОЛНЫЙ ДОСТУП (команды в Sandbox, ПК и перенос файлов разрешены).",
             "verified": (
@@ -5517,10 +6864,10 @@ class Handler(BaseHTTPRequestHandler):
             ),
         }
         system += f"\n\n{trust_notes[trust_level]}\nКорень Sandbox: {SANDBOX_ROOT}"
-        if agent_role == "tester" and sandbox_project_arg:
+        if agent_role in ("tester", "subagent") and sandbox_project_arg:
             system += f"\nЦелевой проект в Sandbox: {sandbox_project_arg}"
         raw_custom_system = str(body.get("systemPrompt") or "").strip()
-        custom_system = raw_custom_system if unlimited_role else raw_custom_system[:12_000]
+        custom_system = raw_custom_system if unlimited_role else raw_custom_system[:16_000]
         if custom_system:
             system += f"\n\nПользовательский системный промпт (обязательно следуй этим правилам):\n{custom_system}"
 
@@ -5530,6 +6877,28 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(raw_recent_reports, list)
             else []
         )
+        raw_recent_sub_reports = context.get("recentSubagentReports") if isinstance(context, dict) else None
+        recent_sub_reports: List[Dict[str, Any]] = (
+            [dict(r) for r in raw_recent_sub_reports if isinstance(r, dict)]
+            if isinstance(raw_recent_sub_reports, list)
+            else []
+        )
+        if agent_role == "agent" and subagents_list:
+            system += "\n\n" + build_orchestrator_subagents_prompt(subagents_list, recent_sub_reports)
+        elif agent_role == "subagent" and active_subagent_meta and subagents_list:
+            peers = [
+                s
+                for s in subagents_list
+                if str(s.get("slug") or "") != str(active_subagent_meta.get("slug") or "")
+                and _is_callee_allowed(active_subagent_meta, s)
+            ]
+            if peers:
+                system += (
+                    "\n\nДоступные тебе субагенты для вызова через Оркестратора (`request_subagent`):\n"
+                    + "\n".join(
+                        f"- `{p.get('slug')}` («{p.get('name')}»)" for p in peers
+                    )
+                )
         if agent_role == "agent" and recent_reports:
             rep_lines = []
             for rep in recent_reports[:3]:
@@ -5688,9 +7057,20 @@ class Handler(BaseHTTPRequestHandler):
             raw_model_ctx = 0
         discovered_max_context = raw_model_ctx if raw_model_ctx > 0 else (raw_ctx_limit if raw_ctx_limit >= 32_768 else 0)
         direct_tester_key = uuid.uuid4().hex[:12] if agent_role == "tester" else ""
+        direct_subagent_key = uuid.uuid4().hex[:12] if agent_role == "subagent" else ""
         qa_state: Optional[Dict[str, Any]] = (
-            {"report": {}, "checks": [], "runKey": direct_tester_key}
-            if agent_role == "tester"
+            {"report": {}, "checks": [], "runKey": direct_tester_key or direct_subagent_key}
+            if agent_role in ("tester", "subagent")
+            else None
+        )
+        direct_subagent_state: Optional[Dict[str, Any]] = (
+            {
+                "subagent": active_subagent_meta or {},
+                "sandboxProject": sandbox_project_arg,
+                "report": None,
+                "runKey": direct_subagent_key,
+            }
+            if agent_role == "subagent"
             else None
         )
         direct_actions_log: List[Dict[str, Any]] = []
@@ -5703,14 +7083,26 @@ class Handler(BaseHTTPRequestHandler):
             return bool(getattr(self, "_client_disconnected", False))
 
         tester_ctx: Dict[str, Any] = {
-            "base_url": base_url,
-            "api_key": api_key,
-            "model": model,
+            "base_url": orch_base_url,
+            "api_key": orch_api_key,
+            "model": orch_model,
             "params": params,
             "discovered_max_context": discovered_max_context,
             "emit_sse": _emit_sse,
             "recent_reports": recent_reports,
             "cancel_check": _is_disconnected,
+        }
+        subagent_ctx: Dict[str, Any] = {
+            "base_url": orch_base_url,
+            "api_key": orch_api_key,
+            "model": orch_model,
+            "params": params,
+            "discovered_max_context": discovered_max_context,
+            "emit_sse": _emit_sse,
+            "subagents": subagents_list,
+            "recent_reports": recent_sub_reports,
+            "cancel_check": _is_disconnected,
+            "chain_depth": 1 if agent_role == "subagent" else 0,
         }
 
         if agent_role == "tester":
@@ -5734,6 +7126,30 @@ class Handler(BaseHTTPRequestHandler):
                         "model": model or MODEL,
                     },
                     "tester_start",
+                )
+            )
+        elif agent_role == "subagent" and active_subagent_meta:
+            last_user_prompt = ""
+            for msg_item in reversed(messages):
+                if msg_item.get("role") == "user":
+                    c = msg_item.get("content")
+                    last_user_prompt = c if isinstance(c, str) else ""
+                    break
+            self.write(
+                sse(
+                    {
+                        "runKey": direct_subagent_key,
+                        "subagentId": active_subagent_meta.get("id"),
+                        "subagentSlug": active_subagent_meta.get("slug"),
+                        "subagentName": active_subagent_meta.get("name"),
+                        "callerKind": "user",
+                        "sandboxProject": sandbox_project_arg,
+                        "summary": last_user_prompt[:4000],
+                        "task": last_user_prompt[:4000],
+                        "model": model or MODEL,
+                        "usedCustomApi": bool(active_subagent_meta.get("usedCustomApi")),
+                    },
+                    "subagent_start",
                 )
             )
         use_tools = True
@@ -6043,6 +7459,7 @@ class Handler(BaseHTTPRequestHandler):
 
                     try:
                         tester_ctx["discovered_max_context"] = discovered_max_context
+                        subagent_ctx["discovered_max_context"] = discovered_max_context
                         with self._sse_keepalive():
                             result_text, events = run_tool(
                                 name,
@@ -6054,6 +7471,8 @@ class Handler(BaseHTTPRequestHandler):
                                 github_ctx=github_ctx,
                                 unlimited=unlimited_role,
                                 tester_ctx=tester_ctx,
+                                subagent_ctx=subagent_ctx,
+                                subagent_state=direct_subagent_state,
                                 qa_state=qa_state,
                                 run_state=run_state,
                                 on_status=_on_tool_status,
@@ -6142,7 +7561,7 @@ class Handler(BaseHTTPRequestHandler):
                                     has_browser_images = True
                         if event["type"] == "file":
                             files += 1
-                            if agent_role == "tester":
+                            if agent_role in ("tester", "subagent"):
                                 direct_files_log.append(
                                     {
                                         "name": event.get("name", "файл"),
@@ -6162,10 +7581,10 @@ class Handler(BaseHTTPRequestHandler):
                                     "tool": event.get("tool") or name,
                                     "durationMs": elapsed_ms,
                                 }
-                                if agent_role == "tester" and isinstance(event, dict)
+                                if agent_role in ("tester", "subagent") and isinstance(event, dict)
                                 else event
                             )
-                            if agent_role == "tester":
+                            if agent_role in ("tester", "subagent"):
                                 direct_actions_log.append(
                                     {k: v for k, v in out_ev.items() if k != "preview"}
                                     if isinstance(out_ev, dict)
@@ -6173,10 +7592,10 @@ class Handler(BaseHTTPRequestHandler):
                                 )
                             self.write(sse(out_ev, "action"))
 
-                    if agent_role == "tester" and not emitted_non_file:
+                    if agent_role in ("tester", "subagent") and not emitted_non_file:
                         actions += 1
                         synth_ev: Dict[str, Any] = {
-                            "type": "tester_tool",
+                            "type": "tester_tool" if agent_role == "tester" else "subagent_tool",
                             "callId": call_id,
                             "step": steps,
                             "tool": name,
@@ -6247,6 +7666,15 @@ class Handler(BaseHTTPRequestHandler):
                             content.strip()
                             or str(qa_state["report"].get("summary") or "").strip()
                             or "Проверка завершена."
+                        )
+                    break
+                if agent_role == "subagent" and direct_subagent_state is not None and direct_subagent_state.get("report"):
+                    rep_direct = direct_subagent_state["report"]
+                    if not final_text:
+                        final_text = (
+                            content.strip()
+                            or str(rep_direct.get("summary") or "").strip()
+                            or "Подзадача завершена."
                         )
                     break
 
@@ -6358,6 +7786,38 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     },
                     "tester_done",
+                )
+            )
+        elif agent_role == "subagent" and direct_subagent_state is not None:
+            rep_d = direct_subagent_state.get("report") or {}
+            out_sum = str(rep_d.get("summary") or final_text or "Работа завершена.")
+            self.write(
+                sse(
+                    {
+                        "runKey": direct_subagent_key,
+                        "subagentId": (active_subagent_meta or {}).get("id"),
+                        "subagentSlug": (active_subagent_meta or {}).get("slug"),
+                        "subagentName": (active_subagent_meta or {}).get("name"),
+                        "sandboxProject": sandbox_project_arg,
+                        "status": str(rep_d.get("status") or "completed"),
+                        "outputSummary": out_sum,
+                        "requestedCalleeSlug": str(rep_d.get("requestNextSubagent") or ""),
+                        "requestedCalleeTask": str(rep_d.get("nextTask") or ""),
+                        "filesTouched": list(rep_d.get("filesTouched") or []),
+                        "model": model or MODEL,
+                        "usedCustomApi": bool((active_subagent_meta or {}).get("usedCustomApi")),
+                        "fullResponse": final_text,
+                        "reasoning": thinking,
+                        "actions": direct_actions_log[:120],
+                        "files": direct_files_log[:30],
+                        "usage": {
+                            "prompt": usage_prompt,
+                            "completion": usage_completion,
+                            "total": usage_total,
+                            "model": model or MODEL,
+                        },
+                    },
+                    "subagent_done",
                 )
             )
 
@@ -6872,14 +8332,15 @@ def self_test() -> int:
             and stream_msg.get("content") == "Готово!",
         )
 
-        # 16. Политика шагов: безлимит (0 / >500) только при unlimited=True, иначе предел 500
+        # 16. Политика шагов: безлимит (0 и любые >500 шагов) для всех ролей пользователей
         check(
-            "resolve_steps_limit: unlimited=True снимает потолок и поддерживает 0 (без лимита), unlimited=False ограничивает 500",
+            "resolve_steps_limit: лимита шагов нет для всех ролей (0 = без лимита, >500 без потолка)",
             resolve_steps_limit(0, True) == 0
             and resolve_steps_limit(None, True) == 0
             and resolve_steps_limit(1200, True) == 1200
-            and resolve_steps_limit(0, False) == MAX_STEPS_LIMIT
-            and resolve_steps_limit(1200, False) == MAX_STEPS_LIMIT
+            and resolve_steps_limit(0, False) == 0
+            and resolve_steps_limit(None, False) == 0
+            and resolve_steps_limit(1200, False) == 1200
             and resolve_steps_limit(25, False) == 25,
         )
 
@@ -7163,6 +8624,154 @@ def self_test() -> int:
             and any(e.get("type") == "github_pr" for e in pr_ev)
             and "влит в main" in mg_txt
             and any(e.get("type") == "github_merge" for e in mg_ev),
+        )
+
+        # 22. tools_for_trust(role="subagent") даёт субагенту handoff-инструменты + базовые, но НЕ оркестраторские call_subagent/list_subagents
+        sub_names = {t["function"]["name"] for t in tools_for_trust("full", role="subagent")}
+        agent_names_full = {t["function"]["name"] for t in tools_for_trust("full", role="agent")}
+        check(
+            "tools_for_trust(role='subagent') = handoff+базовые без call_subagent; role='agent' = call_subagent/list_subagents",
+            "report_to_orchestrator" in sub_names
+            and "request_subagent" in sub_names
+            and "create_file" in sub_names
+            and "browse_project" in sub_names
+            and "call_subagent" not in sub_names
+            and "list_subagents" not in sub_names
+            and "call_subagent" in agent_names_full
+            and "list_subagents" in agent_names_full,
+        )
+
+        # 23. build_orchestrator_subagents_prompt строит дерево вызовов по активным субагентам
+        orch_prompt = build_orchestrator_subagents_prompt(
+            [
+                {"slug": "qa", "name": "QA", "orchestratorCanCall": True, "description": "тестирование"},
+                {"slug": "dev", "name": "Dev", "orchestratorCanCall": False, "parentSubagentId": None, "description": "код"},
+            ],
+            [],
+        )
+        check(
+            "build_orchestrator_subagents_prompt упоминает субагентов и правила вызова Оркестратором",
+            "qa" in orch_prompt and "dev" in orch_prompt and "Оркестратор" in orch_prompt,
+        )
+
+        # 24. Гейтинг дерева зависимостей: разрешённые вызываемые субагенты
+        caller_a = {"slug": "a", "name": "A", "orchestratorCanCall": True, "allowedCallees": ["b"]}
+        target_b = {"slug": "b", "name": "B", "orchestratorCanCall": False, "parentSubagentId": None}
+        target_x = {"slug": "x", "name": "X", "orchestratorCanCall": False, "parentSubagentId": None}
+        check(
+            "дерево зависимостей: allowedCallees ограничивает вызовы субагента к субагенту",
+            _is_callee_allowed(caller_a, target_b) is True
+            and _is_callee_allowed(caller_a, target_x) is False
+            and _is_callee_allowed({"slug": "a", "name": "A", "allowedCallees": ["*"]}, target_x) is True
+            and _is_callee_allowed({"slug": "a", "name": "A", "allowedCallees": []}, target_x) is False,
+        )
+
+        # 25. Гейтинг Оркестратора и приоритет заблокированного API vs unlockApi=True в run_subagent_session
+        captured = {}
+
+        def _fake_sub_call_model(base_url, api_key, model, *args, **kwargs):
+            captured["base_url"] = str(base_url)
+            captured["api_key"] = str(api_key)
+            captured["model"] = str(model)
+            return {
+                "choices": [{"message": {"content": "Итог субагента готов.", "tool_calls": []}}],
+                "usage": {"total_tokens": 12},
+            }
+
+        real_call_model = globals().get("call_model")
+        globals()["call_model"] = _fake_sub_call_model
+        try:
+            # Оркестратор не может вызвать субагента с orchestratorCanCall=False — выход до обращения к модели
+            gated = run_subagent_session(
+                target_ref="x",
+                summary="задача",
+                task="сделай",
+                caller_kind="orchestrator",
+                trust_level="verified",
+                subagent_ctx={
+                    "base_url": "http://orch.local/v1",
+                    "api_key": "orch-key",
+                    "model": "orch-model",
+                    "subagents": [
+                        {"id": 1, "slug": "x", "name": "X", "orchestratorCanCall": False, "parentSubagentId": None},
+                    ],
+                },
+            )
+            # Заблокированный API (unlockApi=False) — строго берётся API Оркестратора
+            captured.clear()
+            locked = run_subagent_session(
+                target_ref="x",
+                summary="задача",
+                task="сделай",
+                caller_kind="orchestrator",
+                trust_level="verified",
+                subagent_ctx={
+                    "base_url": "http://orch.local/v1",
+                    "api_key": "orch-key",
+                    "model": "orch-model",
+                    "subagents": [
+                        {
+                            "id": 1,
+                            "slug": "x",
+                            "name": "X",
+                            "orchestratorCanCall": True,
+                            "parentSubagentId": None,
+                            "unlockApi": False,
+                        },
+                    ],
+                },
+            )
+            locked_used_orch = (
+                captured.get("base_url") == "http://orch.local/v1"
+                and captured.get("api_key") == "orch-key"
+                and captured.get("model") == "orch-model"
+            )
+            # Разблокированное своё API (unlockApi=True + customApi) — берётся API субагента
+            captured.clear()
+            unlocked = run_subagent_session(
+                target_ref="x",
+                summary="задача",
+                task="сделай",
+                caller_kind="orchestrator",
+                trust_level="verified",
+                subagent_ctx={
+                    "base_url": "http://orch.local/v1",
+                    "api_key": "orch-key",
+                    "model": "orch-model",
+                    "subagents": [
+                        {
+                            "id": 1,
+                            "slug": "x",
+                            "name": "X",
+                            "orchestratorCanCall": True,
+                            "parentSubagentId": None,
+                            "unlockApi": True,
+                            "customApi": {
+                                "unlocked": True,
+                                "baseUrl": "http://custom.local/v1",
+                                "model": "custom-model",
+                                "apiKey": "custom-key",
+                                "reasoningMode": "high",
+                            },
+                        },
+                    ],
+                },
+            )
+            unlocked_used_custom = (
+                captured.get("base_url") == "http://custom.local/v1"
+                and captured.get("api_key") == "custom-key"
+                and captured.get("model") == "custom-model"
+            )
+        finally:
+            globals()["call_model"] = real_call_model
+
+        check(
+            "run_subagent_session: гейтинг orchestratorCanCall + приоритет заблокированного API vs unlockApi",
+            isinstance(gated, dict)
+            and "не вызывается Оркестратором" in str(gated.get("agentText") or "")
+            and "agentEvents" in gated
+            and locked_used_orch
+            and unlocked_used_custom,
         )
 
     passed = sum(1 for item in checks if item)

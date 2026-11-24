@@ -11,7 +11,6 @@ import {
   isUnlimitedAiRole,
   roleStepLimit,
 } from "@/lib/aiPolicy";
-import { AGENT_MAX_STEPS } from "@/lib/genParams";
 
 describe("политика лимитов ИИ по ролям", () => {
   it("у главного админа (super_admin) нет ограничений по токенам, файлам, RAG и шагам и доступен режим max", () => {
@@ -30,14 +29,14 @@ describe("политика лимитов ИИ по ролям", () => {
     expect(formatStepLimit(superPolicy.maxSteps)).toBe("без лимита");
   });
 
-  it("обычный администратор (admin) и остальные роли ограничены пределом 500 шагов и лимитом на чат", () => {
+  it("обычный администратор (admin) и остальные роли тоже имеют шаги без лимита (null)", () => {
     const nonSuperRoles = ["admin", "developer", "manager", "consultant", "user"] as const;
     for (const role of nonSuperRoles) {
       const policy = AI_ROLE_POLICY[role];
       expect(policy.perChatTokens).toBe(1_000_000);
-      expect(policy.maxSteps).toBe(AGENT_MAX_STEPS);
-      expect(roleStepLimit(role)).toBe(AGENT_MAX_STEPS);
-      expect(formatStepLimit(policy.maxSteps)).toBe(`до ${AGENT_MAX_STEPS}`);
+      expect(policy.maxSteps).toBeNull();
+      expect(roleStepLimit(role)).toBeNull();
+      expect(formatStepLimit(policy.maxSteps)).toBe("без лимита");
       expect(chatTokensLeft({ tokensTotal: 250_000 }, policy)).toBe(750_000);
     }
     expect(AI_ROLE_POLICY.admin.monthlyTokens).toBeNull();

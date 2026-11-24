@@ -7,4 +7,5 @@ export * from "./repos/tasks";
 export * from "./repos/chat";
 export * from "./repos/ai";
 export * from "./repos/agent";
+export * from "./repos/subagents";
 export { getUserRoleById } from "./repos/shared";

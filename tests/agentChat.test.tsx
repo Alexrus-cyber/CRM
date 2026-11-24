@@ -904,6 +904,7 @@ describe("вкладка «Агент»", () => {
       "Доверие и RAG",
       "Sandbox и Оператор",
       "Тестировщик",
+      "Субагенты",
       "Чат",
     ]);
     expect(tabs[tabs.length - 1]?.textContent).toBe("Чат");

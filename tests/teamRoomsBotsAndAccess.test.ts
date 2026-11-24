@@ -60,7 +60,7 @@ describe("права к Агенту/Оператору, профиль лаун
     expect(profileDenied.user.canUseOperator).toBe(false);
     expect(profileDenied.operator.token).toBeNull();
     expect("agentUsage" in profileDenied).toBe(false);
-    expect(profileDenied.limits.maxSteps).toBe(500);
+    expect(profileDenied.limits.maxSteps).toBeNull();
 
     // Выдаём разработчику права на Агента и Оператора.
     await repo.setUserAgentAccess(devId, { canUseAgent: true, canUseOperator: true });

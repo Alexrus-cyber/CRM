@@ -100,6 +100,7 @@ import {
   type TesterIssueItem,
   type TesterRunItem,
 } from "./agent/TesterPanel";
+import { SubagentsPanel } from "./agent/SubagentsPanel";
 
 const SSE_IDLE_TIMEOUT_MS = 120_000;
 
@@ -551,13 +552,14 @@ const EXAMPLES = [
 const DEFAULT_RAG_PREFS: RagPrefs = { folderId: 0, ragFull: false, ragChunks: 12 };
 
 type AgentLayoutMode = "tabs" | "classic";
-type AgentTabId = "model" | "knowledge" | "workspace" | "tester" | "chat";
+type AgentTabId = "model" | "knowledge" | "workspace" | "tester" | "subagents" | "chat";
 
 const AGENT_TABS: Array<{ id: AgentTabId; label: string; hint: string }> = [
   { id: "model", label: "Модель и генерация", hint: "Подключение, выбор модели, возможности, раздумья и системный промпт" },
   { id: "knowledge", label: "Доверие и RAG", hint: "Уровень доверия ИИ, RAG-база знаний, контекст и архив переписок" },
   { id: "workspace", label: "Sandbox и Оператор", hint: "Изолированная папка Sandbox, экспорт на ПК и совместная работа с Оператором" },
   { id: "tester", label: "Тестировщик", hint: "Независимый QA-тестировщик в отдельном чате с теми же настройками модели" },
+  { id: "subagents", label: "Субагенты", hint: "Оркестратор и специализированные субагенты: дерево зависимостей, изолированные чаты и своё API" },
   { id: "chat", label: "Чат", hint: "История переписок, диалог с Агентом, вложения и запуск" },
 ];
 
@@ -754,6 +756,11 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const [liveBrowserLog, setLiveBrowserLog] = useState<string[]>([]);
   const [testerError, setTesterError] = useState<string | null>(null);
   const [testerDecisionBusy, setTesterDecisionBusy] = useState<number | null>(null);
+  const [subagentStats, setSubagentStats] = useState<{ totalCount: number; activeCount: number; runs: number }>({
+    totalCount: 0,
+    activeCount: 0,
+    runs: 0,
+  });
 
   const listRef = useRef<HTMLDivElement>(null);
   const dragDepthRef = useRef(0);
@@ -3568,6 +3575,18 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                     {liveTester ? "…" : testerRuns.length}
                   </span>
                 )}
+                {tab.id === "subagents" && (subagentStats.activeCount > 0 || subagentStats.runs > 0) && (
+                  <span
+                    className={cn(
+                      "rounded px-1 py-0.5 text-[10px]",
+                      subagentStats.runs > 0
+                        ? "bg-cyan-500/20 text-cyan-300"
+                        : "bg-card2 text-muted",
+                    )}
+                  >
+                    {subagentStats.runs > 0 ? subagentStats.runs : `${subagentStats.activeCount}/${subagentStats.totalCount}`}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -4596,6 +4615,30 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             if (isTabs) setActiveTab("model");
           }}
           onOpenAgentChat={(convId) => void openAgentChatFromTester(convId)}
+        />
+      </div>
+
+      {/* Вкладка 4.5: Оркестратор и Субагенты (дерево зависимостей, изолированные чаты, своё API) */}
+      <div
+        role={isTabs ? "tabpanel" : undefined}
+        aria-label="Субагенты"
+        hidden={isTabs && activeTab !== "subagents"}
+        className="space-y-3"
+      >
+        <SubagentsPanel
+          settings={settings}
+          params={params as Record<string, unknown>}
+          trustLevel={trustLevel}
+          modelContextLength={modelCapabilities?.contextLength ?? null}
+          github={
+            ghAccount && ghAccount.enabled && ghAccount.selectedOwner && ghAccount.selectedRepo
+              ? { owner: ghAccount.selectedOwner, repo: ghAccount.selectedRepo, branch: ghAccount.selectedBranch || "main" }
+              : null
+          }
+          onStats={setSubagentStats}
+          onOpenModelTab={() => {
+            if (isTabs) setActiveTab("model");
+          }}
         />
       </div>
 

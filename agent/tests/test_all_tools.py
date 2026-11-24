@@ -317,6 +317,9 @@ class AllToolsRegistryCoverageTests(unittest.TestCase):
         "call_tester",
         "confirm_minor_fixes",
         "list_tester_reports",
+        # Sub-Agent orchestration (2)
+        "list_subagents",
+        "call_subagent",
         # QA (8)
         "qa_static_review",
         "qa_run_tests",
@@ -363,12 +366,12 @@ class AllToolsRegistryCoverageTests(unittest.TestCase):
         "github_merge_pr",
     }
 
-    def test_exact_inventory_of_all_59_tools(self) -> None:
+    def test_exact_inventory_of_all_61_tools(self) -> None:
         agent_tools = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", has_github=True, role="agent")}
         tester_tools = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", has_github=True, role="tester")}
         actual_all = agent_tools | tester_tools
         self.assertEqual(actual_all, self.EXPECTED_ALL_TOOLS)
-        self.assertEqual(len(actual_all), 59)
+        self.assertEqual(len(actual_all), 61)
 
 
 class BaseOperatorSandboxToolsTests(unittest.TestCase):

@@ -1,21 +1,29 @@
 import {
+  completeSubagentRun,
   completeTesterRun,
+  createSubagentRunWithConversation,
   createTesterRunWithConversation,
   getAiUserSettingsSecret,
   getGithubConnectionWithSecret,
   getRagFolder,
+  getSubagentWithSecret,
+  listActiveSubagentsWithSecrets,
   listRagChunks,
+  listSubagentRuns,
   listTesterRuns,
   recordAgentUsage,
   searchRagChunks,
   updateTesterMinorDecision,
+  type AgentSubagentSecret,
+  type SubagentCallerKind,
+  type SubagentRunStatus,
   type TesterMinorDecision,
   type TesterRunStatus,
 } from "@/db/repo";
 import { AGENT_START_HINT, fetchAgent, resolveSafeAgentUrl } from "@/lib/agentConfig";
 import { createAgentSseProxyStream } from "@/lib/agentSseProxy";
 import { registerAgentApproval } from "@/lib/agentApprovals";
-import { hasAgentAccess } from "@/lib/aiPolicy";
+import { hasAgentAccess, isUnlimitedAiRole } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { estimateTokens, normalizeBaseUrl } from "@/lib/ai";
 import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
@@ -139,14 +147,25 @@ export async function POST(req: Request) {
         githubOwner?: string;
         githubRepo?: string;
         githubBranch?: string;
-        agentRole?: "agent" | "tester";
+        agentRole?: "agent" | "tester" | "subagent";
+        subagentId?: number | null;
         agentConversationId?: number | null;
         testerConversationId?: number | null;
+        subagentConversationId?: number | null;
         sandboxProject?: string;
       }
     | null;
 
-  const agentRole = body?.agentRole === "tester" ? "tester" : "agent";
+  const agentRole =
+    body?.agentRole === "tester"
+      ? "tester"
+      : body?.agentRole === "subagent"
+        ? "subagent"
+        : "agent";
+  const subagentId =
+    Number.isFinite(body?.subagentId) && Number(body?.subagentId) > 0
+      ? Math.floor(Number(body?.subagentId))
+      : null;
   const agentConversationId =
     Number.isFinite(body?.agentConversationId) && Number(body?.agentConversationId) > 0
       ? Math.floor(Number(body?.agentConversationId))
@@ -155,46 +174,62 @@ export async function POST(req: Request) {
     Number.isFinite(body?.testerConversationId) && Number(body?.testerConversationId) > 0
       ? Math.floor(Number(body?.testerConversationId))
       : null;
+  const subagentConversationId =
+    Number.isFinite(body?.subagentConversationId) && Number(body?.subagentConversationId) > 0
+      ? Math.floor(Number(body?.subagentConversationId))
+      : null;
   const sandboxProject =
     typeof body?.sandboxProject === "string" ? body.sandboxProject.trim().slice(0, 300) : "";
 
+  let targetSubagent: AgentSubagentSecret | null = null;
+  if (agentRole === "subagent") {
+    if (!subagentId) {
+      return Response.json({ error: "Укажите subagentId для запуска субагента" }, { status: 400 });
+    }
+    targetSubagent = await getSubagentWithSecret(me.id, subagentId);
+    if (!targetSubagent) {
+      return Response.json({ error: "Субагент не найден" }, { status: 404 });
+    }
+  }
+
   const unlimitedSteps = isUnlimitedStepsRole(me.role);
+  const unlimitedAi = isUnlimitedAiRole(me.role);
   const rawMessages = (body?.messages ?? []).filter(
     (m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string",
   );
-  const messages = (unlimitedSteps ? rawMessages : rawMessages.slice(-100)).map((m) => ({
+  const messages = (unlimitedAi ? rawMessages : rawMessages.slice(-100)).map((m) => ({
     role: m.role,
-    content: unlimitedSteps ? String(m.content) : String(m.content).slice(0, 256_000),
+    content: unlimitedAi ? String(m.content) : String(m.content).slice(0, 256_000),
   }));
   if (messages.length === 0) {
     return Response.json({ error: "Пустой запрос" }, { status: 400 });
   }
 
   const rawAttachments = (body?.attachments ?? []).filter((item) => item && typeof item === "object");
-  const attachments = (unlimitedSteps ? rawAttachments : rawAttachments.slice(0, 8)).map((item) => {
+  const attachments = (unlimitedAi ? rawAttachments : rawAttachments.slice(0, 8)).map((item) => {
     const image =
       typeof item.image === "string" && item.image.startsWith("data:image/")
-        ? unlimitedSteps
+        ? unlimitedAi
           ? item.image
           : item.image.slice(0, 6_000_000)
         : "";
     return {
       name: String(item.name ?? "файл").slice(0, 240),
       note: String(item.note ?? "").slice(0, 240),
-      text: unlimitedSteps ? String(item.text ?? "") : String(item.text ?? "").slice(0, 120_000),
+      text: unlimitedAi ? String(item.text ?? "") : String(item.text ?? "").slice(0, 120_000),
       ...(image ? { image } : {}),
     };
   });
 
-  const params = normalizeGenParams(body?.params, { unlimited: unlimitedSteps });
+  const params = normalizeGenParams(body?.params, { unlimited: unlimitedAi });
   const maxSteps = resolveStepsForRole(me.role, body?.maxSteps, unlimitedSteps ? 0 : AGENT_MAX_STEPS);
   const trustLevel = normalizeTrustLevel(body?.trustLevel);
   const runId = typeof body?.runId === "string" && body.runId.trim() ? body.runId.trim().slice(0, 80) : undefined;
   const systemPrompt =
     typeof body?.systemPrompt === "string"
-      ? unlimitedSteps
+      ? unlimitedAi
         ? body.systemPrompt.trim()
-        : body.systemPrompt.trim().slice(0, 12_000)
+        : body.systemPrompt.trim().slice(0, 16_000)
       : "";
 
   // Персональный GitHub-контекст и RAG по выбранному репозиторию текущего пользователя CRM.
@@ -337,10 +372,31 @@ export async function POST(req: Request) {
   }
 
   const savedSettings = await getAiUserSettingsSecret(me.id).catch(() => ({ baseUrl: "", model: "", apiKey: "" }));
-  const baseUrl = normalizeBaseUrl(body?.settings?.baseUrl || savedSettings.baseUrl || "") ?? undefined;
-  if (baseUrl) {
+  const orchestratorBaseUrl = normalizeBaseUrl(body?.settings?.baseUrl || savedSettings.baseUrl || "") ?? undefined;
+  const orchestratorApiKey = ((body?.settings?.apiKey ?? "").trim() || savedSettings.apiKey).slice(0, 400);
+  const orchestratorModel = ((body?.settings?.model ?? "").trim() || savedSettings.model).slice(0, 200);
+
+  // Приоритет заблокированного API Агента (Оркестратора):
+  // если у субагента НЕ стоит галочка unlockApi, всегда используется API Оркестратора.
+  let effectiveBaseUrl = orchestratorBaseUrl;
+  let effectiveApiKey = orchestratorApiKey;
+  let effectiveModel = orchestratorModel;
+  let directSubagentUsedCustomApi = false;
+
+  if (agentRole === "subagent" && targetSubagent && targetSubagent.unlockApi) {
+    const customUrl = normalizeBaseUrl(targetSubagent.baseUrl || "") || orchestratorBaseUrl;
+    effectiveBaseUrl = customUrl ?? undefined;
+    effectiveModel = (targetSubagent.model.trim() || orchestratorModel).slice(0, 200);
+    effectiveApiKey = (
+      targetSubagent.apiKey ||
+      (!targetSubagent.baseUrl ? orchestratorApiKey : "")
+    ).slice(0, 400);
+    directSubagentUsedCustomApi = Boolean(targetSubagent.baseUrl || targetSubagent.model || targetSubagent.apiKey);
+  }
+
+  if (effectiveBaseUrl) {
     try {
-      await assertSafeAiUrl(baseUrl);
+      await assertSafeAiUrl(effectiveBaseUrl);
     } catch (err) {
       return Response.json(
         { error: err instanceof Error ? err.message : "Запрещённый адрес модели" },
@@ -355,12 +411,58 @@ export async function POST(req: Request) {
     return Response.json({ error: (err as Error).message }, { status: 400 });
   }
 
+  // Загружаем активных субагентов (до 10 активных) и их дерево зависимостей.
+  const activeSubagentsRaw = await listActiveSubagentsWithSecrets(me.id).catch(() => []);
+  const subagentsPayload: Array<Record<string, unknown>> = [];
+  for (const sub of activeSubagentsRaw) {
+    let customApi: Record<string, unknown> = { unlocked: false };
+    if (sub.unlockApi) {
+      const subUrl = normalizeBaseUrl(sub.baseUrl || "") || orchestratorBaseUrl || "";
+      let urlSafe = true;
+      if (subUrl) {
+        try {
+          await assertSafeAiUrl(subUrl);
+        } catch {
+          urlSafe = false;
+        }
+      }
+      if (urlSafe) {
+        customApi = {
+          unlocked: true,
+          baseUrl: subUrl,
+          model: (sub.model.trim() || orchestratorModel).slice(0, 200),
+          apiKey: (sub.apiKey || (!sub.baseUrl ? orchestratorApiKey : "")).slice(0, 400),
+          reasoningMode: sub.reasoningMode || "default",
+        };
+      }
+    }
+    subagentsPayload.push({
+      id: sub.id,
+      slug: sub.slug,
+      name: sub.name,
+      roleTitle: sub.roleTitle,
+      description: sub.description,
+      systemPrompt: sub.systemPrompt,
+      color: sub.color,
+      parentSubagentId: sub.parentSubagentId,
+      orchestratorCanCall: sub.orchestratorCanCall,
+      allowedCallees: sub.allowedCallees,
+      unlockApi: sub.unlockApi,
+      customApi,
+    });
+  }
+
+  const effectiveSystemPrompt =
+    agentRole === "subagent" && targetSubagent
+      ? [targetSubagent.systemPrompt, systemPrompt].filter(Boolean).join("\n\n")
+      : systemPrompt;
+
   const payload = {
     messages,
     attachments,
     params,
     ownerUserId: me.id,
-    ...(systemPrompt ? { systemPrompt } : {}),
+    ...(effectiveSystemPrompt ? { systemPrompt: effectiveSystemPrompt } : {}),
     maxSteps,
     maxRunTokens: unlimitedSteps ? 0 : 2_500_000,
     unlimited: unlimitedSteps,
@@ -369,9 +471,14 @@ export async function POST(req: Request) {
     ...(modelContextLength > 0 ? { modelContextLength } : {}),
     ...(runId ? { runId } : {}),
     settings: {
-      baseUrl,
-      apiKey: ((body?.settings?.apiKey ?? "").trim() || savedSettings.apiKey).slice(0, 400),
-      model: ((body?.settings?.model ?? "").trim() || savedSettings.model).slice(0, 200),
+      baseUrl: effectiveBaseUrl,
+      apiKey: effectiveApiKey,
+      model: effectiveModel,
+    },
+    orchestratorSettings: {
+      baseUrl: orchestratorBaseUrl,
+      apiKey: orchestratorApiKey,
+      model: orchestratorModel,
     },
     ...(useGithub && ghConn
       ? {
@@ -398,9 +505,9 @@ export async function POST(req: Request) {
   };
 
   const modelName = payload.settings.model || "";
-  const recentTesterReports =
+  const [recentTesterReports, recentSubagentReports] = await Promise.all([
     agentRole === "agent"
-      ? await listTesterRuns(me.id, 4)
+      ? listTesterRuns(me.id, 4)
           .then((rows) =>
             rows.map((r) => ({
               id: r.id,
@@ -416,15 +523,55 @@ export async function POST(req: Request) {
             })),
           )
           .catch(() => [])
-      : [];
+      : Promise.resolve([]),
+    agentRole === "agent"
+      ? listSubagentRuns(me.id, { limit: 10 })
+          .then((rows) =>
+            rows.map((r) => ({
+              id: r.id,
+              subagentId: r.subagentId,
+              subagentSlug: r.subagentSlug ?? "",
+              subagentName: r.subagentName ?? "",
+              subagentConversationId: r.subagentConversationId,
+              callerKind: r.callerKind,
+              sandboxProject: r.sandboxProject,
+              status: r.status,
+              outputSummary: r.outputSummary.slice(0, 1200),
+              requestedCalleeSlug: r.requestedCalleeSlug,
+              requestedCalleeTask: r.requestedCalleeTask,
+              filesTouched: r.filesTouched.slice(0, 20),
+              totalTokens: r.totalTokens,
+              updatedAt: r.updatedAt,
+            })),
+          )
+          .catch(() => [])
+      : Promise.resolve([]),
+  ]);
 
   const fullPayload = {
     ...payload,
     agentRole,
     ...(sandboxProject ? { sandboxProject } : {}),
+    ...(subagentsPayload.length > 0 ? { subagents: subagentsPayload } : {}),
+    ...(targetSubagent
+      ? {
+          activeSubagent: {
+            id: targetSubagent.id,
+            slug: targetSubagent.slug,
+            name: targetSubagent.name,
+            roleTitle: targetSubagent.roleTitle,
+            description: targetSubagent.description,
+            systemPrompt: targetSubagent.systemPrompt,
+            allowedCallees: targetSubagent.allowedCallees,
+            unlockApi: targetSubagent.unlockApi,
+            usedCustomApi: directSubagentUsedCustomApi,
+          },
+        }
+      : {}),
     context: {
       ...payload.context,
       ...(recentTesterReports.length > 0 ? { recentTesterReports } : {}),
+      ...(recentSubagentReports.length > 0 ? { recentSubagentReports } : {}),
     },
   };
 
@@ -468,6 +615,10 @@ export async function POST(req: Request) {
   let reportedTotal = 0;
   let recorded = false;
   const activeTesterRuns = new Map<string, { runId: number; testerConversationId: number }>();
+  const activeSubagentRuns = new Map<
+    string,
+    { runId: number; subagentId: number; subagentConversationId: number }
+  >();
 
   const flushUsage = async () => {
     if (recorded) return;
@@ -480,7 +631,11 @@ export async function POST(req: Request) {
       await recordAgentUsage({
         userId: me.id,
         kind: "agent",
-        ...(agentRole === "tester" && testerConversationId ? { refId: testerConversationId } : {}),
+        ...(agentRole === "tester" && testerConversationId
+          ? { refId: testerConversationId }
+          : agentRole === "subagent" && subagentConversationId
+            ? { refId: subagentConversationId }
+            : {}),
         model: modelName,
         prompt: promptTokens,
         completion: completionTokens,
@@ -514,7 +669,145 @@ export async function POST(req: Request) {
           parsed.testerRunId = mapped.runId;
           parsed.testerConversationId = mapped.testerConversationId;
         }
+        const srk = typeof parsed.subagentRunKey === "string" ? parsed.subagentRunKey : "";
+        const mappedSub = srk ? activeSubagentRuns.get(srk) : undefined;
+        if (mappedSub) {
+          parsed.subagentRunId = mappedSub.runId;
+          parsed.subagentConversationId = mappedSub.subagentConversationId;
+        }
         return `event: ${ev}\ndata: ${JSON.stringify(parsed)}\n\n`;
+      } else if (ev === "subagent_start") {
+        const runKey = String(parsed.runKey ?? "default");
+        const parsedSubId = Number(parsed.subagentId ?? subagentId ?? 0);
+        if (parsedSubId > 0) {
+          try {
+            const rawCaller = String(parsed.callerKind ?? "orchestrator");
+            const callerKind: SubagentCallerKind =
+              rawCaller === "subagent" || rawCaller === "user" ? rawCaller : "orchestrator";
+            const created = await createSubagentRunWithConversation({
+              userId: me.id,
+              subagentId: parsedSubId,
+              agentConversationId,
+              existingConversationId:
+                agentRole === "subagent" ? subagentConversationId : null,
+              skipInitialMessage:
+                agentRole === "subagent" && Boolean(subagentConversationId),
+              callerKind,
+              callerSubagentId:
+                Number.isFinite(Number(parsed.callerSubagentId)) && Number(parsed.callerSubagentId) > 0
+                  ? Math.floor(Number(parsed.callerSubagentId))
+                  : null,
+              sandboxProject:
+                typeof parsed.sandboxProject === "string"
+                  ? parsed.sandboxProject
+                  : sandboxProject,
+              inputSummary: typeof parsed.summary === "string" ? parsed.summary : "",
+              taskPrompt: typeof parsed.task === "string" ? parsed.task : "",
+              model: typeof parsed.model === "string" ? parsed.model : modelName,
+              usedCustomApi: Boolean(parsed.usedCustomApi),
+            });
+            activeSubagentRuns.set(runKey, {
+              runId: created.run.id,
+              subagentId: created.run.subagentId,
+              subagentConversationId: created.conversation.id,
+            });
+            return `event: subagent_run\ndata: ${JSON.stringify({
+              runKey,
+              runId: created.run.id,
+              subagentId: created.run.subagentId,
+              subagentSlug: created.run.subagentSlug,
+              subagentName: created.run.subagentName,
+              subagentColor: created.run.subagentColor,
+              subagentConversationId: created.conversation.id,
+              run: created.run,
+              conversation: created.conversation,
+            })}\n\n`;
+          } catch {
+            return `event: subagent_run\ndata: ${JSON.stringify(parsed)}\n\n`;
+          }
+        }
+        return `event: subagent_run\ndata: ${JSON.stringify(parsed)}\n\n`;
+      } else if (
+        ev === "subagent_status" ||
+        ev === "subagent_reasoning" ||
+        ev === "subagent_text" ||
+        ev === "subagent_action" ||
+        ev === "subagent_handoff"
+      ) {
+        const runKey = String(parsed.runKey ?? "default");
+        const mappedSub = activeSubagentRuns.get(runKey);
+        if (mappedSub) {
+          parsed.runId = mappedSub.runId;
+          parsed.subagentId = mappedSub.subagentId;
+          parsed.subagentConversationId = mappedSub.subagentConversationId;
+        }
+        return `event: ${ev}\ndata: ${JSON.stringify(parsed)}\n\n`;
+      } else if (ev === "subagent_done") {
+        const runKey = String(parsed.runKey ?? "default");
+        const mappedSub = activeSubagentRuns.get(runKey);
+        const u = (parsed.usage && typeof parsed.usage === "object" ? parsed.usage : {}) as Record<
+          string,
+          unknown
+        >;
+        const sPrompt = Math.max(
+          0,
+          Math.round(Number(u.prompt ?? u.prompt_tokens ?? parsed.promptTokens ?? 0) || 0),
+        );
+        const sCompletion = Math.max(
+          0,
+          Math.round(Number(u.completion ?? u.completion_tokens ?? parsed.completionTokens ?? 0) || 0),
+        );
+        const sTotal = Math.max(
+          0,
+          Math.round(Number(u.total ?? u.total_tokens ?? parsed.totalTokens ?? 0) || 0),
+        );
+        if (mappedSub) {
+          const rawStatus = String(parsed.status ?? "completed");
+          const safeStatus: SubagentRunStatus =
+            rawStatus === "handoff" ||
+            rawStatus === "blocked" ||
+            rawStatus === "error" ||
+            rawStatus === "completed"
+              ? rawStatus
+              : "completed";
+          const savedRun = await completeSubagentRun({
+            userId: me.id,
+            runId: mappedSub.runId,
+            status: safeStatus,
+            outputSummary:
+              typeof parsed.outputSummary === "string"
+                ? parsed.outputSummary
+                : typeof parsed.reportSummary === "string"
+                  ? parsed.reportSummary
+                  : "",
+            requestedCalleeSlug:
+              typeof parsed.requestedCalleeSlug === "string" ? parsed.requestedCalleeSlug : "",
+            requestedCalleeTask:
+              typeof parsed.requestedCalleeTask === "string" ? parsed.requestedCalleeTask : "",
+            filesTouched: Array.isArray(parsed.filesTouched)
+              ? parsed.filesTouched.map((x) => String(x))
+              : [],
+            promptTokens: agentRole === "subagent" ? 0 : sPrompt,
+            completionTokens: agentRole === "subagent" ? 0 : sCompletion,
+            totalTokens: agentRole === "subagent" ? 0 : sTotal,
+            model: typeof parsed.model === "string" ? parsed.model : modelName,
+            usedCustomApi: Boolean(parsed.usedCustomApi),
+            assistantContent:
+              typeof parsed.fullResponse === "string" ? parsed.fullResponse : undefined,
+            assistantReasoning:
+              typeof parsed.reasoning === "string" ? parsed.reasoning : undefined,
+            assistantActions: Array.isArray(parsed.actions) ? parsed.actions : undefined,
+            assistantFiles: Array.isArray(parsed.files) ? parsed.files : undefined,
+            assistantError: typeof parsed.error === "string" ? parsed.error : undefined,
+          }).catch(() => null);
+          if (savedRun) {
+            parsed.runId = savedRun.id;
+            parsed.subagentId = savedRun.subagentId;
+            parsed.subagentConversationId = savedRun.subagentConversationId;
+            parsed.run = savedRun;
+          }
+        }
+        return `event: subagent_done\ndata: ${JSON.stringify(parsed)}\n\n`;
       } else if (ev === "tester_start") {
         const runKey = String(parsed.runKey ?? "default");
         try {
@@ -563,6 +856,18 @@ export async function POST(req: Request) {
         if (mapped) {
           if (!parsed.runId) parsed.runId = mapped.runId;
           if (!parsed.testerConversationId) parsed.testerConversationId = mapped.testerConversationId;
+        }
+        const srk =
+          typeof parsed.subagentRunKey === "string"
+            ? parsed.subagentRunKey
+            : typeof parsed.runKey === "string"
+              ? parsed.runKey
+              : "";
+        const mappedSub = srk ? activeSubagentRuns.get(srk) : undefined;
+        if (mappedSub) {
+          if (!parsed.runId) parsed.runId = mappedSub.runId;
+          if (!parsed.subagentId) parsed.subagentId = mappedSub.subagentId;
+          if (!parsed.subagentConversationId) parsed.subagentConversationId = mappedSub.subagentConversationId;
         }
         return `event: action\ndata: ${JSON.stringify(parsed)}\n\n`;
       } else if (ev === "tester_done") {
