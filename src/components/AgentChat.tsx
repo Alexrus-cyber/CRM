@@ -761,6 +761,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     activeCount: 0,
     runs: 0,
   });
+  const [subagentRefreshKey, setSubagentRefreshKey] = useState(0);
 
   const listRef = useRef<HTMLDivElement>(null);
   const dragDepthRef = useRef(0);
@@ -3128,6 +3129,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             if (updRun) {
               setTesterRuns((prev) => prev.map((r) => (r.id === updRun.id ? updRun : r)));
             }
+          } else if (event === "subagent_done") {
+            setSubagentRefreshKey((k) => k + 1);
           } else if (event === "reasoning") {
             assistantDraft.reasoning = String(data.text ?? "");
             patch((t) => ({ ...t, reasoning: assistantDraft.reasoning }));
@@ -4635,6 +4638,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               ? { owner: ghAccount.selectedOwner, repo: ghAccount.selectedRepo, branch: ghAccount.selectedBranch || "main" }
               : null
           }
+          refreshKey={subagentRefreshKey}
           onStats={setSubagentStats}
           onOpenModelTab={() => {
             if (isTabs) setActiveTab("model");

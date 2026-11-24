@@ -39,6 +39,24 @@ export async function GET(req: Request) {
   const conversationIdRaw = Number(sp.get("conversationId") || 0);
   const conversationId =
     Number.isSafeInteger(conversationIdRaw) && conversationIdRaw > 0 ? conversationIdRaw : null;
+  const onlyConversation = sp.get("onlyConversation") === "1" && conversationId !== null;
+
+  if (onlyConversation && conversationId) {
+    let selectedConversation = null;
+    const conv = await getAgentConversation(user.id, conversationId);
+    if (conv && conv.kind === "subagent") {
+      const [messages, usage] = await Promise.all([
+        listAgentConversationMessages(conv.id),
+        getAgentConversationUsage(user.id, conv.id),
+      ]);
+      selectedConversation = {
+        conversation: conv,
+        messages,
+        tokens: usage,
+      };
+    }
+    return Response.json({ selectedConversation }, { headers: { "Cache-Control": "no-store" } });
+  }
 
   const [subagents, counts, runs, conversations] = await Promise.all([
     listSubagentsPublic(user.id),

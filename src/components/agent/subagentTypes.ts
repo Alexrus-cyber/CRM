@@ -1,0 +1,103 @@
+export type Subagent = {
+  id: number;
+  userId: number;
+  slug: string;
+  name: string;
+  roleTitle: string;
+  description: string;
+  systemPrompt: string;
+  color: string;
+  isActive: boolean;
+  parentSubagentId: number | null;
+  orchestratorCanCall: boolean;
+  allowedCallees: string[];
+  unlockApi: boolean;
+  provider: string;
+  baseUrl: string;
+  model: string;
+  hasApiKey: boolean;
+  apiKeyHint: string;
+  reasoningMode: string;
+  runsCount: number;
+  conversationsCount: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type SubagentRun = {
+  id: number;
+  subagentId: number;
+  subagentSlug?: string;
+  subagentName?: string;
+  subagentColor?: string;
+  agentConversationId: number | null;
+  subagentConversationId: number;
+  callerKind: "orchestrator" | "subagent" | "user";
+  callerSubagentId: number | null;
+  callerSubagentName?: string;
+  sandboxProject: string;
+  inputSummary: string;
+  outputSummary: string;
+  status: "running" | "completed" | "handoff" | "blocked" | "error";
+  requestedCalleeSlug: string;
+  requestedCalleeTask: string;
+  actionsCount: number;
+  filesTouched: string[];
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  model: string;
+  usedCustomApi: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type SubagentConversation = {
+  id: number;
+  kind: "subagent";
+  subagentId?: number;
+  title: string;
+  messagesCount: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type SubagentMessage = {
+  id: number;
+  conversationId: number;
+  role: "user" | "assistant";
+  content: string;
+  reasoning: string;
+  attachments: string[];
+  actions: string[];
+  files: string[];
+  error: string;
+  createdAt: string;
+};
+
+export type SubagentLimits = {
+  maxStored: number;
+  maxActive: number;
+  totalCount: number;
+  activeCount: number;
+};
+
+export type TreeNodeDraft = {
+  isActive: boolean;
+  parentSubagentId: number | null;
+  orchestratorCanCall: boolean;
+  allowedCalleesText: string;
+};
+
+export function parseCalleesList(text: string): string[] {
+  return text
+    .split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+export function formatTokensCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2).replace(".", ",")} млн`;
+  if (n >= 10_000) return `${Math.round(n / 1000)} тыс.`;
+  return n.toLocaleString("ru-RU");
+}
