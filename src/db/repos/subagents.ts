@@ -16,6 +16,34 @@ export const MAX_ACTIVE_SUBAGENTS = 10;
 
 export type SubagentCallerKind = "orchestrator" | "subagent" | "user";
 export type SubagentRunStatus = "running" | "completed" | "handoff" | "blocked" | "error";
+export type SubagentRoutingMode = "linear" | "layered";
+export type OverseerMode = "strict" | "rules_only";
+
+export type OverseerConfigPublic = {
+  enabled: boolean;
+  mode: OverseerMode;
+  systemPrompt: string;
+  unlockApi: boolean;
+  provider: string;
+  baseUrl: string;
+  model: string;
+  hasApiKey: boolean;
+  apiKeyHint: string;
+};
+
+export type OverseerConfigSecret = OverseerConfigPublic & {
+  apiKey: string;
+};
+
+export type AgentOrchestrationConfigPublic = {
+  routingMode: SubagentRoutingMode;
+  overseer: OverseerConfigPublic;
+};
+
+export type AgentOrchestrationConfigSecret = {
+  routingMode: SubagentRoutingMode;
+  overseer: OverseerConfigSecret;
+};
 
 export type AgentSubagentPublic = {
   id: number;
@@ -947,3 +975,217 @@ export async function completeSubagentRun(input: {
 
   return getSubagentRun(input.userId, input.runId);
 }
+
+export function normalizeSubagentRoutingMode(raw: unknown): SubagentRoutingMode {
+  return String(raw ?? "").trim().toLowerCase() === "layered" ? "layered" : "linear";
+}
+
+export function normalizeOverseerMode(raw: unknown): OverseerMode {
+  return String(raw ?? "").trim().toLowerCase() === "rules_only" ? "rules_only" : "strict";
+}
+
+const DEFAULT_ORCHESTRATION_PUBLIC: AgentOrchestrationConfigPublic = {
+  routingMode: "linear",
+  overseer: {
+    enabled: true,
+    mode: "strict",
+    systemPrompt: "",
+    unlockApi: false,
+    provider: "custom",
+    baseUrl: "",
+    model: "",
+    hasApiKey: false,
+    apiKeyHint: "",
+  },
+};
+
+function mapOrchestrationPublic(row: Raw | null | undefined): AgentOrchestrationConfigPublic {
+  if (!row) {
+    return {
+      routingMode: DEFAULT_ORCHESTRATION_PUBLIC.routingMode,
+      overseer: { ...DEFAULT_ORCHESTRATION_PUBLIC.overseer },
+    };
+  }
+  const encrypted = String(row.overseer_api_key_encrypted ?? "");
+  return {
+    routingMode: normalizeSubagentRoutingMode(row.subagent_routing_mode),
+    overseer: {
+      enabled: row.overseer_enabled === undefined ? true : toBool(row.overseer_enabled),
+      mode: normalizeOverseerMode(row.overseer_mode),
+      systemPrompt: String(row.overseer_system_prompt ?? ""),
+      unlockApi: toBool(row.overseer_unlock_api),
+      provider: String(row.overseer_provider ?? "custom") || "custom",
+      baseUrl: String(row.overseer_base_url ?? ""),
+      model: String(row.overseer_model ?? ""),
+      hasApiKey: encrypted.length > 0,
+      apiKeyHint: String(row.overseer_api_key_hint ?? ""),
+    },
+  };
+}
+
+export async function getAgentOrchestrationConfigPublic(
+  userId: number,
+): Promise<AgentOrchestrationConfigPublic> {
+  const row = await q1(sql`
+    select subagent_routing_mode,
+           overseer_enabled,
+           overseer_mode,
+           overseer_system_prompt,
+           overseer_unlock_api,
+           overseer_provider,
+           overseer_base_url,
+           overseer_model,
+           overseer_api_key_encrypted,
+           overseer_api_key_hint
+    from ai_user_settings
+    where user_id = ${userId}
+    limit 1`);
+  return mapOrchestrationPublic(row);
+}
+
+export async function getAgentOrchestrationConfigSecret(
+  userId: number,
+): Promise<AgentOrchestrationConfigSecret> {
+  const row = await q1(sql`
+    select subagent_routing_mode,
+           overseer_enabled,
+           overseer_mode,
+           overseer_system_prompt,
+           overseer_unlock_api,
+           overseer_provider,
+           overseer_base_url,
+           overseer_model,
+           overseer_api_key_encrypted,
+           overseer_api_key_hint
+    from ai_user_settings
+    where user_id = ${userId}
+    limit 1`);
+  const pub = mapOrchestrationPublic(row);
+  let apiKey = "";
+  if (pub.overseer.unlockApi && row?.overseer_api_key_encrypted) {
+    try {
+      apiKey = decryptSecret(String(row.overseer_api_key_encrypted));
+    } catch {
+      apiKey = "";
+    }
+  }
+  return {
+    routingMode: pub.routingMode,
+    overseer: {
+      ...pub.overseer,
+      apiKey,
+    },
+  };
+}
+
+export type UpsertAgentOrchestrationInput = {
+  routingMode?: SubagentRoutingMode;
+  overseer?: {
+    enabled?: boolean;
+    mode?: OverseerMode;
+    systemPrompt?: string;
+    unlockApi?: boolean;
+    provider?: string;
+    baseUrl?: string;
+    model?: string;
+    apiKey?: string;
+    clearApiKey?: boolean;
+  };
+};
+
+export async function upsertAgentOrchestrationConfig(
+  userId: number,
+  input: UpsertAgentOrchestrationInput,
+): Promise<AgentOrchestrationConfigPublic> {
+  const now = nowIso();
+  const existing = await q1(sql`
+    select id,
+           subagent_routing_mode,
+           overseer_enabled,
+           overseer_mode,
+           overseer_system_prompt,
+           overseer_unlock_api,
+           overseer_provider,
+           overseer_base_url,
+           overseer_model,
+           overseer_api_key_encrypted,
+           overseer_api_key_hint
+    from ai_user_settings
+    where user_id = ${userId}
+    limit 1`);
+
+  const cur = mapOrchestrationPublic(existing);
+  const nextRouting =
+    input.routingMode !== undefined
+      ? normalizeSubagentRoutingMode(input.routingMode)
+      : cur.routingMode;
+
+  const ov = input.overseer ?? {};
+  // Надсмотрщик всегда остаётся активным для защиты Sandbox; режим можно выбрать ('strict' | 'rules_only').
+  const nextEnabled = ov.enabled !== undefined ? Boolean(ov.enabled) : cur.overseer.enabled;
+  const nextMode = ov.mode !== undefined ? normalizeOverseerMode(ov.mode) : cur.overseer.mode;
+  const nextPrompt =
+    ov.systemPrompt !== undefined
+      ? String(ov.systemPrompt ?? "").trim().slice(0, 16_000)
+      : cur.overseer.systemPrompt;
+  const nextUnlockApi =
+    ov.unlockApi !== undefined ? Boolean(ov.unlockApi) : cur.overseer.unlockApi;
+  const nextProvider =
+    ov.provider !== undefined
+      ? String(ov.provider ?? "").trim().slice(0, 40) || "custom"
+      : cur.overseer.provider;
+  const nextBaseUrl =
+    ov.baseUrl !== undefined
+      ? ov.baseUrl
+        ? normalizeBaseUrl(String(ov.baseUrl).slice(0, 400)) ?? ""
+        : ""
+      : cur.overseer.baseUrl;
+  const nextModel =
+    ov.model !== undefined
+      ? String(ov.model ?? "").trim().slice(0, 200)
+      : cur.overseer.model;
+
+  let nextEncrypted = String(existing?.overseer_api_key_encrypted ?? "");
+  let nextHint = String(existing?.overseer_api_key_hint ?? "");
+  if (ov.clearApiKey) {
+    nextEncrypted = "";
+    nextHint = "";
+  } else if (typeof ov.apiKey === "string" && ov.apiKey.trim()) {
+    const cleanKey = ov.apiKey.trim().slice(0, 500);
+    nextEncrypted = encryptSecret(cleanKey);
+    nextHint = maskSecret(cleanKey);
+  }
+
+  if (existing) {
+    await q(sql`
+      update ai_user_settings
+      set subagent_routing_mode = ${nextRouting},
+          overseer_enabled = ${nextEnabled},
+          overseer_mode = ${nextMode},
+          overseer_system_prompt = ${nextPrompt},
+          overseer_unlock_api = ${nextUnlockApi},
+          overseer_provider = ${nextProvider},
+          overseer_base_url = ${nextBaseUrl},
+          overseer_model = ${nextModel},
+          overseer_api_key_encrypted = ${nextEncrypted},
+          overseer_api_key_hint = ${nextHint},
+          updated_at = ${now}
+      where user_id = ${userId}`);
+  } else {
+    await q(sql`
+      insert into ai_user_settings (
+        user_id, base_url, api_key_encrypted, api_key_hint, model,
+        subagent_routing_mode, overseer_enabled, overseer_mode, overseer_system_prompt,
+        overseer_unlock_api, overseer_provider, overseer_base_url, overseer_model,
+        overseer_api_key_encrypted, overseer_api_key_hint, created_at, updated_at
+      ) values (
+        ${userId}, '', '', '', '',
+        ${nextRouting}, ${nextEnabled}, ${nextMode}, ${nextPrompt},
+        ${nextUnlockApi}, ${nextProvider}, ${nextBaseUrl}, ${nextModel},
+        ${nextEncrypted}, ${nextHint}, ${now}, ${now}
+      )`);
+  }
+
+  return getAgentOrchestrationConfigPublic(userId);
+}
+

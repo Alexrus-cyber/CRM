@@ -1,10 +1,12 @@
 "use client";
 
-import { useId, useMemo, useState } from "react";
+import { useId, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   AlertTriangle,
   Check,
   GitBranch,
+  Layers,
+  Link2,
   Lock,
   MessageSquare,
   Pencil,
@@ -12,7 +14,9 @@ import {
   RotateCcw,
   Save,
   Sparkles,
+  Unlink,
   Unlock,
+  Workflow,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -21,6 +25,7 @@ import { cn } from "@/lib/utils";
 import {
   parseCalleesList,
   type Subagent,
+  type SubagentRoutingMode,
   type TreeNodeDraft,
 } from "./subagentTypes";
 
@@ -36,6 +41,8 @@ type Props = {
   subagents: Subagent[];
   orchestratorModel?: string;
   maxActive: number;
+  routingMode?: SubagentRoutingMode;
+  onChangeRoutingMode?: (mode: SubagentRoutingMode) => Promise<void>;
   onSave: (nodes: DependencyTreeNodePayload[]) => Promise<void>;
   onCreateNew?: () => void;
   onEditSubagent?: (subagent: Subagent) => void;
@@ -173,6 +180,8 @@ export function DependencyTreeCanvas({
   subagents,
   orchestratorModel,
   maxActive,
+  routingMode = "linear",
+  onChangeRoutingMode,
   onSave,
   onCreateNew,
   onEditSubagent,
@@ -180,10 +189,14 @@ export function DependencyTreeCanvas({
   onClose,
 }: Props) {
   const uid = useId().replace(/:/g, "");
+  const svgRef = useRef<SVGSVGElement | null>(null);
   const [overrides, setOverrides] = useState<Record<number, Partial<TreeNodeDraft>>>({});
   const [selectedNodeId, setSelectedNodeId] = useState<number | "orchestrator" | null>(() =>
     subagents[0]?.id ?? "orchestrator",
   );
+  const [connectFrom, setConnectFrom] = useState<number | "orchestrator" | null>(null);
+  const [cursorSvgPos, setCursorSvgPos] = useState<{ x: number; y: number } | null>(null);
+  const [routingBusy, setRoutingBusy] = useState(false);
   const [showCrossLinks, setShowCrossLinks] = useState(true);
   const [zoomed, setZoomed] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -537,6 +550,109 @@ export function DependencyTreeCanvas({
     updateDraft(subagentId, { allowedCalleesText: next.join(", ") });
   };
 
+  const handleRoutingSwitch = async (nextMode: SubagentRoutingMode) => {
+    if (nextMode === routingMode || !onChangeRoutingMode || routingBusy) return;
+    setRoutingBusy(true);
+    setError(null);
+    setSavedToast(null);
+    try {
+      await onChangeRoutingMode(nextMode);
+      setSavedToast(
+        nextMode === "layered"
+          ? "Режим изменён: По уровням (строгая иерархия Оркестратор ↔ Уровень 1 ↔ Уровень 2…)"
+          : "Режим изменён: Линейно (Оркестратор напрямую координирует субагентов)",
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Не удалось переключить режим");
+    } finally {
+      setRoutingBusy(false);
+    }
+  };
+
+  const startConnectFrom = (src: number | "orchestrator") => {
+    setError(null);
+    setSavedToast(null);
+    setConnectFrom(src);
+    setSelectedNodeId(src);
+  };
+
+  const cancelConnect = () => {
+    setConnectFrom(null);
+    setCursorSvgPos(null);
+  };
+
+  const connectTargetNode = (targetId: number) => {
+    if (connectFrom === null) return;
+    if (connectFrom === "orchestrator") {
+      updateDraft(targetId, {
+        orchestratorCanCall: true,
+        ...(routingMode === "layered" ? { parentSubagentId: null } : {}),
+      });
+      setSelectedNodeId(targetId);
+      setSavedToast("Связь «Оркестратор → субагент» добавлена (не забудьте сохранить дерево)");
+      cancelConnect();
+      return;
+    }
+    if (connectFrom === targetId) {
+      cancelConnect();
+      return;
+    }
+    const targetBlocked = collectDescendantIds(targetId, draftById);
+    if (targetBlocked.has(connectFrom)) {
+      setError("Нельзя создать циклическую связь (выбранный узел уже является родителем источника).");
+      cancelConnect();
+      return;
+    }
+    const parentSub = subagents.find((s) => s.id === connectFrom);
+    const targetSub = subagents.find((s) => s.id === targetId);
+    updateDraft(targetId, {
+      parentSubagentId: connectFrom,
+      ...(routingMode === "layered" ? { orchestratorCanCall: false } : {}),
+    });
+    if (parentSub && targetSub) {
+      const parentCallees = parseCalleesList(draftById[parentSub.id]?.allowedCalleesText ?? "");
+      if (!parentCallees.includes("*") && !parentCallees.includes(targetSub.slug)) {
+        updateDraft(parentSub.id, {
+          allowedCalleesText: [...parentCallees, targetSub.slug].join(", "),
+        });
+      }
+    }
+    setSelectedNodeId(targetId);
+    setSavedToast(`Связь «${parentSub?.name ?? connectFrom} → ${targetSub?.name ?? targetId}» добавлена`);
+    cancelConnect();
+  };
+
+  const disconnectEdge = (edge: EdgeInfo) => {
+    setError(null);
+    setSavedToast(null);
+    if (edge.fromNodeId === "orchestrator") {
+      updateDraft(edge.toNodeId, { orchestratorCanCall: false });
+      setSavedToast("Прямая связь с Оркестратором удалена");
+    } else {
+      updateDraft(edge.toNodeId, { parentSubagentId: null });
+      setSavedToast("Иерархическая связь с родителем удалена");
+    }
+  };
+
+  const handleSvgPointerMove = (e: ReactPointerEvent<SVGSVGElement>) => {
+    if (connectFrom === null || !svgRef.current) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const x = ((e.clientX - rect.left) / rect.width) * layout.width;
+    const y = ((e.clientY - rect.top) / rect.height) * layout.height;
+    setCursorSvgPos({ x, y });
+  };
+
+  const connectSourcePoint = useMemo(() => {
+    if (connectFrom === null) return null;
+    if (connectFrom === "orchestrator") {
+      return { x: layout.rootX, y: layout.rootY + 38, label: "Оркестратор" };
+    }
+    const n = layout.nodesMap.get(connectFrom);
+    if (!n) return null;
+    return { x: n.x, y: n.y + 30, label: n.subagent.name };
+  }, [connectFrom, layout.nodesMap, layout.rootX, layout.rootY]);
+
   const handleSave = async () => {
     setBusy(true);
     setError(null);
@@ -585,6 +701,56 @@ export function DependencyTreeCanvas({
       subtitle="Интерактивная нейронная топология: нажмите на любой шестиугольник, чтобы перенастроить связи, родителя, handoff-вызовы и активность."
       action={
         <div className="flex flex-wrap items-center gap-1.5">
+          {onChangeRoutingMode && (
+            <div
+              role="group"
+              aria-label="Режим маршрутизации субагентов"
+              className="inline-flex rounded-xl border border-border bg-card2 p-0.5"
+            >
+              <button
+                type="button"
+                disabled={routingBusy}
+                onClick={() => void handleRoutingSwitch("linear")}
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-medium transition",
+                  routingMode === "linear"
+                    ? "bg-accent text-white shadow-sm"
+                    : "text-muted hover:text-text",
+                )}
+              >
+                <Workflow size={12} />
+                Линейно
+              </button>
+              <button
+                type="button"
+                disabled={routingBusy}
+                onClick={() => void handleRoutingSwitch("layered")}
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-medium transition",
+                  routingMode === "layered"
+                    ? "bg-cyan-500 text-slate-950 shadow-sm"
+                    : "text-muted hover:text-text",
+                )}
+              >
+                <Layers size={12} />
+                По уровням
+              </button>
+            </div>
+          )}
+          {subagents.length > 0 && (
+            <Button
+              size="sm"
+              variant={connectFrom !== null ? "primary" : "secondary"}
+              onClick={() => {
+                if (connectFrom !== null) cancelConnect();
+                else startConnectFrom(effectiveSelectedId);
+              }}
+              title="Нажмите и кликните целевой узел на схеме, чтобы провести связь"
+            >
+              <Link2 size={12} />
+              {connectFrom !== null ? "Отменить связь" : "Провести связь"}
+            </Button>
+          )}
           <Button
             size="sm"
             variant={showCrossLinks ? "secondary" : "ghost"}
@@ -611,6 +777,38 @@ export function DependencyTreeCanvas({
         </div>
       }
     >
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-card2/70 px-3 py-2 text-[11px]">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge
+            className={
+              routingMode === "layered"
+                ? "border-cyan-500/40 bg-cyan-500/15 text-cyan-300"
+                : "border-accent/40 bg-accent/15 text-accent2"
+            }
+          >
+            {routingMode === "layered" ? "Режим: По уровням" : "Режим: Линейно"}
+          </Badge>
+          <span className="text-muted">
+            {routingMode === "layered"
+              ? "Каждый уровень общается только с соседним (Оркестратор ↔ Уровень 1 ↔ Уровень 2…); вверх — через эскалацию к верхнему узлу."
+              : "Оркестратор вызывает субагентов напрямую и координирует handoff между ветками."}
+          </span>
+        </div>
+        {connectFrom !== null && connectSourcePoint && (
+          <div className="flex items-center gap-2 text-cyan-300">
+            <span className="font-medium">
+              Проводим связь от «{connectSourcePoint.label}» — кликните по целевому шестиугольнику
+            </span>
+            <button
+              type="button"
+              onClick={cancelConnect}
+              className="rounded-md border border-cyan-500/40 bg-card px-2 py-0.5 text-[10px] text-text hover:bg-cyan-500/15"
+            >
+              Отмена
+            </button>
+          </div>
+        )}
+      </div>
       {error && (
         <div className="mb-3 flex items-center gap-2 rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-400">
           <AlertTriangle size={14} className="shrink-0" />
@@ -644,11 +842,21 @@ export function DependencyTreeCanvas({
 
         <div className="overflow-x-auto">
           <svg
+            ref={svgRef}
             role="img"
             aria-label="Схема зависимостей Оркестратора и субагентов"
             viewBox={`0 0 ${layout.width} ${layout.height}`}
+            onPointerMove={handleSvgPointerMove}
+            onPointerLeave={() => setCursorSvgPos(null)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && connectFrom !== null) {
+                e.preventDefault();
+                cancelConnect();
+              }
+            }}
             className={cn(
               "block select-none transition-all duration-300",
+              connectFrom !== null && "cursor-crosshair",
               zoomed ? "min-w-[1180px] w-[130%]" : "w-full min-w-[680px]",
             )}
             style={{
@@ -846,6 +1054,13 @@ export function DependencyTreeCanvas({
                 const gradUrl = `url(#${uid}-edge-${edge.id})`;
                 const baseStroke = edge.active ? gradUrl : "#475569";
                 const offsets = edge.active ? [-4.5, 0, 4.5] : [0];
+                const midX = (edge.fromX + edge.toX) / 2;
+                const midY = (edge.fromY + edge.toY) / 2;
+                const fromLabel =
+                  edge.fromNodeId === "orchestrator"
+                    ? "Оркестратор"
+                    : subagents.find((s) => s.id === edge.fromNodeId)?.name ?? `#${edge.fromNodeId}`;
+                const toLabel = subagents.find((s) => s.id === edge.toNodeId)?.name ?? `#${edge.toNodeId}`;
                 return (
                   <g key={edge.id} opacity={edge.active ? (isSelectedEdge ? 1 : 0.86) : 0.42}>
                     {/* Ортогональная фоновая PCB-направляющая для техно-эффекта */}
@@ -886,9 +1101,50 @@ export function DependencyTreeCanvas({
                         opacity={isSelectedEdge ? 0.85 : 0.48}
                       />
                     )}
+                    {/* Кликабельная кнопка удаления связи на линии */}
+                    <g
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`Удалить связь ${fromLabel} → ${toLabel}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        disconnectEdge(edge);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          disconnectEdge(edge);
+                        }
+                      }}
+                      transform={`translate(${midX}, ${midY})`}
+                      className="cursor-pointer opacity-75 transition hover:opacity-100 focus:outline-none"
+                    >
+                      <title>Удалить связь {fromLabel} → {toLabel}</title>
+                      <circle
+                        r={9}
+                        fill="#071222"
+                        stroke={isSelectedEdge ? "#f87171" : "rgba(148,163,184,0.6)"}
+                        strokeWidth="1.2"
+                      />
+                      <line x1={-3} y1={-3} x2={3} y2={3} stroke="#fca5a5" strokeWidth="1.5" strokeLinecap="round" />
+                      <line x1={3} y1={-3} x2={-3} y2={3} stroke="#fca5a5" strokeWidth="1.5" strokeLinecap="round" />
+                    </g>
                   </g>
                 );
               })}
+
+              {/* Предпросмотр проводимой линии связи */}
+              {connectFrom !== null && connectSourcePoint && cursorSvgPos && (
+                <path
+                  d={`M ${connectSourcePoint.x} ${connectSourcePoint.y} C ${connectSourcePoint.x} ${(connectSourcePoint.y + cursorSvgPos.y) / 2}, ${cursorSvgPos.x} ${(connectSourcePoint.y + cursorSvgPos.y) / 2}, ${cursorSvgPos.x} ${cursorSvgPos.y}`}
+                  fill="none"
+                  stroke="#22d3ee"
+                  strokeWidth="2.4"
+                  strokeDasharray="6 4"
+                  pointerEvents="none"
+                />
+              )}
             </g>
 
             {/* 5. Перекрёстные handoff-дуги (allowedCallees) */}
@@ -1018,23 +1274,27 @@ export function DependencyTreeCanvas({
               role="button"
               tabIndex={0}
               aria-label="Узел Оркестратор (Главный Агент)"
-              onClick={() => setSelectedNodeId("orchestrator")}
+              onClick={() => {
+                if (connectFrom !== null) cancelConnect();
+                else setSelectedNodeId("orchestrator");
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
-                  setSelectedNodeId("orchestrator");
+                  if (connectFrom !== null) cancelConnect();
+                  else setSelectedNodeId("orchestrator");
                 }
               }}
               className="cursor-pointer focus:outline-none"
             >
-              {effectiveSelectedId === "orchestrator" && (
+              {(effectiveSelectedId === "orchestrator" || connectFrom === "orchestrator") && (
                 <polygon
                   points={hexPoints(layout.rootX, layout.rootY, 47)}
                   fill="none"
-                  stroke="#fb923c"
-                  strokeWidth="1.5"
+                  stroke={connectFrom === "orchestrator" ? "#22d3ee" : "#fb923c"}
+                  strokeWidth={connectFrom === "orchestrator" ? "2" : "1.5"}
                   strokeDasharray="4 3"
-                  opacity="0.9"
+                  opacity="0.95"
                 />
               )}
               <polygon
@@ -1072,6 +1332,38 @@ export function DependencyTreeCanvas({
               >
                 ОРКЕСТРАТОР · ГЛАВНЫЙ АГЕНТ
               </text>
+              {/* Нижний выходной порт для протягивания связи */}
+              {subagents.length > 0 && (
+                <g
+                  role="button"
+                  tabIndex={0}
+                  aria-label="Провести связь от Оркестратора"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (connectFrom === "orchestrator") cancelConnect();
+                    else startConnectFrom("orchestrator");
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (connectFrom === "orchestrator") cancelConnect();
+                      else startConnectFrom("orchestrator");
+                    }
+                  }}
+                  transform={`translate(${layout.rootX}, ${layout.rootY + 39})`}
+                  className="cursor-crosshair"
+                >
+                  <circle
+                    r={6.5}
+                    fill={connectFrom === "orchestrator" ? "#22d3ee" : "#0b101d"}
+                    stroke="#ff884d"
+                    strokeWidth="1.5"
+                  />
+                  <line x1={-2.5} y1={0} x2={2.5} y2={0} stroke="#fff" strokeWidth="1.3" />
+                  <line x1={0} y1={-2.5} x2={0} y2={2.5} stroke="#fff" strokeWidth="1.3" />
+                </g>
+              )}
             </g>
 
             {/* 9. Шестиугольные узлы субагентов */}
@@ -1082,6 +1374,8 @@ export function DependencyTreeCanvas({
                 ? TIER_THEMES[Math.min(node.tier, TIER_THEMES.length - 1)]
                 : INACTIVE_THEME;
               const isSelected = effectiveSelectedId === s.id;
+              const isConnectSource = connectFrom === s.id;
+              const isConnectTarget = connectFrom !== null && connectFrom !== s.id;
               const labelText = s.name.length > 18 ? `${s.name.slice(0, 17)}…` : s.name;
               const subTag = node.manualDetached
                 ? "вручную"
@@ -1094,22 +1388,32 @@ export function DependencyTreeCanvas({
                   key={s.id}
                   role="button"
                   tabIndex={0}
-                  aria-label={`Субагент ${s.name}`}
-                  onClick={() => setSelectedNodeId(s.id)}
+                  aria-label={isConnectTarget ? `Соединить с субагентом ${s.name}` : `Субагент ${s.name}`}
+                  onClick={() => {
+                    if (connectFrom !== null) {
+                      connectTargetNode(s.id);
+                    } else {
+                      setSelectedNodeId(s.id);
+                    }
+                  }}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
-                      setSelectedNodeId(s.id);
+                      if (connectFrom !== null) {
+                        connectTargetNode(s.id);
+                      } else {
+                        setSelectedNodeId(s.id);
+                      }
                     }
                   }}
                   className="cursor-pointer focus:outline-none"
                 >
-                  {isSelected && (
+                  {(isSelected || isConnectSource || isConnectTarget) && (
                     <polygon
                       points={hexPoints(node.x, node.y, 37)}
                       fill="none"
-                      stroke="#ffffff"
-                      strokeWidth="1.5"
+                      stroke={isConnectSource ? "#22d3ee" : isConnectTarget ? "#34d399" : "#ffffff"}
+                      strokeWidth={isConnectTarget || isConnectSource ? "2" : "1.5"}
                       strokeDasharray="4 3"
                       opacity="0.92"
                     />
@@ -1117,8 +1421,8 @@ export function DependencyTreeCanvas({
                   <polygon
                     points={hexPoints(node.x, node.y, 30)}
                     fill="#061220"
-                    stroke={theme.primary}
-                    strokeWidth={isSelected ? 2.6 : 1.9}
+                    stroke={isConnectTarget ? "#34d399" : theme.primary}
+                    strokeWidth={isSelected || isConnectTarget ? 2.6 : 1.9}
                     filter={d.isActive ? `url(#${uid}-${theme.glowFilter === "amber" ? "glow-orange" : "glow-cyan"})` : undefined}
                   />
                   <polygon
@@ -1145,6 +1449,37 @@ export function DependencyTreeCanvas({
                     stroke="#030812"
                     strokeWidth="1.3"
                   />
+
+                  {/* Нижний выходной порт для протягивания связи к дочерним субагентам */}
+                  <g
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Провести связь от субагента ${s.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (connectFrom === s.id) cancelConnect();
+                      else startConnectFrom(s.id);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (connectFrom === s.id) cancelConnect();
+                        else startConnectFrom(s.id);
+                      }
+                    }}
+                    transform={`translate(${node.x}, ${node.y + 30})`}
+                    className="cursor-crosshair"
+                  >
+                    <circle
+                      r={5.5}
+                      fill={isConnectSource ? "#22d3ee" : "#071222"}
+                      stroke={theme.primary}
+                      strokeWidth="1.3"
+                    />
+                    <line x1={-2} y1={0} x2={2} y2={0} stroke="#e2e8f0" strokeWidth="1.2" />
+                    <line x1={0} y1={-2} x2={0} y2={2} stroke="#e2e8f0" strokeWidth="1.2" />
+                  </g>
 
                   {/* Индикатор API на правой верхней грани */}
                   <g transform={`translate(${node.x + 22}, ${node.y - 16})`}>
@@ -1196,7 +1531,7 @@ export function DependencyTreeCanvas({
                       fontSize="8.2"
                       fontFamily="monospace"
                     >
-                      {d.isActive ? subTag : "выключен"} · {parseCalleesList(d.allowedCalleesText).includes("*") ? "*" : parseCalleesList(d.allowedCalleesText).length}
+                      Ур.{node.tier} · {d.isActive ? subTag : "выкл"} · {parseCalleesList(d.allowedCalleesText).includes("*") ? "*" : parseCalleesList(d.allowedCalleesText).length}
                     </text>
                   </g>
                 </g>
@@ -1286,11 +1621,23 @@ export function DependencyTreeCanvas({
                     <code className="rounded bg-card px-1 py-0.5 font-mono text-[10px]">call_subagent</code>.
                   </p>
                 </div>
-                {onCreateNew && (
-                  <Button size="sm" variant="secondary" onClick={onCreateNew}>
-                    <Plus size={13} /> Добавить субагента
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Button
+                    size="sm"
+                    variant={connectFrom === "orchestrator" ? "primary" : "secondary"}
+                    onClick={() => {
+                      if (connectFrom === "orchestrator") cancelConnect();
+                      else startConnectFrom("orchestrator");
+                    }}
+                  >
+                    <Link2 size={12} /> {connectFrom === "orchestrator" ? "Отменить связь" : "Связать с субагентом"}
                   </Button>
-                )}
+                  {onCreateNew && (
+                    <Button size="sm" variant="secondary" onClick={onCreateNew}>
+                      <Plus size={13} /> Добавить субагента
+                    </Button>
+                  )}
+                </div>
               </div>
             </div>
           )}
@@ -1320,6 +1667,28 @@ export function DependencyTreeCanvas({
                     </Badge>
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5">
+                    <Button
+                      size="sm"
+                      variant={connectFrom === s.id ? "primary" : "secondary"}
+                      onClick={() => {
+                        if (connectFrom === s.id) cancelConnect();
+                        else startConnectFrom(s.id);
+                      }}
+                    >
+                      <Link2 size={12} /> {connectFrom === s.id ? "Отменить связь" : "Связать с…"}
+                    </Button>
+                    {(d.parentSubagentId !== null || d.orchestratorCanCall) && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => {
+                          updateDraft(s.id, { parentSubagentId: null, orchestratorCanCall: false });
+                          setSavedToast(`Входящие связи для «${s.name}» сброшены`);
+                        }}
+                      >
+                        <Unlink size={12} /> Отвязать
+                      </Button>
+                    )}
                     {onOpenChat && (
                       <Button size="sm" variant="secondary" onClick={() => onOpenChat(s.id)}>
                         <MessageSquare size={12} /> Чаты

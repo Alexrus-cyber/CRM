@@ -3,6 +3,7 @@ import {
   completeTesterRun,
   createSubagentRunWithConversation,
   createTesterRunWithConversation,
+  getAgentOrchestrationConfigSecret,
   getAiUserSettingsSecret,
   getGithubConnectionWithSecret,
   getRagFolder,
@@ -411,8 +412,25 @@ export async function POST(req: Request) {
     return Response.json({ error: (err as Error).message }, { status: 400 });
   }
 
-  // Загружаем активных субагентов (до 10 активных) и их дерево зависимостей.
-  const activeSubagentsRaw = await listActiveSubagentsWithSecrets(me.id).catch(() => []);
+  // Загружаем активных субагентов (до 10 активных), режим дерева и настройки Надсмотрщика.
+  const [activeSubagentsRaw, orchestrationCfg] = await Promise.all([
+    listActiveSubagentsWithSecrets(me.id).catch(() => []),
+    getAgentOrchestrationConfigSecret(me.id).catch(() => ({
+      routingMode: "linear" as const,
+      overseer: {
+        enabled: true,
+        mode: "strict" as const,
+        systemPrompt: "",
+        unlockApi: false,
+        provider: "custom",
+        baseUrl: "",
+        model: "",
+        hasApiKey: false,
+        apiKeyHint: "",
+        apiKey: "",
+      },
+    })),
+  ]);
   const subagentsPayload: Array<Record<string, unknown>> = [];
   for (const sub of activeSubagentsRaw) {
     let customApi: Record<string, unknown> = { unlocked: false };
@@ -450,6 +468,39 @@ export async function POST(req: Request) {
       unlockApi: sub.unlockApi,
       customApi,
     });
+  }
+
+  let overseerPayload: Record<string, unknown> = {
+    enabled: orchestrationCfg.overseer.enabled,
+    mode: orchestrationCfg.overseer.mode,
+    systemPrompt: orchestrationCfg.overseer.systemPrompt,
+    unlockApi: false,
+    baseUrl: orchestratorBaseUrl ?? "",
+    apiKey: orchestratorApiKey,
+    model: orchestratorModel,
+  };
+  if (orchestrationCfg.overseer.unlockApi) {
+    const ovUrl = normalizeBaseUrl(orchestrationCfg.overseer.baseUrl || "") || orchestratorBaseUrl || "";
+    let ovUrlSafe = true;
+    if (ovUrl) {
+      try {
+        await assertSafeAiUrl(ovUrl);
+      } catch {
+        ovUrlSafe = false;
+      }
+    }
+    if (ovUrlSafe) {
+      overseerPayload = {
+        ...overseerPayload,
+        unlockApi: true,
+        baseUrl: ovUrl,
+        model: (orchestrationCfg.overseer.model.trim() || orchestratorModel).slice(0, 200),
+        apiKey: (
+          orchestrationCfg.overseer.apiKey ||
+          (!orchestrationCfg.overseer.baseUrl ? orchestratorApiKey : "")
+        ).slice(0, 400),
+      };
+    }
   }
 
   const effectiveSystemPrompt =
@@ -551,6 +602,8 @@ export async function POST(req: Request) {
   const fullPayload = {
     ...payload,
     agentRole,
+    subagentRoutingMode: orchestrationCfg.routingMode,
+    overseer: overseerPayload,
     ...(sandboxProject ? { sandboxProject } : {}),
     ...(subagentsPayload.length > 0 ? { subagents: subagentsPayload } : {}),
     ...(targetSubagent
@@ -719,6 +772,13 @@ export async function POST(req: Request) {
               subagentName: created.run.subagentName,
               subagentColor: created.run.subagentColor,
               subagentConversationId: created.conversation.id,
+              tier: typeof parsed.tier === "number" ? parsed.tier : undefined,
+              routingMode: typeof parsed.routingMode === "string" ? parsed.routingMode : undefined,
+              callerKind: created.run.callerKind,
+              callerSubagentName: typeof parsed.callerSubagentName === "string" ? parsed.callerSubagentName : "",
+              sandboxProject: created.run.sandboxProject,
+              model: created.run.model,
+              usedCustomApi: created.run.usedCustomApi,
               run: created.run,
               conversation: created.conversation,
             })}\n\n`;
@@ -727,6 +787,20 @@ export async function POST(req: Request) {
           }
         }
         return `event: subagent_run\ndata: ${JSON.stringify(parsed)}\n\n`;
+      } else if (
+        ev === "overseer_start" ||
+        ev === "overseer_status" ||
+        ev === "overseer_reasoning" ||
+        ev === "overseer_done"
+      ) {
+        const srk = typeof parsed.subagentRunKey === "string" ? parsed.subagentRunKey : "";
+        const mappedSub = srk ? activeSubagentRuns.get(srk) : undefined;
+        if (mappedSub) {
+          parsed.subagentRunId = mappedSub.runId;
+          parsed.subagentId = mappedSub.subagentId;
+          parsed.subagentConversationId = mappedSub.subagentConversationId;
+        }
+        return `event: ${ev}\ndata: ${JSON.stringify(parsed)}\n\n`;
       } else if (
         ev === "subagent_status" ||
         ev === "subagent_reasoning" ||

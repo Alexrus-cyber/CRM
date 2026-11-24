@@ -20,6 +20,7 @@ import {
   Plus,
   RefreshCw,
   Send,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   Square,
@@ -27,6 +28,8 @@ import {
   Unlock,
   X,
 } from "lucide-react";
+import { ApprovalToast } from "../ApprovalToast";
+import { LiveReasoningBox } from "../LiveReasoningBox";
 import {
   Badge,
   Button,
@@ -47,10 +50,14 @@ import {
 import {
   formatTokensCount,
   parseCalleesList,
+  type OverseerConfig,
+  type OverseerMode,
+  type OverseerVerdictMeta,
   type Subagent,
   type SubagentConversation,
   type SubagentLimits,
   type SubagentMessage,
+  type SubagentRoutingMode,
   type SubagentRun,
 } from "./subagentTypes";
 
@@ -70,13 +77,31 @@ type Props = {
   github?: { owner: string; repo: string; branch: string } | null;
   refreshKey?: number;
   onOpenModelTab?: () => void;
-  onStats?: (stats: { totalCount: number; activeCount: number; runs: number }) => void;
+  onStats?: (stats: {
+    totalCount: number;
+    activeCount: number;
+    runs: number;
+    routingMode?: SubagentRoutingMode;
+    overseerEnabled?: boolean;
+  }) => void;
 };
 
 type SubagentFormState = Partial<Subagent> & {
   apiKey: string;
   clearApiKey?: boolean;
   allowedCalleesText: string;
+};
+
+const DEFAULT_OVERSEER: OverseerConfig = {
+  enabled: true,
+  mode: "strict",
+  systemPrompt: "",
+  unlockApi: false,
+  provider: "local",
+  baseUrl: "",
+  model: "",
+  hasApiKey: false,
+  apiKeyHint: "",
 };
 
 const EMPTY_FORM: SubagentFormState = {
@@ -186,6 +211,10 @@ export function SubagentsPanel({
     totalCount: 0,
     activeCount: 0,
   });
+  const [routingMode, setRoutingMode] = useState<SubagentRoutingMode>("linear");
+  const [overseer, setOverseer] = useState<OverseerConfig>(DEFAULT_OVERSEER);
+  const [overseerSyncKey, setOverseerSyncKey] = useState(0);
+  const [showOverseer, setShowOverseer] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -244,6 +273,8 @@ export function SubagentsPanel({
           runs?: SubagentRun[];
           conversations?: SubagentConversation[];
           limits?: SubagentLimits;
+          routingMode?: SubagentRoutingMode;
+          overseer?: Partial<OverseerConfig>;
         };
         if (controller.signal.aborted || !mountedRef.current) return;
 
@@ -256,11 +287,22 @@ export function SubagentsPanel({
           totalCount: nextSubs.length,
           activeCount: nextSubs.filter((s) => s.isActive).length,
         };
+        const nextRouting: SubagentRoutingMode =
+          data.routingMode === "layered" ? "layered" : "linear";
+        const nextOverseer: OverseerConfig = {
+          ...DEFAULT_OVERSEER,
+          ...(data.overseer ?? {}),
+          mode: data.overseer?.mode === "rules_only" ? "rules_only" : "strict",
+          enabled: data.overseer?.enabled !== undefined ? Boolean(data.overseer.enabled) : true,
+        };
 
         setSubagents(nextSubs);
         setRuns(nextRuns);
         setConversations(nextConvs);
         setLimits(nextLimits);
+        setRoutingMode(nextRouting);
+        setOverseer(nextOverseer);
+        setOverseerSyncKey((k) => k + 1);
         setError(null);
 
         if (selectedIdRef.current && !nextSubs.some((s) => s.id === selectedIdRef.current)) {
@@ -271,6 +313,8 @@ export function SubagentsPanel({
           totalCount: nextLimits.totalCount,
           activeCount: nextLimits.activeCount,
           runs: nextRuns.length,
+          routingMode: nextRouting,
+          overseerEnabled: nextOverseer.enabled,
         });
       } catch (e) {
         if (controller.signal.aborted || !mountedRef.current) return;
@@ -388,7 +432,7 @@ export function SubagentsPanel({
       const res = await fetch("/api/agent/subagents", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ nodes }),
+        body: JSON.stringify({ nodes, routingMode }),
       });
       if (!res.ok) {
         const d = (await res.json().catch(() => ({}))) as { error?: string };
@@ -396,7 +440,70 @@ export function SubagentsPanel({
       }
       await load({ showSpinner: true });
     },
-    [load],
+    [load, routingMode],
+  );
+
+  const changeRoutingMode = useCallback(
+    async (nextMode: SubagentRoutingMode) => {
+      setError(null);
+      const res = await fetch("/api/agent/subagents", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ routingMode: nextMode }),
+      });
+      if (!res.ok) {
+        const d = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(d.error ?? "Не удалось сохранить режим маршрутизации");
+      }
+      const data = (await res.json()) as { routingMode?: SubagentRoutingMode };
+      const savedMode = data.routingMode === "layered" ? "layered" : "linear";
+      setRoutingMode(savedMode);
+      onStatsRef.current?.({
+        totalCount: limits.totalCount,
+        activeCount: limits.activeCount,
+        runs: runs.length,
+        routingMode: savedMode,
+        overseerEnabled: overseer.enabled,
+      });
+    },
+    [limits.activeCount, limits.totalCount, overseer.enabled, runs.length],
+  );
+
+  const saveOverseer = useCallback(
+    async (payload: {
+      enabled: boolean;
+      mode: OverseerMode;
+      systemPrompt: string;
+      unlockApi: boolean;
+      provider: string;
+      baseUrl: string;
+      model: string;
+      apiKey?: string;
+      clearApiKey?: boolean;
+    }) => {
+      setError(null);
+      const res = await fetch("/api/agent/subagents", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ overseer: payload }),
+      });
+      if (!res.ok) {
+        const d = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(d.error ?? "Не удалось сохранить настройки Надсмотрщика");
+      }
+      const data = (await res.json()) as { overseer?: OverseerConfig };
+      if (data.overseer) {
+        setOverseer(data.overseer);
+        onStatsRef.current?.({
+          totalCount: limits.totalCount,
+          activeCount: limits.activeCount,
+          runs: runs.length,
+          routingMode,
+          overseerEnabled: data.overseer.enabled,
+        });
+      }
+    },
+    [limits.activeCount, limits.totalCount, routingMode, runs.length],
   );
 
   const openNewForm = useCallback(() => {
@@ -445,6 +552,16 @@ export function SubagentsPanel({
                   Запуски: {runs.length} · {formatTokensCount(totalRunsTokens)} ток.
                 </Badge>
               )}
+              <Badge
+                className={
+                  overseer.enabled
+                    ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-400"
+                    : "border-amber-500/35 bg-amber-500/10 text-amber-400"
+                }
+              >
+                {overseer.enabled ? <ShieldCheck size={10} /> : <ShieldAlert size={10} />}
+                Надсмотрщик: {overseer.enabled ? (overseer.mode === "strict" ? "строгий" : "правила") : "выкл"}
+              </Badge>
             </div>
             <p className="text-[11px] text-muted">
               Главный Агент выступает <span className="font-medium text-text">Оркестратором</span>: делегирует задачи
@@ -459,6 +576,15 @@ export function SubagentsPanel({
                 <Cpu size={13} /> Модель Оркестратора
               </Button>
             )}
+            <Button
+              size="sm"
+              variant={showOverseer ? "primary" : "secondary"}
+              onClick={() => setShowOverseer((v) => !v)}
+              title="Настройки агента-Надсмотрщика (защита от побега из Sandbox и утечки данных)"
+            >
+              <ShieldCheck size={13} className={overseer.enabled ? "text-emerald-400" : "text-amber-400"} />
+              Надсмотрщик
+            </Button>
             <Button
               size="sm"
               variant={showTree ? "secondary" : "outline"}
@@ -496,12 +622,26 @@ export function SubagentsPanel({
         </div>
       )}
 
+      {/* Настройки агента-Надсмотрщика */}
+      {showOverseer && (
+        <OverseerConfigCard
+          key={overseerSyncKey}
+          initial={overseer}
+          orchestratorModelLabel={orchestratorModelLabel}
+          onOpenModelTab={onOpenModelTab}
+          onClose={() => setShowOverseer(false)}
+          onSave={saveOverseer}
+        />
+      )}
+
       {/* Интерактивное нейронное дерево зависимостей */}
       {showTree && (
         <DependencyTreeCanvas
           subagents={subagents}
           orchestratorModel={orchestratorModelLabel}
           maxActive={limits.maxActive}
+          routingMode={routingMode}
+          onChangeRoutingMode={changeRoutingMode}
           onSave={saveTree}
           onCreateNew={limits.totalCount < limits.maxStored ? openNewForm : undefined}
           onEditSubagent={openEditForm}
@@ -1168,6 +1308,285 @@ function SubagentFormEditor({
   );
 }
 
+function OverseerConfigCard({
+  initial,
+  orchestratorModelLabel,
+  onOpenModelTab,
+  onClose,
+  onSave,
+}: {
+  initial: OverseerConfig;
+  orchestratorModelLabel: string;
+  onOpenModelTab?: () => void;
+  onClose: () => void;
+  onSave: (payload: {
+    enabled: boolean;
+    mode: OverseerMode;
+    systemPrompt: string;
+    unlockApi: boolean;
+    provider: string;
+    baseUrl: string;
+    model: string;
+    apiKey?: string;
+    clearApiKey?: boolean;
+  }) => Promise<void>;
+}) {
+  const [enabled, setEnabled] = useState(initial.enabled);
+  const [mode, setMode] = useState<OverseerMode>(initial.mode);
+  const [systemPrompt, setSystemPrompt] = useState(initial.systemPrompt);
+  const [unlockApi, setUnlockApi] = useState(initial.unlockApi);
+  const [provider, setProvider] = useState(initial.provider || "local");
+  const [baseUrl, setBaseUrl] = useState(initial.baseUrl || "");
+  const [model, setModel] = useState(initial.model || "");
+  const [apiKey, setApiKey] = useState("");
+  const [clearApiKey, setClearApiKey] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [savedMsg, setSavedMsg] = useState<string | null>(null);
+
+  const activeProviderId = resolveProviderId(provider, baseUrl);
+  const applyProviderPreset = (id: string) => {
+    const p = SUBAGENT_PROVIDERS.find((x) => x.id === id);
+    if (!p) return;
+    setProvider(p.id);
+    if (p.id !== "custom") setBaseUrl(p.baseUrl);
+    if (p.model) setModel(p.model);
+  };
+
+  const handleSave = async () => {
+    setBusy(true);
+    setErr(null);
+    setSavedMsg(null);
+    try {
+      await onSave({
+        enabled,
+        mode,
+        systemPrompt,
+        unlockApi,
+        provider: activeProviderId,
+        baseUrl,
+        model,
+        ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+        ...(clearApiKey ? { clearApiKey: true } : {}),
+      });
+      setApiKey("");
+      setClearApiKey(false);
+      setSavedMsg("Настройки Надсмотрщика сохранены");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Не удалось сохранить Надсмотрщика");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card
+      className="border-emerald-500/30"
+      title={
+        <span className="flex flex-wrap items-center gap-2">
+          <ShieldCheck size={15} className="text-emerald-400" />
+          Агент-Надсмотрщик (Guard безопасности)
+          <Badge
+            className={
+              enabled
+                ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-400"
+                : "border-amber-500/35 bg-amber-500/10 text-amber-400"
+            }
+          >
+            {enabled ? "Активен" : "Отключён"}
+          </Badge>
+        </span>
+      }
+      subtitle="Контролирует все потенциально опасные действия Оркестратора, субагентов и Тестировщика (побег из Sandbox, утечка секретов, команды ПК, экспорт, сеть) — работает даже при полном доверии."
+      action={
+        <Button size="sm" variant="ghost" onClick={onClose}>
+          <X size={14} /> Свернуть
+        </Button>
+      }
+    >
+      {err && (
+        <div className="mb-3 flex items-center gap-2 rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+          <AlertTriangle size={14} className="shrink-0" />
+          <span>{err}</span>
+        </div>
+      )}
+      {savedMsg && (
+        <div className="mb-3 flex items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-400">
+          <Check size={14} className="shrink-0" />
+          <span>{savedMsg}</span>
+        </div>
+      )}
+
+      <div className="space-y-3">
+        <div className="grid gap-3 md:grid-cols-2">
+          <label className="flex cursor-pointer items-start gap-2.5 rounded-xl border border-border bg-card2/60 p-3 transition hover:border-emerald-500/40">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(e) => setEnabled(e.target.checked)}
+              className="mt-0.5 h-4 w-4 accent-[#10b981]"
+            />
+            <div>
+              <div className="text-xs font-semibold text-text">Включить Надсмотрщика</div>
+              <div className="mt-0.5 text-[11px] text-muted">
+                При угрозе или сомнительной операции запрашивает явное решение человека в окне подтверждения на сайте.
+              </div>
+            </div>
+          </label>
+
+          <Field label="Режим проверки">
+            <Select
+              aria-label="Режим проверки Надсмотрщика"
+              value={mode}
+              onChange={(e) => setMode(e.target.value === "rules_only" ? "rules_only" : "strict")}
+            >
+              <option value="strict">Строгий — правила + ИИ-аудит подозрительных операций</option>
+              <option value="rules_only">Только статические правила (без доп. запросов к LLM)</option>
+            </Select>
+          </Field>
+        </div>
+
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <Label className="mb-0">Дополнительные правила / системный промпт Надсмотрщика</Label>
+            {systemPrompt && (
+              <button
+                type="button"
+                onClick={() => setSystemPrompt("")}
+                className="text-[11px] text-red-400 hover:underline"
+              >
+                Очистить
+              </button>
+            )}
+          </div>
+          <Textarea
+            value={systemPrompt}
+            onChange={(e) => setSystemPrompt(e.target.value.slice(0, 12_000))}
+            rows={3}
+            className="font-mono text-xs"
+            placeholder="Оставьте пустым для встроенной политики безопасности, либо добавьте особые запреты (например: запретить удаление файлов старше …, проверять все curl/fetch к внешним доменам)."
+          />
+        </div>
+
+        <div
+          className={cn(
+            "space-y-3 rounded-2xl border p-3.5 transition",
+            unlockApi ? "border-amber-500/40 bg-amber-500/5" : "border-border bg-card2/50",
+          )}
+        >
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <label className="flex cursor-pointer items-start gap-2.5 text-xs">
+              <input
+                type="checkbox"
+                checked={unlockApi}
+                onChange={(e) => setUnlockApi(e.target.checked)}
+                className="mt-0.5 h-4 w-4 accent-[#7c5cff]"
+              />
+              <div>
+                <span className="inline-flex items-center gap-1.5 font-semibold text-text">
+                  {unlockApi ? (
+                    <Unlock size={13} className="text-amber-400" />
+                  ) : (
+                    <Lock size={13} className="text-accent2" />
+                  )}
+                  Разблокировать API Надсмотрщика (отдельная модель проверки)
+                </span>
+                <p className="mt-0.5 text-[11px] text-muted">
+                  {unlockApi
+                    ? "Надсмотрщик использует указанный ниже API независимо от модели Оркестратора."
+                    : `API заблокирован — Надсмотрщик использует общую модель Оркестратора (${orchestratorModelLabel}).`}
+                </p>
+              </div>
+            </label>
+            {!unlockApi && onOpenModelTab && (
+              <Button size="sm" variant="secondary" onClick={onOpenModelTab}>
+                <ShieldCheck size={12} /> Модель Оркестратора
+              </Button>
+            )}
+          </div>
+
+          {unlockApi && (
+            <div className="grid gap-3 border-t border-border/80 pt-3 md:grid-cols-2">
+              <Field label="Провайдер">
+                <Select
+                  value={activeProviderId}
+                  onChange={(e) => applyProviderPreset(e.target.value)}
+                >
+                  {SUBAGENT_PROVIDERS.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.label}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Модель Надсмотрщика">
+                <Input
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder="например, qwen3:8b или gpt-4o-mini"
+                />
+              </Field>
+              <Field label="Base URL">
+                <Input
+                  value={baseUrl}
+                  onChange={(e) => setBaseUrl(e.target.value)}
+                  placeholder="http://127.0.0.1:8888/v1"
+                />
+              </Field>
+              <div>
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <Label className="mb-0 inline-flex items-center gap-1.5">
+                    <KeyRound size={12} className="text-muted" />
+                    API-ключ (опционально для локальных)
+                  </Label>
+                  {initial.hasApiKey && !clearApiKey && (
+                    <button
+                      type="button"
+                      onClick={() => setClearApiKey(true)}
+                      className="text-[11px] text-red-400 hover:underline"
+                    >
+                      Удалить ({initial.apiKeyHint || "sk-•••"})
+                    </button>
+                  )}
+                  {clearApiKey && (
+                    <button
+                      type="button"
+                      onClick={() => setClearApiKey(false)}
+                      className="text-[11px] text-amber-400 hover:underline"
+                    >
+                      Отменить удаление
+                    </button>
+                  )}
+                </div>
+                <Input
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => {
+                    setApiKey(e.target.value);
+                    if (e.target.value && clearApiKey) setClearApiKey(false);
+                  }}
+                  placeholder={
+                    initial.hasApiKey && !clearApiKey
+                      ? `Сохранён на сервере (${initial.apiKeyHint || "sk-•••"})`
+                      : "sk-..."
+                  }
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-3 flex justify-end border-t border-border pt-3">
+        <Button size="md" variant="primary" onClick={() => void handleSave()} disabled={busy}>
+          {busy ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
+          {busy ? "Сохраняю…" : "Сохранить Надсмотрщика"}
+        </Button>
+      </div>
+    </Card>
+  );
+}
+
 function SubagentChatViewer({
   subagentId,
   subagents,
@@ -1209,11 +1628,29 @@ function SubagentChatViewer({
   const [chatError, setChatError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [running, setRunning] = useState(false);
-  const [live, setLive] = useState<{ reasoning: string; text: string; status: string }>({
+  const [live, setLive] = useState<{
+    reasoning: string;
+    text: string;
+    status: string;
+    actorLabel: string;
+    overseerReasoning: string;
+  }>({
     reasoning: "",
     text: "",
     status: "",
+    actorLabel: "",
+    overseerReasoning: "",
   });
+  const [subApproval, setSubApproval] = useState<{
+    approvalId: string;
+    kind: string;
+    title: string;
+    description: string;
+    command?: string;
+    cwd?: string;
+    overseer?: OverseerVerdictMeta;
+  } | null>(null);
+  const [approvalBusy, setApprovalBusy] = useState(false);
   const [tokenUsage, setTokenUsage] = useState<{ prompt: number; completion: number; total: number } | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const convAbortRef = useRef<AbortController | null>(null);
@@ -1242,7 +1679,7 @@ function SubagentChatViewer({
         if (ctrl.signal.aborted) return;
         setMessages(data.selectedConversation?.messages ?? []);
         setTokenUsage(data.selectedConversation?.tokens ?? null);
-        setLive({ reasoning: "", text: "", status: "" });
+        setLive({ reasoning: "", text: "", status: "", actorLabel: "", overseerReasoning: "" });
       } catch (e) {
         if (ctrl.signal.aborted) return;
         setChatError(e instanceof Error ? e.message : "Ошибка загрузки чата");
@@ -1349,6 +1786,28 @@ function SubagentChatViewer({
     streamAbortRef.current?.abort();
   };
 
+  const resolveSubApproval = async (approved: boolean) => {
+    if (!subApproval || approvalBusy) return;
+    setApprovalBusy(true);
+    try {
+      await fetch("/api/ai/agent/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approvalId: subApproval.approvalId, approved }),
+      });
+      setSubApproval(null);
+      setLive((l) => ({
+        ...l,
+        actorLabel: sub?.name ?? "Субагент",
+        status: approved ? "Разрешение получено — продолжаю…" : "Действие отклонено человеком",
+      }));
+    } catch {
+      setChatError("Не удалось отправить подтверждение");
+    } finally {
+      setApprovalBusy(false);
+    }
+  };
+
   const send = async () => {
     const prompt = draft.trim();
     if (!prompt || !sub || running) return;
@@ -1374,7 +1833,13 @@ function SubagentChatViewer({
     setDraft("");
     setChatError(null);
     setRunning(true);
-    setLive({ reasoning: "", text: "", status: "Запуск субагента…" });
+    setLive({
+      reasoning: "",
+      text: "",
+      status: "Запуск субагента…",
+      actorLabel: sub.name,
+      overseerReasoning: "",
+    });
 
     const ctrl = new AbortController();
     streamAbortRef.current = ctrl;
@@ -1471,11 +1936,39 @@ function SubagentChatViewer({
           resolvedConvId = incomingConvId;
         }
         if (ev === "subagent_reasoning") {
-          setLive((l) => ({ ...l, reasoning: String(data.text ?? "") }));
+          setLive((l) => ({ ...l, actorLabel: sub.name, reasoning: String(data.text ?? "") }));
         } else if (ev === "subagent_text") {
           setLive((l) => ({ ...l, text: String(data.text ?? "") }));
         } else if (ev === "subagent_status") {
-          setLive((l) => ({ ...l, status: String(data.text ?? "") }));
+          setLive((l) => ({ ...l, actorLabel: sub.name, status: String(data.text ?? "") }));
+        } else if (ev === "overseer_start" || ev === "overseer_status") {
+          setLive((l) => ({
+            ...l,
+            actorLabel: "Надсмотрщик",
+            status: String(data.text ?? `Надсмотрщик проверяет ${String(data.tool ?? "")}…`),
+          }));
+        } else if (ev === "overseer_reasoning") {
+          setLive((l) => ({
+            ...l,
+            actorLabel: "Надсмотрщик",
+            overseerReasoning: String(data.text ?? ""),
+          }));
+        } else if (ev === "overseer_done") {
+          setLive((l) => ({ ...l, actorLabel: sub.name }));
+        } else if (ev === "approval_required") {
+          const ov =
+            data.overseer && typeof data.overseer === "object"
+              ? (data.overseer as OverseerVerdictMeta)
+              : undefined;
+          setSubApproval({
+            approvalId: String(data.approvalId ?? ""),
+            kind: String(data.kind ?? "command"),
+            title: String(data.title ?? "Требуется разрешение"),
+            description: String(data.description ?? data.reason ?? ""),
+            command: data.command ? String(data.command) : undefined,
+            cwd: data.cwd ? String(data.cwd) : undefined,
+            overseer: ov,
+          });
         } else if (ev === "subagent_done") {
           const u = (data.usage && typeof data.usage === "object" ? data.usage : {}) as {
             prompt?: number;
@@ -1505,7 +1998,8 @@ function SubagentChatViewer({
         }
       }
 
-      setLive({ reasoning: "", text: "", status: "" });
+      setLive({ reasoning: "", text: "", status: "", actorLabel: "", overseerReasoning: "" });
+      setSubApproval(null);
       if (resolvedConvId && resolvedConvId !== activeConvId) {
         setSelectedConvId(resolvedConvId);
       }
@@ -1517,7 +2011,8 @@ function SubagentChatViewer({
       if (!ctrl.signal.aborted) {
         setChatError(e instanceof Error ? e.message : "Ошибка");
       }
-      setLive({ reasoning: "", text: "", status: "" });
+      setLive({ reasoning: "", text: "", status: "", actorLabel: "", overseerReasoning: "" });
+      setSubApproval(null);
     } finally {
       setRunning(false);
     }
@@ -1669,20 +2164,78 @@ function SubagentChatViewer({
           </div>
         ))}
         {running && (
-          <div className="rounded-xl border border-cyan-500/35 bg-card p-3 text-xs">
-            <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-cyan-400">
+          <div className="space-y-2 rounded-xl border border-cyan-500/35 bg-card p-3 text-xs">
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-medium text-cyan-400">
               <Loader2 size={12} className="animate-spin" />
-              {live.status || "Субагент работает…"}
+              {live.actorLabel && (
+                <Badge className="border-cyan-500/35 bg-cyan-500/10 text-cyan-300">
+                  {live.actorLabel}
+                </Badge>
+              )}
+              <span>{live.status || "Субагент работает…"}</span>
             </div>
+            {live.overseerReasoning && (
+              <LiveReasoningBox
+                text={live.overseerReasoning}
+                streaming={live.actorLabel === "Надсмотрщик"}
+                badgeLabel="Надсмотрщик · в эфире"
+              />
+            )}
             {live.reasoning && (
-              <pre className="mb-2 max-h-36 overflow-y-auto whitespace-pre-wrap rounded-lg border border-border bg-card2/70 p-2 font-mono text-[11px] text-muted">
-                {live.reasoning}
-              </pre>
+              <LiveReasoningBox
+                text={live.reasoning}
+                streaming={live.actorLabel !== "Надсмотрщик"}
+                defaultOpen
+                badgeLabel={`${sub?.name ?? "Субагент"} · в эфире`}
+              />
             )}
             {live.text && <div className="whitespace-pre-wrap leading-relaxed text-text">{live.text}</div>}
           </div>
         )}
       </div>
+
+      {subApproval && (
+        <ApprovalToast
+          kind={subApproval.kind}
+          badgeLabel={subApproval.overseer ? "Надсмотрщик безопасности" : "Запрос разрешения"}
+          title={subApproval.title}
+          description={subApproval.description}
+          onDismiss={() => void resolveSubApproval(false)}
+          dismissDisabled={approvalBusy}
+          actions={
+            <>
+              <Button
+                size="sm"
+                variant="primary"
+                disabled={approvalBusy}
+                onClick={() => void resolveSubApproval(true)}
+              >
+                <Check size={12} /> Разрешить
+              </Button>
+              <Button
+                size="sm"
+                variant="danger"
+                disabled={approvalBusy}
+                onClick={() => void resolveSubApproval(false)}
+              >
+                <X size={12} /> Отклонить
+              </Button>
+            </>
+          }
+        >
+          {subApproval.command && (
+            <pre className="max-h-24 overflow-auto rounded-lg bg-card2 px-2 py-1.5 font-mono text-[11px] text-text">
+              {subApproval.command}
+              {subApproval.cwd ? `\n# cwd: ${subApproval.cwd}` : ""}
+            </pre>
+          )}
+          {subApproval.overseer?.reason && (
+            <p className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-300">
+              {subApproval.overseer.reason}
+            </p>
+          )}
+        </ApprovalToast>
+      )}
 
       {/* Поле отправки */}
       <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">

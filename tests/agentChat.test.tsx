@@ -1691,4 +1691,168 @@ describe("вкладка «Агент»", () => {
     expect(await screen.findByText(/Успешный хвост/i)).toBeTruthy();
     expect(screen.getAllByText(/Поток ответа от агента оборвался без завершения/i)).toHaveLength(1);
   });
+
+  it("показывает единую карточку активного актора, эскалацию субагентов и блокировку Надсмотрщика в прямом эфире", async () => {
+    const encoder = new TextEncoder();
+    const streamCtrl: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
+    sseResponder = () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamCtrl.current = controller;
+          controller.enqueue(
+            encoder.encode(
+              `event: agent_card\ndata: ${JSON.stringify({
+                kind: "orchestrator",
+                name: "Оркестратор",
+                routingMode: "layered",
+                model: "qwen3:8b",
+                statusText: "Выбираю субагента по уровням…",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: subagent_start\ndata: ${JSON.stringify({
+                subagentSlug: "css-leaf",
+                subagentName: "Стили",
+                subagentColor: "#06b6d4",
+                tier: 4,
+                routingMode: "layered",
+                model: "deepseek-r1",
+                usedCustomApi: true,
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: subagent_reasoning\ndata: ${JSON.stringify({
+                subagentName: "Стили",
+                text: "Проверяю CSS переменные и эскалацию на уровень 1.",
+              })}\n\n`,
+            ),
+          );
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(<AgentChat userName="Тест" />);
+    const chatBox = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    fireEvent.change(chatBox, { target: { value: "Проверь цвета по уровням" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    // Единая живая карточка показывает активного Субагента 4-го уровня с кастомным API
+    const liveCard = await screen.findByTestId("live-actor-card");
+    expect(liveCard.textContent).toContain("Субагент · Стили");
+    expect(liveCard.textContent).toContain("ур.4");
+    expect(liveCard.textContent).toContain("По уровням");
+    expect(liveCard.textContent).toContain("своё API");
+    expect(await screen.findByText(/Проверяю CSS переменные и эскалацию на уровень 1/i)).toBeTruthy();
+
+    // Надсмотрщик перехватывает команду — карточка временно переключается на Надсмотрщика и открывает ApprovalToast
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: overseer_start\ndata: ${JSON.stringify({
+          tool: "run_command",
+          targetAgent: "Стили",
+          model: "guard-7b",
+        })}\n\n`,
+      ),
+    );
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: overseer_reasoning\ndata: ${JSON.stringify({
+          text: "Обнаружен выход из песочницы в cat ../.env",
+          tool: "run_command",
+        })}\n\n`,
+      ),
+    );
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: approval_required\ndata: ${JSON.stringify({
+          approvalId: "ov-main-1",
+          kind: "overseer_approval",
+          title: "Надсмотрщик: подозрительный доступ",
+          description: "Попытка чтения секретов",
+          command: "cat ../.env",
+          overseer: {
+            checkId: "ov1",
+            verdict: "require_human",
+            riskLevel: "critical",
+            title: "Побег из Sandbox",
+            reason: "Команда содержит ../.env",
+            recommendation: "Отклоните запрос",
+            requestedBy: "Стили",
+            tool: "run_command",
+          },
+        })}\n\n`,
+      ),
+    );
+
+    expect(await screen.findByText(/Надсмотрщик · риск: critical/i)).toBeTruthy();
+    expect(screen.getByText(/Команда содержит \.\.\/\.env/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Отклонить$/i }));
+    await waitFor(() => {
+      expect(approvalsSent.some((a) => a.approvalId === "ov-main-1" && a.approved === false)).toBe(true);
+    });
+
+    // Надсмотрщик завершает, субагент передаёт задачу на верхний уровень и отдаёт отчёт
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: overseer_done\ndata: ${JSON.stringify({
+          verdict: "require_human",
+          riskLevel: "critical",
+          tool: "run_command",
+          reason: "Отклонено пользователем",
+        })}\n\n`,
+      ),
+    );
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: subagent_handoff\ndata: ${JSON.stringify({
+          fromSubagentName: "Стили",
+          toSubagentName: "Архитектор",
+          handoffVia: "escalation",
+          task: "Уточнить токены темы",
+        })}\n\n`,
+      ),
+    );
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: subagent_done\ndata: ${JSON.stringify({
+          subagentName: "Стили",
+        })}\n\n`,
+      ),
+    );
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: overseer_verdict\ndata: ${JSON.stringify({
+          verdict: "require_human",
+          tool: "run_command",
+          riskLevel: "critical",
+          reason: "Отклонено человеком",
+          label: "Надсмотрщик заблокировал run_command",
+        })}\n\n`,
+      ),
+    );
+    streamCtrl.current?.enqueue(
+      encoder.encode(
+        `event: action\ndata: ${JSON.stringify({
+          type: "subagent_report",
+          subagentName: "Стили",
+          tier: 4,
+          reportSummary: "Запрошена эскалация на Уровень 1.",
+        })}\n\n`,
+      ),
+    );
+    streamCtrl.current?.enqueue(encoder.encode('event: text\ndata: {"text":"Итоговый ответ готов."}\n\n'));
+    streamCtrl.current?.enqueue(encoder.encode('event: done\ndata: {}\n\n'));
+    streamCtrl.current?.close();
+
+    expect(await screen.findByText(/Итоговый ответ готов\./i)).toBeTruthy();
+    expect(screen.getByText(/Стили → Архитектор/i)).toBeTruthy();
+    expect(screen.getByText(/Надсмотрщик заблокировал run_command/i)).toBeTruthy();
+    expect(screen.getByText(/Отчёт субагента · Стили/i)).toBeTruthy();
+  });
 });

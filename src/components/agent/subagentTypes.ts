@@ -1,3 +1,43 @@
+export type SubagentRoutingMode = "linear" | "layered";
+export type OverseerMode = "strict" | "rules_only";
+
+export type OverseerConfig = {
+  enabled: boolean;
+  mode: OverseerMode;
+  systemPrompt: string;
+  unlockApi: boolean;
+  provider: string;
+  baseUrl: string;
+  model: string;
+  hasApiKey: boolean;
+  apiKeyHint: string;
+};
+
+export type OverseerVerdictMeta = {
+  checkId?: string;
+  verdict?: "allow" | "require_human" | "block" | "approved_by_human";
+  riskLevel?: "low" | "medium" | "high" | "critical" | string;
+  category?: string;
+  title?: string;
+  reason?: string;
+  recommendation?: string;
+  requestedBy?: string;
+  requestedByKind?: string;
+  tool?: string;
+  targetPreview?: string;
+  model?: string;
+  reasoning?: string;
+  trustBypassBlocked?: boolean;
+};
+
+export type AgentLiveActorKind =
+  | "orchestrator"
+  | "subagent"
+  | "tester"
+  | "overseer"
+  | "browser_inspector"
+  | "approval";
+
 export type Subagent = {
   id: number;
   userId: number;

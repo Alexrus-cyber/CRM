@@ -55,6 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import browser_inspector  # noqa: E402
 import code_tools  # noqa: E402
 import github_tools  # noqa: E402
+import overseer as overseer_mod  # noqa: E402
 import qa_tools  # noqa: E402
 import sandbox as sandbox_mod  # noqa: E402
 
@@ -603,7 +604,8 @@ SUBAGENT_BASE_SYSTEM_PROMPT = """Ты — специализированный �
 1. Действуй строго в рамках переданной подзадачи и своего системного промпта. Общайся по-русски, чётко и по делу.
 2. Опирайся на входное `summary` от Оркестратора (или предыдущего субагента) и работай непосредственно с общими файлами проекта в Sandbox (`sandbox_list`, `sandbox_read_file`, `sandbox_write_file`, `code_search`, `run_command` и др.).
 3. Если по ходу работы требуется подключить другого субагента из дерева зависимостей — вызови `request_subagent(target_subagent=..., summary=..., next_task=..., sandbox_project=...)`, обязательно сформировав подробное `summary` своих действий и того, что нужно сделать дальше.
-4. По завершении своей подзадачи вызови `report_to_orchestrator(summary=..., status=..., files_touched=..., request_next_subagent=..., next_task=...)`, чтобы Оркестратор получил точное `summary` выполненных действий, список затронутых файлов и понимал следующие шаги.
+4. В режиме маршрутизации «По уровням» (`layered`), если ты работаешь на глубоком уровне (например, 4-м) и столкнулся с проблемой контракта/архитектуры или нужна помощь/исправление от верхних уровней (1, 2, 3), используй `escalate_to_upper_tier(target=..., mode=..., summary=..., request=...)` — можно получить совет (`advice`), прямую помощь (`direct_help`) или исправление с каскадом по промежуточным уровням (`fix_and_cascade`).
+5. По завершении своей подзадачи вызови `report_to_orchestrator(summary=..., status=..., files_touched=..., request_next_subagent=..., next_task=...)`, чтобы Оркестратор получил точное `summary` выполненных действий, список затронутых файлов и понимал следующие шаги.
 """
 
 BASE_TOOLS = [
@@ -1202,8 +1204,63 @@ SUBAGENT_HANDOFF_TOOLS: List[Dict[str, Any]] = [
                         "type": "string",
                         "description": "Необязательно: задача для следующего субагента или рекомендация Оркестратору.",
                     },
+                    "cascade_downstream": {
+                        "type": "boolean",
+                        "description": "Только для ответа на эскалацию в режиме 'по уровням': true — повторить цепочку исправлений по промежуточным уровням вниз из-за последствий; false — вернуть помощь/ответ напрямую запросившему уровню без каскада.",
+                    },
                 },
                 "required": ["summary"],
+            },
+        },
+    },
+]
+
+SUBAGENT_LAYERED_TOOLS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "escalate_to_upper_tier",
+            "description": (
+                "Только в режиме дерева «По уровням» (`layered`): обратиться от субагента нижнего уровня "
+                "(например, 4-го) к верхнему уровню (1, 2 или 3) за советом (`advice`), прямой помощью (`direct_help`) "
+                "или исправлением с возможностью повторить цепочку исправлений вниз по промежуточным уровням "
+                "в зависимости от последствий (`fix_and_cascade`)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Номер верхнего уровня (например '1', '2', '3') или slug/имя/ID субагента верхнего уровня.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["advice", "direct_help", "fix_and_cascade"],
+                        "description": (
+                            "'advice' — попросить совет/проверку без правок; "
+                            "'direct_help' — попросить верхний уровень напрямую помочь с задачей 4-му уровню; "
+                            "'fix_and_cascade' — попросить исправление на верхнем уровне и при наличии последствий "
+                            "повторить цепочку исправлений по промежуточным уровням вниз."
+                        ),
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Подробное summary того, что уже сделано на твоём уровне и в чём возникла проблема/конфликт.",
+                    },
+                    "request": {
+                        "type": "string",
+                        "description": "Конкретный вопрос или запрос на исправление/помощь для верхнего уровня.",
+                    },
+                    "cascade_down": {
+                        "type": "boolean",
+                        "description": "Необязательно: явно разрешить (true) или отключить (false) прогон промежуточных уровней при mode='fix_and_cascade'.",
+                    },
+                    "sandbox_project": {
+                        "type": "string",
+                        "description": "Папка общего проекта в Sandbox (по умолчанию текущая).",
+                    },
+                },
+                "required": ["target", "mode", "summary", "request"],
             },
         },
     },
@@ -1217,6 +1274,7 @@ TOOLS = (
     + TESTER_ORCHESTRATION_TOOLS
     + SUBAGENT_ORCHESTRATION_TOOLS
     + SUBAGENT_HANDOFF_TOOLS
+    + SUBAGENT_LAYERED_TOOLS
     + qa_tools.QA_TOOLS
     + code_tools.CODE_READ_TOOLS
     + code_tools.CODE_EXEC_TOOLS
@@ -1346,12 +1404,19 @@ def tools_for_trust(
     *,
     has_github: bool = False,
     role: str = "agent",
+    routing_mode: str = "linear",
+    subagent_tier: int = 1,
 ) -> List[Dict[str, Any]]:
     gh_read = list(github_tools.GITHUB_READ_TOOLS) if has_github else []
     gh_write = list(github_tools.GITHUB_WRITE_TOOLS) if (has_github and trust_level != "none") else []
     code_read = list(code_tools.CODE_READ_TOOLS)
     code_exec = list(code_tools.CODE_EXEC_TOOLS) if trust_level != "none" else []
     if role == "subagent":
+        layered_extra = (
+            list(SUBAGENT_LAYERED_TOOLS)
+            if (routing_mode == "layered" and subagent_tier > 1)
+            else []
+        )
         # Все Tools доступны субагенту (с учётом уровня доверия) + инструменты вызова через Оркестратора и сдачи summary.
         if trust_level == "none":
             submit_only = [t for t in qa_tools.QA_TOOLS if t["function"]["name"] == "qa_submit_report"]
@@ -1367,6 +1432,7 @@ def tools_for_trust(
                 + submit_only
                 + safe_orch
                 + list(SUBAGENT_HANDOFF_TOOLS)
+                + layered_extra
             )
         return _dedupe_tools(
             list(BASE_TOOLS)
@@ -1380,6 +1446,7 @@ def tools_for_trust(
             + list(qa_tools.QA_TOOLS)
             + list(TESTER_ORCHESTRATION_TOOLS)
             + list(SUBAGENT_HANDOFF_TOOLS)
+            + layered_extra
         )
     if role == "tester":
         if trust_level == "none":
@@ -1461,15 +1528,112 @@ def run_tool(
     tester_ctx: Optional[Dict[str, Any]] = None,
     subagent_ctx: Optional[Dict[str, Any]] = None,
     subagent_state: Optional[Dict[str, Any]] = None,
+    overseer_ctx: Optional[Dict[str, Any]] = None,
+    caller_info: Optional[Dict[str, Any]] = None,
     qa_state: Optional[Dict[str, Any]] = None,
     run_state: Optional[Dict[str, Any]] = None,
     on_status: Optional[Any] = None,
     cancel_check: Optional[Any] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Выполнить инструмент с учётом Sandbox и уровня доверия."""
+    """Выполнить инструмент с учётом Sandbox, уровня доверия и Надсмотрщика безопасности."""
     args = args or {}
     events: List[Dict[str, Any]] = []
     trust = normalize_trust(trust_level)
+
+    _ORCH_BOOKKEEPING_TOOLS = {
+        "call_subagent",
+        "list_subagents",
+        "request_subagent",
+        "escalate_to_upper_tier",
+        "report_to_orchestrator",
+        "call_tester",
+        "list_tester_reports",
+        "confirm_minor_fixes",
+        "agent_plan",
+        "create_file",
+        "open_website",
+        "play_youtube",
+        "formulate_operator_task",
+    }
+
+    overseer_approved = False
+    overseer_decision: Optional[Dict[str, Any]] = None
+    effective_approval_fn = approval_fn
+
+    if name not in _ORCH_BOOKKEEPING_TOOLS and trust != "none":
+        eff_overseer_ctx = overseer_ctx
+        if eff_overseer_ctx is None and isinstance(subagent_ctx, dict):
+            eff_overseer_ctx = subagent_ctx.get("overseer_ctx")
+        if eff_overseer_ctx is None and isinstance(tester_ctx, dict):
+            eff_overseer_ctx = tester_ctx.get("overseer_ctx")
+
+        eff_emit = None
+        if isinstance(eff_overseer_ctx, dict) and callable(eff_overseer_ctx.get("emit_sse")):
+            eff_emit = eff_overseer_ctx.get("emit_sse")
+        elif isinstance(subagent_ctx, dict) and callable(subagent_ctx.get("emit_sse")):
+            eff_emit = subagent_ctx.get("emit_sse")
+        elif isinstance(tester_ctx, dict) and callable(tester_ctx.get("emit_sse")):
+            eff_emit = tester_ctx.get("emit_sse")
+
+        eff_caller = caller_info
+        if eff_caller is None and isinstance(subagent_state, dict) and isinstance(subagent_state.get("subagent"), dict):
+            sub_meta = subagent_state["subagent"]
+            eff_caller = {
+                "agentKind": "subagent",
+                "agentName": f"Субагент «{sub_meta.get('name') or sub_meta.get('slug') or 'subagent'}»",
+                "subagentRunKey": str(subagent_state.get("runKey") or ""),
+            }
+        elif eff_caller is None and isinstance(qa_state, dict) and qa_state.get("runKey"):
+            eff_caller = {"agentKind": "tester", "agentName": "Тестировщик"}
+
+        default_cfg: Dict[str, Any] = {}
+        for src_ctx in (subagent_ctx, tester_ctx, eff_overseer_ctx):
+            if isinstance(src_ctx, dict) and src_ctx.get("base_url"):
+                default_cfg = {
+                    "base_url": src_ctx.get("base_url"),
+                    "api_key": src_ctx.get("api_key"),
+                    "model": src_ctx.get("model"),
+                    "params": src_ctx.get("params"),
+                }
+                break
+
+        try:
+            ov_res = overseer_mod.guard_tool_execution(
+                tool_name=name,
+                args=args,
+                sandbox_root=sandbox_root,
+                trust_level=trust,
+                approval_fn=approval_fn,
+                overseer_ctx=eff_overseer_ctx,
+                caller_info=eff_caller,
+                call_model_fn=call_model,
+                emit_sse=eff_emit,
+                default_model_cfg=default_cfg,
+                cancel_check=cancel_check,
+            )
+        except overseer_mod.OverseerBlockedError as ov_err:
+            raise AgentError(str(ov_err)) from ov_err
+
+        overseer_approved = bool(ov_res.get("humanApproved"))
+        overseer_decision = ov_res.get("decision") if isinstance(ov_res.get("decision"), dict) else None
+        ov_meta = ov_res.get("overseerMeta") if isinstance(ov_res.get("overseerMeta"), dict) else None
+        if overseer_approved and ov_meta and callable(eff_emit):
+            eff_emit(
+                "overseer_verdict",
+                {
+                    "verdict": "approved_by_human",
+                    "tool": name,
+                    "riskLevel": ov_meta.get("riskLevel", "medium"),
+                    "reason": ov_meta.get("reason", ""),
+                    "label": f"Надсмотрщик + человек одобрили {name}",
+                    **({"subagentRunKey": eff_caller.get("subagentRunKey")} if isinstance(eff_caller, dict) and eff_caller.get("subagentRunKey") else {}),
+                },
+            )
+        if ov_res.get("attachToNativeApproval") and ov_meta and approval_fn is not None:
+            def _with_overseer_approval(req_obj: Dict[str, Any], _orig=approval_fn, _ov=ov_meta) -> Dict[str, Any]:
+                return _orig({**req_obj, "overseer": _ov})
+
+            effective_approval_fn = _with_overseer_approval
 
     if name in code_tools.ALL_CODE_TOOL_NAMES:
         try:
@@ -1493,8 +1657,8 @@ def run_tool(
                 name,
                 args,
                 sandbox_root=sandbox_root,
-                trust_level=trust,
-                approval_fn=approval_fn,
+                trust_level=("full" if overseer_approved and name == "qa_run_tests" else trust),
+                approval_fn=effective_approval_fn,
                 browser_manager=browser_manager,
                 github_ctx=github_ctx,
                 report_sink=report_sink,
@@ -1608,13 +1772,14 @@ def run_tool(
         s_ctx = subagent_ctx or {}
         sub_list = s_ctx.get("subagents") or []
         recent_sub = s_ctx.get("recent_reports") or []
+        r_mode = str(s_ctx.get("routing_mode") or "linear")
         if not isinstance(sub_list, list) or not sub_list:
             return (
                 "У пользователя сейчас нет активных пользовательских субагентов. "
                 "Их можно создать и активировать во вкладке «Субагенты» (до 10 активных, до 50 в базе).",
                 events,
             )
-        tree_txt = build_orchestrator_subagents_prompt(sub_list, recent_sub)
+        tree_txt = build_orchestrator_subagents_prompt(sub_list, recent_sub, routing_mode=r_mode)
         return tree_txt, events
 
     if name == "call_subagent":
@@ -1682,6 +1847,44 @@ def run_tool(
         events.extend(sub_res.get("agentEvents") or [])
         return str(sub_res.get("agentText") or "Целевой субагент завершил работу."), events
 
+    if name == "escalate_to_upper_tier":
+        target_ref = str(args.get("target") or args.get("level") or "").strip()
+        esc_mode = str(args.get("mode") or "advice").strip().lower()
+        summary_txt = str(args.get("summary") or "").strip()
+        request_txt = str(args.get("request") or "").strip()
+        cascade_raw = args.get("cascade_down")
+        cascade_opt = bool(cascade_raw) if isinstance(cascade_raw, bool) else None
+        default_proj = str((subagent_state or {}).get("sandboxProject") or ".").strip() or "."
+        sandbox_proj = str(args.get("sandbox_project") or default_proj).strip() or default_proj
+        caller_meta = (subagent_state or {}).get("subagent") if isinstance(subagent_state, dict) else None
+        if not isinstance(caller_meta, dict):
+            raise AgentError("Инструмент `escalate_to_upper_tier` доступен только внутри запущенного субагента.")
+        if not target_ref:
+            raise AgentError("Укажите target (номер верхнего уровня, например '1'/'2'/'3', или slug/имя субагента)")
+        if not summary_txt:
+            raise AgentError("Передайте summary для верхнего уровня")
+        if not request_txt:
+            raise AgentError("Укажите request — вопрос или запрос на помощь/исправление")
+        esc_res = run_layered_escalation(
+            caller_subagent=caller_meta,
+            target_ref=target_ref,
+            mode=esc_mode,
+            summary=summary_txt,
+            request=request_txt,
+            cascade_down=cascade_opt,
+            sandbox_project=sandbox_proj,
+            trust_level=trust,
+            approval_fn=approval_fn,
+            sandbox_root=sandbox_root,
+            browser_manager=browser_manager,
+            github_ctx=github_ctx,
+            unlimited=unlimited,
+            tester_ctx=tester_ctx,
+            subagent_ctx=subagent_ctx,
+        )
+        events.extend(esc_res.get("agentEvents") or [])
+        return str(esc_res.get("agentText") or "Эскалация на верхний уровень завершена."), events
+
     if name == "report_to_orchestrator":
         summary_txt = str(args.get("summary") or "").strip()
         if not summary_txt:
@@ -1696,6 +1899,10 @@ def run_tool(
         )
         req_next = str(args.get("request_next_subagent") or "").strip()
         req_task = str(args.get("next_task") or "").strip()
+        cascade_raw = args.get("cascade_downstream")
+        cascade_downstream: Optional[bool] = (
+            bool(cascade_raw) if isinstance(cascade_raw, bool) else None
+        )
         if req_next and rep_status == "completed":
             rep_status = "handoff"
         report_obj = {
@@ -1704,6 +1911,7 @@ def run_tool(
             "filesTouched": touched,
             "requestNextSubagent": req_next,
             "nextTask": req_task,
+            "cascadeDownstream": cascade_downstream,
         }
         if isinstance(subagent_state, dict):
             subagent_state["report"] = report_obj
@@ -1735,7 +1943,7 @@ def run_tool(
                 args,
                 github_ctx=github_ctx,
                 trust_level=trust,
-                approval_fn=approval_fn,
+                approval_fn=effective_approval_fn,
                 sandbox_root=sandbox_root,
             )
         except github_tools.GithubToolError as error:
@@ -1835,8 +2043,8 @@ def run_tool(
             return browser_inspector.execute_browse_action(
                 mgr,
                 args,
-                trust_level=trust,
-                approval_fn=approval_fn,
+                trust_level=("full" if overseer_approved else trust),
+                approval_fn=effective_approval_fn,
                 on_status=on_status,
                 cancel_check=cancel_check,
             )
@@ -1853,9 +2061,9 @@ def run_tool(
         if op_trust == "none":
             op_trust = "verified"
 
-        if approval_fn is None:
+        if effective_approval_fn is None:
             raise AgentError("Для снимка экрана через Оператора требуется разрешение пользователя на сайте")
-        decision = approval_fn(
+        decision = effective_approval_fn(
             {
                 "kind": "capture_screen",
                 "title": "Разрешить Оператору сделать снимок экрана ПК?",
@@ -1920,9 +2128,9 @@ def run_tool(
             op_trust = "verified"
 
         # Вызов Оператора ВСЕГДА требует явного разрешения пользователя на сайте (независимо от full/verified).
-        if approval_fn is None:
+        if effective_approval_fn is None:
             raise AgentError("Для вызова Оператора требуется разрешение пользователя на сайте")
-        decision = approval_fn(
+        decision = effective_approval_fn(
             {
                 "kind": "call_operator",
                 "title": "Разрешить Агенту вызвать Оператора на ПК?",
@@ -2082,10 +2290,10 @@ def run_tool(
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
 
-        if trust == "verified":
-            if approval_fn is None:
+        if trust == "verified" and not overseer_approved:
+            if effective_approval_fn is None:
                 raise AgentError("Требуется подтверждение пользователя на сайте для запуска команды")
-            decision = approval_fn(
+            decision = effective_approval_fn(
                 {
                     "kind": "bash_command",
                     "title": "Разрешить выполнение команды в Sandbox?",
@@ -2163,25 +2371,26 @@ def run_tool(
         if not command:
             raise AgentError("Пустая команда для ПК")
         # Команды на ПК (вне Sandbox) ВСЕГДА требуют явного разрешения пользователя на сайте.
-        if approval_fn is None:
-            raise AgentError("Требуется подтверждение пользователя на сайте для команды на ПК")
-        decision = approval_fn(
-            {
-                "kind": "pc_command",
-                "title": "Разрешить команду на компьютере?",
-                "description": description or "Команда на ПК (вне песочницы) — полная работа с разрешения пользователя",
-                "command": command,
-                "cwd": "~",
-            }
-        )
-        if not decision.get("approved"):
-            note = str(decision.get("note") or "").strip()
-            return (
-                f"Пользователь отклонил команду на ПК «{command}»"
-                + (f" ({note})" if note else "")
-                + ".",
-                events,
+        if not overseer_approved:
+            if effective_approval_fn is None:
+                raise AgentError("Требуется подтверждение пользователя на сайте для команды на ПК")
+            decision = effective_approval_fn(
+                {
+                    "kind": "pc_command",
+                    "title": "Разрешить команду на компьютере?",
+                    "description": description or "Команда на ПК (вне песочницы) — полная работа с разрешения пользователя",
+                    "command": command,
+                    "cwd": "~",
+                }
             )
+            if not decision.get("approved"):
+                note = str(decision.get("note") or "").strip()
+                return (
+                    f"Пользователь отклонил команду на ПК «{command}»"
+                    + (f" ({note})" if note else "")
+                    + ".",
+                    events,
+                )
 
         try:
             res = sandbox_mod.run_pc_command(command, unlimited=unlimited)
@@ -2217,10 +2426,13 @@ def run_tool(
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
 
-        if trust == "verified":
-            if approval_fn is None:
+        if overseer_approved:
+            if isinstance(overseer_decision, dict) and str(overseer_decision.get("destination") or "").strip():
+                destination = str(overseer_decision["destination"]).strip()
+        elif trust == "verified":
+            if effective_approval_fn is None:
                 raise AgentError("Требуется согласие пользователя на сайте для переноса файлов из Sandbox")
-            decision = approval_fn(
+            decision = effective_approval_fn(
                 {
                     "kind": "sandbox_export",
                     "title": "Разрешить перенос файлов из Sandbox на ПК?",
@@ -4280,6 +4492,8 @@ def run_tester_session(
                             github_ctx=github_ctx,
                             unlimited=unlimited,
                             tester_ctx=tester_ctx,
+                            overseer_ctx=ctx.get("overseer_ctx"),
+                            caller_info={"agentKind": "tester", "agentName": "Тестировщик"},
                             qa_state=qa_state,
                             run_state=tester_run_state,
                             on_status=_on_tester_tool_status,
@@ -4714,27 +4928,200 @@ def _is_callee_allowed(caller: Dict[str, Any], target: Dict[str, Any]) -> bool:
     return bool(norm & candidates)
 
 
-def build_orchestrator_subagents_prompt(
+def _normalize_routing_mode(raw: Any) -> str:
+    return "layered" if str(raw or "").strip().lower() == "layered" else "linear"
+
+
+def _compute_subagent_hierarchy(
     subagents: List[Dict[str, Any]],
-    recent_reports: Optional[List[Dict[str, Any]]] = None,
-) -> str:
+) -> Dict[str, Any]:
+    """
+    Вычисляет уровни (1-based tier: 1 — первый уровень под Оркестратором, 2, 3, 4...),
+    таблицу узлов по id и карту parent_map для дерева субагентов с защитой от циклов.
+    """
     clean_subs = [s for s in subagents if isinstance(s, dict)]
-    if not clean_subs:
-        return ""
     by_id: Dict[int, Dict[str, Any]] = {}
-    children_map: Dict[Optional[int], List[Dict[str, Any]]] = {None: []}
+    by_slug: Dict[str, Dict[str, Any]] = {}
     for s in clean_subs:
         sid = int(s.get("id") or 0)
         if sid > 0:
             by_id[sid] = s
-            children_map.setdefault(sid, [])
+        slug_k = str(s.get("slug") or "").strip().lower()
+        if slug_k:
+            by_slug[slug_k] = s
+
+    tier_by_key: Dict[str, int] = {}
+    parent_key_by_key: Dict[str, Optional[str]] = {}
+
+    def _node_key(node: Dict[str, Any]) -> str:
+        sid = int(node.get("id") or 0)
+        if sid > 0:
+            return f"id:{sid}"
+        return f"slug:{str(node.get('slug') or node.get('name') or '').strip().lower()}"
+
+    for s in clean_subs:
+        k = _node_key(s)
+        pid_raw = s.get("parentSubagentId")
+        parent_node: Optional[Dict[str, Any]] = None
+        if isinstance(pid_raw, (int, float)) and int(pid_raw) in by_id and int(pid_raw) != int(s.get("id") or 0):
+            parent_node = by_id[int(pid_raw)]
+        parent_key_by_key[k] = _node_key(parent_node) if parent_node else None
+
+    def _calc_tier(key: str, seen: Optional[set[str]] = None) -> int:
+        if key in tier_by_key:
+            return tier_by_key[key]
+        vis = set(seen or set())
+        if key in vis:
+            tier_by_key[key] = 1
+            return 1
+        vis.add(key)
+        pk = parent_key_by_key.get(key)
+        if not pk or pk == key:
+            tier_by_key[key] = 1
+            return 1
+        t = min(10, _calc_tier(pk, vis) + 1)
+        tier_by_key[key] = t
+        return t
+
+    tiers_grouped: Dict[int, List[Dict[str, Any]]] = {}
+    for s in clean_subs:
+        k = _node_key(s)
+        t = _calc_tier(k)
+        tiers_grouped.setdefault(t, []).append(s)
+
+    return {
+        "node_key": _node_key,
+        "tier_by_key": tier_by_key,
+        "parent_key_by_key": parent_key_by_key,
+        "tiers_grouped": tiers_grouped,
+        "by_id": by_id,
+        "by_slug": by_slug,
+    }
+
+
+def _subagent_tier(hierarchy: Dict[str, Any], sub: Optional[Dict[str, Any]]) -> int:
+    if not isinstance(sub, dict):
+        return 1
+    k = hierarchy["node_key"](sub)
+    return int(hierarchy["tier_by_key"].get(k) or 1)
+
+
+def _find_upper_target_in_hierarchy(
+    subagents: List[Dict[str, Any]],
+    hierarchy: Dict[str, Any],
+    *,
+    caller_subagent: Dict[str, Any],
+    target_ref: str,
+) -> Optional[Dict[str, Any]]:
+    raw = str(target_ref or "").strip()
+    if not raw:
+        return None
+    m = re.match(r"^(?:уровень|tier|level|lvl|l)?\s*#?(\d+)$", raw, re.I)
+    if m:
+        wanted_tier = int(m.group(1))
+        by_id = hierarchy["by_id"]
+        cur: Optional[Dict[str, Any]] = caller_subagent
+        seen_ids: set[int] = set()
+        while isinstance(cur, dict):
+            cid = int(cur.get("id") or 0)
+            if cid and cid in seen_ids:
+                break
+            if cid:
+                seen_ids.add(cid)
+            if _subagent_tier(hierarchy, cur) == wanted_tier and cur is not caller_subagent:
+                return cur
+            pid_raw = cur.get("parentSubagentId")
+            cur = by_id.get(int(pid_raw)) if isinstance(pid_raw, (int, float)) else None
+        candidates = hierarchy["tiers_grouped"].get(wanted_tier) or []
+        for cand in candidates:
+            if cand is not caller_subagent and str(cand.get("slug") or "") != str(caller_subagent.get("slug") or ""):
+                return cand
+    return _find_subagent_in_list(subagents, raw)
+
+
+def _find_cascade_intermediate_chain(
+    subagents: List[Dict[str, Any]],
+    hierarchy: Dict[str, Any],
+    *,
+    upper_sub: Dict[str, Any],
+    lower_sub: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Возвращает промежуточные уровни между `upper_sub` (например, Уровень 1) и `lower_sub` (например, Уровень 4),
+    то есть Уровень 2 -> Уровень 3, чтобы при каскадном исправлении последовательно прогнать последствия вниз.
+    """
+    upper_tier = _subagent_tier(hierarchy, upper_sub)
+    lower_tier = _subagent_tier(hierarchy, lower_sub)
+    if lower_tier - upper_tier <= 1:
+        return []
+
+    by_id = hierarchy["by_id"]
+    path_up: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = lower_sub
+    seen: set[int] = set()
+    reached_upper = False
+    while isinstance(cur, dict):
+        cid = int(cur.get("id") or 0)
+        if cid and cid in seen:
+            break
+        if cid:
+            seen.add(cid)
+        if cur is upper_sub or (
+            upper_sub.get("slug") and str(cur.get("slug") or "") == str(upper_sub.get("slug") or "")
+        ):
+            reached_upper = True
+            break
+        if cur is not lower_sub:
+            t_cur = _subagent_tier(hierarchy, cur)
+            if upper_tier < t_cur < lower_tier:
+                path_up.append(cur)
+        pid_raw = cur.get("parentSubagentId")
+        cur = by_id.get(int(pid_raw)) if isinstance(pid_raw, (int, float)) else None
+
+    if reached_upper and path_up:
+        path_up.reverse()
+        return path_up
+
+    chain: List[Dict[str, Any]] = []
+    for t_lvl in range(upper_tier + 1, lower_tier):
+        group = hierarchy["tiers_grouped"].get(t_lvl) or []
+        for cand in group:
+            if str(cand.get("slug") or "") not in (
+                str(upper_sub.get("slug") or ""),
+                str(lower_sub.get("slug") or ""),
+            ):
+                chain.append(cand)
+                break
+    return chain
+
+
+def build_orchestrator_subagents_prompt(
+    subagents: List[Dict[str, Any]],
+    recent_reports: Optional[List[Dict[str, Any]]] = None,
+    *,
+    routing_mode: str = "linear",
+) -> str:
+    clean_subs = [s for s in subagents if isinstance(s, dict)]
+    if not clean_subs:
+        return ""
+    r_mode = _normalize_routing_mode(routing_mode)
+    hierarchy = _compute_subagent_hierarchy(clean_subs)
+    by_id = hierarchy["by_id"]
+    children_map: Dict[Optional[int], List[Dict[str, Any]]] = {None: []}
+    for sid in by_id:
+        children_map.setdefault(sid, [])
     for s in clean_subs:
         pid_raw = s.get("parentSubagentId")
         pid = int(pid_raw) if isinstance(pid_raw, (int, float)) and int(pid_raw) in by_id else None
         children_map.setdefault(pid, []).append(s)
 
+    mode_label = (
+        "ПО УРОВНЯМ (иерархия уровней 1→2→3→4 с эскалацией вверх и опциональным каскадом)"
+        if r_mode == "layered"
+        else "ЛИНЕЙНО (последовательные зависимости)"
+    )
     lines: List[str] = [
-        f"ДЕРЕВО ЗАВИСИМОСТЕЙ: Главный Агент (Оркестратор) ↔ Активные Субагенты ({len(clean_subs)}/10 активных):",
+        f"ДЕРЕВО ЗАВИСИМОСТЕЙ [{mode_label}]: Главный Агент (Оркестратор) ↔ Активные Субагенты ({len(clean_subs)}/10 активных):",
         "Корень: [Оркестратор (Главный Агент)]",
     ]
 
@@ -4768,9 +5155,11 @@ def build_orchestrator_subagents_prompt(
             api_txt = f"Своё API ({custom_model or 'custom'})" if api_unlocked else "API Оркестратора"
             role_part = f" — {node.get('roleTitle')}" if node.get("roleTitle") else ""
             desc_part = f" | {str(node.get('description') or '')[:160]}" if node.get("description") else ""
+            node_tier = _subagent_tier(hierarchy, node)
+            tier_tag = f"Уровень {node_tier}, " if r_mode == "layered" else ""
             lines.append(
                 f"{indent}Субагент «{node.get('name')}» (slug: `{node.get('slug')}`, id={nid}{role_part}) "
-                f"[{orch_direct}; {callee_txt}; {api_txt}]{desc_part}"
+                f"[{tier_tag}{orch_direct}; {callee_txt}; {api_txt}]{desc_part}"
             )
             if nid:
                 _render_branch(nid, depth + 1)
@@ -4781,13 +5170,23 @@ def build_orchestrator_subagents_prompt(
         if lid and lid not in visited:
             _render_branch(leftover.get("parentSubagentId"), 1)
 
-    lines.append(
-        "\nКак работать Оркестратору с субагентами:\n"
-        "- Вызывай `call_subagent(subagent='<slug>', summary='...', task='...', sandbox_project='...')`, "
-        "чтобы делегировать подзадачи в отдельный свежий чат субагента с общим доступом к Sandbox/GitHub (экономия токенов на раздумья).\n"
-        "- В `summary` ВСЕГДА указывай: что уже сделано, какие файлы проекта созданы/затронуты и что конкретно нужно сделать субагенту.\n"
-        "- Соблюдай дерево зависимостей: напрямую вызывай субагентов с `вызов Оркестратором: ДА`, а дочерних — после или по запросу их родительского субагента."
-    )
+    if r_mode == "layered":
+        lines.append(
+            "\nКак работать Оркестратору в режиме «ПО УРОВНЯМ»:\n"
+            "- Уровни идут сверху вниз: Уровень 1 (архитектура/верхний слой) → Уровень 2 → Уровень 3 → Уровень 4 (листовая реализация).\n"
+            "- Вызывай `call_subagent(subagent='<slug>', summary='...', task='...', sandbox_project='...')`, передавая подробное `summary`.\n"
+            "- Субагенты глубоких уровней (2, 3, 4…) имеют инструмент `escalate_to_upper_tier(target=..., mode=..., summary=..., request=...)`: "
+            "они могут обратиться на любой верхний уровень (1, 2, 3) за советом (`advice`), прямой помощью (`direct_help`) или исправлением "
+            "с опциональным каскадом вниз через промежуточные уровни (`fix_and_cascade`)."
+        )
+    else:
+        lines.append(
+            "\nКак работать Оркестратору с субагентами (линейный режим):\n"
+            "- Вызывай `call_subagent(subagent='<slug>', summary='...', task='...', sandbox_project='...')`, "
+            "чтобы делегировать подзадачи в отдельный свежий чат субагента с общим доступом к Sandbox/GitHub (экономия токенов на раздумья).\n"
+            "- В `summary` ВСЕГДА указывай: что уже сделано, какие файлы проекта созданы/затронуты и что конкретно нужно сделать субагенту.\n"
+            "- Соблюдай дерево зависимостей: напрямую вызывай субагентов с `вызов Оркестратором: ДА`, а дочерних — после или по запросу их родительского субагента."
+        )
 
     if recent_reports:
         rep_lines: List[str] = []
@@ -4818,21 +5217,29 @@ def _build_subagent_system_prompt(
     sandbox_root: Path,
     sandbox_project: str,
     github_ctx: Optional[Dict[str, Any]] = None,
+    routing_mode: str = "linear",
+    hierarchy: Optional[Dict[str, Any]] = None,
 ) -> str:
     trust_notes = {
         "full": "Уровень доверия: ПОЛНЫЙ ДОСТУП.",
         "verified": "Уровень доверия: С ПРОВЕРКОЙ ДАННЫХ (команды и действия на ПК согласуются на сайте).",
         "none": "Уровень доверия: НЕТ ДОСТУПА К КОМПЬЮТЕРУ (только безопасные инструменты и чтение).",
     }
+    r_mode = _normalize_routing_mode(routing_mode)
+    hier = hierarchy or _compute_subagent_hierarchy(all_subagents)
+    my_tier = _subagent_tier(hier, subagent)
+
     name = str(subagent.get("name") or "Субагент")
     slug = str(subagent.get("slug") or "subagent")
     role_title = str(subagent.get("roleTitle") or "").strip()
     description = str(subagent.get("description") or "").strip()
     custom_prompt = str(subagent.get("systemPrompt") or "").strip()
 
+    tier_label = f" · Уровень дерева: {my_tier}" if r_mode == "layered" else ""
     parts: List[str] = [
         SUBAGENT_BASE_SYSTEM_PROMPT.strip(),
-        f"\nТвой профиль субагента: «{name}» (slug: `{slug}`)" + (f" · Роль: {role_title}" if role_title else ""),
+        f"\nТвой профиль субагента: «{name}» (slug: `{slug}`{tier_label})"
+        + (f" · Роль: {role_title}" if role_title else ""),
     ]
     if description:
         parts.append(f"Описание твоей зоны ответственности: {description}")
@@ -4852,6 +5259,24 @@ def _build_subagent_system_prompt(
         gh_uid = int(github_ctx.get("userId") or 0)
         rel_ws = f"_github/u{gh_uid}/{github_tools._slug(gh_owner)}__{github_tools._slug(gh_repo)}"
         parts.append(f"Подключён общий GitHub-репозиторий: {gh_owner}/{gh_repo}@{gh_branch} (клон в Sandbox: {rel_ws}).")
+
+    if r_mode == "layered" and my_tier > 1:
+        upper_lines: List[str] = []
+        for lvl in range(1, my_tier):
+            nodes = hier["tiers_grouped"].get(lvl) or []
+            if nodes:
+                names_txt = ", ".join(f"`{n.get('slug')}` («{n.get('name')}»)" for n in nodes)
+                upper_lines.append(f"- Уровень {lvl}: {names_txt}")
+        if upper_lines:
+            parts.append(
+                f"\nРЕЖИМ ДЕРЕВА «ПО УРОВНЯМ» (ты на Уровне {my_tier}):\n"
+                "Если нужно обратиться к верхнему уровню (например, 1, 2 или 3) — используй "
+                "`escalate_to_upper_tier(target=..., mode='advice'|'direct_help'|'fix_and_cascade', summary=..., request=...)`:\n"
+                "  • `advice` — совет/консультация без изменений на верхнем уровне;\n"
+                "  • `direct_help` — прямая помощь верхнего уровня тебе напрямую;\n"
+                "  • `fix_and_cascade` — исправление на верхнем уровне с возможным повторением цепочки по промежуточным уровням вниз, если есть последствия.\n"
+                "Доступные верхние уровни:\n" + "\n".join(upper_lines)
+            )
 
     peers = [
         s
@@ -4878,6 +5303,220 @@ def _build_subagent_system_prompt(
 
     parts.append("Лимита шагов нет — выполняй все необходимые действия качественно и экономно по токенам.")
     return "\n".join(parts)
+
+
+def run_layered_escalation(
+    *,
+    caller_subagent: Dict[str, Any],
+    target_ref: str,
+    mode: str,
+    summary: str,
+    request: str,
+    cascade_down: Optional[bool] = None,
+    sandbox_project: str = ".",
+    trust_level: str = "verified",
+    approval_fn: Optional[Any] = None,
+    sandbox_root: Path = SANDBOX_ROOT,
+    browser_manager: Optional[browser_inspector.BrowserSessionManager] = None,
+    github_ctx: Optional[Dict[str, Any]] = None,
+    unlimited: bool = True,
+    tester_ctx: Optional[Dict[str, Any]] = None,
+    subagent_ctx: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Эскалация от нижнего уровня дерева (например, Уровень 4) к верхнему (Уровень 1/2/3) в режиме «по уровням».
+    Поддерживает три варианта: `advice` (совет), `direct_help` (прямая помощь) и `fix_and_cascade`
+    (исправление на верхнем уровне + опциональный каскад по промежуточным уровням в зависимости от последствий).
+    """
+    ctx = subagent_ctx or {}
+    routing_mode = _normalize_routing_mode(ctx.get("routing_mode") or "linear")
+    if routing_mode != "layered":
+        return {
+            "agentText": (
+                "Эскалация `escalate_to_upper_tier` доступна только в режиме дерева «По уровням». "
+                "Используй `request_subagent` или `report_to_orchestrator`."
+            ),
+            "agentEvents": [],
+        }
+
+    esc_depth = int(ctx.get("escalation_depth") or 0)
+    if esc_depth >= 3:
+        return {
+            "agentText": (
+                "Достигнута максимальная глубина эскалаций между уровнями (3). "
+                "Зафиксируй текущее состояние и передай отчёт Оркестратору."
+            ),
+            "agentEvents": [],
+        }
+
+    subagents_list: List[Dict[str, Any]] = [
+        s for s in (ctx.get("subagents") or []) if isinstance(s, dict)
+    ]
+    hierarchy = _compute_subagent_hierarchy(subagents_list)
+    caller_tier = _subagent_tier(hierarchy, caller_subagent)
+    target = _find_upper_target_in_hierarchy(
+        subagents_list,
+        hierarchy,
+        caller_subagent=caller_subagent,
+        target_ref=target_ref,
+    )
+    if target is None:
+        return {
+            "agentText": f"Верхний уровень или субагент «{target_ref}» не найден в активном дереве.",
+            "agentEvents": [],
+        }
+
+    target_tier = _subagent_tier(hierarchy, target)
+    if target_tier >= caller_tier:
+        return {
+            "agentText": (
+                f"Эскалация возможна только на более высокий уровень: ты на Уровне {caller_tier}, "
+                f"а «{target.get('name')}» находится на Уровне {target_tier}."
+            ),
+            "agentEvents": [],
+        }
+
+    norm_mode = mode if mode in ("advice", "direct_help", "fix_and_cascade") else "advice"
+    intermediate_chain = _find_cascade_intermediate_chain(
+        subagents_list,
+        hierarchy,
+        upper_sub=target,
+        lower_sub=caller_subagent,
+    )
+    inter_desc = (
+        ", ".join(
+            f"Уровень {_subagent_tier(hierarchy, n)}: «{n.get('name')}» (`{n.get('slug')}`)"
+            for n in intermediate_chain
+        )
+        or "нет промежуточных уровней"
+    )
+
+    if norm_mode == "advice":
+        upper_task = (
+            f"[ЭСКАЛАЦИЯ С УРОВНЯ {caller_tier} НА УРОВЕНЬ {target_tier} · РЕЖИМ: СОВЕТ (advice)]\n"
+            f"Запросивший субагент: «{caller_subagent.get('name')}» (`{caller_subagent.get('slug')}`).\n"
+            f"Запрос: {request}\n\n"
+            "Дай чёткий профессиональный совет, решение или архитектурное указание для Уровня "
+            f"{caller_tier} (без каскадного перезапуска остальных уровней) и вызови "
+            "`report_to_orchestrator(summary=..., status='completed', cascade_downstream=false)`."
+        )
+    elif norm_mode == "direct_help":
+        upper_task = (
+            f"[ЭСКАЛАЦИЯ С УРОВНЯ {caller_tier} НА УРОВЕНЬ {target_tier} · РЕЖИМ: ПРЯМАЯ ПОМОЩЬ (direct_help)]\n"
+            f"Запросивший субагент: «{caller_subagent.get('name')}» (`{caller_subagent.get('slug')}`).\n"
+            f"Запрос: {request}\n"
+            f"Промежуточные уровни ({inter_desc}) затрагивать не требуется, если только твои правки не ломают их напрямую.\n"
+            "Окажи прямую помощь Уровню "
+            f"{caller_tier} (при необходимости обнови контракт/файл) и вызови "
+            "`report_to_orchestrator(summary=..., files_touched=..., cascade_downstream=false)`."
+        )
+    else:
+        upper_task = (
+            f"[ЭСКАЛАЦИЯ С УРОВНЯ {caller_tier} НА УРОВЕНЬ {target_tier} · РЕЖИМ: ИСПРАВЛЕНИЕ И ОЦЕНКА ПОСЛЕДСТВИЙ (fix_and_cascade)]\n"
+            f"Запросивший субагент: «{caller_subagent.get('name')}» (`{caller_subagent.get('slug')}`).\n"
+            f"Запрос на исправление: {request}\n"
+            f"Промежуточные уровни между вами: {inter_desc}.\n"
+            "Внеси необходимое исправление на своём уровне и в `report_to_orchestrator` обязательно укажи:\n"
+            "- `cascade_downstream=true`, если изменения затрагивают контракты/архитектуру и промежуточные уровни должны адаптировать свои шаги;\n"
+            "- `cascade_downstream=false`, если последствий для промежуточных уровней нет и ответ можно вернуть напрямую запросившему уровню."
+        )
+
+    esc_ctx = {
+        **ctx,
+        "escalation_depth": esc_depth + 1,
+        "bypass_parent_guard": True,
+        "handoff_via": "layered_escalation",
+    }
+    upper_res = run_subagent_session(
+        target_ref=str(target.get("slug") or target.get("id") or ""),
+        summary=summary,
+        task=upper_task,
+        sandbox_project=sandbox_project,
+        caller_kind="subagent",
+        caller_subagent=caller_subagent,
+        trust_level=trust_level,
+        approval_fn=approval_fn,
+        sandbox_root=sandbox_root,
+        browser_manager=browser_manager,
+        github_ctx=github_ctx,
+        unlimited=unlimited,
+        tester_ctx=tester_ctx,
+        subagent_ctx=esc_ctx,
+    )
+    all_events: List[Dict[str, Any]] = list(upper_res.get("agentEvents") or [])
+    upper_done = upper_res.get("done") if isinstance(upper_res.get("done"), dict) else {}
+    upper_report = upper_res.get("report") if isinstance(upper_res.get("report"), dict) else {}
+    upper_cascade_flag = upper_report.get("cascadeDownstream")
+    upper_touched = list(upper_done.get("filesTouched") or [])
+
+    if norm_mode == "advice":
+        should_cascade = False
+    elif norm_mode == "direct_help":
+        should_cascade = bool(upper_cascade_flag is True)
+    else:
+        if cascade_down is False or upper_cascade_flag is False:
+            should_cascade = False
+        elif cascade_down is True or upper_cascade_flag is True:
+            should_cascade = True
+        else:
+            should_cascade = bool(upper_touched and intermediate_chain)
+
+    cascade_reports: List[str] = [
+        f"• Уровень {target_tier} («{target.get('name')}», режим `{norm_mode}`):\n"
+        f"{upper_done.get('outputSummary') or upper_res.get('agentText')}"
+    ]
+    prev_sub = target
+    prev_summary = str(upper_done.get("outputSummary") or upper_res.get('agentText') or summary)
+
+    if should_cascade and intermediate_chain:
+        for step_sub in intermediate_chain:
+            step_tier = _subagent_tier(hierarchy, step_sub)
+            step_task = (
+                f"[КАСКАДНОЕ ИСПРАВЛЕНИЕ С ВЕРХНЕГО УРОВНЯ → УРОВЕНЬ {step_tier} → УРОВЕНЬ {caller_tier}]\n"
+                f"Верхний Уровень {target_tier} («{target.get('name')}») внёс исправления по запросу от "
+                f"Уровня {caller_tier} («{caller_subagent.get('name')}»).\n"
+                "Проверь последствия на своём уровне, при необходимости обнови код/интерфейсы и передай "
+                "`report_to_orchestrator(summary=..., files_touched=...)` для следующего уровня вниз."
+            )
+            cascade_ctx = {
+                **esc_ctx,
+                "bypass_parent_guard": True,
+                "handoff_via": "layered_cascade",
+            }
+            step_res = run_subagent_session(
+                target_ref=str(step_sub.get("slug") or step_sub.get("id") or ""),
+                summary=prev_summary,
+                task=step_task,
+                sandbox_project=sandbox_project,
+                caller_kind="subagent",
+                caller_subagent=prev_sub,
+                trust_level=trust_level,
+                approval_fn=approval_fn,
+                sandbox_root=sandbox_root,
+                browser_manager=browser_manager,
+                github_ctx=github_ctx,
+                unlimited=unlimited,
+                tester_ctx=tester_ctx,
+                subagent_ctx=cascade_ctx,
+            )
+            all_events.extend(step_res.get("agentEvents") or [])
+            step_done = step_res.get("done") if isinstance(step_res.get("done"), dict) else {}
+            step_sum = str(step_done.get("outputSummary") or step_res.get("agentText") or "").strip()
+            cascade_reports.append(f"• Промежуточный Уровень {step_tier} («{step_sub.get('name')}»):\n{step_sum}")
+            prev_sub = step_sub
+            prev_summary = f"{prev_summary}\n\n[Уровень {step_tier} «{step_sub.get('name')}»]: {step_sum}"
+
+    cascade_status = (
+        f"цепочка каскадно обновлена через {len(intermediate_chain)} промежуточных уровней"
+        if (should_cascade and intermediate_chain)
+        else "прямой возврат на твой уровень без перезапуска промежуточных уровней"
+    )
+    final_msg = (
+        f"Результат эскалации с Уровня {caller_tier} → Уровень {target_tier} ({cascade_status}):\n\n"
+        + "\n\n".join(cascade_reports)
+        + f"\n\nТеперь можешь продолжать работу на своём Уровне {caller_tier} с учётом этого ответа."
+    )
+    return {"agentText": final_msg, "agentEvents": all_events}
 
 
 def run_subagent_session(
@@ -4954,7 +5593,7 @@ def run_subagent_session(
         }
 
     if caller_kind == "subagent" and isinstance(caller_subagent, dict):
-        if not _is_callee_allowed(caller_subagent, target):
+        if not ctx.get("bypass_parent_guard") and not _is_callee_allowed(caller_subagent, target):
             return {
                 "agentText": (
                     f"По дереву зависимостей субагенту «{caller_subagent.get('name')}» не разрешено вызывать "
@@ -4964,6 +5603,11 @@ def run_subagent_session(
                 ),
                 "agentEvents": [],
             }
+
+    routing_mode = _normalize_routing_mode(ctx.get("routing_mode") or "linear")
+    hierarchy = _compute_subagent_hierarchy(subagents_list)
+    sub_tier = _subagent_tier(hierarchy, target)
+    handoff_via = str(ctx.get("handoff_via") or "orchestrator")
 
     # Приоритет заблокированного API Агента (Оркестратора):
     # если галочка unlockApi НЕ стоит, строго берётся API Оркестратора!
@@ -5025,7 +5669,9 @@ def run_subagent_session(
                 "toSubagentId": sub_id,
                 "toSubagentSlug": sub_slug,
                 "toSubagentName": sub_name,
-                "via": "orchestrator",
+                "via": handoff_via,
+                "routingMode": routing_mode,
+                "tier": sub_tier,
                 "summary": summary[:1200],
                 "nextTask": task[:800],
                 "sandboxProject": proj_clean,
@@ -5033,7 +5679,7 @@ def run_subagent_session(
         )
 
     log(
-        f"Субагент [{run_key}] «{sub_name}» ({sub_slug}) старт: "
+        f"Субагент [{run_key}] «{sub_name}» ({sub_slug}, tier={sub_tier}, mode={routing_mode}) старт: "
         f"caller={caller_kind}, project={proj_clean}, model={sub_model or MODEL}, customApi={used_custom_api}"
     )
 
@@ -5053,6 +5699,8 @@ def run_subagent_session(
             "task": task,
             "model": sub_model or MODEL,
             "usedCustomApi": used_custom_api,
+            "tier": sub_tier,
+            "routingMode": routing_mode,
         },
     )
 
@@ -5063,6 +5711,8 @@ def run_subagent_session(
         sandbox_root=sandbox_root,
         sandbox_project=proj_clean,
         github_ctx=github_ctx if has_github_repo else None,
+        routing_mode=routing_mode,
+        hierarchy=hierarchy,
     )
     tree_preview = _build_sandbox_tree_preview(sandbox_root, proj_clean)
     caller_label = (
@@ -5096,7 +5746,13 @@ def run_subagent_session(
     }
     sub_qa_state: Dict[str, Any] = {"report": {}, "checks": [], "runKey": run_key}
     sub_run_state: Dict[str, Any] = {}
-    sub_tools = tools_for_trust(trust_level, has_github=has_github_repo, role="subagent")
+    sub_tools = tools_for_trust(
+        trust_level,
+        has_github=has_github_repo,
+        role="subagent",
+        routing_mode=routing_mode,
+        subagent_tier=sub_tier,
+    )
     local_browser_mgr = browser_manager or browser_inspector.BrowserSessionManager(sandbox_root=sandbox_root)
     owns_browser_mgr = browser_manager is None
     sub_browser_session_id = f"subagent_{run_key}"
@@ -5415,6 +6071,12 @@ def run_subagent_session(
                         tester_ctx=tester_ctx,
                         subagent_ctx=nested_subagent_ctx,
                         subagent_state=sub_state,
+                        overseer_ctx=ctx.get("overseer_ctx"),
+                        caller_info={
+                            "agentKind": "subagent",
+                            "agentName": f"Субагент «{sub_name}»",
+                            "subagentRunKey": run_key,
+                        },
                         qa_state=sub_qa_state,
                         run_state=sub_run_state,
                         on_status=_on_sub_tool_status,
@@ -5634,13 +6296,16 @@ def run_subagent_session(
         "totalTokens": sub_usage_total,
         "model": sub_model or MODEL,
         "usedCustomApi": used_custom_api,
+        "tier": sub_tier,
+        "routingMode": routing_mode,
         "label": f"Субагент «{sub_name}»: {proj_clean} ({final_status})",
     }
 
     return {
         "agentText": "\n".join(out_lines),
         "agentEvents": [agent_card],
-        "done": done_payload,
+        "done": {**done_payload, "tier": sub_tier, "routingMode": routing_mode},
+        "report": rep_final,
     }
 
 
@@ -6832,6 +7497,41 @@ class Handler(BaseHTTPRequestHandler):
         orch_base_url = assert_safe_ai_url(str(orch_settings.get("baseUrl") or base_url))
         orch_api_key = str(orch_settings.get("apiKey") or api_key)
         orch_model = str(orch_settings.get("model") or model)
+        subagent_routing_mode = _normalize_routing_mode(body.get("subagentRoutingMode"))
+        subagent_hierarchy = _compute_subagent_hierarchy(subagents_list)
+        direct_subagent_tier = (
+            _subagent_tier(subagent_hierarchy, active_subagent_meta)
+            if active_subagent_meta
+            else 1
+        )
+        raw_overseer = body.get("overseer") if isinstance(body.get("overseer"), dict) else {}
+        overseer_unlocked = bool(raw_overseer.get("unlockApi"))
+        overseer_custom_url = str(raw_overseer.get("baseUrl") or "").strip()
+        overseer_base_url = (
+            assert_safe_ai_url(overseer_custom_url)
+            if (overseer_unlocked and overseer_custom_url)
+            else orch_base_url
+        )
+        overseer_api_key = (
+            str(raw_overseer.get("apiKey") or orch_api_key)
+            if overseer_unlocked
+            else orch_api_key
+        )
+        overseer_model = (
+            str(raw_overseer.get("model") or orch_model)
+            if overseer_unlocked
+            else orch_model
+        )
+        overseer_cfg: Dict[str, Any] = {
+            "enabled": raw_overseer.get("enabled", True) is not False,
+            "mode": str(raw_overseer.get("mode") or "strict").strip().lower(),
+            "systemPrompt": str(raw_overseer.get("systemPrompt") or "").strip(),
+            "unlockApi": overseer_unlocked,
+            "baseUrl": overseer_base_url,
+            "apiKey": overseer_api_key,
+            "model": overseer_model,
+            "params": params,
+        }
 
         incoming = body.get("messages") or []
         if not isinstance(incoming, list) or not incoming:
@@ -6884,8 +7584,25 @@ class Handler(BaseHTTPRequestHandler):
             else []
         )
         if agent_role == "agent" and subagents_list:
-            system += "\n\n" + build_orchestrator_subagents_prompt(subagents_list, recent_sub_reports)
+            system += "\n\n" + build_orchestrator_subagents_prompt(
+                subagents_list,
+                recent_sub_reports,
+                routing_mode=subagent_routing_mode,
+            )
         elif agent_role == "subagent" and active_subagent_meta and subagents_list:
+            if subagent_routing_mode == "layered" and direct_subagent_tier > 1:
+                upper_lines: List[str] = []
+                for lvl in range(1, direct_subagent_tier):
+                    nodes = subagent_hierarchy["tiers_grouped"].get(lvl) or []
+                    if nodes:
+                        names_txt = ", ".join(f"`{n.get('slug')}` («{n.get('name')}»)" for n in nodes)
+                        upper_lines.append(f"- Уровень {lvl}: {names_txt}")
+                if upper_lines:
+                    system += (
+                        f"\n\nРЕЖИМ ДЕРЕВА «ПО УРОВНЯМ» (ты на Уровне {direct_subagent_tier}):\n"
+                        "Для обращения к верхнему уровню используй `escalate_to_upper_tier(target=..., mode=..., summary=..., request=...)`.\n"
+                        + "\n".join(upper_lines)
+                    )
             peers = [
                 s
                 for s in subagents_list
@@ -7045,7 +7762,13 @@ class Handler(BaseHTTPRequestHandler):
                         part.get("text", "") for part in content if part.get("type") == "text"
                     )
 
-        active_tools = tools_for_trust(trust_level, has_github=has_github_repo, role=agent_role)
+        active_tools = tools_for_trust(
+            trust_level,
+            has_github=has_github_repo,
+            role=agent_role,
+            routing_mode=subagent_routing_mode,
+            subagent_tier=direct_subagent_tier,
+        )
         browser_mgr = browser_inspector.BrowserSessionManager(sandbox_root=SANDBOX_ROOT)
         try:
             raw_ctx_limit = max(0, int(body.get("contextLimit") or 0))
@@ -7082,6 +7805,11 @@ class Handler(BaseHTTPRequestHandler):
         def _is_disconnected() -> bool:
             return bool(getattr(self, "_client_disconnected", False))
 
+        overseer_ctx: Dict[str, Any] = {
+            **overseer_cfg,
+            "emit_sse": _emit_sse,
+            "cancel_check": _is_disconnected,
+        }
         tester_ctx: Dict[str, Any] = {
             "base_url": orch_base_url,
             "api_key": orch_api_key,
@@ -7091,6 +7819,7 @@ class Handler(BaseHTTPRequestHandler):
             "emit_sse": _emit_sse,
             "recent_reports": recent_reports,
             "cancel_check": _is_disconnected,
+            "overseer_ctx": overseer_ctx,
         }
         subagent_ctx: Dict[str, Any] = {
             "base_url": orch_base_url,
@@ -7101,8 +7830,10 @@ class Handler(BaseHTTPRequestHandler):
             "emit_sse": _emit_sse,
             "subagents": subagents_list,
             "recent_reports": recent_sub_reports,
+            "routing_mode": subagent_routing_mode,
             "cancel_check": _is_disconnected,
             "chain_depth": 1 if agent_role == "subagent" else 0,
+            "overseer_ctx": overseer_ctx,
         }
 
         if agent_role == "tester":
@@ -7148,6 +7879,8 @@ class Handler(BaseHTTPRequestHandler):
                         "task": last_user_prompt[:4000],
                         "model": model or MODEL,
                         "usedCustomApi": bool(active_subagent_meta.get("usedCustomApi")),
+                        "tier": direct_subagent_tier,
+                        "routingMode": subagent_routing_mode,
                     },
                     "subagent_start",
                 )
@@ -7212,7 +7945,19 @@ class Handler(BaseHTTPRequestHandler):
                 def _emit_live_reasoning(step_reasoning: str) -> None:
                     combined = ((thinking + "\n\n" if thinking else "") + step_reasoning).strip()
                     if combined:
-                        self.write(sse({"text": combined}, "reasoning"))
+                        self.write(
+                            sse(
+                                {
+                                    "text": combined,
+                                    "actor": (
+                                        "subagent_llm"
+                                        if agent_role == "subagent"
+                                        else ("tester_llm" if agent_role == "tester" else "agent_llm")
+                                    ),
+                                },
+                                "reasoning",
+                            )
+                        )
 
                 def _emit_live_text(step_text: str) -> None:
                     cleaned = step_text.strip()
@@ -7309,7 +8054,19 @@ class Handler(BaseHTTPRequestHandler):
                 usage_total += step_usage["total"]
                 if reasoning:
                     thinking += ("\n\n" if thinking else "") + reasoning
-                    self.write(sse({"text": thinking}, "reasoning"))
+                    self.write(
+                        sse(
+                            {
+                                "text": thinking,
+                                "actor": (
+                                    "subagent_llm"
+                                    if agent_role == "subagent"
+                                    else ("tester_llm" if agent_role == "tester" else "agent_llm")
+                                ),
+                            },
+                            "reasoning",
+                        )
+                    )
                 tool_calls = message.get("tool_calls") or []
                 log(
                     f"{role_label} шаг {steps}: ответ модели за {time.monotonic() - llm_started:.2f}с "
@@ -7473,6 +8230,16 @@ class Handler(BaseHTTPRequestHandler):
                                 tester_ctx=tester_ctx,
                                 subagent_ctx=subagent_ctx,
                                 subagent_state=direct_subagent_state,
+                                overseer_ctx=overseer_ctx,
+                                caller_info={
+                                    "agentKind": agent_role,
+                                    "agentName": (
+                                        f"Субагент «{active_subagent_meta.get('name')}»"
+                                        if (agent_role == "subagent" and active_subagent_meta)
+                                        else ("Тестировщик" if agent_role == "tester" else "Главный Агент")
+                                    ),
+                                    **({"subagentRunKey": direct_subagent_key} if direct_subagent_key else {}),
+                                },
                                 qa_state=qa_state,
                                 run_state=run_state,
                                 on_status=_on_tool_status,
