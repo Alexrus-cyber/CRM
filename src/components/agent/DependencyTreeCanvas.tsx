@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   AlertTriangle,
   Check,
@@ -46,6 +46,8 @@ export type OrchestratorPosition = {
 
 type Props = {
   subagents: Subagent[];
+  /** Версия дерева с сервера: при её смене локальные правки сбрасываются. */
+  dataVersion?: string;
   orchestratorModel?: string;
   orchestratorPos?: OrchestratorPosition | null;
   maxActive: number;
@@ -189,6 +191,7 @@ type EdgeInfo = {
 
 export function DependencyTreeCanvas({
   subagents,
+  dataVersion = "",
   orchestratorModel,
   orchestratorPos,
   maxActive,
@@ -226,6 +229,16 @@ export function DependencyTreeCanvas({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedToast, setSavedToast] = useState<string | null>(null);
+
+  // P0-4: сервер прислал новую версию дерева (после «Обновить данные»/чужой правки) —
+  // локальные override-правки больше не актуальны и должны быть сброшены.
+  const lastDataVersionRef = useRef(dataVersion);
+  useEffect(() => {
+    if (lastDataVersionRef.current === dataVersion) return;
+    lastDataVersionRef.current = dataVersion;
+    setOverrides({});
+    setOrchPosOverride(undefined);
+  }, [dataVersion]);
 
   const effectiveOrchPos = useMemo<OrchestratorPosition>(() => {
     if (orchPosOverride !== undefined) return orchPosOverride;
@@ -839,7 +852,12 @@ export function DependencyTreeCanvas({
       setOrchPosOverride(undefined);
       setSavedToast("Топология дерева и позиции узлов сохранены");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Не удалось сохранить дерево");
+      // P2-2: откатываем оптимистичные правки, иначе тумблер «Активен» залипает,
+      // карточка показывает «Выключен», а бейдж — «11/10» при реально несохранённых данных.
+      setOverrides({});
+      setOrchPosOverride(undefined);
+      const message = e instanceof Error ? e.message : "Не удалось сохранить дерево";
+      setError(`${message} — локальные правки отменены, показаны данные с сервера`);
     } finally {
       setBusy(false);
     }

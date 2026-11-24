@@ -13,6 +13,7 @@ import {
   listSubagentRuns,
   recordAgentUsage,
   searchRagChunks,
+  touchSubagentRun,
   updateTesterMinorDecision,
   type AgentSubagentSecret,
   type SubagentCallerKind,
@@ -665,6 +666,38 @@ export async function POST(req: Request) {
     string,
     { runId: number; subagentId: number; subagentConversationId: number }
   >();
+  /** Запуски, по которым уже пришёл `subagent_done` — их нельзя закрывать как «осиротевшие». */
+  const closedSubagentRuns = new Set<string>();
+  /** Троттлинг heartbeat: не чаще одного UPDATE на запуск в 10 секунд. */
+  const heartbeatAt = new Map<string, number>();
+  const HEARTBEAT_INTERVAL_MS = 10_000;
+
+  const touchRunHeartbeat = (runKey: string, runId: number) => {
+    const now = Date.now();
+    const last = heartbeatAt.get(runKey) ?? 0;
+    if (now - last < HEARTBEAT_INTERVAL_MS) return;
+    heartbeatAt.set(runKey, now);
+    void touchSubagentRun(me.id, runId).catch(() => undefined);
+  };
+
+  /**
+   * Закрывает запуски, которые остались в статусе `running`, но так и не получили `subagent_done`
+   * (обрыв SSE, закрытая вкладка). Без этого UI показывал вечное «выполняется».
+   */
+  const finalizeOpenSubagentRuns = async () => {
+    for (const [runKey, mapped] of activeSubagentRuns) {
+      if (closedSubagentRuns.has(runKey)) continue;
+      closedSubagentRuns.add(runKey);
+      await completeSubagentRun({
+        userId: me.id,
+        runId: mapped.runId,
+        status: "error",
+        outputSummary:
+          "Запуск прерван: соединение с клиентом закрыто до завершения. Используйте «Повторить», чтобы продолжить задачу.",
+        model: modelName,
+      }).catch(() => null);
+    }
+  };
 
   const flushUsage = async () => {
     if (recorded) return;
@@ -812,6 +845,7 @@ export async function POST(req: Request) {
           parsed.runId = mappedSub.runId;
           parsed.subagentId = mappedSub.subagentId;
           parsed.subagentConversationId = mappedSub.subagentConversationId;
+          touchRunHeartbeat(runKey, mappedSub.runId);
         }
         return `event: ${ev}\ndata: ${JSON.stringify(parsed)}\n\n`;
       } else if (ev === "subagent_done") {
@@ -839,9 +873,12 @@ export async function POST(req: Request) {
             rawStatus === "handoff" ||
             rawStatus === "blocked" ||
             rawStatus === "error" ||
-            rawStatus === "completed"
+            rawStatus === "completed" ||
+            rawStatus === "rotated" ||
+            rawStatus === "cancelled"
               ? rawStatus
               : "completed";
+          closedSubagentRuns.add(runKey);
           const savedRun = await completeSubagentRun({
             userId: me.id,
             runId: mappedSub.runId,
@@ -1029,7 +1066,10 @@ export async function POST(req: Request) {
   const trackedStream = createAgentSseProxyStream({
     upstreamReader,
     processFrame,
-    onDone: flushUsage,
+    onDone: async () => {
+      await flushUsage();
+      await finalizeOpenSubagentRuns();
+    },
     reqSignal: req.signal,
   });
 

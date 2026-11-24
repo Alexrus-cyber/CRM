@@ -177,10 +177,44 @@ const RUN_STATUS_META: Record<
     badgeClass: "border-amber-500/35 bg-amber-500/15 text-amber-500",
   },
   error: {
-    label: "ошибка",
+    label: "Ошибка",
     badgeClass: "border-red-500/35 bg-red-500/15 text-red-500",
   },
+  // Автоперенос контекста в новый чат — это НЕ передача задачи другому субагенту.
+  rotated: {
+    label: "Перенос в новый чат",
+    badgeClass: "border-sky-500/35 bg-sky-500/15 text-sky-300",
+  },
+  cancelled: {
+    label: "Отменён",
+    badgeClass: "border-border bg-card2 text-muted",
+  },
 };
+
+/** Запуск без heartbeat дольше 10 минут считаем «устаревшим» (как на сервере). */
+const SUBAGENT_RUN_STALE_MS = 10 * 60 * 1000;
+
+/** Понятные названия полей дерева для баннера конфликта версий. */
+const TREE_FIELD_LABELS: Record<string, string> = {
+  isActive: "активность",
+  parentSubagentId: "родительский субагент",
+  orchestratorCanCall: "прямой вызов Оркестратором",
+  allowedCallees: "разрешённые вызываемые субагенты",
+  routingMode: "режим маршрутизации",
+};
+
+/** «5 мин назад» — чтобы у застрявшего запуска был виден возраст. */
+function formatElapsedSince(iso: string): string {
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return "";
+  const diffMs = Math.max(0, Date.now() - ts);
+  const mins = Math.floor(diffMs / 60_000);
+  if (mins < 1) return "только что";
+  if (mins < 60) return `${mins} мин назад`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} ч назад`;
+  return `${Math.floor(hours / 24)} дн назад`;
+}
 
 function slugifyFallback(name: string): string {
   const s = name
@@ -232,11 +266,28 @@ export function SubagentsPanel({
   const [editing, setEditing] = useState<SubagentFormState | null>(null);
   const [showTree, setShowTree] = useState(true);
   const [viewChatFor, setViewChatFor] = useState<number | null>(null);
+  /** Версия дерева из GET — для оптимистичной блокировки PUT (P0-4). */
+  const [treeVersion, setTreeVersion] = useState<string | null>(null);
+  const [treeConflict, setTreeConflict] = useState<{
+    message: string;
+    conflicts: Array<{ id: number; name: string; field: string }>;
+  } | null>(null);
+  /** Какой запуск сейчас выполняет cancel/retry — чтобы блокировать кнопки. */
+  const [runActionBusy, setRunActionBusy] = useState<number | null>(null);
+  /** Чат, который нужно открыть после retry: {субагент, conversation.id из ответа}. */
+  const [presetChat, setPresetChat] = useState<{ subagentId: number; convId: number } | null>(null);
 
   const onStatsRef = useRef(onStats);
   const selectedIdRef = useRef(selectedId);
   const inFlightLoadRef = useRef<Promise<void> | null>(null);
   const abortLoadRef = useRef<AbortController | null>(null);
+  /** Номер последнего запроса load(): устаревшие ответы игнорируются. */
+  const loadSeqRef = useRef(0);
+  /** Последний payload дерева — для «Сохранить принудительно» после 409. */
+  const lastTreePayloadRef = useRef<{
+    nodes: DependencyTreeNodePayload[];
+    nextOrchPos?: OrchestratorPosition;
+  } | null>(null);
   const mountedRef = useRef(true);
   const prevRefreshKeyRef = useRef(refreshKey);
 
@@ -257,14 +308,17 @@ export function SubagentsPanel({
     };
   }, []);
 
-  /** Стабильный единичный загрузчик: без циклических зависимостей и с дедупликацией. */
+  /**
+   * Единый загрузчик: новый вызов отменяет предыдущий запрос, а устаревший ответ
+   * игнорируется (иначе `await load()` после сохранения мог откатить UI к старым данным).
+   */
   const load = useCallback(async (opts?: { showSpinner?: boolean }) => {
-    if (inFlightLoadRef.current && !abortLoadRef.current?.signal.aborted) {
-      return inFlightLoadRef.current;
-    }
-
+    abortLoadRef.current?.abort();
     const controller = new AbortController();
     abortLoadRef.current = controller;
+    const seq = ++loadSeqRef.current;
+    const isCurrent = () =>
+      !controller.signal.aborted && seq === loadSeqRef.current && mountedRef.current;
 
     const promise = (async () => {
       if (opts?.showSpinner && mountedRef.current) {
@@ -287,8 +341,9 @@ export function SubagentsPanel({
           routingMode?: SubagentRoutingMode;
           orchestratorPos?: OrchestratorPosition | null;
           overseer?: Partial<OverseerConfig>;
+          treeVersion?: string;
         };
-        if (controller.signal.aborted || !mountedRef.current) return;
+        if (!isCurrent()) return;
 
         const nextSubs = Array.isArray(data.subagents) ? data.subagents : [];
         const nextRuns = Array.isArray(data.runs) ? data.runs : [];
@@ -319,7 +374,9 @@ export function SubagentsPanel({
         setRoutingMode(nextRouting);
         setOrchestratorPos(nextOrchPos);
         setOverseer(nextOverseer);
-        setOverseerSyncKey((k) => k + 1);
+        setTreeVersion(typeof data.treeVersion === "string" ? data.treeVersion : null);
+        // P2-1: карточку Надсмотрщика НЕ перемонтируем на каждом load() — иначе
+        // несохранённые правки стираются после любого SSE-события.
         setError(null);
 
         if (selectedIdRef.current && !nextSubs.some((s) => s.id === selectedIdRef.current)) {
@@ -334,13 +391,13 @@ export function SubagentsPanel({
           overseerEnabled: nextOverseer.enabled,
         });
       } catch (e) {
-        if (controller.signal.aborted || !mountedRef.current) return;
+        if (!isCurrent()) return;
         setError(e instanceof Error ? e.message : "Ошибка загрузки");
       } finally {
         if (abortLoadRef.current === controller) {
           inFlightLoadRef.current = null;
         }
-        if (mountedRef.current) {
+        if (mountedRef.current && seq === loadSeqRef.current) {
           setLoading(false);
         }
       }
@@ -360,6 +417,16 @@ export function SubagentsPanel({
       void load();
     }
   }, [refreshKey, load]);
+
+  // P1-3: пока есть хотя бы один `running`-запуск — обновляем статусы раз в 15 секунд.
+  const hasRunningRuns = useMemo(() => runs.some((r) => r.status === "running"), [runs]);
+  useEffect(() => {
+    if (!hasRunningRuns) return;
+    const timer = setInterval(() => {
+      void load();
+    }, 15_000);
+    return () => clearInterval(timer);
+  }, [hasRunningRuns, load]);
 
   const byId = useMemo(() => new Map(subagents.map((s) => [s.id, s])), [subagents]);
   const totalRunsTokens = useMemo(
@@ -445,8 +512,14 @@ export function SubagentsPanel({
   );
 
   const saveTree = useCallback(
-    async (nodes: DependencyTreeNodePayload[], nextOrchPos?: OrchestratorPosition) => {
+    async (
+      nodes: DependencyTreeNodePayload[],
+      nextOrchPos?: OrchestratorPosition,
+      opts?: { force?: boolean },
+    ) => {
       setError(null);
+      if (!opts?.force) setTreeConflict(null);
+      lastTreePayloadRef.current = { nodes, nextOrchPos };
       const res = await fetch("/api/agent/subagents", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -454,15 +527,119 @@ export function SubagentsPanel({
           nodes,
           routingMode,
           ...(nextOrchPos !== undefined ? { orchestratorPos: nextOrchPos } : {}),
+          // P0-4: оптимистичная блокировка — сервер сравнит версию и вернёт 409 при конфликте.
+          ...(treeVersion && !opts?.force ? { expectedVersion: treeVersion } : {}),
+          ...(opts?.force ? { force: true } : {}),
         }),
       });
+      if (res.status === 409) {
+        const d = (await res.json().catch(() => ({}))) as {
+          error?: string;
+          code?: string;
+          currentVersion?: string;
+          conflicts?: Array<{ id: number; name: string; field: string }>;
+        };
+        const conflicts = Array.isArray(d.conflicts) ? d.conflicts : [];
+        const detail = conflicts
+          .map((c) => `«${c.name}»: ${TREE_FIELD_LABELS[c.field] ?? c.field}`)
+          .join("; ");
+        const message =
+          (d.error || "Дерево зависимостей изменено в другой вкладке") + (detail ? ` — ${detail}` : "");
+        setTreeConflict({ message, conflicts });
+        // Ошибка сохранения обязана попадать в ОБЩИЙ баннер панели, а не только внутрь блока дерева.
+        setError(message);
+        throw new Error(message);
+      }
       if (!res.ok) {
         const d = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(d.error ?? "Не удалось сохранить дерево зависимостей");
+        const message = d.error ?? "Не удалось сохранить дерево зависимостей";
+        setError(message);
+        throw new Error(message);
       }
+      const data = (await res.json().catch(() => ({}))) as { treeVersion?: string };
+      if (typeof data.treeVersion === "string") setTreeVersion(data.treeVersion);
+      setTreeConflict(null);
       await load({ showSpinner: true });
     },
-    [load, routingMode],
+    [load, routingMode, treeVersion],
+  );
+
+  /** «Сохранить принудительно» — повторяем PUT с force: true поверх чужой правки. */
+  const forceSaveTree = useCallback(async () => {
+    const last = lastTreePayloadRef.current;
+    if (!last) {
+      setTreeConflict(null);
+      await load({ showSpinner: true });
+      return;
+    }
+    try {
+      await saveTree(last.nodes, last.nextOrchPos, { force: true });
+    } catch {
+      /* текст ошибки уже показан в общем баннере панели */
+    }
+  }, [load, saveTree]);
+
+  /** «Обновить данные» — отбрасываем локальные правки и перечитываем дерево с сервера. */
+  const reloadTree = useCallback(() => {
+    setTreeConflict(null);
+    setError(null);
+    void load({ showSpinner: true });
+  }, [load]);
+
+  /** P1-3: остановить запуск на сервере (running -> cancelled). */
+  const cancelRun = useCallback(
+    async (runId: number) => {
+      setRunActionBusy(runId);
+      setError(null);
+      try {
+        const res = await fetch(`/api/agent/subagents/runs/${runId}/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reason: "Запуск остановлен пользователем из карточки запуска" }),
+        });
+        if (!res.ok) {
+          const d = (await res.json().catch(() => ({}))) as { error?: string };
+          throw new Error(d.error ?? "Не удалось остановить запуск");
+        }
+        await load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Ошибка остановки запуска");
+      } finally {
+        setRunActionBusy(null);
+      }
+    },
+    [load],
+  );
+
+  /** P1-3: повторить запуск в том же изолированном чате и открыть его. */
+  const retryRun = useCallback(
+    async (run: SubagentRun) => {
+      setRunActionBusy(run.id);
+      setError(null);
+      try {
+        const res = await fetch(`/api/agent/subagents/runs/${run.id}/retry`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        const d = (await res.json().catch(() => ({}))) as {
+          error?: string;
+          conversation?: { id?: number };
+        };
+        if (!res.ok) throw new Error(d.error ?? "Не удалось повторить запуск");
+        const convId = Number(d.conversation?.id ?? 0);
+        setViewChatFor(run.subagentId);
+        if (Number.isSafeInteger(convId) && convId > 0) {
+          setPresetChat({ subagentId: run.subagentId, convId });
+        }
+        await load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Ошибка повторного запуска");
+      } finally {
+        setRunActionBusy(null);
+      }
+    },
+    [load],
   );
 
   const changeRoutingMode = useCallback(
@@ -601,7 +778,11 @@ export function SubagentsPanel({
             <Button
               size="sm"
               variant={showOverseer ? "primary" : "secondary"}
-              onClick={() => setShowOverseer((v) => !v)}
+              onClick={() => {
+                // Перемонтируем карточку только при явном открытии — несохранённые правки не теряются.
+                if (!showOverseer) setOverseerSyncKey((k) => k + 1);
+                setShowOverseer(!showOverseer);
+              }}
               title="Настройки агента-Надсмотрщика (защита от побега из Sandbox и утечки данных)"
             >
               <ShieldCheck size={13} className={overseer.enabled ? "text-emerald-400" : "text-amber-400"} />
@@ -644,6 +825,35 @@ export function SubagentsPanel({
         </div>
       )}
 
+      {treeConflict && (
+        <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-300">
+          <div className="flex items-start gap-2">
+            <GitBranch size={14} className="mt-0.5 shrink-0" />
+            <div className="min-w-0 space-y-1">
+              <div className="font-semibold">Конфликт версий дерева зависимостей</div>
+              <p className="leading-relaxed">{treeConflict.message}</p>
+              {treeConflict.conflicts.length > 0 && (
+                <ul className="list-inside list-disc text-[11px] text-amber-200/90">
+                  {treeConflict.conflicts.map((c) => (
+                    <li key={`${c.id}-${c.field}`}>
+                      «{c.name}» — {TREE_FIELD_LABELS[c.field] ?? c.field}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            <Button size="sm" variant="secondary" onClick={reloadTree}>
+              <RefreshCw size={12} /> Обновить данные
+            </Button>
+            <Button size="sm" variant="primary" onClick={() => void forceSaveTree()}>
+              <Check size={12} /> Сохранить принудительно
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* Настройки агента-Надсмотрщика */}
       {showOverseer && (
         <OverseerConfigCard
@@ -660,6 +870,7 @@ export function SubagentsPanel({
       {showTree && (
         <DependencyTreeCanvas
           subagents={subagents}
+          dataVersion={treeVersion ?? ""}
           orchestratorModel={orchestratorModelLabel}
           maxActive={limits.maxActive}
           routingMode={routingMode}
@@ -676,6 +887,8 @@ export function SubagentsPanel({
       {/* Форма создания / редактирования субагента */}
       {editing && (
         <SubagentFormEditor
+          // P0-1: без key форма держала useState(initial) от прошлой записи и PATCH уходил с чужими данными.
+          key={editing.id ?? "new"}
           initial={editing}
           subagents={subagents}
           limits={limits}
@@ -803,7 +1016,7 @@ export function SubagentsPanel({
                     <div className="text-xs font-semibold text-text">{formatTokensCount(subTokens)}</div>
                   </div>
                   <div>
-                    <div className="text-[10px] text-muted">Handoff</div>
+                    <div className="text-[10px] text-muted">Может вызывать</div>
                     <div className="text-xs font-semibold text-text">{calleesCountLabel}</div>
                   </div>
                 </div>
@@ -814,22 +1027,53 @@ export function SubagentsPanel({
                     <div className="text-[10px] font-medium text-muted">Последние запуски</div>
                     {recentRuns.map((r) => {
                       const statusMeta = RUN_STATUS_META[r.status] ?? RUN_STATUS_META.completed;
+                      const isRunning = r.status === "running";
+                      const stale = isRunning && Date.now() - Date.parse(r.updatedAt) > SUBAGENT_RUN_STALE_MS;
                       return (
-                        <div
-                          key={r.id}
-                          className="flex items-center justify-between gap-2 text-[11px]"
-                        >
-                          <div className="flex min-w-0 items-center gap-1.5">
-                            <Badge className={cn("px-1.5 py-0 text-[9px]", statusMeta.badgeClass)}>
-                              {statusMeta.label}
-                            </Badge>
-                            <span className="truncate text-muted">
-                              #{r.id} · {r.callerKind} · {r.sandboxProject || "."}
+                        <div key={r.id} className="space-y-1">
+                          <div className="flex items-center justify-between gap-2 text-[11px]">
+                            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                              <Badge className={cn("px-1.5 py-0 text-[9px]", statusMeta.badgeClass)}>
+                                {statusMeta.label}
+                              </Badge>
+                              {stale && (
+                                <Badge className="border-amber-500/40 bg-amber-500/15 px-1.5 py-0 text-[9px] text-amber-400">
+                                  Устарел / нет heartbeat
+                                </Badge>
+                              )}
+                              <span className="truncate text-muted">
+                                #{r.id} · {r.callerKind} · {r.sandboxProject || "."}
+                              </span>
+                              {isRunning && (
+                                <span className="shrink-0 text-[10px] text-muted">
+                                  {formatElapsedSince(r.updatedAt)}
+                                </span>
+                              )}
+                            </div>
+                            <span className="shrink-0 font-mono text-[10px] text-text">
+                              {formatTokensCount(r.totalTokens)} ток.
                             </span>
                           </div>
-                          <span className="shrink-0 font-mono text-[10px] text-text">
-                            {formatTokensCount(r.totalTokens)} ток.
-                          </span>
+                          {isRunning && (
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <Button
+                                size="sm"
+                                variant="danger"
+                                onClick={() => void cancelRun(r.id)}
+                                disabled={runActionBusy === r.id}
+                              >
+                                <Square size={11} /> Остановить
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                onClick={() => void retryRun(r)}
+                                disabled={runActionBusy === r.id}
+                              >
+                                <RefreshCw size={11} /> Повторить
+                              </Button>
+                            </div>
+                          )}
                         </div>
                       );
                     })}
@@ -868,8 +1112,13 @@ export function SubagentsPanel({
       {/* Изолированный чат выбранного субагента */}
       {viewChatFor !== null && (
         <SubagentChatViewer
-          key={`chat-${viewChatFor}`}
+          key={`chat-${viewChatFor}-${
+            presetChat && presetChat.subagentId === viewChatFor ? presetChat.convId : 0
+          }`}
           subagentId={viewChatFor}
+          presetConvId={
+            presetChat && presetChat.subagentId === viewChatFor ? presetChat.convId : null
+          }
           subagents={subagents}
           conversations={conversations}
           settings={settings}
@@ -932,6 +1181,12 @@ function SubagentFormEditor({
   }));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<{
+    name?: string;
+    systemPrompt?: string;
+    allowedCalleesText?: string;
+    parentSubagentId?: string;
+  }>({});
 
   const others = useMemo(() => subagents.filter((s) => s.id !== initial.id), [subagents, initial.id]);
   const blockedParents = useMemo(() => collectFormDescendantIds(initial.id, subagents), [initial.id, subagents]);
@@ -964,11 +1219,38 @@ function SubagentFormEditor({
     set("allowedCalleesText", next.join(", "));
   };
 
+  const validate = (): string | null => {
+    const next: {
+      name?: string;
+      systemPrompt?: string;
+      allowedCalleesText?: string;
+      parentSubagentId?: string;
+    } = {};
+    if (!form.name?.trim()) next.name = "Укажите название субагента";
+    if (!(form.systemPrompt ?? "").trim()) {
+      next.systemPrompt = "Системный промпт обязателен: опишите правила работы субагента";
+    }
+    const knownSlugs = new Set(others.map((s) => s.slug));
+    const unknownCallees = calleesList.filter((slug) => slug !== "*" && !knownSlugs.has(slug));
+    if (unknownCallees.length > 0) {
+      next.allowedCalleesText = `Неизвестные slug: ${unknownCallees.join(", ")}. Доступны: ${
+        Array.from(knownSlugs).join(", ") || "—"
+      }`;
+    }
+    const parentId = form.parentSubagentId ?? null;
+    if (parentId !== null && blockedParents.has(parentId)) {
+      next.parentSubagentId = "Нельзя выбрать потомка — это создаст цикл в дереве";
+    }
+    setFieldErrors(next);
+    return Object.values(next).find(Boolean) ?? null;
+  };
+
   const submit = async () => {
-    setBusy(true);
     setError(null);
+    const invalid = validate();
+    if (invalid) return;
+    setBusy(true);
     try {
-      if (!form.name?.trim()) throw new Error("Укажите название субагента");
       if (form.isActive && others.filter((s) => s.isActive).length >= limits.maxActive && !initial.isActive) {
         throw new Error(`Одновременно может быть активно не более ${limits.maxActive} субагентов`);
       }
@@ -1003,7 +1285,13 @@ function SubagentFormEditor({
         </div>
       )}
 
-      <div className="space-y-4">
+      <form
+        className="space-y-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
         {/* Секция 1: Профиль и специализация */}
         <div className="space-y-3 rounded-2xl border border-border bg-card2/40 p-3.5">
           <div className="flex items-center gap-2 text-xs font-semibold text-text">
@@ -1017,7 +1305,9 @@ function SubagentFormEditor({
                 value={form.name ?? ""}
                 onChange={(e) => set("name", e.target.value)}
                 placeholder="Например: QA-инженер"
+                aria-invalid={Boolean(fieldErrors.name)}
               />
+              {fieldErrors.name && <p className="mt-1 text-[11px] text-red-400">{fieldErrors.name}</p>}
             </Field>
             <Field label="Slug (латиница, опционально)">
               <Input
@@ -1093,7 +1383,11 @@ function SubagentFormEditor({
               rows={4}
               className="min-h-[112px] font-mono text-xs"
               placeholder="Ты — узкоспециализированный субагент. Твоя задача: …"
+              aria-invalid={Boolean(fieldErrors.systemPrompt)}
             />
+            {fieldErrors.systemPrompt && (
+              <p className="text-[11px] text-red-400">{fieldErrors.systemPrompt}</p>
+            )}
           </div>
         </div>
 
@@ -1165,6 +1459,7 @@ function SubagentFormEditor({
                 onChange={(e) =>
                   set("parentSubagentId", e.target.value ? Number(e.target.value) : null)
                 }
+                aria-invalid={Boolean(fieldErrors.parentSubagentId)}
               >
                 <option value="">— нет (прямой узел под Оркестратором) —</option>
                 {others.map((s) => {
@@ -1176,6 +1471,9 @@ function SubagentFormEditor({
                   );
                 })}
               </Select>
+              {fieldErrors.parentSubagentId && (
+                <p className="mt-1 text-[11px] text-red-400">{fieldErrors.parentSubagentId}</p>
+              )}
             </Field>
 
             <Field label="Разрешённые вызываемые субагенты (handoff)">
@@ -1218,7 +1516,11 @@ function SubagentFormEditor({
                   onChange={(e) => set("allowedCalleesText", e.target.value)}
                   placeholder="* — любые, либо slug через запятую"
                   className="font-mono text-xs"
+                  aria-invalid={Boolean(fieldErrors.allowedCalleesText)}
                 />
+                {fieldErrors.allowedCalleesText && (
+                  <p className="text-[11px] text-red-400">{fieldErrors.allowedCalleesText}</p>
+                )}
               </div>
             </Field>
           </div>
@@ -1348,17 +1650,17 @@ function SubagentFormEditor({
             </div>
           )}
         </div>
-      </div>
 
-      <div className="mt-4 flex flex-wrap justify-end gap-2 border-t border-border pt-3">
-        <Button size="md" variant="secondary" onClick={onCancel} disabled={busy}>
-          Отмена
-        </Button>
-        <Button size="md" variant="primary" onClick={() => void submit()} disabled={busy}>
-          {busy ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
-          {busy ? "Сохраняю…" : initial.id ? "Сохранить изменения" : "Создать"}
-        </Button>
-      </div>
+        <div className="mt-4 flex flex-wrap justify-end gap-2 border-t border-border pt-3">
+          <Button size="md" variant="secondary" onClick={onCancel} disabled={busy}>
+            Отмена
+          </Button>
+          <Button size="md" type="submit" variant="primary" disabled={busy}>
+            {busy ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
+            {busy ? "Сохраняю…" : initial.id ? "Сохранить изменения" : "Создать"}
+          </Button>
+        </div>
+      </form>
     </Card>
   );
 }
@@ -1644,6 +1946,7 @@ function OverseerConfigCard({
 
 function SubagentChatViewer({
   subagentId,
+  presetConvId,
   subagents,
   conversations,
   settings,
@@ -1656,6 +1959,8 @@ function SubagentChatViewer({
   onOpenModelTab,
 }: {
   subagentId: number;
+  /** Чат, который нужно открыть после «Повторить» (conversation.id из ответа retry). */
+  presetConvId?: number | null;
   subagents: Subagent[];
   conversations: SubagentConversation[];
   settings: { baseUrl: string; model: string; apiKey?: string };
@@ -1672,7 +1977,9 @@ function SubagentChatViewer({
     () => conversations.filter((c) => c.subagentId === subagentId),
     [conversations, subagentId],
   );
-  const [selectedConvId, setSelectedConvId] = useState<number | null>(() => myChats[0]?.id ?? null);
+  const [selectedConvId, setSelectedConvId] = useState<number | null>(
+    () => (typeof presetConvId === "number" && presetConvId > 0 ? presetConvId : (myChats[0]?.id ?? null)),
+  );
   const activeConvId =
     selectedConvId && myChats.some((c) => c.id === selectedConvId)
       ? selectedConvId
@@ -1710,6 +2017,10 @@ function SubagentChatViewer({
   } | null>(null);
   const [approvalBusy, setApprovalBusy] = useState(false);
   const [tokenUsage, setTokenUsage] = useState<{ prompt: number; completion: number; total: number } | null>(null);
+  /** Статус последнего запуска — чтобы упавший запуск не выглядел успешным. */
+  const [lastRunStatus, setLastRunStatus] = useState<string | null>(null);
+  /** ID запуска (из события subagent_run) — нужен для cancel на сервере. */
+  const lastRunIdRef = useRef<number | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const convAbortRef = useRef<AbortController | null>(null);
   const streamRunningRef = useRef(false);
@@ -1844,6 +2155,17 @@ function SubagentChatViewer({
 
   const stop = () => {
     streamAbortRef.current?.abort();
+    // Останавливаем запуск и на сервере: иначе он навсегда останется `running` в БД.
+    const runId = lastRunIdRef.current;
+    if (runId) {
+      void fetch(`/api/agent/subagents/runs/${runId}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "Запуск остановлен пользователем из чата субагента" }),
+      })
+        .then(() => onChanged())
+        .catch(() => undefined);
+    }
   };
 
   const resolveSubApproval = async (approved: boolean) => {
@@ -2092,10 +2414,13 @@ function SubagentChatViewer({
           setLive((l) => ({ ...l, text: String(data.text ?? "") }));
         } else if (ev === "subagent_status") {
           setLive((l) => ({ ...l, actorLabel: sub.name, status: String(data.text ?? "") }));
+        } else if (ev === "subagent_run") {
+          const runId = Number(data.runId ?? 0);
+          if (Number.isSafeInteger(runId) && runId > 0) lastRunIdRef.current = runId;
+          setLastRunStatus("running");
         } else if (ev === "subagent_chat_rotated") {
-          setHandoffNotice(
-            `Чат субагента автоматически перенесён в новую сессию (${Number(data.steps ?? 300)} шагов). Контекст сжат в summary.`,
-          );
+          // Автоперенос контекста — это НЕ передача задачи другому субагенту.
+          setHandoffNotice(`Контекст перенесён в новый чат (${Number(data.steps ?? 300)} шагов).`);
         } else if (ev === "subagent_handoff_new_chat") {
           const summary = String(data.summary ?? "").trim();
           const continuationPrompt = String(data.continuationPrompt ?? "").trim();
@@ -2145,7 +2470,22 @@ function SubagentChatViewer({
             completion: Number(u.completion ?? 0),
             total: Number(u.total ?? 0),
           });
-        } else if (ev === "error" || ev === "subagent_error") {
+          const runId = Number(data.runId ?? data.subagentRunId ?? 0);
+          if (Number.isSafeInteger(runId) && runId > 0) lastRunIdRef.current = runId;
+          const status = String(data.status ?? "completed");
+          setLastRunStatus(status);
+          // P1-2: упавший/заблокированный/отменённый запуск больше не выглядит успешным.
+          if (status === "error" || status === "blocked" || status === "cancelled") {
+            const label = RUN_STATUS_META[status as SubagentRun["status"]]?.label ?? status;
+            const reason = String(data.error ?? data.outputSummary ?? "").trim();
+            setChatError(reason ? `${label}: ${reason}` : label);
+          } else if (status === "rotated") {
+            setHandoffNotice("Контекст перенесён в новый чат");
+          }
+        } else if (ev === "subagent_error") {
+          setLastRunStatus("error");
+          setChatError(String(data.message ?? data.error ?? "Ошибка выполнения субагента"));
+        } else if (ev === "error") {
           const msg = String(data.message ?? data.error ?? "Ошибка выполнения субагента");
           setChatError(msg);
         }
@@ -2255,6 +2595,17 @@ function SubagentChatViewer({
             <Wrench size={10} />
             {sub?.toolProfile === "full" ? "Полные инструменты" : "Урезанные"}
           </Badge>
+          {lastRunStatus && (
+            <Badge
+              className={cn(
+                "text-[10px]",
+                RUN_STATUS_META[lastRunStatus as SubagentRun["status"]]?.badgeClass ??
+                  "border-border bg-card2 text-muted",
+              )}
+            >
+              {RUN_STATUS_META[lastRunStatus as SubagentRun["status"]]?.label ?? lastRunStatus}
+            </Badge>
+          )}
         </span>
       }
       subtitle={sub?.roleTitle || "Переписка изолирована от основного контекста Оркестратора."}

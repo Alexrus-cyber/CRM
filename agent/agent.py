@@ -144,6 +144,11 @@ MAX_STEPS_LIMIT = MAX_STEPS
 MAX_RUN_TOKENS = _env_int("AGENT_MAX_RUN_TOKENS", 0, minimum=0)
 SUBAGENT_HANDOFF_STEPS = _env_int("CRM_SUBAGENT_HANDOFF_STEPS", 300, minimum=1, maximum=10_000)
 MAX_SUBAGENT_CHAT_ROTATIONS = _env_int("CRM_SUBAGENT_MAX_ROTATIONS", 5, minimum=1, maximum=20)
+# Общий лимит шагов на ВЕСЬ запуск субагента (включая автопереносы в новый чат).
+# 0 = без лимита (совместимость с прежним поведением).
+SUBAGENT_MAX_STEPS_TOTAL = _env_int("CRM_SUBAGENT_MAX_STEPS", 900, minimum=0)
+# Жёсткий дедлайн сеанса субагента (включая вложенные эскалации/каскад/request_subagent).
+SUBAGENT_SESSION_SECONDS = _env_int("CRM_SUBAGENT_SESSION_SECONDS", 1800, minimum=60)
 TIMEOUT = _env_int("AGENT_TIMEOUT", 180, minimum=5)
 HEADER_TIMEOUT = _env_int("AGENT_HEADER_TIMEOUT", 60, minimum=2)
 SSE_WRITE_TIMEOUT = _env_int("AGENT_SSE_WRITE_TIMEOUT", 30, minimum=5)
@@ -604,7 +609,7 @@ SUBAGENT_BASE_SYSTEM_PROMPT = """Ты — специализированный �
 Правила работы Субагента:
 1. Действуй строго в рамках переданной подзадачи и своего системного промпта. Общайся по-русски, чётко и по делу.
 2. Опирайся на входное `summary` от Оркестратора и приложенные файлы чата, работай непосредственно с общими файлами проекта в Sandbox (`sandbox_list`, `sandbox_read_file`, `sandbox_write_file`, `code_search`, `run_command` и др.).
-3. Если по ходу работы требуется подключить другого субагента из дерева зависимостей — вызови `request_subagent(target_subagent=..., summary=..., next_task=..., sandbox_project=..., attachments=[...])`, обязательно сформировав подробное `summary` своих действий и того, что нужно сделать дальше.
+3. Если по ходу работы требуется подключить другого субагента из дерева зависимостей — `request_subagent(target_subagent=..., summary=..., next_task=..., sandbox_project=..., attachments=[...])` — это ПРЯМОЙ синхронный вызов другого субагента с проверкой прав дерева (`allowedCallees` вызывающего + правило предка); его отчёт вернётся тебе в результате инструмента и будет виден Оркестратору. Чтобы ПОПРОСИТЬ Оркестратора вызвать следующего субагента — используй `report_to_orchestrator(request_next_subagent=..., next_task=..., summary=...)`.
 4. В режиме маршрутизации «По уровням» (`layered`), если ты работаешь на глубоком уровне (например, 4-м) и столкнулся с проблемой контракта/архитектуры или нужна помощь/исправление от верхних уровней (1, 2, 3), используй `escalate_to_upper_tier(target=..., mode=..., summary=..., request=..., attachments=[...])` — можно получить совет (`advice`), прямую помощь (`direct_help`) или исправление с каскадом по промежуточным уровням (`fix_and_cascade`).
 5. По завершении своей подзадачи вызови `report_to_orchestrator(summary=..., status=..., files_touched=..., files_attached=..., request_next_subagent=..., next_task=...)`, чтобы Оркестратор получил точное `summary` выполненных действий, затронутые/прикреплённые файлы и понимал следующие шаги.
 """
@@ -1156,10 +1161,14 @@ SUBAGENT_HANDOFF_TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "request_subagent",
             "description": (
-                "Попросить Главного Агента (Оркестратора) вызвать другого активного субагента по дереву зависимостей. "
+                "Прямой синхронный вызов другого активного субагента по дереву зависимостей "
+                "(это НЕ «просьба Оркестратору»). Права проверяются по дереву: `allowedCallees` вызывающего "
+                "+ правило предка (если у цели `orchestratorCanCall=false`, вызывать её может только предок по `parentSubagentId`). "
                 "Передай обязательное summary своих действий, next_task и при необходимости файлы/макеты в `attachments`. "
-                "Оркестратор проверит дерево зависимостей, запустит целевого субагента в новом чате с общим доступом к Sandbox-проекту "
-                "и вернёт тебе его итоговое summary."
+                "Целевой субагент запустится в новом изолированном чате с общим доступом к Sandbox-проекту; "
+                "его итоговое summary вернётся тебе в результате инструмента и будет видно Оркестратору. "
+                "Чтобы ПОПРОСИТЬ Оркестратора вызвать следующего субагента — используй "
+                "`report_to_orchestrator(request_next_subagent=..., next_task=...)`."
             ),
             "parameters": {
                 "type": "object",
@@ -5239,37 +5248,58 @@ def run_tester_session(
     }
 
 
-def _find_subagent_in_list(
-    subagents: List[Dict[str, Any]], ref: Any
-) -> Optional[Dict[str, Any]]:
+def _find_subagent_matches(
+    subagents: List[Dict[str, Any]], ref: Any, *, fuzzy: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Возвращает ВСЕХ кандидатов по ссылке `ref`.
+    Сначала ищется точное совпадение по `slug`/`id`/`name` (без регистра) — оно имеет приоритет.
+    Нечёткий проход (`needle in name/slug`) используется только как подсказка и применим
+    лишь тогда, когда кандидат ровно один (иначе адресация неоднозначна).
+    """
     needle = str(ref or "").strip().lower()
     if not needle:
-        return None
-    for s in subagents:
-        if not isinstance(s, dict):
-            continue
-        if (
+        return []
+    exact = [
+        s
+        for s in subagents
+        if isinstance(s, dict)
+        and (
             str(s.get("slug") or "").strip().lower() == needle
             or str(s.get("id") or "").strip().lower() == needle
             or str(s.get("name") or "").strip().lower() == needle
-        ):
-            return s
-    for s in subagents:
-        if not isinstance(s, dict):
-            continue
-        name_l = str(s.get("name") or "").strip().lower()
-        slug_l = str(s.get("slug") or "").strip().lower()
-        if needle in name_l or needle in slug_l:
-            return s
+        )
+    ]
+    if exact or not fuzzy:
+        return exact
+    return [
+        s
+        for s in subagents
+        if isinstance(s, dict)
+        and (
+            needle in str(s.get("name") or "").strip().lower()
+            or needle in str(s.get("slug") or "").strip().lower()
+        )
+    ]
+
+
+def _find_subagent_in_list(
+    subagents: List[Dict[str, Any]], ref: Any, *, fuzzy: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Строгая адресация: результат только при единственном совпадении (0 или >1 -> None)."""
+    matches = _find_subagent_matches(subagents, ref, fuzzy=fuzzy)
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 
 def _is_callee_allowed(caller: Dict[str, Any], target: Dict[str, Any]) -> bool:
+    """fail-closed: «нет данных о правах» трактуется как запрет, а не как «можно всё»."""
     if caller.get("id") and target.get("id") and caller.get("id") == target.get("id"):
         return False
     raw_allowed = caller.get("allowedCallees")
     if not isinstance(raw_allowed, list):
-        return True
+        return False
     norm = {str(x or "").strip().lower() for x in raw_allowed if str(x or "").strip()}
     if "*" in norm:
         return True
@@ -5282,6 +5312,52 @@ def _is_callee_allowed(caller: Dict[str, Any], target: Dict[str, Any]) -> bool:
     }
     candidates.discard("")
     return bool(norm & candidates)
+
+
+def _is_ancestor_of_caller(
+    subagents: List[Dict[str, Any]],
+    *,
+    caller_subagent: Dict[str, Any],
+    target: Dict[str, Any],
+) -> bool:
+    """
+    True, если `caller_subagent` — предок `target` по цепочке `parentSubagentId`.
+    Поднимаемся от цели вверх по дереву (а не спускаемся из чужой ветки) и ищем вызывающего.
+    """
+    if not isinstance(caller_subagent, dict) or not isinstance(target, dict):
+        return False
+    caller_id = int(caller_subagent.get("id") or 0)
+    caller_slug = str(caller_subagent.get("slug") or "").strip().lower()
+    if not caller_id and not caller_slug:
+        return False
+    by_id: Dict[int, Dict[str, Any]] = {}
+    for s in subagents:
+        if isinstance(s, dict):
+            sid = int(s.get("id") or 0)
+            if sid > 0:
+                by_id[sid] = s
+    cur: Optional[Dict[str, Any]] = target
+    seen: set[int] = set()
+    while isinstance(cur, dict):
+        pid_raw = cur.get("parentSubagentId")
+        if isinstance(pid_raw, str) and pid_raw.strip().isdigit():
+            pid_raw = int(pid_raw.strip())
+        if not isinstance(pid_raw, (int, float)):
+            return False
+        pid = int(pid_raw)
+        if pid in seen:
+            return False
+        seen.add(pid)
+        parent = by_id.get(pid)
+        if parent is None:
+            return False
+        if (caller_id and int(parent.get("id") or 0) == caller_id) or (
+            caller_slug
+            and str(parent.get("slug") or "").strip().lower() == caller_slug
+        ):
+            return True
+        cur = parent
+    return False
 
 
 def _normalize_routing_mode(raw: Any) -> str:
@@ -5372,7 +5448,9 @@ def _find_upper_target_in_hierarchy(
     raw = str(target_ref or "").strip()
     if not raw:
         return None
-    m = re.match(r"^(?:уровень|tier|level|lvl|l)?\s*#?(\d+)$", raw, re.I)
+    # Уровень указывается ТОЛЬКО явно: `tier:2`, `уровень 2`, `level 2`, `lvl 2`.
+    # Голое число ("2") — это точный `id`, а не номер уровня.
+    m = re.match(r"^(?:уровень|tier|level|lvl|l)\s*[:#]?\s*(\d+)$", raw, re.I)
     if m:
         wanted_tier = int(m.group(1))
         by_id = hierarchy["by_id"]
@@ -5388,11 +5466,10 @@ def _find_upper_target_in_hierarchy(
                 return cur
             pid_raw = cur.get("parentSubagentId")
             cur = by_id.get(int(pid_raw)) if isinstance(pid_raw, (int, float)) else None
-        candidates = hierarchy["tiers_grouped"].get(wanted_tier) or []
-        for cand in candidates:
-            if cand is not caller_subagent and str(cand.get("slug") or "") != str(caller_subagent.get("slug") or ""):
-                return cand
-    return _find_subagent_in_list(subagents, raw)
+        # Никакого fallback в чужую ветку дерева: поднимаемся только по цепочке предков
+        # вызывающего; если предка нужного уровня нет — эскалация невозможна.
+        return None
+    return _find_subagent_in_list(subagents, raw, fuzzy=True)
 
 
 def _find_cascade_intermediate_chain(
@@ -5438,17 +5515,9 @@ def _find_cascade_intermediate_chain(
         path_up.reverse()
         return path_up
 
-    chain: List[Dict[str, Any]] = []
-    for t_lvl in range(upper_tier + 1, lower_tier):
-        group = hierarchy["tiers_grouped"].get(t_lvl) or []
-        for cand in group:
-            if str(cand.get("slug") or "") not in (
-                str(upper_sub.get("slug") or ""),
-                str(lower_sub.get("slug") or ""),
-            ):
-                chain.append(cand)
-                break
-    return chain
+    # Никакого fallback на «первый попавшийся узел уровня» из чужой ветки дерева:
+    # если подъём по цепочке предков не дошёл до верхнего узла — каскад не выполняется.
+    return []
 
 
 def build_orchestrator_subagents_prompt(
@@ -5662,8 +5731,10 @@ def _build_subagent_system_prompt(
             for p in peers
         ]
         parts.append(
-            "\nДоступные тебе субагенты в дереве зависимостей (можешь попросить Оркестратора вызвать через `request_subagent` "
-            "или указать в `report_to_orchestrator` с обязательным `summary`):\n"
+            "\nДоступные тебе субагенты в дереве зависимостей: `request_subagent` — это ПРЯМОЙ синхронный вызов "
+            "с проверкой прав дерева (`allowedCallees` + правило предка), его отчёт вернётся тебе в результате инструмента "
+            "и будет виден Оркестратору. Чтобы ПОПРОСИТЬ Оркестратора вызвать следующего субагента — "
+            "`report_to_orchestrator(request_next_subagent=..., next_task=..., summary=...)`:\n"
             + "\n".join(peer_lines)
         )
     else:
@@ -5765,6 +5836,13 @@ def run_layered_escalation(
         )
         or "нет промежуточных уровней"
     )
+    chain_missing_note = ""
+    if not intermediate_chain and target_tier < caller_tier - 1:
+        chain_missing_note = (
+            f"\n\n[ВНИМАНИЕ] «{target.get('name')}» не является предком «{caller_subagent.get('name')}» "
+            "в дереве зависимостей — цепочка промежуточных уровней не построена, "
+            "каскад по промежуточным уровням пропущен."
+        )
 
     if norm_mode == "advice":
         upper_task = (
@@ -5892,6 +5970,7 @@ def run_layered_escalation(
         f"Результат эскалации с Уровня {caller_tier} → Уровень {target_tier} ({cascade_status}):\n\n"
         + "\n\n".join(cascade_reports)
         + f"\n\nТеперь можешь продолжать работу на своём Уровне {caller_tier} с учётом этого ответа."
+        + chain_missing_note
     )
     return {"agentText": final_msg, "agentEvents": all_events}
 
@@ -6054,19 +6133,34 @@ def run_subagent_session(
     emit_sse = ctx.get("emit_sse")
 
     def _emit(ev_name: str, payload: Dict[str, Any]) -> None:
+        # Обрыв SSE-канала не должен прерывать выполнение субагента: отчёт всё равно
+        # должен дойти до БД через финальный `subagent_done`.
         if callable(emit_sse):
-            emit_sse(ev_name, payload)
+            try:
+                emit_sse(ev_name, payload)
+            except Exception:  # noqa: BLE001
+                pass
 
-    target = _find_subagent_in_list(subagents_list, target_ref)
+    target_matches = _find_subagent_matches(subagents_list, target_ref, fuzzy=True)
+    target = target_matches[0] if len(target_matches) == 1 else None
     if target is None:
         available_names = ", ".join(
             f"{s.get('name')} (`{s.get('slug')}`)" for s in subagents_list
         ) or "нет активных субагентов"
+        if len(target_matches) > 1:
+            candidates_desc = ", ".join(
+                f"{s.get('name')} (`{s.get('slug')}`, id={s.get('id')})"
+                for s in target_matches[:10]
+            )
+            reason = (
+                f"Ссылка «{target_ref}» неоднозначна — подходит несколько субагентов: {candidates_desc}. "
+                "Уточните slug (например `request_subagent(target_subagent='razrabotchik-backend', ...)`)"
+                " или используйте точный id."
+            )
+        else:
+            reason = f"Субагент «{target_ref}» не найден среди активных субагентов."
         return {
-            "agentText": (
-                f"Субагент «{target_ref}» не найден среди активных субагентов. "
-                f"Доступные активные субагенты: {available_names}."
-            ),
+            "agentText": f"{reason} Доступные активные субагенты: {available_names}.",
             "agentEvents": [],
         }
 
@@ -6100,6 +6194,23 @@ def run_subagent_session(
         }
 
     if caller_kind == "subagent" and isinstance(caller_subagent, dict):
+        if not ctx.get("bypass_parent_guard"):
+            # Единый шлюз прав дерева: правило `orchestratorCanCall` действует для ЛЮБОГО
+            # вызывающего, включая субагента. Если прямой вызов запрещён — разрешён только предку цели.
+            if not bool(target.get("orchestratorCanCall", True)) and not _is_ancestor_of_caller(
+                subagents_list, caller_subagent=caller_subagent, target=target
+            ):
+                return {
+                    "agentText": (
+                        f"По дереву зависимостей прямой вызов запрещён: субагент «{target.get('name')}» "
+                        f"(`{target.get('slug')}`) имеет `orchestratorCanCall=false`, а "
+                        f"«{caller_subagent.get('name')}» не является его предком по `parentSubagentId`. "
+                        "Используй `report_to_orchestrator(summary=..., "
+                        f"request_next_subagent='{target.get('slug')}', next_task=...)`, "
+                        "чтобы решение принял Главный Агент (Оркестратор)."
+                    ),
+                    "agentEvents": [],
+                }
         if not ctx.get("bypass_parent_guard") and not _is_callee_allowed(caller_subagent, target):
             return {
                 "agentText": (
@@ -6147,7 +6258,19 @@ def run_subagent_session(
         used_custom_api = False
 
     discovered_max_context = int(ctx.get("discovered_max_context") or 0)
-    steps_cap = int(ctx.get("subagent_max_steps") or 0)  # 0 = без лимита шагов!
+    # Общий лимит шагов на ВЕСЬ запуск (с учётом ротаций чата). 0 = без лимита.
+    try:
+        steps_cap = int(ctx.get("subagent_max_steps") or 0)
+    except (TypeError, ValueError):
+        steps_cap = 0
+    if steps_cap <= 0:
+        steps_cap = SUBAGENT_MAX_STEPS_TOTAL
+    # Жёсткий дедлайн сеанса: наследуется вложенными вызовами (эскалация/каскад/request_subagent).
+    deadline_raw = ctx.get("session_deadline")
+    try:
+        session_deadline = float(deadline_raw) if deadline_raw is not None else 0.0
+    except (TypeError, ValueError):
+        session_deadline = 0.0
     cancel_check = ctx.get("cancel_check")
 
     has_github_repo = bool(
@@ -6371,8 +6494,17 @@ def run_subagent_session(
 
     try:
         while steps_cap == 0 or steps < steps_cap:
+            if session_deadline and time.monotonic() > session_deadline:
+                run_error = (
+                    f"Превышен лимит времени сеанса субагента "
+                    f"({max(1, SUBAGENT_SESSION_SECONDS // 60)} мин) — работа остановлена, "
+                    "сформируй отчёт по уже выполненным действиям."
+                )
+                break
             if callable(cancel_check) and cancel_check():
-                raise BrokenPipeError("Клиент закрыл соединение")
+                # Обрыв канала не должен терять отчёт: выходим из цикла и штатно эмитим subagent_done.
+                run_error = run_error or "Клиент закрыл соединение"
+                break
             steps += 1
             step_in_chat += 1
             _emit(
@@ -6547,7 +6679,8 @@ def run_subagent_session(
 
             for idx, tc in enumerate(tool_calls):
                 if callable(cancel_check) and cancel_check():
-                    raise BrokenPipeError("Клиент закрыл соединение")
+                    run_error = run_error or "Клиент закрыл соединение"
+                    break
                 fn = tc.get("function") or {}
                 t_name = str(fn.get("name") or "")
                 raw_a = fn.get("arguments") or "{}"
@@ -6741,6 +6874,8 @@ def run_subagent_session(
                     t_res = _shrink_text_head_tail(t_res, 40_000)
                 call_results.append({"role": "tool", "tool_call_id": cid, "content": t_res})
 
+            if run_error:
+                break
             if sub_state.get("report"):
                 rep_d = sub_state["report"]
                 if not sub_final_text:
@@ -6835,7 +6970,7 @@ def run_subagent_session(
                         "subagentName": sub_name,
                         "subagentColor": sub_color,
                         "sandboxProject": proj_clean,
-                        "status": "handoff",
+                        "status": "rotated",
                         "rotatedToNewChat": True,
                         "outputSummary": handoff_summary,
                         "requestedCalleeSlug": "",
@@ -6920,6 +7055,13 @@ def run_subagent_session(
                     {"role": "system", "content": sub_system},
                     {"role": "user", "content": _build_initial_user_msg(handoff_summary, task, is_cont=True)},
                 ]
+    except BrokenPipeError:
+        # Обрыв SSE: не пробрасываем наружу — иначе `subagent_done` не уйдёт и запуск навсегда
+        # останется `running` в БД.
+        run_error = run_error or "Клиент закрыл соединение"
+    except Exception as exc:  # noqa: BLE001
+        run_error = run_error or f"Сбой выполнения субагента: {exc}"
+        log(f"сбой выполнения субагента «{sub_slug}»: {traceback.format_exc()}")
     finally:
         if local_browser_mgr is not None:
             if owns_browser_mgr:
@@ -6996,6 +7138,19 @@ def run_subagent_session(
         "error": run_error,
         "usage": usage_out,
     }
+    if final_status == "error":
+        # Явное событие ошибки (фронт должен уметь показать падение, а не только бейдж).
+        _emit(
+            "subagent_error",
+            {
+                "runKey": run_key,
+                "subagentId": sub_id,
+                "subagentSlug": sub_slug,
+                "subagentName": sub_name,
+                "status": "error",
+                "message": run_error or str(output_summary or "")[:500],
+            },
+        )
     _emit("subagent_done", done_payload)
 
     out_lines = [
@@ -8603,6 +8758,8 @@ class Handler(BaseHTTPRequestHandler):
             "routing_mode": subagent_routing_mode,
             "cancel_check": _is_disconnected,
             "chain_depth": 1 if agent_role == "subagent" else 0,
+            "subagent_max_steps": SUBAGENT_MAX_STEPS_TOTAL,
+            "session_deadline": time.monotonic() + SUBAGENT_SESSION_SECONDS,
             "overseer_ctx": overseer_ctx,
             "tester_ctx": tester_ctx,
             "written_projects": set(),

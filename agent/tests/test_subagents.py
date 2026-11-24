@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -631,6 +632,422 @@ class SubagentRestrictionsAndTesterOrderTests(unittest.TestCase):
                 agent_mod.SANDBOX_ROOT = prev_sb
                 srv.shutdown()
                 srv.server_close()
+
+
+class SubagentAuditFixesTests(unittest.TestCase):
+    """Регрессии аудита «Агент ↔ Субагенты»: права дерева, адресация, лимиты, статусы."""
+
+    def _tree(self):
+        return [
+            {
+                "id": 1,
+                "slug": "arch",
+                "name": "Архитектор",
+                "parentSubagentId": None,
+                "orchestratorCanCall": True,
+                "allowedCallees": ["*"],
+                "toolProfile": "restricted",
+            },
+            {
+                "id": 2,
+                "slug": "backend",
+                "name": "Бэкенд",
+                "parentSubagentId": 1,
+                "orchestratorCanCall": False,
+                "allowedCallees": ["*"],
+                "toolProfile": "restricted",
+            },
+            {
+                "id": 3,
+                "slug": "backend-python",
+                "name": "Backend-python",
+                "parentSubagentId": 2,
+                "orchestratorCanCall": False,
+                "allowedCallees": ["*"],
+                "toolProfile": "restricted",
+            },
+            {
+                "id": 4,
+                "slug": "tester",
+                "name": "Тестировщик",
+                "parentSubagentId": 3,
+                "orchestratorCanCall": False,
+                "allowedCallees": [],
+                "toolProfile": "restricted",
+            },
+        ]
+
+    def _worker_ctx(self, emit=None, **extra):
+        ctx = {
+            "base_url": "http://orch.local/v1",
+            "api_key": "k",
+            "model": "m",
+            "emit_sse": emit or (lambda _ev, _d: None),
+            "subagents": [
+                {
+                    "id": 1,
+                    "slug": "worker",
+                    "name": "Воркер",
+                    "orchestratorCanCall": True,
+                    "allowedCallees": ["*"],
+                    "toolProfile": "restricted",
+                }
+            ],
+            "shared_files": [],
+            "written_projects": set(),
+            "subagent_runs_by_project": {},
+        }
+        ctx.update(extra)
+        return ctx
+
+    # ---------------------------------------------------------- P0-3 / P1-5
+    def test_is_callee_allowed_is_fail_closed(self):
+        target = {"slug": "b", "name": "B"}
+        # нет поля allowedCallees -> запрет («нет данных» != «можно всё»)
+        self.assertFalse(agent_mod._is_callee_allowed({"slug": "a", "name": "A"}, target))
+        # не список -> запрет
+        self.assertFalse(agent_mod._is_callee_allowed({"slug": "a", "allowedCallees": "b"}, target))
+        self.assertFalse(agent_mod._is_callee_allowed({"slug": "a", "allowedCallees": {"b": 1}}, target))
+        self.assertFalse(agent_mod._is_callee_allowed({"slug": "a", "allowedCallees": None}, target))
+        # явные списки работают как раньше
+        self.assertTrue(agent_mod._is_callee_allowed({"slug": "a", "allowedCallees": ["b"]}, target))
+        self.assertTrue(agent_mod._is_callee_allowed({"slug": "a", "allowedCallees": ["*"]}, target))
+
+    def test_fuzzy_search_requires_unique_match(self):
+        subs = self._tree()
+        # точное совпадение по slug
+        self.assertEqual(agent_mod._find_subagent_in_list(subs, "backend")["id"], 2)
+        # «back» неоднозначно (backend + backend-python) -> None, но кандидаты видны
+        self.assertIsNone(agent_mod._find_subagent_in_list(subs, "back", fuzzy=True))
+        self.assertEqual(len(agent_mod._find_subagent_matches(subs, "back")), 2)
+        # уникальное нечёткое совпадение работает
+        self.assertEqual(agent_mod._find_subagent_in_list(subs, "python", fuzzy=True)["id"], 3)
+        # без fuzzy нечёткий поиск запрещён (строгая адресация по умолчанию)
+        self.assertIsNone(agent_mod._find_subagent_in_list(subs, "python"))
+
+    def test_ambiguous_target_lists_candidates(self):
+        subs = self._tree()
+        res = agent_mod.run_subagent_session(
+            target_ref="back",
+            summary="s",
+            caller_kind="orchestrator",
+            trust_level="verified",
+            subagent_ctx={"subagents": subs},
+        )
+        self.assertIn("неоднозначна", res["agentText"])
+        self.assertIn("backend-python", res["agentText"])
+        self.assertEqual(res["agentEvents"], [])
+
+    def test_upper_target_bare_number_is_id_and_tier_needs_prefix(self):
+        subs = self._tree()
+        hier = agent_mod._compute_subagent_hierarchy(subs)
+        caller = subs[3]  # tester, Уровень 4
+        # «2» — это точный id (Бэкенд), а не «Уровень 2»
+        self.assertEqual(
+            agent_mod._find_upper_target_in_hierarchy(
+                subs, hier, caller_subagent=caller, target_ref="2"
+            )["slug"],
+            "backend",
+        )
+        # tier:2 / уровень 1 — именно номер уровня
+        self.assertEqual(
+            agent_mod._find_upper_target_in_hierarchy(
+                subs, hier, caller_subagent=caller, target_ref="tier:2"
+            )["slug"],
+            "backend",
+        )
+        self.assertEqual(
+            agent_mod._find_upper_target_in_hierarchy(
+                subs, hier, caller_subagent=caller, target_ref="уровень 1"
+            )["slug"],
+            "arch",
+        )
+        # нет предка нужного уровня -> None (никакого fallback в чужую ветку)
+        lonely = {"id": 99, "slug": "lonely", "name": "Одиночка", "parentSubagentId": None}
+        self.assertIsNone(
+            agent_mod._find_upper_target_in_hierarchy(
+                subs, hier, caller_subagent=lonely, target_ref="tier:2"
+            )
+        )
+
+    def test_cascade_chain_has_no_foreign_branch_fallback(self):
+        subs = self._tree()
+        hier = agent_mod._compute_subagent_hierarchy(subs)
+        chain = agent_mod._find_cascade_intermediate_chain(
+            subs, hier, upper_sub=subs[0], lower_sub=subs[3]
+        )
+        self.assertEqual([c["slug"] for c in chain], ["backend", "backend-python"])
+        # верхний узел из чужой ветки -> каскад не выполняется
+        foreign = {"id": 50, "slug": "foreign-arch", "name": "Чужой верх", "parentSubagentId": None}
+        self.assertEqual(
+            agent_mod._find_cascade_intermediate_chain(
+                subs + [foreign], hier, upper_sub=foreign, lower_sub=subs[3]
+            ),
+            [],
+        )
+
+    def test_is_ancestor_of_caller(self):
+        subs = self._tree()
+        self.assertTrue(
+            agent_mod._is_ancestor_of_caller(subs, caller_subagent=subs[0], target=subs[3])
+        )
+        self.assertTrue(
+            agent_mod._is_ancestor_of_caller(subs, caller_subagent=subs[2], target=subs[3])
+        )
+        self.assertFalse(
+            agent_mod._is_ancestor_of_caller(subs, caller_subagent=subs[3], target=subs[0])
+        )
+        self.assertFalse(
+            agent_mod._is_ancestor_of_caller(subs, caller_subagent={"id": 99, "slug": "x"}, target=subs[3])
+        )
+
+    def test_subagent_gate_blocks_non_ancestor_of_locked_target(self):
+        subs = self._tree()
+        outsider = {
+            "id": 7,
+            "slug": "outsider",
+            "name": "Чужак",
+            "parentSubagentId": None,
+            "orchestratorCanCall": True,
+            "allowedCallees": ["*"],
+        }
+        res = agent_mod.run_subagent_session(
+            target_ref="tester",
+            summary="s",
+            caller_kind="subagent",
+            caller_subagent=outsider,
+            trust_level="verified",
+            subagent_ctx={"subagents": subs + [outsider]},
+        )
+        self.assertIn("не является его предком", res["agentText"])
+        self.assertEqual(res["agentEvents"], [])
+
+    # ---------------------------------------------------------- P0-2a / P0-2b
+    def test_subagent_max_steps_caps_total_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            agent_mod.sandbox_mod.mkdir(root, "app")
+            events = []
+            calls = {"n": 0}
+
+            def _loop_model(*_a, **_kw):
+                calls["n"] += 1
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": f"c{calls['n']}",
+                                        "function": {"name": "sandbox_list", "arguments": '{"path":"app"}'},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+
+            real_model = agent_mod.call_model
+            agent_mod.call_model = _loop_model
+            try:
+                with mock.patch.object(agent_mod, "SUBAGENT_MAX_STEPS_TOTAL", 2):
+                    res = agent_mod.run_subagent_session(
+                        target_ref="worker",
+                        summary="s",
+                        task="t",
+                        sandbox_project="app",
+                        caller_kind="orchestrator",
+                        trust_level="verified",
+                        sandbox_root=root,
+                        subagent_ctx=self._worker_ctx(lambda ev, d: events.append((ev, d))),
+                    )
+            finally:
+                agent_mod.call_model = real_model
+
+            # Лимит шагов больше не «бесконечный»: ровно 2 шага и штатное завершение
+            self.assertEqual(calls["n"], 2)
+            self.assertTrue(any(ev == "subagent_done" for ev, _ in events))
+            self.assertIn("выполнил действий: 2", res["done"]["outputSummary"])
+
+    def test_session_deadline_stops_session_and_emits_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            events = []
+            sub_ctx = self._worker_ctx(
+                lambda ev, d: events.append((ev, d)),
+                session_deadline=time.monotonic() - 1,  # дедлайн уже истёк
+            )
+            res = agent_mod.run_subagent_session(
+                target_ref="worker",
+                summary="s",
+                task="t",
+                caller_kind="orchestrator",
+                trust_level="verified",
+                sandbox_root=root,
+                subagent_ctx=sub_ctx,
+            )
+            self.assertIn("Превышен лимит времени сеанса", res["done"]["error"])
+            self.assertEqual(res["done"]["status"], "error")
+            emitted = [ev for ev, _ in events]
+            self.assertIn("subagent_error", emitted)
+            self.assertIn("subagent_done", emitted)
+
+    def test_session_deadline_is_inherited_by_nested_ctx(self):
+        # Вложенные вызовы (эскалация) наследуют ТОТ ЖЕ дедлайн, а не создают новый
+        subs = self._tree()
+        deadline = time.monotonic() + 60
+        captured = {}
+
+        def _fake_session(**kwargs):
+            captured.update(kwargs)
+            return {"agentText": "ok", "agentEvents": [], "done": {}, "report": {}}
+
+        real_session = agent_mod.run_subagent_session
+        agent_mod.run_subagent_session = _fake_session
+        try:
+            res = agent_mod.run_layered_escalation(
+                caller_subagent=subs[3],
+                target_ref="tier:1",
+                mode="advice",
+                summary="s",
+                request="r",
+                subagent_ctx={
+                    "routing_mode": "layered",
+                    "subagents": subs,
+                    "session_deadline": deadline,
+                },
+            )
+        finally:
+            agent_mod.run_subagent_session = real_session
+
+        self.assertIn("agentText", res)
+        self.assertEqual(captured.get("target_ref"), "arch")
+        self.assertEqual(captured["subagent_ctx"].get("session_deadline"), deadline)
+
+    # ---------------------------------------------------------- P0-2c / P1-1
+    def test_broken_pipe_on_emit_does_not_lose_subagent_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            seen = []
+
+            def _broken_emit(ev, _data):
+                seen.append(ev)
+                raise BrokenPipeError("client gone")
+
+            real_model = agent_mod.call_model
+            agent_mod.call_model = _fake_call_model
+            try:
+                res = agent_mod.run_subagent_session(
+                    target_ref="worker",
+                    summary="s",
+                    task="t",
+                    caller_kind="orchestrator",
+                    trust_level="verified",
+                    sandbox_root=root,
+                    subagent_ctx=self._worker_ctx(_broken_emit),
+                )
+            finally:
+                agent_mod.call_model = real_model
+
+            # Обрыв канала не мешает выполнению и не теряет финальное событие
+            self.assertIn("subagent_done", seen)
+            self.assertEqual(res["done"]["status"], "completed")
+
+    def test_cancel_check_sets_error_but_still_emits_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            events = []
+            res = agent_mod.run_subagent_session(
+                target_ref="worker",
+                summary="s",
+                task="t",
+                caller_kind="orchestrator",
+                trust_level="verified",
+                sandbox_root=root,
+                subagent_ctx=self._worker_ctx(
+                    lambda ev, d: events.append((ev, d)),
+                    cancel_check=lambda: True,
+                ),
+            )
+            self.assertEqual(res["done"]["status"], "error")
+            self.assertIn("Клиент закрыл соединение", res["done"]["error"])
+            emitted = [ev for ev, _ in events]
+            self.assertIn("subagent_done", emitted)
+            self.assertIn("subagent_error", emitted)
+
+    def test_chat_rotation_marks_status_rotated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            agent_mod.sandbox_mod.mkdir(root, "app")
+            events = []
+            calls = {"n": 0}
+
+            def _model(*_a, **_kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "c1",
+                                            "function": {"name": "sandbox_list", "arguments": '{"path":"app"}'},
+                                        }
+                                    ],
+                                }
+                            }
+                        ]
+                    }
+                if calls["n"] == 2:
+                    return {"choices": [{"message": {"content": "Саммари для нового чата.", "tool_calls": []}}]}
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "c2",
+                                        "function": {
+                                            "name": "report_to_orchestrator",
+                                            "arguments": '{"status":"completed","summary":"Готово"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+
+            real_model = agent_mod.call_model
+            agent_mod.call_model = _model
+            try:
+                agent_mod.run_subagent_session(
+                    target_ref="worker",
+                    summary="s",
+                    task="t",
+                    sandbox_project="app",
+                    caller_kind="orchestrator",
+                    trust_level="verified",
+                    sandbox_root=root,
+                    subagent_ctx=self._worker_ctx(
+                        lambda ev, d: events.append((ev, d)),
+                        handoff_steps=1,
+                    ),
+                )
+            finally:
+                agent_mod.call_model = real_model
+
+            done_events = [d for ev, d in events if ev == "subagent_done"]
+            self.assertEqual(len(done_events), 2)
+            # Ротация — это НЕ передача другому субагенту
+            self.assertEqual(done_events[0]["status"], "rotated")
+            self.assertTrue(done_events[0]["rotatedToNewChat"])
+            self.assertEqual(done_events[0]["requestedCalleeSlug"], "")
+            self.assertEqual(done_events[1]["status"], "completed")
 
 
 if __name__ == "__main__":

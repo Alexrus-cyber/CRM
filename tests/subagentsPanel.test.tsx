@@ -60,6 +60,7 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
   let routingModeStore: SubagentRoutingMode;
   let overseerStore: OverseerConfig;
   let sseResponder: ((body: Record<string, unknown>) => Response) | null;
+  let runActionCalls: Array<{ id: number; action: "cancel" | "retry" }>;
 
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -169,6 +170,7 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
       apiKeyHint: "",
     };
     sseResponder = null;
+    runActionCalls = [];
 
     vi.stubGlobal(
       "fetch",
@@ -247,6 +249,39 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
           const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
           putTreePayloads.push(body);
           return json({ ok: true });
+        }
+
+        const cancelMatch = url.match(/^\/api\/agent\/subagents\/runs\/(\d+)\/cancel$/);
+        if (cancelMatch && method === "POST") {
+          const id = Number(cancelMatch[1]);
+          runActionCalls.push({ id, action: "cancel" });
+          runsStore = runsStore.map((r) =>
+            r.id === id ? { ...r, status: "cancelled" as SubagentRun["status"] } : r,
+          );
+          return json({ ok: true, run: runsStore.find((r) => r.id === id), alreadyFinished: false });
+        }
+
+        const retryMatch = url.match(/^\/api\/agent\/subagents\/runs\/(\d+)\/retry$/);
+        if (retryMatch && method === "POST") {
+          const id = Number(retryMatch[1]);
+          runActionCalls.push({ id, action: "retry" });
+          const createdConv: SubagentConversation = {
+            id: 202,
+            kind: "subagent",
+            subagentId: 1,
+            title: "Чат: QA-инженер (повтор)",
+            messagesCount: 0,
+            createdAt: "2026-11-17T10:07:00.000Z",
+            updatedAt: "2026-11-17T10:07:00.000Z",
+          };
+          conversationsStore = [createdConv, ...conversationsStore];
+          messagesByConvStore[202] = [];
+          return json({
+            ok: true,
+            run: runsStore.find((r) => r.id === id),
+            conversation: createdConv,
+            previousRunId: id,
+          });
         }
 
         const patchMatch = url.match(/^\/api\/agent\/subagents\/(\d+)$/);
@@ -434,6 +469,16 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
     expect((screen.getByPlaceholderText("http://127.0.0.1:8888/v1") as HTMLInputElement).value).toBe(
       "https://openrouter.ai/api/v1",
     );
+
+    // P2-5: системный промпт обязателен — без него форма не отправится
+    fireEvent.click(screen.getByRole("button", { name: /^Создать$/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/Системный промпт обязателен/i)).toBeTruthy();
+    });
+    expect(postSubagentPayloads.length).toBe(0);
+    fireEvent.change(screen.getByPlaceholderText(/узкоспециализированный субагент/i), {
+      target: { value: "Ты аудитор безопасности CRM." },
+    });
 
     fireEvent.click(screen.getByRole("button", { name: /^Создать$/i }));
     await waitFor(() => {
@@ -680,12 +725,117 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
     fireEvent.change(profileSelect, { target: { value: "full" } });
     expect(screen.getByText(/Субагенту доступны browse_project/i)).toBeTruthy();
 
+    fireEvent.change(screen.getByPlaceholderText(/узкоспециализированный субагент/i), {
+      target: { value: "Ты браузер-аудитор." },
+    });
     fireEvent.click(screen.getByRole("button", { name: /^Создать$/i }));
     await waitFor(() => {
       expect(postSubagentPayloads.length).toBe(1);
     });
     expect(postSubagentPayloads[0].toolProfile).toBe("full");
     expect(await screen.findByText("Полные инструменты")).toBeTruthy();
+  });
+
+  it("P0-1: форма субагента не «перетекает» между записями при переключении Редактировать", async () => {
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="verified"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByText("QA-инженер").length).toBeGreaterThan(0);
+    });
+
+    // Открываем редактирование первого субагента, затем сразу второго
+    const editButtons = screen.getAllByRole("button", { name: /Редактировать/i });
+    fireEvent.click(editButtons[0]);
+    await waitFor(() => {
+      expect((screen.getByPlaceholderText("Например: QA-инженер") as HTMLInputElement).value).toBe(
+        "QA-инженер",
+      );
+    });
+    fireEvent.click(screen.getAllByRole("button", { name: /Редактировать/i })[1]);
+    await waitFor(() => {
+      expect((screen.getByPlaceholderText("Например: QA-инженер") as HTMLInputElement).value).toBe(
+        "UI-архитектор",
+      );
+    });
+  });
+
+  it("P1-2: статус rotated показывается как «Перенос в новый чат», а не «передача»", async () => {
+    runsStore = [{ ...runsStore[0], id: 12, status: "rotated", requestedCalleeSlug: "" }];
+
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="verified"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Перенос в новый чат")).toBeTruthy();
+    });
+    expect(screen.queryByText("Передача")).toBeNull();
+  });
+
+  it("P1-3: останавливает running-запуск через POST runs/{id}/cancel", async () => {
+    runsStore = [{ ...runsStore[0], id: 77, status: "running", updatedAt: new Date().toISOString() }];
+
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="verified"
+      />,
+    );
+
+    const stopBtn = await screen.findByRole("button", { name: /Остановить/i });
+    fireEvent.click(stopBtn);
+    await waitFor(() => {
+      expect(runActionCalls).toEqual([{ id: 77, action: "cancel" }]);
+    });
+  });
+
+  it("P1-3: повторяет running-запуск через POST runs/{id}/retry и открывает новый чат", async () => {
+    runsStore = [{ ...runsStore[0], id: 78, status: "running", updatedAt: new Date().toISOString() }];
+
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="verified"
+      />,
+    );
+
+    const retryBtn = await screen.findByRole("button", { name: /Повторить/i });
+    fireEvent.click(retryBtn);
+    await waitFor(() => {
+      expect(runActionCalls).toEqual([{ id: 78, action: "retry" }]);
+    });
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText(/Сообщение субагенту/i)).toBeTruthy();
+    });
+  });
+
+  it("P1-3: показывает «Устарел / нет heartbeat» для running-запуска без обновлений > 10 минут", async () => {
+    const oldIso = new Date(Date.now() - 25 * 60 * 1000).toISOString();
+    runsStore = [{ ...runsStore[0], id: 79, status: "running", updatedAt: oldIso }];
+
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="verified"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/Устарел \/ нет heartbeat/i)).toBeTruthy();
+    });
   });
 
   it("перетаскивает узлы дерева свободно по холсту, сохраняет posX/posY и сбрасывает раскладку", async () => {

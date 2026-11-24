@@ -1,6 +1,7 @@
 import {
   MAX_ACTIVE_SUBAGENTS,
   MAX_SUBAGENTS_STORED,
+  computeSubagentsTreeVersion,
   countSubagents,
   createSubagent,
   getAgentConversation,
@@ -10,6 +11,7 @@ import {
   listAgentConversations,
   listSubagentRuns,
   listSubagentsPublic,
+  reapStaleSubagentRuns,
   updateSubagentsDependencyTree,
   upsertAgentOrchestrationConfig,
   type CreateSubagentInput,
@@ -62,6 +64,10 @@ export async function GET(req: Request) {
     return Response.json({ selectedConversation }, { headers: { "Cache-Control": "no-store" } });
   }
 
+  // Реапер: закрываем «осиротевшие» запуски (обрыв SSE/закрытая вкладка), чтобы UI
+  // не показывал вечный статус «выполняется» и не терял возможность продолжить задачу.
+  await reapStaleSubagentRuns(user.id).catch(() => 0);
+
   const [subagents, counts, runs, conversations, orchestration] = await Promise.all([
     listSubagentsPublic(user.id),
     countSubagents(user.id),
@@ -98,6 +104,8 @@ export async function GET(req: Request) {
         y: orchestration.orchestratorPosY,
       },
       overseer: orchestration.overseer,
+      // Версия семантического состояния дерева — для оптимистичных блокировок при сохранении.
+      treeVersion: computeSubagentsTreeVersion(subagents, orchestration),
       limits: {
         maxStored: MAX_SUBAGENTS_STORED,
         maxActive: MAX_ACTIVE_SUBAGENTS,
@@ -170,6 +178,53 @@ export async function POST(req: Request) {
   }
 }
 
+type TreeConflict = {
+  id: number;
+  name: string;
+  field: "isActive" | "parentSubagentId" | "orchestratorCanCall" | "allowedCallees";
+  client: unknown;
+  current: unknown;
+};
+
+/** Что именно клиент пытается изменить не так, как лежит в БД (для понятного 409). */
+function collectTreeConflicts(
+  subagents: Awaited<ReturnType<typeof listSubagentsPublic>>,
+  nodes: DependencyTreeNodeUpdate[],
+): TreeConflict[] {
+  const byId = new Map(subagents.map((s) => [s.id, s]));
+  const out: TreeConflict[] = [];
+  for (const node of nodes) {
+    const cur = byId.get(Number(node.id));
+    if (!cur) continue;
+    if (node.isActive !== undefined && Boolean(node.isActive) !== cur.isActive) {
+      out.push({ id: cur.id, name: cur.name, field: "isActive", client: Boolean(node.isActive), current: cur.isActive });
+    }
+    if (node.parentSubagentId !== undefined) {
+      const next = node.parentSubagentId === null || node.parentSubagentId === 0 ? null : Number(node.parentSubagentId);
+      if (next !== cur.parentSubagentId) {
+        out.push({ id: cur.id, name: cur.name, field: "parentSubagentId", client: next, current: cur.parentSubagentId });
+      }
+    }
+    if (node.orchestratorCanCall !== undefined && Boolean(node.orchestratorCanCall) !== cur.orchestratorCanCall) {
+      out.push({
+        id: cur.id,
+        name: cur.name,
+        field: "orchestratorCanCall",
+        client: Boolean(node.orchestratorCanCall),
+        current: cur.orchestratorCanCall,
+      });
+    }
+    if (node.allowedCallees !== undefined) {
+      const next = [...node.allowedCallees].map((c) => String(c)).sort().join(",");
+      const prev = [...cur.allowedCallees].map((c) => String(c)).sort().join(",");
+      if (next !== prev) {
+        out.push({ id: cur.id, name: cur.name, field: "allowedCallees", client: next, current: prev });
+      }
+    }
+  }
+  return out.slice(0, 20);
+}
+
 /** Пакетное сохранение дерева зависимостей «Оркестратор ↔ Субагенты» и активных субагентов. */
 export async function PUT(req: Request) {
   const user = await getCurrentUser();
@@ -192,6 +247,10 @@ export async function PUT(req: Request) {
         nodes?: DependencyTreeNodeUpdate[];
         routingMode?: SubagentRoutingMode;
         orchestratorPos?: { x?: number | null; y?: number | null } | null;
+        /** Версия дерева, которую видел клиент (из GET). Несовпадение -> 409 tree_conflict. */
+        expectedVersion?: string;
+        /** Принудительно перезаписать дерево, даже если версия устарела. */
+        force?: boolean;
       }
     | null;
   if (
@@ -201,6 +260,27 @@ export async function PUT(req: Request) {
     return Response.json(
       { error: "Укажите массив узлов дерева nodes, routingMode или orchestratorPos" },
       { status: 400 },
+    );
+  }
+
+  // Оптимистичная блокировка: две вкладки/два админа больше не затирают дерево молча.
+  const [currentSubagents, currentOrch] = await Promise.all([
+    listSubagentsPublic(user.id),
+    getAgentOrchestrationConfigPublic(user.id),
+  ]);
+  const currentVersion = computeSubagentsTreeVersion(currentSubagents, currentOrch);
+  const expectedVersion = typeof body.expectedVersion === "string" ? body.expectedVersion.trim() : "";
+  if (expectedVersion && expectedVersion !== currentVersion && body.force !== true) {
+    return Response.json(
+      {
+        error:
+          "Дерево зависимостей было изменено в другой вкладке. Обновите данные или сохраните принудительно.",
+        code: "tree_conflict",
+        currentVersion,
+        expectedVersion,
+        conflicts: collectTreeConflicts(currentSubagents, body.nodes ?? []),
+      },
+      { status: 409, headers: { "Cache-Control": "no-store" } },
     );
   }
 
@@ -231,6 +311,7 @@ export async function PUT(req: Request) {
           y: orchestration.orchestratorPosY,
         },
         overseer: orchestration.overseer,
+        treeVersion: computeSubagentsTreeVersion(subagents, orchestration),
         limits: {
           maxStored: MAX_SUBAGENTS_STORED,
           maxActive: MAX_ACTIVE_SUBAGENTS,

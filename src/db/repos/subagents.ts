@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { decryptSecret, encryptSecret, maskSecret } from "@/lib/crypto";
 import { normalizeBaseUrl } from "@/lib/ai";
@@ -15,7 +16,32 @@ export const MAX_SUBAGENTS_STORED = 50;
 export const MAX_ACTIVE_SUBAGENTS = 10;
 
 export type SubagentCallerKind = "orchestrator" | "subagent" | "user";
-export type SubagentRunStatus = "running" | "completed" | "handoff" | "blocked" | "error";
+/**
+ * Статусы запуска субагента.
+ * `rotated` — автоперенос контекста в новый чат (это НЕ передача задачи другому субагенту),
+ * `cancelled` — запуск остановлен пользователем (кнопка «Стоп»/«Сбросить»).
+ */
+export type SubagentRunStatus =
+  | "running"
+  | "completed"
+  | "rotated"
+  | "handoff"
+  | "blocked"
+  | "error"
+  | "cancelled";
+
+export const SUBAGENT_RUN_STATUSES: SubagentRunStatus[] = [
+  "running",
+  "completed",
+  "rotated",
+  "handoff",
+  "blocked",
+  "error",
+  "cancelled",
+];
+
+/** Запуск считается «зависшим», если он `running` и не подавал heartbeat дольше этого времени. */
+export const SUBAGENT_RUN_STALE_MS = 10 * 60 * 1000;
 export type SubagentRoutingMode = "linear" | "layered";
 export type OverseerMode = "strict" | "rules_only";
 export type SubagentToolProfile = "full" | "restricted";
@@ -225,14 +251,10 @@ function mapSubagentRun(row: Raw): AgentSubagentRunRow {
   const rawCaller = String(row.caller_kind ?? "orchestrator");
   const callerKind: SubagentCallerKind =
     rawCaller === "subagent" || rawCaller === "user" ? rawCaller : "orchestrator";
-  const rawStatus = String(row.status ?? "running");
-  const status: SubagentRunStatus =
-    rawStatus === "completed" ||
-    rawStatus === "handoff" ||
-    rawStatus === "blocked" ||
-    rawStatus === "error"
-      ? rawStatus
-      : "running";
+  const rawStatus = String(row.status ?? "running").trim().toLowerCase();
+  const status: SubagentRunStatus = (SUBAGENT_RUN_STATUSES as string[]).includes(rawStatus)
+    ? (rawStatus as SubagentRunStatus)
+    : "running";
   return {
     id: toNum(row.id),
     userId: toNum(row.user_id),
@@ -1266,3 +1288,114 @@ export async function upsertAgentOrchestrationConfig(
   return getAgentOrchestrationConfigPublic(userId);
 }
 
+/* ------------- управление запусками: heartbeat, отмена, retry, реапер ------------- */
+
+/**
+ * Обновляет `updated_at` запуска — используется как heartbeat во время стрима,
+ * чтобы реапер не считал живой запуск зависшим.
+ */
+export async function touchSubagentRun(userId: number, runId: number): Promise<void> {
+  await q(sql`
+    update agent_subagent_runs
+    set updated_at = ${nowIso()}
+    where id = ${runId} and user_id = ${userId} and status = 'running'`);
+}
+
+/** Останавливает «висящий» запуск: `running` -> `cancelled`. Возвращает актуальную запись. */
+export async function cancelSubagentRun(
+  userId: number,
+  runId: number,
+  reason = "Запуск остановлен пользователем",
+): Promise<AgentSubagentRunRow | null> {
+  const current = await getSubagentRun(userId, runId);
+  if (!current) return null;
+  if (current.status !== "running") return current;
+  await q(sql`
+    update agent_subagent_runs
+    set status = 'cancelled',
+        output_summary = ${String(reason || "Запуск остановлен пользователем").slice(0, 4000)},
+        updated_at = ${nowIso()}
+    where id = ${runId} and user_id = ${userId}`);
+  return getSubagentRun(userId, runId);
+}
+
+/**
+ * Перезапуск задачи субагента: старый «висящий» запуск закрывается как `cancelled`,
+ * создаётся новый запуск в том же изолированном чате с тем же контекстом (input_summary).
+ * Модель не вызывается — UI получает новый `run` и может отправить ход заново.
+ */
+export async function retrySubagentRun(
+  userId: number,
+  runId: number,
+): Promise<{ run: AgentSubagentRunRow; conversation: AgentConversationRow } | null> {
+  const current = await getSubagentRun(userId, runId);
+  if (!current) return null;
+  if (current.status === "running") {
+    await cancelSubagentRun(userId, runId, "Запуск перезапущен пользователем");
+  }
+  return createSubagentRunWithConversation({
+    userId,
+    subagentId: current.subagentId,
+    agentConversationId: current.agentConversationId ?? null,
+    existingConversationId: current.subagentConversationId,
+    callerKind: current.callerKind,
+    callerSubagentId: current.callerSubagentId ?? null,
+    sandboxProject: current.sandboxProject,
+    inputSummary: current.inputSummary,
+    taskPrompt: current.requestedCalleeTask || "",
+    model: current.model,
+    usedCustomApi: current.usedCustomApi,
+  });
+}
+
+/**
+ * Реапер «осиротевших» запусков: помечает `error` все `running`-запуски пользователя,
+ * которые не подавали heartbeat дольше `maxAgeMs`. Возвращает число закрытых запусков.
+ */
+export async function reapStaleSubagentRuns(
+  userId: number,
+  options?: { maxAgeMs?: number },
+): Promise<number> {
+  const maxAgeMs = Math.max(60_000, Math.floor(options?.maxAgeMs ?? SUBAGENT_RUN_STALE_MS));
+  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+  const stale = await q<{ id: number }>(sql`
+    select id from agent_subagent_runs
+    where user_id = ${userId} and status = 'running' and updated_at < ${cutoff}`);
+  if (!stale.length) return 0;
+  const now = nowIso();
+  for (const row of stale) {
+    const rid = toNum(row.id);
+    if (!rid) continue;
+    await q(sql`
+      update agent_subagent_runs
+      set status = 'error',
+          output_summary = ${"Запуск прерван: соединение с агентом закрыто, heartbeat не поступал. Используйте «Повторить», чтобы продолжить задачу."},
+          updated_at = ${now}
+      where id = ${rid} and user_id = ${userId} and status = 'running'`);
+  }
+  return stale.length;
+}
+
+/**
+ * Версия семантического состояния дерева зависимостей (без координат узлов —
+ * они косметические и сохраняются last-write-wins).
+ * Используется для оптимистичных блокировок при сохранении дерева.
+ */
+export function computeSubagentsTreeVersion(
+  subagents: AgentSubagentPublic[],
+  orchestration?: { routingMode?: string | null } | null,
+): string {
+  const rows = [...subagents]
+    .sort((a, b) => a.id - b.id)
+    .map((s) =>
+      [
+        s.id,
+        s.isActive ? 1 : 0,
+        s.parentSubagentId ?? 0,
+        s.orchestratorCanCall ? 1 : 0,
+        [...s.allowedCallees].map((c) => String(c).trim().toLowerCase()).sort().join("|"),
+      ].join("~"),
+    );
+  rows.push(`mode:${String(orchestration?.routingMode ?? "")}`);
+  return createHash("sha256").update(rows.join("\n")).digest("hex").slice(0, 16);
+}

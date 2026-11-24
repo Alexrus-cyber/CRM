@@ -24,7 +24,12 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
-  fs.rmSync(dir, { recursive: true, force: true });
+  // Windows держит файл SQLite открытым до закрытия соединения — уборка не должна ронять прогон.
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* файл ещё заблокирован процессом — временная папка ОС очистится сама */
+  }
 });
 
 describe("SQLite DB + миграция 0006 для routingMode и Надсмотрщика", () => {
