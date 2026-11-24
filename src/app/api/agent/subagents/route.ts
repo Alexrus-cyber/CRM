@@ -5,13 +5,17 @@ import {
   createSubagent,
   getAgentConversation,
   getAgentConversationUsage,
+  getAgentOrchestrationConfigPublic,
   listAgentConversationMessages,
   listAgentConversations,
   listSubagentRuns,
   listSubagentsPublic,
   updateSubagentsDependencyTree,
+  upsertAgentOrchestrationConfig,
   type CreateSubagentInput,
   type DependencyTreeNodeUpdate,
+  type OverseerMode,
+  type SubagentRoutingMode,
 } from "@/db/repo";
 import { normalizeBaseUrl } from "@/lib/ai";
 import { hasAgentAccess } from "@/lib/aiPolicy";
@@ -58,11 +62,12 @@ export async function GET(req: Request) {
     return Response.json({ selectedConversation }, { headers: { "Cache-Control": "no-store" } });
   }
 
-  const [subagents, counts, runs, conversations] = await Promise.all([
+  const [subagents, counts, runs, conversations, orchestration] = await Promise.all([
     listSubagentsPublic(user.id),
     countSubagents(user.id),
     listSubagentRuns(user.id, { subagentId, limit: 80 }),
     listAgentConversations(user.id, "subagent", 200, subagentId),
+    getAgentOrchestrationConfigPublic(user.id),
   ]);
 
   let selectedConversation = null;
@@ -87,6 +92,8 @@ export async function GET(req: Request) {
       runs,
       conversations,
       selectedConversation,
+      routingMode: orchestration.routingMode,
+      overseer: orchestration.overseer,
       limits: {
         maxStored: MAX_SUBAGENTS_STORED,
         maxActive: MAX_ACTIVE_SUBAGENTS,
@@ -177,19 +184,30 @@ export async function PUT(req: Request) {
   if (!rl.allowed) return rateLimitErrorResponse(rl);
 
   const body = (await req.json().catch(() => null)) as
-    | { nodes?: DependencyTreeNodeUpdate[] }
+    | {
+        nodes?: DependencyTreeNodeUpdate[];
+        routingMode?: SubagentRoutingMode;
+      }
     | null;
-  if (!body || !Array.isArray(body.nodes)) {
-    return Response.json({ error: "Укажите массив узлов дерева nodes" }, { status: 400 });
+  if (!body || (!Array.isArray(body.nodes) && body.routingMode === undefined)) {
+    return Response.json({ error: "Укажите массив узлов дерева nodes или routingMode" }, { status: 400 });
   }
 
   try {
-    const subagents = await updateSubagentsDependencyTree(user.id, body.nodes);
+    const subagents = Array.isArray(body.nodes)
+      ? await updateSubagentsDependencyTree(user.id, body.nodes)
+      : await listSubagentsPublic(user.id);
+    const orchestration =
+      body.routingMode !== undefined
+        ? await upsertAgentOrchestrationConfig(user.id, { routingMode: body.routingMode })
+        : await getAgentOrchestrationConfigPublic(user.id);
     const counts = await countSubagents(user.id);
     return Response.json(
       {
         ok: true,
         subagents,
+        routingMode: orchestration.routingMode,
+        overseer: orchestration.overseer,
         limits: {
           maxStored: MAX_SUBAGENTS_STORED,
           maxActive: MAX_ACTIVE_SUBAGENTS,
@@ -202,6 +220,88 @@ export async function PUT(req: Request) {
   } catch (err) {
     return Response.json(
       { error: err instanceof Error ? err.message : "Не удалось обновить дерево зависимостей" },
+      { status: 400 },
+    );
+  }
+}
+
+/** Сохранение режима маршрутизации (`linear` | `layered`) и конфигурации агента-Надсмотрщика. */
+export async function PATCH(req: Request) {
+  const user = await getCurrentUser();
+  if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  if (!hasAgentAccess(user)) {
+    return Response.json({ error: "Доступ не выдан главным администратором" }, { status: 403 });
+  }
+
+  const rl = checkApiRateLimit({
+    scope: "agent_subagents_settings",
+    userId: user.id,
+    ip: extractClientIp(req.headers),
+    maxRequests: 40,
+    windowMs: 60_000,
+  });
+  if (!rl.allowed) return rateLimitErrorResponse(rl);
+
+  const body = (await req.json().catch(() => null)) as
+    | {
+        routingMode?: SubagentRoutingMode;
+        overseer?: {
+          enabled?: boolean;
+          mode?: OverseerMode;
+          systemPrompt?: string;
+          unlockApi?: boolean;
+          provider?: string;
+          baseUrl?: string;
+          model?: string;
+          apiKey?: string;
+          clearApiKey?: boolean;
+        };
+      }
+    | null;
+  if (!body || typeof body !== "object") {
+    return Response.json({ error: "Некорректные настройки оркестрации" }, { status: 400 });
+  }
+
+  let cleanOverseerUrl: string | undefined;
+  if (body.overseer?.baseUrl !== undefined) {
+    cleanOverseerUrl = body.overseer.baseUrl
+      ? normalizeBaseUrl(String(body.overseer.baseUrl).slice(0, 400)) ?? ""
+      : "";
+    if (cleanOverseerUrl) {
+      try {
+        await assertSafeAiUrl(cleanOverseerUrl);
+      } catch (err) {
+        return Response.json(
+          { error: err instanceof Error ? err.message : "Запрещённый адрес API Надсмотрщика" },
+          { status: 400 },
+        );
+      }
+    }
+  }
+
+  try {
+    const orchestration = await upsertAgentOrchestrationConfig(user.id, {
+      ...(body.routingMode !== undefined ? { routingMode: body.routingMode } : {}),
+      ...(body.overseer
+        ? {
+            overseer: {
+              ...body.overseer,
+              ...(cleanOverseerUrl !== undefined ? { baseUrl: cleanOverseerUrl } : {}),
+            },
+          }
+        : {}),
+    });
+    return Response.json(
+      {
+        ok: true,
+        routingMode: orchestration.routingMode,
+        overseer: orchestration.overseer,
+      },
+      { headers: { "Cache-Control": "no-store" } },
+    );
+  } catch (err) {
+    return Response.json(
+      { error: err instanceof Error ? err.message : "Не удалось сохранить настройки Надсмотрщика" },
       { status: 400 },
     );
   }

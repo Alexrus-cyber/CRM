@@ -53,7 +53,7 @@ function noopSubscribe() {
   return () => {};
 }
 
-export type ApprovalToastTone = "amber" | "cyan";
+export type ApprovalToastTone = "amber" | "cyan" | "rose";
 
 export function ApprovalToast({
   title,
@@ -111,7 +111,9 @@ export function ApprovalToast({
         "pointer-events-auto space-y-2.5 rounded-2xl border bg-card p-3.5 text-xs shadow-2xl backdrop-blur-sm transition-all",
         tone === "cyan" || isScreen
           ? "border-cyan-500/60 ring-1 ring-cyan-500/25"
-          : "border-amber-500/60 ring-1 ring-amber-500/25",
+          : tone === "rose"
+            ? "border-rose-500/60 ring-1 ring-rose-500/25"
+            : "border-amber-500/60 ring-1 ring-amber-500/25",
       )}
     >
       <div className="flex items-start gap-2.5">
@@ -120,7 +122,9 @@ export function ApprovalToast({
             "mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border",
             tone === "cyan" || isScreen
               ? "border-cyan-500/40 bg-cyan-500/15 text-cyan-400"
-              : "border-amber-500/40 bg-amber-500/15 text-amber-500",
+              : tone === "rose"
+                ? "border-rose-500/40 bg-rose-500/15 text-rose-400"
+                : "border-amber-500/40 bg-amber-500/15 text-amber-500",
           )}
         >
           {isScreen ? (
@@ -139,7 +143,9 @@ export function ApprovalToast({
                 "rounded-md border px-1.5 py-0.5 text-[10px] font-medium",
                 tone === "cyan" || isScreen
                   ? "border-cyan-500/40 bg-cyan-500/10 text-cyan-400"
-                  : "border-amber-500/40 bg-amber-500/10 text-amber-500",
+                  : tone === "rose"
+                    ? "border-rose-500/40 bg-rose-500/10 text-rose-400"
+                    : "border-amber-500/40 bg-amber-500/10 text-amber-500",
               )}
             >
               {badgeLabel}

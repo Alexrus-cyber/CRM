@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { SubagentsPanel, type Subagent, type SubagentConversation, type SubagentRun } from "@/components/agent/SubagentsPanel";
+import { SubagentsPanel } from "@/components/agent/SubagentsPanel";
+import type {
+  OverseerConfig,
+  Subagent,
+  SubagentConversation,
+  SubagentRoutingMode,
+  SubagentRun,
+} from "@/components/agent/subagentTypes";
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -47,6 +54,11 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
   let putTreePayloads: Array<Record<string, unknown>>;
   let postSubagentPayloads: Array<Record<string, unknown>>;
   let patchSubagentPayloads: Array<{ id: number; body: Record<string, unknown> }>;
+  let patchRootPayloads: Array<Record<string, unknown>>;
+  let approvePayloads: Array<Record<string, unknown>>;
+  let routingModeStore: SubagentRoutingMode;
+  let overseerStore: OverseerConfig;
+  let sseResponder: ((body: Record<string, unknown>) => Response) | null;
 
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -113,6 +125,21 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
     putTreePayloads = [];
     postSubagentPayloads = [];
     patchSubagentPayloads = [];
+    patchRootPayloads = [];
+    approvePayloads = [];
+    routingModeStore = "linear";
+    overseerStore = {
+      enabled: true,
+      mode: "strict",
+      systemPrompt: "",
+      unlockApi: false,
+      provider: "local",
+      baseUrl: "",
+      model: "",
+      hasApiKey: false,
+      apiKeyHint: "",
+    };
+    sseResponder = null;
 
     vi.stubGlobal(
       "fetch",
@@ -161,6 +188,8 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
             runs: runsStore,
             conversations: conversationsStore,
             selectedConversation: null,
+            routingMode: routingModeStore,
+            overseer: overseerStore,
             limits: {
               maxStored: 50,
               maxActive: 10,
@@ -168,6 +197,24 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
               activeCount: subagentsStore.filter((s) => s.isActive).length,
             },
           });
+        }
+
+        if (url === "/api/agent/subagents" && method === "PATCH") {
+          const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          patchRootPayloads.push(body);
+          if (body.routingMode === "layered" || body.routingMode === "linear") {
+            routingModeStore = body.routingMode;
+          }
+          if (body.overseer && typeof body.overseer === "object") {
+            overseerStore = { ...overseerStore, ...(body.overseer as Partial<OverseerConfig>) };
+          }
+          return json({ ok: true, routingMode: routingModeStore, overseer: overseerStore });
+        }
+
+        if (url === "/api/ai/agent/approve" && method === "POST") {
+          const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          approvePayloads.push(body);
+          return json({ ok: true });
         }
 
         if (url === "/api/agent/subagents" && method === "POST") {
@@ -203,6 +250,10 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
 
         if (url === "/api/ai/agent" && method === "POST") {
           chatTokensTotal = 610;
+          if (sseResponder) {
+            const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            return sseResponder(body);
+          }
           const sse = [
             `event: subagent_start\ndata: ${JSON.stringify({ subagentConversationId: 201 })}\n\n`,
             `event: subagent_reasoning\ndata: ${JSON.stringify({ text: "Анализирую запрос..." })}\n\n`,
@@ -249,7 +300,9 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
     await new Promise((resolve) => setTimeout(resolve, 180));
 
     expect(getSubagentsCalls).toEqual(["/api/agent/subagents"]);
-    expect(statsSeen).toEqual([{ totalCount: 2, activeCount: 2, runs: 1 }]);
+    expect(statsSeen).toEqual([
+      { totalCount: 2, activeCount: 2, runs: 1, routingMode: "linear", overseerEnabled: true },
+    ]);
 
     // Обновление по сигналу завершения субагента делает ровно 1 дополнительный запрос
     rerender(
@@ -382,6 +435,173 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
     fireEvent.change(chatInput, { target: { value: "Проверь ещё страницу настроек" } });
     fireEvent.click(screen.getByRole("button", { name: /Отправить/i }));
 
+    await waitFor(() => {
+      expect(screen.getByLabelText("Токены: 610")).toBeTruthy();
+    });
+  });
+
+  it("переключает режим маршрутизации Линейно / По уровням и позволяет рисовать/удалять связи в дереве", async () => {
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="verified"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "По уровням" })).toBeTruthy();
+    });
+
+    // Переключаем режим на «По уровням»
+    fireEvent.click(screen.getByRole("button", { name: "По уровням" }));
+    await waitFor(() => {
+      expect(patchRootPayloads.some((p) => p.routingMode === "layered")).toBe(true);
+    });
+    expect(screen.getByText("Режим: По уровням")).toBeTruthy();
+    expect(screen.getByText(/Ур\.1 ·/)).toBeTruthy();
+    expect(screen.getByText(/Ур\.2 ·/)).toBeTruthy();
+
+    // Кликаем «Оркестратор» и соединяем его напрямую с «UI-архитектор»
+    fireEvent.click(screen.getByRole("button", { name: "Оркестратор" }));
+    fireEvent.click(screen.getByRole("button", { name: /Связать с субагентом/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Соединить с субагентом UI-архитектор" }));
+
+    // Проверяем, что можно удалить ребро кнопкой «×» прямо на схеме
+    const removeEdgeBtn = screen.getByRole("button", { name: "Удалить связь Оркестратор → QA-инженер" });
+    fireEvent.click(removeEdgeBtn);
+
+    fireEvent.click(screen.getByRole("button", { name: /Сохранить дерево/i }));
+    await waitFor(() => {
+      expect(putTreePayloads.length).toBe(1);
+    });
+    expect(putTreePayloads[0].routingMode).toBe("layered");
+    const nodes = putTreePayloads[0].nodes as Array<{ id: number; orchestratorCanCall: boolean }>;
+    expect(nodes.find((n) => n.id === 1)?.orchestratorCanCall).toBe(false);
+    expect(nodes.find((n) => n.id === 2)?.orchestratorCanCall).toBe(true);
+  });
+
+  it("настраивает и сохраняет Агента-Надсмотрщика через PATCH /api/agent/subagents", async () => {
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="verified"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/Надсмотрщик: строгий/i)).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^Надсмотрщик$/i }));
+    expect(await screen.findByText(/Агент-Надсмотрщик \(Guard безопасности\)/i)).toBeTruthy();
+
+    // Переключаем режим на «Только статические правила» и сохраняем
+    fireEvent.change(screen.getByLabelText("Режим проверки Надсмотрщика"), {
+      target: { value: "rules_only" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Сохранить Надсмотрщика/i }));
+
+    await waitFor(() => {
+      expect(patchRootPayloads.length).toBe(1);
+    });
+    const ov = patchRootPayloads[0].overseer as Record<string, unknown>;
+    expect(ov.enabled).toBe(true);
+    expect(ov.mode).toBe("rules_only");
+  });
+
+  it("в чате субагента показывает проверку Надсмотрщика и отправляет решение ApprovalToast", async () => {
+    const encoder = new TextEncoder();
+    const ctrlRef: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
+    sseResponder = () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          ctrlRef.current = controller;
+          controller.enqueue(
+            encoder.encode(`event: subagent_start\ndata: ${JSON.stringify({ subagentConversationId: 201 })}\n\n`),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: overseer_start\ndata: ${JSON.stringify({ tool: "run_command", targetAgent: "QA-инженер" })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: overseer_reasoning\ndata: ${JSON.stringify({
+                text: "Обнаружена попытка чтения .env",
+                tool: "run_command",
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `event: approval_required\ndata: ${JSON.stringify({
+                approvalId: "ov-sub-1",
+                kind: "overseer_approval",
+                title: "Надсмотрщик: запрос доступа к .env",
+                description: "Субагент пытается выполнить cat ../.env",
+                command: "cat ../.env",
+                overseer: {
+                  checkId: "chk1",
+                  verdict: "require_human",
+                  riskLevel: "critical",
+                  title: "Чтение секретов",
+                  reason: "Возможна утечка секретов хоста",
+                  recommendation: "Отклоните действие",
+                  requestedBy: "QA-инженер",
+                  tool: "run_command",
+                },
+              })}\n\n`,
+            ),
+          );
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    };
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="full"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Чаты \(1\)/i })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Чаты \(1\)/i }));
+
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText(/Сообщение субагенту/i)).toBeTruthy();
+    });
+    fireEvent.change(screen.getByPlaceholderText(/Сообщение субагенту/i), {
+      target: { value: "Прочитай .env" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Отправить/i }));
+
+    // Проверяем ApprovalToast от Надсмотрщика и живые рассуждения Надсмотрщика
+    expect(await screen.findByText("Надсмотрщик: запрос доступа к .env")).toBeTruthy();
+    expect(screen.getByText(/Возможна утечка секретов хоста/)).toBeTruthy();
+    expect(screen.getByText(/Обнаружена попытка чтения \.env/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Отклонить$/i }));
+    await waitFor(() => {
+      expect(approvePayloads.length).toBe(1);
+    });
+    expect(approvePayloads[0].approvalId).toBe("ov-sub-1");
+    expect(approvePayloads[0].approved).toBe(false);
+
+    ctrlRef.current?.enqueue(
+      encoder.encode(`event: overseer_done\ndata: ${JSON.stringify({ verdict: "require_human", riskLevel: "critical", tool: "run_command" })}\n\n`),
+    );
+    ctrlRef.current?.enqueue(
+      encoder.encode(`event: subagent_done\ndata: ${JSON.stringify({ subagentConversationId: 201, usage: { prompt: 400, completion: 210, total: 610 } })}\n\n`),
+    );
+    ctrlRef.current?.close();
     await waitFor(() => {
       expect(screen.getByLabelText("Токены: 610")).toBeTruthy();
     });

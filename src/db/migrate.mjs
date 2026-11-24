@@ -158,6 +158,8 @@ async function convertPostgresIntegerBooleans(executor) {
     ["agent_subagents", "orchestrator_can_call", true],
     ["agent_subagents", "unlock_api", false],
     ["agent_subagent_runs", "used_custom_api", false],
+    ["ai_user_settings", "overseer_enabled", true],
+    ["ai_user_settings", "overseer_unlock_api", false],
   ];
   for (const [table, column, defVal] of targets) {
     const rows = await executor.queryRaw(

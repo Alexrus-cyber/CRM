@@ -37,6 +37,8 @@ import {
   PlugZap,
   RefreshCw,
   Send,
+  ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Square,
   Terminal,
@@ -101,6 +103,11 @@ import {
   type TesterRunItem,
 } from "./agent/TesterPanel";
 import { SubagentsPanel } from "./agent/SubagentsPanel";
+import type {
+  AgentLiveActorKind,
+  OverseerVerdictMeta,
+  SubagentRoutingMode,
+} from "./agent/subagentTypes";
 
 const SSE_IDLE_TIMEOUT_MS = 120_000;
 
@@ -135,7 +142,10 @@ type AgentAction = {
     | "tester_report"
     | "tester_minor_decision"
     | "tester_tool"
-    | "qa_check";
+    | "qa_check"
+    | "subagent_report"
+    | "subagent_handoff"
+    | "overseer_verdict";
   action?: string;
   kind?: string;
   callId?: string;
@@ -198,6 +208,16 @@ type AgentAction = {
   minorDecision?: string;
   totalTokens?: number;
   approved?: boolean;
+  subagentName?: string;
+  subagentSlug?: string;
+  subagentColor?: string;
+  tier?: number;
+  routingMode?: string;
+  riskLevel?: string;
+  reason?: string;
+  verdict?: string;
+  toSubagentName?: string;
+  handoffVia?: string;
 };
 
 type Turn = {
@@ -276,6 +296,7 @@ type PendingApproval = {
   testerRunId?: number;
   testerConversationId?: number;
   minorIssues?: TesterIssueItem[];
+  overseer?: OverseerVerdictMeta;
   github?: {
     login?: string;
     authorName?: string;
@@ -486,7 +507,39 @@ function parseLiveTesterActor(data: Record<string, unknown>): LiveTesterActor | 
   return undefined;
 }
 
-type StatusActor = "agent_llm" | "agent_tool" | "tester" | "tester_llm" | "tester_tool" | "browser_inspector" | "approval";
+type StatusActor =
+  | "agent_llm"
+  | "agent_tool"
+  | "tester"
+  | "tester_llm"
+  | "tester_tool"
+  | "subagent"
+  | "subagent_llm"
+  | "overseer"
+  | "browser_inspector"
+  | "approval";
+
+type ActiveLiveActor = {
+  kind: AgentLiveActorKind;
+  name: string;
+  roleTitle?: string;
+  color?: string;
+  tier?: number;
+  routingMode?: SubagentRoutingMode;
+  model?: string;
+  usedCustomApi?: boolean;
+  statusText: string;
+  reasoning: string;
+  content: string;
+  tool?: string;
+  overseerVerdict?: {
+    verdict: string;
+    riskLevel: string;
+    title: string;
+    reason: string;
+    tool: string;
+  } | null;
+};
 
 function parseStatusActor(data: Record<string, unknown>, fallback?: StatusActor): StatusActor | undefined {
   const raw = String(data.actor ?? data.source ?? "");
@@ -496,6 +549,9 @@ function parseStatusActor(data: Record<string, unknown>, fallback?: StatusActor)
     raw === "tester" ||
     raw === "tester_llm" ||
     raw === "tester_tool" ||
+    raw === "subagent" ||
+    raw === "subagent_llm" ||
+    raw === "overseer" ||
     raw === "browser_inspector" ||
     raw === "approval"
   ) {
@@ -753,10 +809,21 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const [testerDirectProject, setTesterDirectProject] = useState(".");
   const [liveTester, setLiveTester] = useState<LiveTesterState | null>(null);
   const [liveStatusActor, setLiveStatusActor] = useState<StatusActor | null>(null);
+  const [activeLiveActor, setActiveLiveActor] = useState<ActiveLiveActor | null>(null);
+  const prevActorBeforeOverseerRef = useRef<{
+    statusActor: StatusActor | null;
+    liveActor: ActiveLiveActor | null;
+  } | null>(null);
   const [liveBrowserLog, setLiveBrowserLog] = useState<string[]>([]);
   const [testerError, setTesterError] = useState<string | null>(null);
   const [testerDecisionBusy, setTesterDecisionBusy] = useState<number | null>(null);
-  const [subagentStats, setSubagentStats] = useState<{ totalCount: number; activeCount: number; runs: number }>({
+  const [subagentStats, setSubagentStats] = useState<{
+    totalCount: number;
+    activeCount: number;
+    runs: number;
+    routingMode?: SubagentRoutingMode;
+    overseerEnabled?: boolean;
+  }>({
     totalCount: 0,
     activeCount: 0,
     runs: 0,
@@ -2570,6 +2637,10 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             minorIssues: Array.isArray(data.minorIssues)
               ? (data.minorIssues as TesterIssueItem[])
               : undefined,
+            overseer:
+              data.overseer && typeof data.overseer === "object"
+                ? (data.overseer as OverseerVerdictMeta)
+                : undefined,
           });
           setLiveTester((prev) =>
             prev
@@ -2580,6 +2651,12 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 }
               : prev,
           );
+        } else if (ev === "overseer_start" || ev === "overseer_status") {
+          const st = String(data.text ?? `Надсмотрщик проверяет ${String(data.tool ?? "")}…`);
+          setLiveTester((prev) => (prev ? { ...prev, statusText: st } : prev));
+        } else if (ev === "overseer_reasoning") {
+          const ovR = String(data.text ?? "");
+          setLiveTester((prev) => (prev ? { ...prev, reasoning: ovR } : prev));
         } else if (ev === "tester_done") {
           clearLiveBrowserLog();
           const savedRun =
@@ -2742,6 +2819,17 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     setRunning(true);
     setStatus("Отправляю агенту…");
     setLiveStatusActor("agent_llm");
+    setActiveLiveActor({
+      kind: "orchestrator",
+      name: "Оркестратор",
+      model: settings.model.trim() || undefined,
+      routingMode: subagentStats.routingMode,
+      statusText: "Отправляю запрос Оркестратору…",
+      reasoning: "",
+      content: "",
+      overseerVerdict: null,
+    });
+    prevActorBeforeOverseerRef.current = null;
     setLiveBrowserLog([]);
     browserRunStartRef.current = 0;
     autoScrollPausedRef.current = false;
@@ -2882,8 +2970,24 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             if (isBrowserStep && data.done === true) {
               clearLiveBrowserLog();
               if (!data.actor) setLiveStatusActor("agent_llm");
+              setActiveLiveActor((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      kind: "orchestrator",
+                      name: "Оркестратор",
+                      statusText: st || "Осмотр завершён",
+                    }
+                  : prev,
+              );
             } else if (isBrowserStep && st) {
               setLiveStatusActor("browser_inspector");
+              setActiveLiveActor((prev) => ({
+                ...(prev ?? { name: "BrowserInspector", reasoning: "", content: "" }),
+                kind: "browser_inspector",
+                name: "BrowserInspector",
+                statusText: st,
+              }));
               const isBrowserStart =
                 st.startsWith("Вызываю инструмент: browse_project") ||
                 st.startsWith("Вызываю инструмент: qa_browser_audit") ||
@@ -2891,11 +2995,240 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               pushLiveBrowserLog(st, isBrowserStart);
             } else if (st) {
               clearLiveBrowserLog();
+              setActiveLiveActor((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      ...(nextActor === "agent_llm" || nextActor === "agent_tool"
+                        ? { kind: "orchestrator", name: "Оркестратор" }
+                        : {}),
+                      statusText: st,
+                    }
+                  : prev,
+              );
             }
+          } else if (event === "agent_card") {
+            const cKind = String(data.kind ?? "orchestrator");
+            const mappedKind: AgentLiveActorKind =
+              cKind === "subagent"
+                ? "subagent"
+                : cKind === "tester"
+                  ? "tester"
+                  : cKind === "overseer"
+                    ? "overseer"
+                    : "orchestrator";
+            setActiveLiveActor((prev) => ({
+              kind: mappedKind,
+              name: String(
+                data.name ??
+                  (mappedKind === "subagent"
+                    ? "Субагент"
+                    : mappedKind === "tester"
+                      ? "Тестировщик"
+                      : "Оркестратор"),
+              ),
+              roleTitle: data.roleTitle ? String(data.roleTitle) : undefined,
+              color: data.color ? String(data.color) : undefined,
+              tier: typeof data.tier === "number" ? data.tier : undefined,
+              routingMode:
+                data.routingMode === "layered"
+                  ? "layered"
+                  : data.routingMode === "linear"
+                    ? "linear"
+                    : prev?.routingMode,
+              model: data.model ? String(data.model) : prev?.model,
+              usedCustomApi:
+                typeof data.usedCustomApi === "boolean" ? data.usedCustomApi : undefined,
+              statusText: String(data.statusText ?? prev?.statusText ?? ""),
+              reasoning: prev?.kind === mappedKind && prev?.name === String(data.name ?? prev.name) ? prev.reasoning : "",
+              content: prev?.kind === mappedKind && prev?.name === String(data.name ?? prev.name) ? prev.content : "",
+              overseerVerdict: prev?.overseerVerdict ?? null,
+            }));
+          } else if (event === "subagent_start") {
+            const sName = String(data.subagentName ?? data.subagentSlug ?? "Субагент");
+            const sTier = typeof data.tier === "number" ? data.tier : undefined;
+            const sMode =
+              data.routingMode === "layered"
+                ? "layered"
+                : data.routingMode === "linear"
+                  ? "linear"
+                  : undefined;
+            const sModel = data.model ? String(data.model) : undefined;
+            const sStatus = `Субагент «${sName}»${sTier ? ` (ур.${sTier})` : ""} работает над задачей…`;
+            setLiveStatusActor("subagent");
+            setStatus(sStatus);
+            setSubagentRefreshKey((k) => k + 1);
+            setActiveLiveActor((prev) => ({
+              kind: "subagent",
+              name: sName,
+              color: data.subagentColor ? String(data.subagentColor) : undefined,
+              tier: sTier,
+              routingMode: sMode ?? prev?.routingMode,
+              model: sModel,
+              usedCustomApi:
+                typeof data.usedCustomApi === "boolean" ? data.usedCustomApi : undefined,
+              statusText: sStatus,
+              reasoning: "",
+              content: "",
+              overseerVerdict: prev?.overseerVerdict ?? null,
+            }));
+          } else if (event === "subagent_status") {
+            const st = String(data.text ?? "");
+            if (st) {
+              setLiveStatusActor("subagent");
+              setStatus(st);
+              setActiveLiveActor((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      kind: "subagent",
+                      name: String(data.subagentName ?? prev.name ?? "Субагент"),
+                      statusText: st,
+                    }
+                  : prev,
+              );
+            }
+          } else if (event === "subagent_reasoning") {
+            const r = String(data.text ?? "");
+            setLiveStatusActor("subagent_llm");
+            setActiveLiveActor((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    kind: "subagent",
+                    name: String(data.subagentName ?? prev.name ?? "Субагент"),
+                    reasoning: r,
+                  }
+                : prev,
+            );
+          } else if (event === "subagent_text") {
+            const c = String(data.text ?? "");
+            setActiveLiveActor((prev) => (prev ? { ...prev, content: c } : prev));
+          } else if (event === "subagent_action") {
+            void refreshSandbox(false);
+          } else if (event === "subagent_handoff") {
+            const fromName = String(data.fromSubagentName ?? "Субагент");
+            const toName = String(data.toSubagentName ?? "целевой субагент");
+            const via = String(data.handoffVia ?? "orchestrator");
+            const hStatus = `Передача задачи: ${fromName} → ${toName} (${via === "escalation" ? "эскалация наверх" : via === "cascade" ? "каскад по уровням" : "через Оркестратора"})`;
+            setStatus(hStatus);
+            const hAct: AgentAction = {
+              type: "subagent_handoff",
+              subagentName: fromName,
+              toSubagentName: toName,
+              handoffVia: via,
+              label: hStatus,
+              summary: data.task ? String(data.task) : undefined,
+            };
+            assistantDraft.actions.push(hAct);
+            patch((t) => ({ ...t, actions: [...t.actions, hAct] }));
+          } else if (event === "subagent_done") {
+            setSubagentRefreshKey((k) => k + 1);
+            setLiveStatusActor("agent_llm");
+            const doneName = String(data.subagentName ?? "Субагент");
+            setActiveLiveActor((prev) => ({
+              kind: "orchestrator",
+              name: "Оркестратор",
+              routingMode: prev?.routingMode,
+              model: settings.model.trim() || undefined,
+              statusText: `Субагент «${doneName}» завершил — Оркестратор анализирует результат…`,
+              reasoning: "",
+              content: "",
+              overseerVerdict: prev?.overseerVerdict ?? null,
+            }));
+          } else if (event === "overseer_start") {
+            setActiveLiveActor((prev) => {
+              if (prev?.kind !== "overseer") {
+                const derivedStatusActor: StatusActor =
+                  prev?.kind === "subagent"
+                    ? "subagent"
+                    : prev?.kind === "tester"
+                      ? "tester"
+                      : prev?.kind === "browser_inspector"
+                        ? "browser_inspector"
+                        : "agent_llm";
+                prevActorBeforeOverseerRef.current = {
+                  statusActor: derivedStatusActor,
+                  liveActor: prev,
+                };
+              }
+              const toolLabel = String(data.tool ?? "инструмент");
+              const targetLabel = String(data.targetAgent ?? "Агент");
+              return {
+                kind: "overseer",
+                name: "Надсмотрщик безопасности",
+                model: data.model ? String(data.model) : undefined,
+                tool: toolLabel,
+                routingMode: prev?.routingMode,
+                statusText: `Проверяю «${toolLabel}» от ${targetLabel}…`,
+                reasoning: "",
+                content: "",
+                overseerVerdict: prev?.overseerVerdict ?? null,
+              };
+            });
+            setLiveStatusActor("overseer");
+            setStatus(`Надсмотрщик проверяет «${String(data.tool ?? "")}»…`);
+          } else if (event === "overseer_status") {
+            const st = String(data.text ?? "");
+            if (st) {
+              setLiveStatusActor("overseer");
+              setStatus(st);
+              setActiveLiveActor((prev) => (prev ? { ...prev, statusText: st } : prev));
+            }
+          } else if (event === "overseer_reasoning") {
+            const ovR = String(data.text ?? "");
+            setLiveStatusActor("overseer");
+            setActiveLiveActor((prev) =>
+              prev ? { ...prev, kind: "overseer", name: "Надсмотрщик безопасности", reasoning: ovR } : prev,
+            );
+          } else if (event === "overseer_done") {
+            const verdict = String(data.verdict ?? "allow");
+            const riskLevel = String(data.riskLevel ?? "low");
+            const ovTitle = String(data.title ?? "");
+            const ovReason = String(data.reason ?? "");
+            const ovTool = String(data.tool ?? "");
+            const snapshot = prevActorBeforeOverseerRef.current;
+            prevActorBeforeOverseerRef.current = null;
+            setLiveStatusActor(snapshot?.statusActor ?? "agent_llm");
+            setActiveLiveActor(() => {
+              const base = snapshot?.liveActor ?? {
+                kind: "orchestrator" as AgentLiveActorKind,
+                name: "Оркестратор",
+                model: settings.model.trim() || undefined,
+                statusText: "",
+                reasoning: "",
+                content: "",
+              };
+              return {
+                ...base,
+                overseerVerdict: {
+                  verdict,
+                  riskLevel,
+                  title: ovTitle,
+                  reason: ovReason,
+                  tool: ovTool,
+                },
+              };
+            });
+          } else if (event === "overseer_verdict") {
+            const ovAct: AgentAction = {
+              type: "overseer_verdict",
+              verdict: data.verdict ? String(data.verdict) : undefined,
+              tool: data.tool ? String(data.tool) : undefined,
+              riskLevel: data.riskLevel ? String(data.riskLevel) : undefined,
+              reason: data.reason ? String(data.reason) : undefined,
+              label: String(data.label ?? `Надсмотрщик: ${String(data.tool ?? "")}`),
+            };
+            assistantDraft.actions.push(ovAct);
+            patch((t) => ({ ...t, actions: [...t.actions, ovAct] }));
           } else if (event === "approval_required") {
             const ghPayload =
               data.github && typeof data.github === "object"
                 ? (data.github as Record<string, unknown>)
+                : undefined;
+            const ovPayload =
+              data.overseer && typeof data.overseer === "object"
+                ? (data.overseer as OverseerVerdictMeta)
                 : undefined;
             const req: PendingApproval = {
               approvalId: String(data.approvalId ?? ""),
@@ -2922,6 +3255,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               minorIssues: Array.isArray(data.minorIssues)
                 ? (data.minorIssues as TesterIssueItem[])
                 : undefined,
+              overseer: ovPayload,
               github: ghPayload
                 ? {
                     login: ghPayload.login ? String(ghPayload.login) : undefined,
@@ -2977,6 +3311,25 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 : prev,
             );
             setLiveStatusActor("approval");
+            setActiveLiveActor((prev) => ({
+              ...(prev ?? { name: ovPayload ? "Надсмотрщик безопасности" : "Ожидает подтверждения", reasoning: "", content: "" }),
+              kind: "approval",
+              name: ovPayload ? "Надсмотрщик безопасности" : prev?.name ?? "Ожидает подтверждения",
+              statusText: ovPayload
+                ? `Надсмотрщик запрашивает подтверждение: ${ovPayload.title || req.title}`
+                : `Ждёт подтверждения: ${req.title}`,
+              ...(ovPayload
+                ? {
+                    overseerVerdict: {
+                      verdict: ovPayload.verdict || "require_human",
+                      riskLevel: ovPayload.riskLevel || "high",
+                      title: ovPayload.title || req.title,
+                      reason: ovPayload.reason || req.description || "",
+                      tool: ovPayload.tool || req.kind,
+                    },
+                  }
+                : {}),
+            }));
             scrollDown();
           } else if (event === "github") {
             const ghRepoName = `${String(data.owner ?? "")}/${String(data.repo ?? "")}`;
@@ -3006,6 +3359,16 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               setTesterRuns((prev) => [createdRun, ...prev.filter((r) => r.id !== createdRun.id)]);
             }
             setLiveStatusActor("tester");
+            setActiveLiveActor((prev) => ({
+              kind: "tester",
+              name: "Тестировщик",
+              model: String(createdRun?.model ?? data.model ?? settings.model ?? ""),
+              routingMode: prev?.routingMode,
+              statusText: "Тестировщик запущен в новом чате…",
+              reasoning: "",
+              content: "",
+              overseerVerdict: prev?.overseerVerdict ?? null,
+            }));
             setLiveTester({
               runKey: String(data.runKey ?? "default"),
               runId: typeof data.runId === "number" ? data.runId : createdRun?.id,
@@ -3028,12 +3391,20 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             const testerActor = parseLiveTesterActor(data);
             const step = typeof data.step === "number" ? data.step : undefined;
             const statusActor = parseStatusActor(data, "tester");
-            if (statusActor) setLiveStatusActor(statusActor);
-            setStatus(st);
             const isBrowserStep =
               data.source === "browser_inspector" ||
               data.tool === "browse_project" ||
               data.tool === "qa_browser_audit";
+            if (statusActor) setLiveStatusActor(statusActor);
+            setStatus(st);
+            if (st) {
+              setActiveLiveActor((prev) => ({
+                ...(prev ?? { name: "Тестировщик", reasoning: "", content: "" }),
+                kind: isBrowserStep && data.done !== true ? "browser_inspector" : "tester",
+                name: isBrowserStep && data.done !== true ? "BrowserInspector" : "Тестировщик",
+                statusText: st,
+              }));
+            }
             if (isBrowserStep && data.done === true) {
               clearLiveBrowserLog();
               setLiveTester((prev) =>
@@ -3082,9 +3453,13 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             const r = String(data.text ?? "");
             setLiveStatusActor("tester_llm");
             setLiveTester((prev) => (prev ? { ...prev, reasoning: r, actor: "tester_llm" } : prev));
+            setActiveLiveActor((prev) =>
+              prev ? { ...prev, kind: "tester", name: "Тестировщик", reasoning: r } : prev,
+            );
           } else if (event === "tester_text") {
             const c = String(data.text ?? "");
             setLiveTester((prev) => (prev ? { ...prev, content: c } : prev));
+            setActiveLiveActor((prev) => (prev ? { ...prev, content: c } : prev));
           } else if (event === "tester_action") {
             const act =
               data.action && typeof data.action === "object"
@@ -3108,6 +3483,16 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           } else if (event === "tester_done") {
             clearLiveBrowserLog();
             setLiveStatusActor("agent_llm");
+            setActiveLiveActor((prev) => ({
+              kind: "orchestrator",
+              name: "Оркестратор",
+              routingMode: prev?.routingMode,
+              model: settings.model.trim() || undefined,
+              statusText: "Тестировщик завершил — Оркестратор анализирует отчёт…",
+              reasoning: "",
+              content: "",
+              overseerVerdict: prev?.overseerVerdict ?? null,
+            }));
             const savedRun =
               data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
             if (savedRun) {
@@ -3129,11 +3514,14 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             if (updRun) {
               setTesterRuns((prev) => prev.map((r) => (r.id === updRun.id ? updRun : r)));
             }
-          } else if (event === "subagent_done") {
-            setSubagentRefreshKey((k) => k + 1);
           } else if (event === "reasoning") {
             assistantDraft.reasoning = String(data.text ?? "");
             patch((t) => ({ ...t, reasoning: assistantDraft.reasoning }));
+            setActiveLiveActor((prev) =>
+              prev && (prev.kind === "orchestrator" || !data.actor || data.actor === "agent_llm")
+                ? { ...prev, kind: "orchestrator", name: "Оркестратор", reasoning: assistantDraft.reasoning }
+                : prev,
+            );
             scrollDown();
           } else if (event === "text") {
             clearLiveBrowserLog();
@@ -3146,6 +3534,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             patch((t) => ({ ...t, error: assistantDraft.error }));
             setStatus(null);
             setLiveStatusActor(null);
+            setActiveLiveActor(null);
+            prevActorBeforeOverseerRef.current = null;
             setPendingApproval(null);
             setScreenCapture(null);
             setLiveTester(null);
@@ -3247,6 +3637,21 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 minorDecision: data.minorDecision ? String(data.minorDecision) : undefined,
                 totalTokens: typeof data.totalTokens === "number" ? data.totalTokens : undefined,
                 approved: typeof data.approved === "boolean" ? data.approved : undefined,
+                subagentName: data.subagentName ? String(data.subagentName) : undefined,
+                subagentColor: data.subagentColor ? String(data.subagentColor) : undefined,
+                tier: typeof data.tier === "number" ? data.tier : undefined,
+                routingMode:
+                  data.routingMode === "layered"
+                    ? "layered"
+                    : data.routingMode === "linear"
+                      ? "linear"
+                      : undefined,
+                riskLevel: data.riskLevel ? String(data.riskLevel) : undefined,
+                reason: data.reason ? String(data.reason) : undefined,
+                verdict: data.verdict ? String(data.verdict) : undefined,
+                toSubagentName: data.toSubagentName ? String(data.toSubagentName) : undefined,
+                handoffVia: data.handoffVia ? String(data.handoffVia) : undefined,
+                tool: data.tool ? String(data.tool) : undefined,
               };
               assistantDraft.actions.push(action);
               patch((t) => ({ ...t, actions: [...t.actions, action] }));
@@ -3269,6 +3674,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             sawDone = true;
             setStatus(null);
             setLiveStatusActor(null);
+            setActiveLiveActor(null);
+            prevActorBeforeOverseerRef.current = null;
             setPendingApproval(null);
             setScreenCapture(null);
             setLiveTester(null);
@@ -3309,6 +3716,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       if (!sawDone && !assistantDraft.error) {
         setStatus(null);
         setLiveStatusActor(null);
+        setActiveLiveActor(null);
+        prevActorBeforeOverseerRef.current = null;
         setPendingApproval(null);
         setScreenCapture(null);
         setLiveTester(null);
@@ -3320,6 +3729,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       if (chatStalled) {
         setStatus(null);
         setLiveStatusActor(null);
+        setActiveLiveActor(null);
+        prevActorBeforeOverseerRef.current = null;
         setPendingApproval(null);
         setScreenCapture(null);
         setLiveTester(null);
@@ -3385,6 +3796,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       setScreenCapture(null);
       setLiveTester(null);
       setLiveStatusActor(null);
+      setActiveLiveActor(null);
+      prevActorBeforeOverseerRef.current = null;
       setLiveBrowserLog([]);
       browserRunStartRef.current = 0;
       setStatus(null);
@@ -3578,15 +3991,21 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                     {liveTester ? "…" : testerRuns.length}
                   </span>
                 )}
-                {tab.id === "subagents" && (subagentStats.activeCount > 0 || subagentStats.runs > 0) && (
+                {tab.id === "subagents" && (subagentStats.activeCount > 0 || subagentStats.runs > 0 || subagentStats.overseerEnabled) && (
                   <span
                     className={cn(
-                      "rounded px-1 py-0.5 text-[10px]",
+                      "inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[10px]",
                       subagentStats.runs > 0
                         ? "bg-cyan-500/20 text-cyan-300"
                         : "bg-card2 text-muted",
                     )}
+                    title={
+                      subagentStats.overseerEnabled
+                        ? `Надсмотрщик включён · режим: ${subagentStats.routingMode === "layered" ? "По уровням" : "Линейно"}`
+                        : undefined
+                    }
                   >
+                    {subagentStats.overseerEnabled && <ShieldCheck size={9} className="text-emerald-400" />}
                     {subagentStats.runs > 0 ? subagentStats.runs : `${subagentStats.activeCount}/${subagentStats.totalCount}`}
                   </span>
                 )}
@@ -4690,6 +5109,25 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             >
               Тестировщик: {testerRuns.length}
             </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("subagents")}
+              className={cn(
+                "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 transition",
+                subagentStats.overseerEnabled
+                  ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/15"
+                  : "border-border bg-card2 hover:text-text",
+              )}
+              title="Настройки дерева субагентов, режима маршрутизации и Надсмотрщика"
+            >
+              {subagentStats.overseerEnabled ? (
+                <ShieldCheck size={10} className="text-emerald-400" />
+              ) : (
+                <ShieldAlert size={10} className="text-muted" />
+              )}
+              Субагенты: {subagentStats.routingMode === "layered" ? "По уровням" : "Линейно"} · Надсмотрщик{" "}
+              {subagentStats.overseerEnabled ? "вкл" : "выкл"}
+            </button>
           </div>
         )}
 
@@ -4840,8 +5278,111 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   {turn.reasoning && turn.reasoning.trim() && (
                     <LiveReasoningBox
                       text={turn.reasoning}
-                      streaming={isStreamingTurn && !liveTester && liveBrowserLog.length === 0}
+                      streaming={
+                        isStreamingTurn &&
+                        !liveTester &&
+                        liveBrowserLog.length === 0 &&
+                        (!activeLiveActor || activeLiveActor.kind === "orchestrator")
+                      }
                     />
+                  )}
+
+                  {isStreamingTurn && activeLiveActor && (!liveTester || activeLiveActor.kind === "overseer" || activeLiveActor.kind === "subagent") && (
+                    <div
+                      data-testid="live-actor-card"
+                      className={cn(
+                        "space-y-1.5 rounded-xl border p-2.5 text-[11px]",
+                        activeLiveActor.kind === "overseer"
+                          ? "border-rose-500/45 bg-rose-500/10"
+                          : activeLiveActor.kind === "subagent"
+                            ? "border-cyan-500/45 bg-cyan-500/10"
+                            : activeLiveActor.kind === "approval"
+                              ? "border-amber-500/45 bg-amber-500/10"
+                              : activeLiveActor.kind === "browser_inspector"
+                                ? "border-sky-500/45 bg-sky-500/10"
+                                : "border-accent/35 bg-accent/10",
+                      )}
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {activeLiveActor.kind === "overseer" ? (
+                            <ShieldAlert size={12} className="shrink-0 animate-pulse text-rose-400" />
+                          ) : activeLiveActor.kind === "subagent" && activeLiveActor.color ? (
+                            <span
+                              className="inline-block h-2.5 w-2.5 shrink-0 rounded-full"
+                              style={{ backgroundColor: activeLiveActor.color }}
+                            />
+                          ) : (
+                            <Loader2 size={12} className="shrink-0 animate-spin text-accent2" />
+                          )}
+                          <span className="font-semibold text-text">
+                            {activeLiveActor.kind === "orchestrator"
+                              ? "Оркестратор"
+                              : activeLiveActor.kind === "overseer"
+                                ? "Надсмотрщик безопасности"
+                                : activeLiveActor.kind === "subagent"
+                                  ? `Субагент · ${activeLiveActor.name}`
+                                  : activeLiveActor.name}
+                          </span>
+                          {activeLiveActor.tier !== undefined && (
+                            <span className="rounded border border-cyan-500/40 bg-card px-1.5 py-0.5 text-[10px] font-medium text-cyan-300">
+                              ур.{activeLiveActor.tier}
+                            </span>
+                          )}
+                          {activeLiveActor.routingMode && (
+                            <span className="rounded border border-border bg-card px-1.5 py-0.5 text-[10px] text-muted">
+                              {activeLiveActor.routingMode === "layered" ? "По уровням" : "Линейно"}
+                            </span>
+                          )}
+                          {activeLiveActor.model && (
+                            <span className="rounded bg-card px-1.5 py-0.5 font-mono text-[10px] text-muted">
+                              {activeLiveActor.model}
+                            </span>
+                          )}
+                          {activeLiveActor.usedCustomApi && (
+                            <span className="rounded border border-emerald-500/35 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-300">
+                              своё API
+                            </span>
+                          )}
+                        </div>
+                        {activeLiveActor.overseerVerdict && activeLiveActor.kind !== "overseer" && (
+                          <span
+                            className={cn(
+                              "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium",
+                              activeLiveActor.overseerVerdict.verdict === "block"
+                                ? "border-rose-500/40 bg-rose-500/15 text-rose-300"
+                                : activeLiveActor.overseerVerdict.verdict === "require_approval" ||
+                                    activeLiveActor.overseerVerdict.verdict === "require_human"
+                                  ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
+                                  : "border-emerald-500/40 bg-emerald-500/15 text-emerald-300",
+                            )}
+                            title={activeLiveActor.overseerVerdict.reason}
+                          >
+                            <ShieldCheck size={10} />
+                            Надсмотрщик: {activeLiveActor.overseerVerdict.tool || activeLiveActor.overseerVerdict.verdict}
+                          </span>
+                        )}
+                      </div>
+                      {activeLiveActor.statusText && (
+                        <p className="text-[10px] text-muted">{activeLiveActor.statusText}</p>
+                      )}
+                      {activeLiveActor.kind !== "orchestrator" && activeLiveActor.reasoning && (
+                        <LiveReasoningBox
+                          text={activeLiveActor.reasoning}
+                          streaming={
+                            activeLiveActor.kind === "overseer" ||
+                            activeLiveActor.kind === "subagent"
+                          }
+                          defaultOpen
+                          badgeLabel={`${activeLiveActor.name} · в эфире`}
+                        />
+                      )}
+                      {activeLiveActor.kind === "subagent" && activeLiveActor.content && (
+                        <p className="whitespace-pre-wrap rounded-lg border border-border bg-card/70 px-2 py-1.5 text-[10px] text-text">
+                          {activeLiveActor.content}
+                        </p>
+                      )}
+                    </div>
                   )}
 
                   {isStreamingTurn && liveTester && (
@@ -5305,6 +5846,100 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                         </div>
                       );
                     }
+                    if (action.type === "subagent_handoff") {
+                      return (
+                        <div
+                          key={`sub-handoff-${index}`}
+                          className="space-y-1 rounded-xl border border-cyan-500/35 bg-cyan-500/10 px-2.5 py-2 text-[11px]"
+                        >
+                          <div className="flex flex-wrap items-center gap-1.5 font-medium text-text">
+                            <span className="rounded bg-card px-1.5 py-0.5 text-[10px] text-cyan-300">
+                              Передача задачи
+                            </span>
+                            <span>
+                              {action.subagentName || "Субагент"} → {action.toSubagentName || "цель"}
+                            </span>
+                            {action.handoffVia && (
+                              <span className="text-[10px] text-muted">
+                                ({action.handoffVia === "escalation" ? "эскалация наверх" : action.handoffVia === "cascade" ? "каскад" : "Оркестратор"})
+                              </span>
+                            )}
+                          </div>
+                          {action.summary && <p className="text-[10px] text-muted">{action.summary}</p>}
+                        </div>
+                      );
+                    }
+                    if (action.type === "overseer_verdict") {
+                      const isBlocked = action.verdict === "block";
+                      const isAsk = action.verdict === "require_approval" || action.verdict === "require_human";
+                      return (
+                        <div
+                          key={`ov-verdict-${index}`}
+                          className={cn(
+                            "space-y-1 rounded-xl border px-2.5 py-2 text-[11px]",
+                            isBlocked
+                              ? "border-rose-500/45 bg-rose-500/10"
+                              : isAsk
+                                ? "border-amber-500/45 bg-amber-500/10"
+                                : "border-emerald-500/40 bg-emerald-500/10",
+                          )}
+                        >
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {isBlocked || isAsk ? (
+                              <ShieldAlert size={13} className={isBlocked ? "text-rose-400" : "text-amber-400"} />
+                            ) : (
+                              <ShieldCheck size={13} className="text-emerald-400" />
+                            )}
+                            <span className="font-semibold text-text">
+                              {action.label || `Надсмотрщик: ${action.tool || "проверка"}`}
+                            </span>
+                            {action.riskLevel && (
+                              <span className="rounded bg-card px-1.5 py-0.5 text-[10px] text-muted">
+                                риск: {action.riskLevel}
+                              </span>
+                            )}
+                          </div>
+                          {action.reason && <p className="text-[10px] text-muted">{action.reason}</p>}
+                        </div>
+                      );
+                    }
+                    if (action.type === "subagent_report") {
+                      return (
+                        <div
+                          key={`sub-report-${index}`}
+                          className="space-y-1 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-2 text-[11px]"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-1.5 font-semibold text-text">
+                              {action.subagentColor && (
+                                <span
+                                  className="inline-block h-2.5 w-2.5 rounded-full"
+                                  style={{ backgroundColor: action.subagentColor }}
+                                />
+                              )}
+                              <span>Отчёт субагента · {action.subagentName || action.label}</span>
+                              {action.tier !== undefined && (
+                                <span className="rounded bg-card px-1.5 py-0.5 text-[10px] text-cyan-300">
+                                  ур.{action.tier}
+                                </span>
+                              )}
+                            </div>
+                            {isTabs && (
+                              <button
+                                type="button"
+                                onClick={() => setActiveTab("subagents")}
+                                className="text-[10px] font-medium text-accent2 hover:underline"
+                              >
+                                Открыть субагентов
+                              </button>
+                            )}
+                          </div>
+                          {(action.reportSummary || action.summary) && (
+                            <p className="text-[10px] text-muted">{action.reportSummary || action.summary}</p>
+                          )}
+                        </div>
+                      );
+                    }
                     const fallbackPreview =
                       action.previewUrl ||
                       (action.type === "sandbox_update" || action.type === "project_created"
@@ -5405,20 +6040,30 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                     "rounded border px-1.5 py-0.5 text-[10px] font-semibold",
                     liveStatusActor === "browser_inspector"
                       ? "border-cyan-500/40 bg-cyan-500/15 text-cyan-300"
-                      : liveStatusActor === "tester" || liveStatusActor === "tester_llm" || liveStatusActor === "tester_tool"
-                        ? "border-violet-500/40 bg-violet-500/15 text-violet-300"
-                        : liveStatusActor === "approval"
-                          ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
-                          : "border-border bg-card2 text-text",
+                      : liveStatusActor === "overseer"
+                        ? "border-rose-500/45 bg-rose-500/15 text-rose-300"
+                        : liveStatusActor === "subagent" || liveStatusActor === "subagent_llm"
+                          ? "border-cyan-500/45 bg-cyan-500/15 text-cyan-200"
+                          : liveStatusActor === "tester" || liveStatusActor === "tester_llm" || liveStatusActor === "tester_tool"
+                            ? "border-violet-500/40 bg-violet-500/15 text-violet-300"
+                            : liveStatusActor === "approval"
+                              ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
+                              : "border-border bg-card2 text-text",
                   )}
                 >
                   {liveStatusActor === "browser_inspector"
                     ? "BrowserInspector"
-                    : liveStatusActor === "tester" || liveStatusActor === "tester_llm" || liveStatusActor === "tester_tool"
-                      ? "Тестировщик"
-                      : liveStatusActor === "approval"
-                        ? "Ожидает подтверждения"
-                        : "Агент"}
+                    : liveStatusActor === "overseer"
+                      ? "Надсмотрщик"
+                      : liveStatusActor === "subagent" || liveStatusActor === "subagent_llm"
+                        ? activeLiveActor?.kind === "subagent"
+                          ? `Субагент · ${activeLiveActor.name}`
+                          : "Субагент"
+                        : liveStatusActor === "tester" || liveStatusActor === "tester_llm" || liveStatusActor === "tester_tool"
+                          ? "Тестировщик"
+                          : liveStatusActor === "approval"
+                            ? "Ожидает подтверждения"
+                            : "Оркестратор"}
                 </span>
               )}
               <span>{status}</span>
@@ -5537,19 +6182,29 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       {pendingApproval && (
         <ApprovalToast
           kind={pendingApproval.kind}
-          tone={pendingApproval.kind === "capture_screen" ? "cyan" : "amber"}
-          badgeLabel={
+          tone={
             pendingApproval.kind === "capture_screen"
-              ? "Запрос снимка экрана"
-              : pendingApproval.kind === "browser_inspect"
-                ? "Осмотр внешнего сайта"
-                : pendingApproval.kind === "call_operator"
-                  ? "Запуск Оператора"
-                  : pendingApproval.kind === "tester_minor_fixes"
-                    ? "Тестировщик · мелкие замечания"
-                    : pendingApproval.kind.startsWith("github_")
-                      ? `GitHub · @${pendingApproval.github?.login || ghAccount?.login || "аккаунт"}`
-                      : "Запрос разрешения"
+              ? "cyan"
+              : pendingApproval.kind === "overseer_approval" || Boolean(pendingApproval.overseer)
+                ? "rose"
+                : "amber"
+          }
+          badgeLabel={
+            pendingApproval.kind === "overseer_approval"
+              ? `Надсмотрщик · риск: ${pendingApproval.overseer?.riskLevel || "высокий"}`
+              : pendingApproval.overseer
+                ? `Надсмотрщик + ${pendingApproval.kind === "call_operator" ? "Оператор" : pendingApproval.kind.startsWith("github_") ? "GitHub" : "Разрешение"}`
+                : pendingApproval.kind === "capture_screen"
+                  ? "Запрос снимка экрана"
+                  : pendingApproval.kind === "browser_inspect"
+                    ? "Осмотр внешнего сайта"
+                    : pendingApproval.kind === "call_operator"
+                      ? "Запуск Оператора"
+                      : pendingApproval.kind === "tester_minor_fixes"
+                        ? "Тестировщик · мелкие замечания"
+                        : pendingApproval.kind.startsWith("github_")
+                          ? `GitHub · @${pendingApproval.github?.login || ghAccount?.login || "аккаунт"}`
+                          : "Запрос разрешения"
           }
           title={pendingApproval.title}
           description={pendingApproval.description}
@@ -5643,6 +6298,31 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             )
           }
         >
+          {pendingApproval.overseer && (
+            <div className="space-y-1 rounded-lg border border-rose-500/35 bg-rose-500/10 p-2 text-[10px]">
+              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                <span className="flex items-center gap-1 font-semibold text-rose-200">
+                  <ShieldAlert size={11} className="text-rose-400" />
+                  Надсмотрщик: {pendingApproval.overseer.title || pendingApproval.overseer.tool}
+                </span>
+                <span className="rounded bg-card px-1.5 py-0.5 text-[10px] text-rose-300">
+                  риск: {pendingApproval.overseer.riskLevel}
+                  {pendingApproval.overseer.requestedBy ? ` · от: ${pendingApproval.overseer.requestedBy}` : ""}
+                </span>
+              </div>
+              {pendingApproval.overseer.reason && (
+                <p className="text-text">{pendingApproval.overseer.reason}</p>
+              )}
+              {pendingApproval.overseer.recommendation && (
+                <p className="text-muted">Рекомендация: {pendingApproval.overseer.recommendation}</p>
+              )}
+              {pendingApproval.overseer.targetPreview && (
+                <p className="truncate font-mono text-[10px] text-rose-200/90">
+                  Цель: {pendingApproval.overseer.targetPreview}
+                </p>
+              )}
+            </div>
+          )}
           {pendingApproval.command && (
             <pre className="max-h-28 overflow-auto rounded-lg bg-card2 px-2 py-1.5 font-mono text-[11px] text-text">
               {pendingApproval.command}

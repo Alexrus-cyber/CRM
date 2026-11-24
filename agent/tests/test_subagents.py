@@ -183,5 +183,168 @@ class SubagentOrchestratorTests(unittest.TestCase):
         self.assertEqual(agent_mod.resolve_steps_limit(25, False), 25)
 
 
+class SubagentLayeredRoutingTests(unittest.TestCase):
+    def _layered_tree(self):
+        return [
+            {
+                "id": 1,
+                "slug": "arch",
+                "name": "Архитектор",
+                "roleTitle": "Верхний уровень",
+                "parentSubagentId": None,
+                "orchestratorCanCall": True,
+                "allowedCallees": ["*"],
+            },
+            {
+                "id": 2,
+                "slug": "backend",
+                "name": "Бэкенд",
+                "roleTitle": "Средний слой",
+                "parentSubagentId": 1,
+                "orchestratorCanCall": False,
+                "allowedCallees": ["*"],
+            },
+            {
+                "id": 3,
+                "slug": "frontend",
+                "name": "Фронтенд",
+                "roleTitle": "Слой UI",
+                "parentSubagentId": 2,
+                "orchestratorCanCall": False,
+                "allowedCallees": ["*"],
+            },
+            {
+                "id": 4,
+                "slug": "css-leaf",
+                "name": "Стили",
+                "roleTitle": "Нижний слой",
+                "parentSubagentId": 3,
+                "orchestratorCanCall": False,
+                "allowedCallees": [],
+            },
+        ]
+
+    def test_hierarchy_and_prompt_in_layered_mode(self):
+        subs = self._layered_tree()
+        hier = agent_mod._compute_subagent_hierarchy(subs)
+        self.assertEqual(agent_mod._subagent_tier(hier, subs[0]), 1)
+        self.assertEqual(agent_mod._subagent_tier(hier, subs[1]), 2)
+        self.assertEqual(agent_mod._subagent_tier(hier, subs[2]), 3)
+        self.assertEqual(agent_mod._subagent_tier(hier, subs[3]), 4)
+
+        prompt = agent_mod.build_orchestrator_subagents_prompt(subs, [], routing_mode="layered")
+        self.assertIn("ПО УРОВНЯМ", prompt)
+        self.assertIn("Уровень 1", prompt)
+        self.assertIn("Уровень 4", prompt)
+        self.assertIn("escalate_to_upper_tier", prompt)
+
+        leaf_sys = agent_mod._build_subagent_system_prompt(
+            subagent=subs[3],
+            all_subagents=subs,
+            trust_level="verified",
+            sandbox_root=agent_mod.SANDBOX_ROOT,
+            sandbox_project="demo",
+            routing_mode="layered",
+            hierarchy=hier,
+        )
+        self.assertIn("Уровень дерева: 4", leaf_sys)
+        self.assertIn("escalate_to_upper_tier", leaf_sys)
+        self.assertIn("`arch`", leaf_sys)
+
+    def test_layered_escalation_blocked_in_linear_mode(self):
+        subs = self._layered_tree()
+        res = agent_mod.run_layered_escalation(
+            caller_subagent=subs[3],
+            target_ref="1",
+            mode="advice",
+            summary="Проблема со схемой",
+            request="Нужен совет",
+            subagent_ctx={"routing_mode": "linear", "subagents": subs},
+        )
+        self.assertIn("По уровням", res["agentText"])
+
+    def test_layered_escalation_advice_calls_only_upper_tier(self):
+        subs = self._layered_tree()
+        called_models = []
+        emitted = []
+
+        def _fake_model(base_url, api_key, model, messages, *args, **kwargs):
+            sys_txt = messages[0]["content"]
+            called_models.append(sys_txt)
+            return {
+                "choices": [{"message": {"content": "Совет от Уровня 1 готов.", "tool_calls": []}}],
+                "usage": {"total_tokens": 15},
+            }
+
+        real = agent_mod.call_model
+        agent_mod.call_model = _fake_model
+        try:
+            res = agent_mod.run_layered_escalation(
+                caller_subagent=subs[3],
+                target_ref="1",
+                mode="advice",
+                summary="Нужна рекомендация по API",
+                request="Как лучше разбить эндпоинты?",
+                subagent_ctx={
+                    "routing_mode": "layered",
+                    "subagents": subs,
+                    "base_url": "http://orch.local/v1",
+                    "api_key": "k",
+                    "model": "m",
+                    "emit_sse": lambda ev, d: emitted.append((ev, d)),
+                },
+            )
+        finally:
+            agent_mod.call_model = real
+
+        self.assertEqual(len(called_models), 1)
+        self.assertIn("Архитектор", called_models[0])
+        self.assertIn("Уровень 1", res["agentText"])
+        self.assertTrue(any(ev == "subagent_start" for ev, _ in emitted))
+
+    def test_layered_escalation_fix_and_cascade_runs_intermediate_tiers(self):
+        subs = self._layered_tree()
+        visited_slugs = []
+
+        def _fake_session(**kwargs):
+            tref = kwargs["target_ref"]
+            visited_slugs.append(tref)
+            return {
+                "agentText": f"Исправлено в {tref}",
+                "agentEvents": [],
+                "done": {
+                    "outputSummary": f"Обновлено {tref}",
+                    "filesTouched": ["api.ts"],
+                },
+                "report": {
+                    "summary": f"Обновлено {tref}",
+                    "cascadeDownstream": True if tref == "arch" else False,
+                },
+            }
+
+        real_session = agent_mod.run_subagent_session
+        agent_mod.run_subagent_session = _fake_session
+        try:
+            res = agent_mod.run_layered_escalation(
+                caller_subagent=subs[3],  # css-leaf (tier 4)
+                target_ref="1",           # arch (tier 1)
+                mode="fix_and_cascade",
+                summary="Контракт изменился",
+                request="Нужно обновить схему и прокинуть вниз",
+                cascade_down=True,
+                subagent_ctx={
+                    "routing_mode": "layered",
+                    "subagents": subs,
+                },
+            )
+        finally:
+            agent_mod.run_subagent_session = real_session
+
+        # Ожидаем последовательный вызов: Уровень 1 (arch) -> Уровень 2 (backend) -> Уровень 3 (frontend)
+        self.assertEqual(visited_slugs, ["arch", "backend", "frontend"])
+        self.assertIn("backend", res["agentText"])
+        self.assertIn("frontend", res["agentText"])
+
+
 if __name__ == "__main__":
     unittest.main()
