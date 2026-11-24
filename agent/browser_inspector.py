@@ -2508,12 +2508,18 @@ class BrowserSession:
 
 
 class BrowserSessionManager:
-    """Держит активные вкладки в рамках одного запуска Агента и гарантированно закрывает их."""
+    """Держит не более одного активного headless-браузера (при новой сессии убивает старую) и закрывает все при выходе."""
 
-    MAX_SESSIONS = 4
+    MAX_SESSIONS = 1
 
-    def __init__(self, sandbox_root: Path = sandbox_mod.get_sandbox_root()) -> None:
+    def __init__(
+        self,
+        sandbox_root: Path = sandbox_mod.get_sandbox_root(),
+        *,
+        max_sessions: Optional[int] = None,
+    ) -> None:
         self.sandbox_root = sandbox_root
+        self._max_sessions = max(1, int(max_sessions if max_sessions is not None else self.MAX_SESSIONS))
         self._lock = threading.Lock()
         self._sessions: Dict[str, BrowserSession] = {}
         self._last_used: Dict[str, float] = {}
@@ -2524,6 +2530,7 @@ class BrowserSessionManager:
         width: int,
         height: int,
         *,
+        restart: bool = False,
         on_status: Optional[Any] = None,
         cancel_check: Optional[Any] = None,
         trace: Optional[List[str]] = None,
@@ -2537,7 +2544,7 @@ class BrowserSessionManager:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is not None:
-                if session.is_alive():
+                if not restart and session.is_alive():
                     self._last_used[session_id] = now
                     _emit_step(
                         on_status,
@@ -2549,15 +2556,15 @@ class BrowserSessionManager:
                 stale = self._sessions.pop(session_id, None)
                 self._last_used.pop(session_id, None)
                 preserved_origins = set(session.approved_external_origins)
-            # Ограничиваем число одновременных процессов браузера: сначала вычищаем мёртвые, затем старейшую.
+            # Ограничиваем число одновременных процессов браузера: сначала вычищаем мёртвые, затем вытесняем старые.
             dead_ids = [sid for sid, sess in self._sessions.items() if not sess.is_alive()]
             for sid in dead_ids:
                 dead_sess = self._sessions.pop(sid, None)
                 self._last_used.pop(sid, None)
                 if dead_sess is not None:
                     evicted.append((sid, dead_sess))
-            while len(self._sessions) >= self.MAX_SESSIONS:
-                # По возможности не закрываем основную сессию "default" раньше вспомогательных.
+            while len(self._sessions) >= self._max_sessions:
+                # Если лимит > 1, стараемся не закрывать основную сессию "default" раньше вспомогательных.
                 candidates = [sid for sid in self._sessions if sid != "default"] or list(self._sessions)
                 oldest_id = min(candidates, key=lambda sid: self._last_used.get(sid, 0.0))
                 old_sess = self._sessions.pop(oldest_id, None)
@@ -2565,7 +2572,14 @@ class BrowserSessionManager:
                 if old_sess is not None:
                     evicted.append((oldest_id, old_sess))
         if stale is not None:
-            _emit_step(on_status, f"Предыдущая сессия «{session_id}» завершилась — перезапускаю…", trace=trace, started_at=started_at)
+            _emit_step(
+                on_status,
+                f"Закрываю предыдущую сессию «{session_id}» перед перезапуском…"
+                if restart
+                else f"Предыдущая сессия «{session_id}» завершилась — перезапускаю…",
+                trace=trace,
+                started_at=started_at,
+            )
             stale.close()
         for old_sid, old_sess in evicted:
             _emit_step(on_status, f"Закрываю вытесненную браузерную сессию «{old_sid}»…", trace=trace, started_at=started_at)
@@ -2918,6 +2932,8 @@ def execute_browse_action(
             gm_varkw = False
 
         gm_kw: Dict[str, Any] = {}
+        if raw_action == "open" and bool(args.get("restart")) and (gm_varkw or "restart" in gm_params):
+            gm_kw["restart"] = True
         if gm_varkw or "on_status" in gm_params:
             gm_kw["on_status"] = forward_child_status
         if cancel_check is not None and (gm_varkw or "cancel_check" in gm_params):
@@ -2935,6 +2951,11 @@ def execute_browse_action(
 
         sandbox_note = ""
         if sandbox_project and not target_url:
+            # Закрываем лишние статические серверы других проектов, чтобы они не плодились в памяти.
+            for other_proj in [k for k in list(session.static_servers.keys()) if k != sandbox_project]:
+                old_srv = session.static_servers.pop(other_proj, None)
+                if old_srv is not None:
+                    old_srv.close()
             srv = session.static_servers.get(sandbox_project)
             if srv is None:
                 emit_status(f"Поднимаю локальный HTTP-сервер для Sandbox «{sandbox_project}»…")

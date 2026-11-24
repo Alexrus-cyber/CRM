@@ -700,6 +700,32 @@ def _terminate_pid_tree(pid: int) -> None:
         pass
 
 
+def _extract_command_ports(command: str) -> set[int]:
+    ports: set[int] = set()
+    text = str(command or "")
+    for m in re.finditer(
+        r"(?:http\.server\s+|--port[=\s]+|-p\s+|PORT=|:)(\d{2,5})\b",
+        text,
+    ):
+        try:
+            p = int(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= p <= 65535:
+            ports.add(p)
+    return ports
+
+
+def _cwd_overlaps(a: str, b: str) -> bool:
+    na = (a or ".").strip("/\\") or "."
+    nb = (b or ".").strip("/\\") or "."
+    if na == "." or nb == ".":
+        return False
+    if na == nb:
+        return True
+    return na.startswith(nb + "/") or nb.startswith(na + "/")
+
+
 class ProcessManager:
     """Управляет фоновыми процессами (локальными серверами проектов) внутри Sandbox."""
 
@@ -813,6 +839,41 @@ class ProcessManager:
         self._terminate_proc(info["proc"])
         return True
 
+    def stop_matching(
+        self,
+        *,
+        rel_cwd: Optional[str] = None,
+        ports: Optional[set[int]] = None,
+        owner: Optional[str] = None,
+        command: str = "",
+    ) -> int:
+        """Останавливает предыдущие фоновые процессы этого же проекта/порта перед перезапуском."""
+        norm_cwd = (rel_cwd or ".").strip("/\\") or "."
+        target_ports = set(ports or ())
+        cmd_norm = " ".join(str(command or "").strip().split()).lower()
+        entries: List[Dict[str, Any]] = []
+        with self._lock:
+            self._prune_dead_locked()
+            for pid, info in list(self._procs.items()):
+                info_cwd = str(info.get("cwd") or ".").strip("/\\") or "."
+                info_ports = set(_extract_command_ports(info.get("command") or ""))
+                info_url_port = extract_port_from_url(str(info.get("url") or ""))
+                if info_url_port is not None:
+                    info_ports.add(info_url_port)
+                info_cmd_norm = " ".join(str(info.get("command") or "").strip().split()).lower()
+                same_project = _cwd_overlaps(info_cwd, norm_cwd)
+                same_port = bool(target_ports and (info_ports & target_ports))
+                same_cmd = bool(cmd_norm and info_cmd_norm == cmd_norm)
+                same_owner_in_cwd = bool(owner and info.get("owner") == owner and same_project)
+                if same_project or same_port or same_cmd or same_owner_in_cwd:
+                    entries.append(info)
+                    self._procs.pop(pid, None)
+            if entries:
+                self._sync_registry_locked()
+        for info in entries:
+            self._terminate_proc(info["proc"])
+        return len(entries)
+
     def stop_all(self, *, owner: Optional[str] = None) -> None:
         with self._lock:
             if owner is None:
@@ -826,13 +887,32 @@ class ProcessManager:
         for info in entries:
             self._terminate_proc(info["proc"])
 
-    def start(self, root: Path, command: str, rel_cwd: str = ".", *, owner: str = "agent") -> Dict[str, Any]:
+    def start(
+        self,
+        root: Path,
+        command: str,
+        rel_cwd: str = ".",
+        *,
+        owner: str = "agent",
+        replace_existing: bool = True,
+    ) -> Dict[str, Any]:
         issue = inspect_command_escape(command, root, rel_cwd)
         if issue:
             raise SandboxError(issue)
         cwd = safe_resolve(root, rel_cwd, allow_root=True)
         cwd.mkdir(parents=True, exist_ok=True)
         self.cleanup_orphans(root)
+
+        norm_cwd = relative_to_root(root, cwd) if cwd != root.resolve(strict=False) else "."
+        cmd_ports = _extract_command_ports(command)
+        replaced_count = 0
+        if replace_existing:
+            replaced_count = self.stop_matching(
+                rel_cwd=norm_cwd,
+                ports=cmd_ports,
+                owner=owner,
+                command=command,
+            )
 
         with self._lock:
             self._prune_dead_locked()
@@ -896,9 +976,10 @@ class ProcessManager:
             return {
                 "background": False,
                 "exitCode": proc.returncode,
-                "cwd": relative_to_root(root, cwd) if cwd != root.resolve(strict=False) else ".",
+                "cwd": norm_cwd,
                 "output": output or f"Процесс завершился с кодом {proc.returncode}",
                 "url": url,
+                "replacedCount": replaced_count,
             }
 
         reg_path = root.resolve(strict=False) / ".tmp" / ".crm_agent_procs.json"
@@ -908,7 +989,7 @@ class ProcessManager:
             "owner": str(owner or "agent")[:120],
             "registry": reg_path,
             "command": command[:300],
-            "cwd": relative_to_root(root, cwd) if cwd != root.resolve(strict=False) else ".",
+            "cwd": norm_cwd,
             "url": url,
             "lines": lines,
             "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -924,6 +1005,7 @@ class ProcessManager:
             "cwd": entry["cwd"],
             "output": output or f"Фоновый процесс запущен (PID {proc.pid})",
             "url": url,
+            "replacedCount": replaced_count,
         }
 
     def list(self) -> List[Dict[str, Any]]:
@@ -992,11 +1074,12 @@ def run_command(
     unlimited: bool = False,
     raise_on_timeout: bool = True,
     owner: str = "agent",
+    replace_existing: bool = True,
 ) -> Dict[str, Any]:
     """Выполнить bash/shell-команду строго внутри песочницы `root`."""
     if background:
         mgr = process_manager or ProcessManager()
-        return mgr.start(root, command, rel_cwd, owner=owner)
+        return mgr.start(root, command, rel_cwd, owner=owner, replace_existing=replace_existing)
 
     issue = inspect_command_escape(command, root, rel_cwd)
     if issue:

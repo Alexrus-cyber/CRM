@@ -478,11 +478,15 @@ SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CR
      горизонтальное переполнение, застрявшие `opacity: 0` блоки и живые анимации
      (`document.getAnimations()`, CSS transition/animation, замер кадров до и после ожидания
      через `inspect_animations`);
+   - ВАЖНО: `browse_project` / `qa_browser_audit` доступны ТОЛЬКО тебе (Оркестратору) и Тестировщику!
+     Субагентам вызов браузерного инспектора ЗАПРЕЩЁН ради экономии токенов и ресурсов CPU.
    - когда пользователь просит «зайди на проект и посмотри, что не так, какие анимации не работают,
      почему не нажимается кнопка / ломается вёрстка» — используй `browse_project` интерактивно шаг за шагом;
    - как только получил нужные результаты осмотра и дальнейшие действия в браузере не требуются, не делай
      лишних повторных проверок: закрой вкладку (`browse_project(action="close")` или `close_after=true` на
      последнем шаге) и сразу переходи к итоговому ответу пользователю.
+   - При повторном запуске сервера через `run_command(background=true)` старый фоновый процесс того же
+     проекта/порта автоматически завершается перед новым стартом — не плоди параллельные серверы и браузеры.
 7. Совместная работа с Настольным Оператором экрана:
    - formulate_operator_task — превратить просьбу пользователя (работа в программах, на экране,
      или управление персонажем в игре) в чёткое пошаговое задание для Оператора с подходящим
@@ -527,9 +531,13 @@ SYSTEM_PROMPT = """Ты — умный ИИ-агент внутри CRM (Nova CR
      или специализированные задачи между ними согласно дереву зависимостей!
    - Каждый вызов `call_subagent(subagent=..., summary=..., task=..., sandbox_project=...)` запускает
      субагента в ЕГО СОБСТВЕННОМ НОВОМ ЧАТЕ (чтобы не тянуть длинную историю и тратить минимум токенов
-     на контекст и раздумья), при этом субагенту открыт общий доступ к проекту в Sandbox/GitHub и ко всем Tools!
+     на контекст и раздумья), при этом субагенту открыт общий доступ к проекту в Sandbox/GitHub, но
+     **ЗАПРЕЩЁН `browser_inspector` (`browse_project`, `qa_browser_audit`) и открытие браузера**!
+   - **СТРОГИЙ ПОРЯДОК ИСПРАВЛЕНИЙ**: после сборки/изменения кода или при запросе исправить ошибки ты
+     ОБЯЗАН сначала вызвать Тестировщика (`call_tester`), дождаться его отчёта, и **ТОЛЬКО ПОСЛЕ того,
+     как Тестировщик выдаст свой отчёт**, передавать задачи на исправление другим субагентам!
    - При каждом вызове субагента ОБЯЗАТЕЛЬНО формируй подробное `summary` (что уже сделано, какие файлы
-     проекта созданы/изменены, что нужно сделать дальше).
+     проекта созданы/изменены, что найдено в отчёте Тестировщика, что нужно сделать дальше).
    - Если субагент по завершении работы передаёт запрос Оркестратору вызвать следующего субагента
      (по дереву зависимостей), изучи его `summary` и вызови нужного субагента через `call_subagent`.
 
@@ -598,11 +606,16 @@ TESTER_SYSTEM_PROMPT = """Ты — независимый QA-инженер (п�
 """
 
 SUBAGENT_BASE_SYSTEM_PROMPT = """Ты — специализированный пользовательский Субагент внутри CRM (Nova CRM), работающий под управлением Главного Агента — Оркестратора.
-Ты запущен в СВОЁМ НОВОМ ИЗОЛИРОВАННОМ ЧАТЕ, чтобы тратить минимум токенов на контекст и раздумья, при этом у тебя есть полный доступ к общему проекту в Sandbox/GitHub от главного Агента и ко ВСЕМ инструментам (Tools): Sandbox, анализ и редактирование кода, команды/тесты, браузерный инспектор, QA-проверки, файлы, GitHub и Оператор.
+Ты запущен в СВОЁМ НОВОМ ИЗОЛИРОВАННОМ ЧАТЕ, чтобы тратить минимум токенов на контекст и раздумья, при этом у тебя есть общий доступ к проекту в Sandbox/GitHub от главного Агента и к инструментам кода, файлов, команд/тестов, статики/HTTP-аудита и GitHub.
+
+ВАЖНЫЕ ОГРАНИЧЕНИЯ СУБАГЕНТА:
+- Тебе ЗАПРЕЩЕНЫ `browser_inspector` (`browse_project`, `qa_browser_audit`), `open_website`, `play_youtube` и запуск любых браузеров через команды — это экономит токены и защищает CPU. Проверять проект в браузере могут ТОЛЬКО Тестировщик и Оркестратор.
+- Приступать к исправлениям по итогам проверки разрешено ТОЛЬКО ПОСЛЕ того, как Тестировщик выдаст свой отчёт (`list_tester_reports` или summary от Оркестратора). Если отчёт Тестировщика ещё не получен и требуется проверка/починка после проверки — верни `report_to_orchestrator(status='blocked', ...)` с просьбой сначала запустить Тестировщика.
+- Не плоди фоновые серверы: повторный запуск проекта через `run_command(background=true)` автоматически завершает старый процесс этого проекта и запускает новый.
 
 Правила работы Субагента:
 1. Действуй строго в рамках переданной подзадачи и своего системного промпта. Общайся по-русски, чётко и по делу.
-2. Опирайся на входное `summary` от Оркестратора (или предыдущего субагента) и работай непосредственно с общими файлами проекта в Sandbox (`sandbox_list`, `sandbox_read_file`, `sandbox_write_file`, `code_search`, `run_command` и др.).
+2. Опирайся на входное `summary` от Оркестратора (или отчёт Тестировщика) и работай непосредственно с общими файлами проекта в Sandbox (`sandbox_list`, `sandbox_read_file`, `sandbox_write_file`, `code_search`, `run_command` и др.).
 3. Если по ходу работы требуется подключить другого субагента из дерева зависимостей — вызови `request_subagent(target_subagent=..., summary=..., next_task=..., sandbox_project=...)`, обязательно сформировав подробное `summary` своих действий и того, что нужно сделать дальше.
 4. В режиме маршрутизации «По уровням» (`layered`), если ты работаешь на глубоком уровне (например, 4-м) и столкнулся с проблемой контракта/архитектуры или нужна помощь/исправление от верхних уровней (1, 2, 3), используй `escalate_to_upper_tier(target=..., mode=..., summary=..., request=...)` — можно получить совет (`advice`), прямую помощь (`direct_help`) или исправление с каскадом по промежуточным уровням (`fix_and_cascade`).
 5. По завершении своей подзадачи вызови `report_to_orchestrator(summary=..., status=..., files_touched=..., request_next_subagent=..., next_task=...)`, чтобы Оркестратор получил точное `summary` выполненных действий, список затронутых файлов и понимал следующие шаги.
@@ -923,6 +936,10 @@ BROWSER_TOOLS = [
                         "type": "boolean",
                         "description": "Закрыть браузерную сессию сразу после завершения этого шага",
                     },
+                    "restart": {
+                        "type": "boolean",
+                        "description": "При action='open': принудительно закрыть старую сессию браузера и запустить новую",
+                    },
                 },
                 "required": ["action"],
             },
@@ -1089,8 +1106,9 @@ SUBAGENT_ORCHESTRATION_TOOLS: List[Dict[str, Any]] = [
             "description": (
                 "Вызвать активного пользовательского субагента из дерева зависимостей Оркестратора. "
                 "Субагент запускается в собственном НОВОМ изолированном чате (экономия токенов на раздумья и контекст), "
-                "получает полный доступ ко всем Tools и общему проекту в Sandbox/GitHub, выполняет подзадачу "
-                "и возвращает структурированное summary обратно Оркестратору."
+                "работает с общим проектом в Sandbox/GitHub (БЕЗ browser_inspector и открытия браузера — браузер доступен "
+                "только Тестировщику и Оркестратору) и возвращает структурированное summary обратно Оркестратору. "
+                "Исправления субагентами по проекту разрешены ТОЛЬКО ПОСЛЕ получения отчёта Тестировщика (`call_tester`)."
             ),
             "parameters": {
                 "type": "object",
@@ -1417,34 +1435,43 @@ def tools_for_trust(
             if (routing_mode == "layered" and subagent_tier > 1)
             else []
         )
-        # Все Tools доступны субагенту (с учётом уровня доверия) + инструменты вызова через Оркестратора и сдачи summary.
+        # Субагентам запрещены browser_inspector (`browse_project`, `qa_browser_audit`),
+        # открытие браузера (`open_website`, `play_youtube`) и прямой запуск Тестировщика (`call_tester`):
+        # экономия токенов и ресурсов CPU. Оставляем только чтение отчётов Тестировщика (`list_tester_reports`).
+        sub_base_tools = [
+            t
+            for t in BASE_TOOLS
+            if t["function"]["name"] not in ("open_website", "play_youtube")
+        ]
+        sub_qa_tools = [
+            t
+            for t in qa_tools.QA_TOOLS
+            if t["function"]["name"] not in ("qa_browser_audit", "qa_submit_report")
+        ]
+        sub_tester_reports_only = [
+            t
+            for t in TESTER_ORCHESTRATION_TOOLS
+            if t["function"]["name"] == "list_tester_reports"
+        ]
         if trust_level == "none":
-            submit_only = [t for t in qa_tools.QA_TOOLS if t["function"]["name"] == "qa_submit_report"]
-            safe_orch = [
-                t
-                for t in TESTER_ORCHESTRATION_TOOLS
-                if t["function"]["name"] in ("confirm_minor_fixes", "list_tester_reports")
-            ]
             return _dedupe_tools(
-                list(BASE_TOOLS)
+                sub_base_tools
                 + gh_read
                 + code_read
-                + submit_only
-                + safe_orch
+                + sub_tester_reports_only
                 + list(SUBAGENT_HANDOFF_TOOLS)
                 + layered_extra
             )
         return _dedupe_tools(
-            list(BASE_TOOLS)
+            sub_base_tools
             + list(SANDBOX_TOOLS)
-            + list(BROWSER_TOOLS)
             + list(OPERATOR_TOOLS)
             + gh_read
             + gh_write
             + code_read
             + code_exec
-            + list(qa_tools.QA_TOOLS)
-            + list(TESTER_ORCHESTRATION_TOOLS)
+            + sub_qa_tools
+            + sub_tester_reports_only
             + list(SUBAGENT_HANDOFF_TOOLS)
             + layered_extra
         )
@@ -1515,6 +1542,49 @@ def http_url(raw: str) -> str:
     return url
 
 
+_SUBAGENT_FORBIDDEN_TOOLS = frozenset(
+    {
+        "browse_project",
+        "qa_browser_audit",
+        "open_website",
+        "play_youtube",
+        "call_tester",
+        "confirm_minor_fixes",
+    }
+)
+
+_SUBAGENT_BROWSER_SPAWN_RE = re.compile(
+    r"(?:^|[\s;|&`('\"])(?:"
+    r"google-chrome|chromium(?:-browser)?|firefox|microsoft-edge|msedge|safari|"
+    r"xdg-open|sensible-browser|x-www-browser|playwright|puppeteer|"
+    r"start\s+https?://|open\s+https?://"
+    r")(?:[\s;|&`'\"]|$)"
+    r"|--remote-debugging-port\b|--headless\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_project_key(raw: Any) -> str:
+    txt = str(raw or ".").strip().strip("/\\")
+    return txt or "."
+
+
+def _record_written_project(subagent_ctx: Optional[Dict[str, Any]], project_or_path: Any) -> None:
+    if not isinstance(subagent_ctx, dict):
+        return
+    written = subagent_ctx.get("written_projects")
+    if not isinstance(written, set):
+        written = set()
+        subagent_ctx["written_projects"] = written
+    raw = str(project_or_path or ".").strip().strip("/\\")
+    if not raw or raw == ".":
+        written.add(".")
+        return
+    top = raw.split("/")[0].split("\\")[0].strip() or "."
+    written.add(top)
+    written.add(raw)
+
+
 def run_tool(
     name: str,
     args: Dict[str, Any],
@@ -1539,6 +1609,28 @@ def run_tool(
     args = args or {}
     events: List[Dict[str, Any]] = []
     trust = normalize_trust(trust_level)
+
+    caller_kind_raw = str((caller_info or {}).get("agentKind") or "").strip().lower()
+    is_subagent_caller = bool(caller_kind_raw == "subagent" or subagent_state is not None)
+    is_tester_caller = bool(
+        not is_subagent_caller
+        and (caller_kind_raw == "tester" or (isinstance(qa_state, dict) and bool(qa_state.get("runKey"))))
+    )
+
+    if is_subagent_caller and name in _SUBAGENT_FORBIDDEN_TOOLS:
+        raise AgentError(
+            f"Инструмент `{name}` запрещён для субагентов ради экономии токенов и ресурсов CPU. "
+            "Браузерный инспектор (`browse_project`, `qa_browser_audit`) и открытие браузера могут вызывать "
+            "ТОЛЬКО Тестировщик (`call_tester`) и Главный Агент — Оркестратор. "
+            "Верни `report_to_orchestrator`, чтобы Оркестратор при необходимости вызвал Тестировщика."
+        )
+    if is_subagent_caller and name == "run_command":
+        sub_cmd = str(args.get("command") or "").strip()
+        if sub_cmd and _SUBAGENT_BROWSER_SPAWN_RE.search(sub_cmd):
+            raise AgentError(
+                "Субагенту запрещено запускать браузеры или headless-движки через командную строку. "
+                "Проверку сайта в браузере выполняют только Тестировщик и Оркестратор."
+            )
 
     _ORCH_BOOKKEEPING_TOOLS = {
         "call_subagent",
@@ -2195,6 +2287,7 @@ def run_tool(
             )
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
+        _record_written_project(subagent_ctx, res["path"])
         events.append({"type": "sandbox_update", "path": res["path"], "size": res["size"], "kind": "file"})
         return f"Файл записан в Sandbox: {res['path']} ({res['size']} байт)", events
 
@@ -2230,6 +2323,7 @@ def run_tool(
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
 
+        _record_written_project(subagent_ctx, project)
         preview_url = f"/api/ai/agent/sandbox/preview/{urllib.parse.quote(project, safe='/')}"
         events.append(
             {
@@ -2312,6 +2406,14 @@ def run_tool(
                     events,
                 )
 
+        cmd_owner = "agent"
+        if is_subagent_caller:
+            sub_meta_obj = (subagent_state or {}).get("subagent") if isinstance(subagent_state, dict) else {}
+            sub_slug_own = str((sub_meta_obj or {}).get("slug") or "subagent").strip()
+            cmd_owner = f"subagent:{sub_slug_own}"
+        elif is_tester_caller:
+            cmd_owner = f"tester:{str((qa_state or {}).get('runKey') or 'qa')}"
+
         try:
             res = sandbox_mod.run_command(
                 sandbox_root,
@@ -2321,6 +2423,8 @@ def run_tool(
                 background=background,
                 process_manager=PROCESS_MANAGER,
                 unlimited=unlimited,
+                owner=cmd_owner,
+                replace_existing=True,
             )
         except sandbox_mod.SandboxError as error:
             raise AgentError(str(error)) from error
@@ -2329,6 +2433,7 @@ def run_tool(
         local_url = str(res.get("url") or "")
         detected_port = sandbox_mod.extract_port_from_url(local_url)
         proxy_url = f"/api/ai/agent/sandbox/proxy/{detected_port}" if detected_port else ""
+        replaced_count = int(res.get("replacedCount") or 0)
         events.append(
             {
                 "type": "command_result",
@@ -2337,13 +2442,15 @@ def run_tool(
                 "background": bool(res.get("background")),
                 "pid": res.get("pid"),
                 "port": detected_port,
+                "replacedCount": replaced_count,
                 "exitCode": res.get("exitCode"),
                 "output": raw_out if unlimited else raw_out[:4000],
                 "url": local_url,
                 "previewUrl": proxy_url,
             }
         )
-        if local_url:
+        # Субагенты и тестировщик не должны открывать новые вкладки браузера у пользователя.
+        if local_url and not is_subagent_caller and not is_tester_caller:
             events.append(
                 {
                     "type": "open_url",
@@ -2354,8 +2461,14 @@ def run_tool(
                 }
             )
         if res.get("background"):
+            replaced_note = (
+                f" (предыдущих фоновых процессов этого проекта/порта остановлено: {replaced_count})\n"
+                if replaced_count > 0
+                else ""
+            )
             return (
                 f"Фоновый процесс запущен (PID {res.get('pid')}) в Sandbox/{res.get('cwd')}.\n"
+                + replaced_note
                 + (f"Адрес: {local_url}" + (f" (в CRM/сети: {proxy_url})" if proxy_url else "") + "\n" if local_url else "")
                 + f"Лог:\n{res.get('output')}",
                 events,
@@ -4812,21 +4925,29 @@ def run_tester_session(
             {"runKey": run_key, "decision": minor_decision, "note": minor_note},
         )
 
+    report_entry = {
+        "runKey": run_key,
+        "sandboxProject": proj_clean,
+        "status": status,
+        "reportSummary": report_summary,
+        "criticalIssues": critical_issues,
+        "minorIssues": minor_issues,
+        "minorDecision": minor_decision,
+        "totalTokens": tester_usage_total,
+    }
+    session_cache = ctx.get("session_reports")
+    if isinstance(session_cache, list):
+        session_cache.insert(0, report_entry)
     recent_cache = ctx.get("recent_reports")
     if isinstance(recent_cache, list):
-        recent_cache.insert(
-            0,
-            {
-                "runKey": run_key,
-                "sandboxProject": proj_clean,
-                "status": status,
-                "reportSummary": report_summary,
-                "criticalIssues": critical_issues,
-                "minorIssues": minor_issues,
-                "minorDecision": minor_decision,
-                "totalTokens": tester_usage_total,
-            },
-        )
+        recent_cache.insert(0, report_entry)
+    sub_ref = ctx.get("subagent_ctx_ref")
+    if isinstance(sub_ref, dict):
+        runs_map = sub_ref.get("subagent_runs_by_project")
+        if isinstance(runs_map, dict):
+            runs_map.pop(_normalize_project_key(proj_clean), None)
+            if _normalize_project_key(proj_clean) == ".":
+                runs_map.clear()
 
     lines = [
         f"Отчёт Тестировщика (runKey={run_key}, проект=«{proj_clean}», статус={status}, токены нового QA-чата={tester_usage_total}):",
@@ -5177,7 +5298,9 @@ def build_orchestrator_subagents_prompt(
             "- Вызывай `call_subagent(subagent='<slug>', summary='...', task='...', sandbox_project='...')`, передавая подробное `summary`.\n"
             "- Субагенты глубоких уровней (2, 3, 4…) имеют инструмент `escalate_to_upper_tier(target=..., mode=..., summary=..., request=...)`: "
             "они могут обратиться на любой верхний уровень (1, 2, 3) за советом (`advice`), прямой помощью (`direct_help`) или исправлением "
-            "с опциональным каскадом вниз через промежуточные уровни (`fix_and_cascade`)."
+            "с опциональным каскадом вниз через промежуточные уровни (`fix_and_cascade`).\n"
+            "- Ограничения: субагентам ЗАПРЕЩЁН `browser_inspector` (`browse_project`, `qa_browser_audit`) и браузер — проверяют сайт только Тестировщик и Оркестратор. "
+            "Исправления субагентами разрешены ТОЛЬКО ПОСЛЕ получения отчёта Тестировщика (`call_tester`)."
         )
     else:
         lines.append(
@@ -5185,7 +5308,9 @@ def build_orchestrator_subagents_prompt(
             "- Вызывай `call_subagent(subagent='<slug>', summary='...', task='...', sandbox_project='...')`, "
             "чтобы делегировать подзадачи в отдельный свежий чат субагента с общим доступом к Sandbox/GitHub (экономия токенов на раздумья).\n"
             "- В `summary` ВСЕГДА указывай: что уже сделано, какие файлы проекта созданы/затронуты и что конкретно нужно сделать субагенту.\n"
-            "- Соблюдай дерево зависимостей: напрямую вызывай субагентов с `вызов Оркестратором: ДА`, а дочерних — после или по запросу их родительского субагента."
+            "- Соблюдай дерево зависимостей: напрямую вызывай субагентов с `вызов Оркестратором: ДА`, а дочерних — после или по запросу их родительского субагента.\n"
+            "- Ограничения: субагентам ЗАПРЕЩЁН `browser_inspector` (`browse_project`, `qa_browser_audit`) и браузер — проверяют сайт только Тестировщик и Оркестратор. "
+            "Исправления субагентами разрешены ТОЛЬКО ПОСЛЕ получения отчёта Тестировщика (`call_tester`)."
         )
 
     if recent_reports:
@@ -5519,6 +5644,74 @@ def run_layered_escalation(
     return {"agentText": final_msg, "agentEvents": all_events}
 
 
+_SUBAGENT_FIX_TASK_RE = re.compile(
+    r"(?:исправ\w*|почин\w*|пофикс\w*|\bфикс\w*|"
+    r"доработ\w*\s+(?:баг|ошибк|проблем|замечан|после\s+проверк|по\s+отч[её]т)|"
+    r"устран\w*\s+(?:баг|ошибк|проблем|дефект|неисправ|неполад)|"
+    r"\bбаг(?:и|ов|а|у|е)?\b|\bbug(?:s|fix(?:es)?)?\b|\bhotfix\b|"
+    r"\b(?:fix|fixes|fixed|fixing)\b|"
+    r"(?:исправ\w*|устрани\w*|реши\w*)\s+(?:ошибк|сбо|проблем)|"
+    r"не\s+работает|сломан[оа]?|падает\s+(?:тест|сборка|сервер|страниц)|"
+    r"после\s+(?:тест|аудит|проверк)\w*|по\s+результатам\s+(?:тест|проверк))",
+    re.IGNORECASE,
+)
+
+
+def _subagent_task_is_fix_or_rework(summary: str, task: str) -> bool:
+    combined = f"{task or ''}\n{summary or ''}".strip()
+    if not combined:
+        return False
+    return bool(_SUBAGENT_FIX_TASK_RE.search(combined))
+
+
+def _report_matches_project(rep: Dict[str, Any], project_key: str) -> bool:
+    rep_proj = _normalize_project_key(rep.get("sandboxProject") or ".")
+    if project_key == "." or rep_proj == ".":
+        return True
+    return rep_proj == project_key or rep_proj.startswith(project_key + "/") or project_key.startswith(rep_proj + "/")
+
+
+def _has_tester_report_for_project(
+    tester_ctx: Optional[Dict[str, Any]],
+    subagent_ctx: Optional[Dict[str, Any]],
+    project_key: str,
+) -> bool:
+    t_ctx = tester_ctx if isinstance(tester_ctx, dict) else (
+        subagent_ctx.get("tester_ctx")
+        if isinstance(subagent_ctx, dict) and isinstance(subagent_ctx.get("tester_ctx"), dict)
+        else {}
+    )
+    if not isinstance(t_ctx, dict) or not t_ctx:
+        return False
+
+    # 1. В текущем прогоне Тестировщик уже выдал отчёт по этому проекту (или корню).
+    session_reps = t_ctx.get("session_reports")
+    if isinstance(session_reps, list):
+        for rep in session_reps:
+            if isinstance(rep, dict) and _report_matches_project(rep, project_key):
+                return True
+
+    # 2. Исторические отчёты из БД (если проект не переписывался с нуля в текущей сессии).
+    written = subagent_ctx.get("written_projects") if isinstance(subagent_ctx, dict) else None
+    written_in_session = isinstance(written, set) and (
+        project_key in written or ("." in written and project_key == ".")
+    )
+    recent_reps = t_ctx.get("recent_reports")
+    if isinstance(recent_reps, list) and not written_in_session:
+        for rep in recent_reps:
+            if not isinstance(rep, dict):
+                continue
+            if _report_matches_project(rep, project_key):
+                if (
+                    rep.get("status") in ("critical_issues", "minor_issues")
+                    or rep.get("criticalIssues")
+                    or rep.get("minorIssues")
+                    or rep.get("runKey")
+                ):
+                    return True
+    return False
+
+
 def run_subagent_session(
     *,
     target_ref: str,
@@ -5652,12 +5845,41 @@ def run_subagent_session(
 
     run_key = uuid.uuid4().hex[:12]
     proj_clean = str(sandbox_project or ".").strip() or "."
+    proj_norm = _normalize_project_key(proj_clean)
     sub_id = int(target.get("id") or 0)
     sub_slug = str(target.get("slug") or "subagent")
     sub_name = str(target.get("name") or sub_slug)
     sub_color = str(target.get("color") or "#8b5cf6")
     caller_sub_id = int(caller_subagent.get("id") or 0) if isinstance(caller_subagent, dict) else 0
     caller_sub_name = str(caller_subagent.get("name") or "") if isinstance(caller_subagent, dict) else ""
+
+    # Правило: другие субагенты могут приступать к исправлениям ТОЛЬКО ПОСЛЕ отчёта Тестировщика.
+    # Исключения: внутренняя эскалация/каскад на верхний уровень в layered-режиме.
+    if (
+        caller_kind in ("orchestrator", "subagent")
+        and not ctx.get("bypass_parent_guard")
+        and ctx.get("handoff_via") not in ("layered_escalation", "layered_cascade")
+    ):
+        is_fix_task = _subagent_task_is_fix_or_rework(summary, task)
+        runs_map = ctx.get("subagent_runs_by_project") if isinstance(ctx.get("subagent_runs_by_project"), dict) else {}
+        written_set = ctx.get("written_projects") if isinstance(ctx.get("written_projects"), set) else set()
+        prev_runs = runs_map.get(proj_norm) or []
+        is_rework_after_write = (sub_slug in prev_runs) and (
+            proj_norm in written_set or "." in written_set or proj_norm == "."
+        )
+        if (is_fix_task or is_rework_after_write) and not _has_tester_report_for_project(
+            tester_ctx, ctx, proj_norm
+        ):
+            return {
+                "agentText": (
+                    f"Отказано в запуске субагента «{sub_name}» (`{sub_slug}`): "
+                    f"по правилам работы другие субагенты могут приступать к исправлениям по проекту «{proj_clean}» "
+                    "ТОЛЬКО ПОСЛЕ того, как Тестировщик проверит проект и выдаст свой отчёт. "
+                    f"Сначала вызови `call_tester(summary=..., sandbox_project='{proj_clean}')`, "
+                    "дождись отчёта Тестировщика и уже затем передавай замечания на исправление."
+                ),
+                "agentEvents": [],
+            }
 
     if caller_kind == "subagent" and caller_sub_name:
         _emit(
@@ -5753,9 +5975,8 @@ def run_subagent_session(
         routing_mode=routing_mode,
         subagent_tier=sub_tier,
     )
-    local_browser_mgr = browser_manager or browser_inspector.BrowserSessionManager(sandbox_root=sandbox_root)
-    owns_browser_mgr = browser_manager is None
-    sub_browser_session_id = f"subagent_{run_key}"
+    # Субагентам запрещён browser_inspector — браузерная сессия для них не создаётся (экономия токенов и CPU).
+    local_browser_mgr: Optional[browser_inspector.BrowserSessionManager] = None
 
     nested_subagent_ctx: Dict[str, Any] = {
         **ctx,
@@ -5993,14 +6214,12 @@ def run_subagent_session(
                 t_args = raw_a if isinstance(raw_a, dict) else (_parse_json_dict_relaxed(str(raw_a)) or {})
                 if not isinstance(t_args, dict):
                     t_args = {}
-                if t_name == "browse_project" and not t_args.get("session_id"):
-                    t_args = {**t_args, "session_id": sub_browser_session_id}
 
                 # Автоучёт затронутых файлов проекта
                 if t_name in ("sandbox_write_file", "github_write_file", "github_edit_file") and t_args.get("path"):
                     auto_touched_files.append(str(t_args["path"]))
                 elif t_name == "sandbox_create_project" and isinstance(t_args.get("files"), list):
-                    proj_prefix = str(t_args.get("project_name") or "").strip()
+                    proj_prefix = str(t_args.get("project") or t_args.get("project_name") or "").strip()
                     for f_obj in t_args["files"]:
                         if isinstance(f_obj, dict) and f_obj.get("path"):
                             p_str = f"{proj_prefix}/{f_obj['path']}" if proj_prefix else str(f_obj["path"])
@@ -6200,10 +6419,8 @@ def run_subagent_session(
                     }
                 )
     finally:
-        if owns_browser_mgr:
+        if local_browser_mgr is not None:
             local_browser_mgr.close_all()
-        else:
-            local_browser_mgr.close_session(sub_browser_session_id)
 
     rep_final = sub_state.get("report") if isinstance(sub_state.get("report"), dict) else {}
     output_summary = str(rep_final.get("summary") or sub_final_text or "").strip()
@@ -6224,6 +6441,12 @@ def run_subagent_session(
             [*(rep_final.get("filesTouched") or []), *auto_touched_files]
         )
     )[:80]
+    if all_touched:
+        _record_written_project(ctx, proj_norm)
+        for tf in all_touched:
+            _record_written_project(ctx, tf)
+    if isinstance(ctx.get("subagent_runs_by_project"), dict):
+        ctx["subagent_runs_by_project"].setdefault(proj_norm, []).append(sub_slug)
     req_next_slug = str(rep_final.get("requestNextSubagent") or "").strip()
     req_next_task = str(rep_final.get("nextTask") or "").strip()
     final_status = (
@@ -7769,7 +7992,11 @@ class Handler(BaseHTTPRequestHandler):
             routing_mode=subagent_routing_mode,
             subagent_tier=direct_subagent_tier,
         )
-        browser_mgr = browser_inspector.BrowserSessionManager(sandbox_root=SANDBOX_ROOT)
+        browser_mgr: Optional[browser_inspector.BrowserSessionManager] = (
+            None
+            if agent_role == "subagent"
+            else browser_inspector.BrowserSessionManager(sandbox_root=SANDBOX_ROOT)
+        )
         try:
             raw_ctx_limit = max(0, int(body.get("contextLimit") or 0))
         except (TypeError, ValueError):
@@ -7818,6 +8045,7 @@ class Handler(BaseHTTPRequestHandler):
             "discovered_max_context": discovered_max_context,
             "emit_sse": _emit_sse,
             "recent_reports": recent_reports,
+            "session_reports": [],
             "cancel_check": _is_disconnected,
             "overseer_ctx": overseer_ctx,
         }
@@ -7834,7 +8062,11 @@ class Handler(BaseHTTPRequestHandler):
             "cancel_check": _is_disconnected,
             "chain_depth": 1 if agent_role == "subagent" else 0,
             "overseer_ctx": overseer_ctx,
+            "tester_ctx": tester_ctx,
+            "written_projects": set(),
+            "subagent_runs_by_project": {},
         }
+        tester_ctx["subagent_ctx_ref"] = subagent_ctx
 
         if agent_role == "tester":
             last_user_prompt = ""
@@ -8508,7 +8740,8 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
         finally:
-            browser_mgr.close_all()
+            if browser_mgr is not None:
+                browser_mgr.close_all()
 
         if not final_text:
             if agent_role == "tester" and qa_state is not None:
@@ -9393,17 +9626,22 @@ def self_test() -> int:
             and any(e.get("type") == "github_merge" for e in mg_ev),
         )
 
-        # 22. tools_for_trust(role="subagent") даёт субагенту handoff-инструменты + базовые, но НЕ оркестраторские call_subagent/list_subagents
+        # 22. tools_for_trust(role="subagent") даёт субагенту handoff-инструменты + базовые, но НЕ оркестраторские и НЕ browser_inspector
         sub_names = {t["function"]["name"] for t in tools_for_trust("full", role="subagent")}
         agent_names_full = {t["function"]["name"] for t in tools_for_trust("full", role="agent")}
         check(
-            "tools_for_trust(role='subagent') = handoff+базовые без call_subagent; role='agent' = call_subagent/list_subagents",
+            "tools_for_trust(role='subagent') = handoff+базовые без browser_inspector и call_subagent; role='agent' = browse_project+call_subagent",
             "report_to_orchestrator" in sub_names
             and "request_subagent" in sub_names
             and "create_file" in sub_names
-            and "browse_project" in sub_names
+            and "list_tester_reports" in sub_names
+            and "browse_project" not in sub_names
+            and "qa_browser_audit" not in sub_names
+            and "open_website" not in sub_names
+            and "call_tester" not in sub_names
             and "call_subagent" not in sub_names
             and "list_subagents" not in sub_names
+            and "browse_project" in agent_names_full
             and "call_subagent" in agent_names_full
             and "list_subagents" in agent_names_full,
         )

@@ -133,6 +133,15 @@ _DANGEROUS_CMD_RULES: List[Tuple[re.Pattern[str], str, str, str]] = [
         "critical",
         "Попытка сменить рабочий каталог на корень системы или домашнюю папку вне Sandbox.",
     ),
+    (
+        re.compile(
+            r"(?:^|[\s;|&`(])(?:google-chrome|chromium(?:-browser)?|firefox|microsoft-edge|msedge|xdg-open|sensible-browser)\b",
+            re.IGNORECASE,
+        ),
+        "outside_sandbox",
+        "high",
+        "Попытка запустить браузер из командной строки вместо управляемого инструмента браузерного инспектора.",
+    ),
 ]
 
 _SENSITIVE_PATH_PATTERNS = re.compile(

@@ -316,23 +316,73 @@ class QaAndBrowserFixesTests(unittest.TestCase):
         sess.navigate("http://127.0.0.1:8080/next", wait_ms=0)
         self.assertFalse(sess._screenshots_disabled)
 
-        # Вытеснение старейших не-"default" сессий при MAX_SESSIONS
+        # Лимит одновременных браузерных сессий по умолчанию = 1 (не плодим параллельные браузеры).
         with tempfile.TemporaryDirectory() as tmp:
-            mgr = browser_inspector.BrowserSessionManager(sandbox_root=Path(tmp))
+            mgr_single = browser_inspector.BrowserSessionManager(sandbox_root=Path(tmp))
+            self.assertEqual(mgr_single._max_sessions, 1)
+            s_first = mock.MagicMock()
+            s_first.is_alive.return_value = True
+            s_first.approved_external_origins = set()
+            s_second = mock.MagicMock()
+            s_second.is_alive.return_value = True
+            s_second.approved_external_origins = set()
+            with mock.patch.object(browser_inspector.BrowserSession, "launch", side_effect=[s_first, s_second]):
+                mgr_single.get_or_create("default", 1280, 800)
+                mgr_single.get_or_create("second_tab", 1280, 800)
+            self.assertEqual(len(mgr_single._sessions), 1)
+            self.assertIn("second_tab", mgr_single._sessions)
+            s_first.close.assert_called_once()
+
+            # Вытеснение старейших не-"default" сессий при явном max_sessions=3
+            mgr = browser_inspector.BrowserSessionManager(sandbox_root=Path(tmp), max_sessions=3)
             created_sessions = []
-            for idx in range(browser_inspector.BrowserSessionManager.MAX_SESSIONS + 1):
+            for idx in range(mgr._max_sessions + 1):
                 s = mock.MagicMock()
                 s.is_alive.return_value = True
                 s.approved_external_origins = set()
                 created_sessions.append(s)
             with mock.patch.object(browser_inspector.BrowserSession, "launch", side_effect=created_sessions):
                 mgr.get_or_create("default", 1280, 800)
-                for idx in range(1, browser_inspector.BrowserSessionManager.MAX_SESSIONS + 1):
+                for idx in range(1, mgr._max_sessions + 1):
                     mgr.get_or_create(f"extra_{idx}", 1280, 800)
             self.assertIn("default", mgr._sessions)
-            self.assertEqual(len(mgr._sessions), browser_inspector.BrowserSessionManager.MAX_SESSIONS)
+            self.assertEqual(len(mgr._sessions), mgr._max_sessions)
             created_sessions[1].close.assert_called_once()
             created_sessions[0].close.assert_not_called()
+
+    def test_process_manager_replaces_existing_project_and_port_process_on_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            sandbox_mod.mkdir(root, "landing")
+            pm = sandbox_mod.ProcessManager()
+            next_pid = [80000]
+            killed_procs: list[int] = []
+
+            def _fake_popen(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+                next_pid[0] += 1
+                p = mock.MagicMock()
+                p.pid = next_pid[0]
+                p.poll.return_value = None
+                p.stdout = None
+                return p
+
+            with (
+                mock.patch("sandbox.subprocess.Popen", side_effect=_fake_popen),
+                mock.patch("sandbox._is_pid_alive", return_value=True),
+                mock.patch(
+                    "sandbox._terminate_proc_tree",
+                    side_effect=lambda proc: killed_procs.append(proc.pid),
+                ),
+            ):
+                first = pm.start(root, f'"{sys.executable}" -m http.server 8451', rel_cwd="landing", owner="agent")
+                self.assertEqual(first["replacedCount"], 0)
+                second = pm.start(root, f'"{sys.executable}" -m http.server 8452', rel_cwd="landing", owner="agent")
+                self.assertEqual(second["replacedCount"], 1)
+                self.assertEqual(killed_procs, [first["pid"]])
+                active = pm.list()
+                self.assertEqual(len(active), 1)
+                self.assertEqual(active[0]["pid"], second["pid"])
+                pm.stop_all()
 
 
 class AgentAuthSecretsAndSharedBrowserTests(unittest.TestCase):

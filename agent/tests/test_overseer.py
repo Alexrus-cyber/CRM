@@ -115,6 +115,14 @@ class OverseerStaticRulesTests(unittest.TestCase):
         )
         self.assertFalse(local_browse["flagged"])
 
+        gui_browser_cmd = overseer_mod.analyze_static_security(
+            "run_command",
+            {"command": "google-chrome http://127.0.0.1:3000", "cwd": "."},
+            self.sandbox_root,
+        )
+        self.assertTrue(gui_browser_cmd["flagged"])
+        self.assertEqual(gui_browser_cmd["category"], "outside_sandbox")
+
 
 class OverseerGuardExecutionTests(unittest.TestCase):
     def setUp(self):
