@@ -29,12 +29,18 @@ function cleanFileMetadata(value: unknown): Array<{ name: string; mime: string; 
   }));
 }
 
-function cleanAttachments(value: unknown): Array<{ name: string; size: number; mime?: string }> {
+function cleanAttachments(
+  value: unknown,
+): Array<{ name: string; size: number; mime?: string; note?: string; sandboxPath?: string }> {
   if (!Array.isArray(value)) return [];
   return value.filter(isDict).map((item) => ({
     name: String(item.name ?? "файл").slice(0, 240),
     size: boundedNumber(item.size),
     ...(typeof item.mime === "string" ? { mime: item.mime.slice(0, 160) } : {}),
+    ...(typeof item.note === "string" && item.note ? { note: item.note.slice(0, 240) } : {}),
+    ...(typeof item.sandboxPath === "string" && item.sandboxPath
+      ? { sandboxPath: item.sandboxPath.slice(0, 300) }
+      : {}),
   }));
 }
 
@@ -50,6 +56,8 @@ const ALLOWED_ACTION_TYPES = new Set([
   "subagent_tool",
   "subagent_report",
   "subagent_handoff",
+  "subagent_chat_rotated",
+  "subagent_handoff_new_chat",
   "qa_check",
   "plan_step",
   "create_task",

@@ -125,34 +125,52 @@ class QaToolsTests(unittest.TestCase):
 class TesterAgentOrchestrationTests(unittest.TestCase):
     def test_tool_separation_between_agent_and_tester_roles(self) -> None:
         agent_tool_names = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", role="agent")}
-        tester_tool_names = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", role="tester")}
+        sub_restricted_names = {
+            t["function"]["name"]
+            for t in agent_mod.tools_for_trust("full", role="subagent", subagent_tool_profile="restricted")
+        }
+        sub_full_names = {
+            t["function"]["name"]
+            for t in agent_mod.tools_for_trust("full", role="subagent", subagent_tool_profile="full")
+        }
 
-        self.assertIn("call_tester", agent_tool_names)
-        self.assertIn("confirm_minor_fixes", agent_tool_names)
-        self.assertIn("list_tester_reports", agent_tool_names)
+        # Встроенный Тестировщик отключён у Оркестратора и у субагентов
+        for removed in ("call_tester", "confirm_minor_fixes", "list_tester_reports"):
+            self.assertNotIn(removed, agent_tool_names)
+            self.assertNotIn(removed, sub_restricted_names)
+            self.assertNotIn(removed, sub_full_names)
+
         self.assertNotIn("qa_static_review", agent_tool_names)
         self.assertNotIn("qa_submit_report", agent_tool_names)
+        self.assertIn("call_subagent", agent_tool_names)
+        self.assertIn("browse_project", agent_tool_names)
 
-        self.assertIn("qa_static_review", tester_tool_names)
-        self.assertIn("qa_run_tests", tester_tool_names)
-        self.assertIn("qa_http_audit", tester_tool_names)
-        self.assertIn("qa_browser_audit", tester_tool_names)
-        self.assertIn("qa_submit_report", tester_tool_names)
-        self.assertNotIn("call_tester", tester_tool_names)
-        self.assertNotIn("confirm_minor_fixes", tester_tool_names)
+        # Профиль restricted не даёт QA-браузер и browse_project, а full даёт всё, кроме call_subagent
+        self.assertNotIn("qa_browser_audit", sub_restricted_names)
+        self.assertNotIn("browse_project", sub_restricted_names)
+        self.assertIn("qa_static_review", sub_full_names)
+        self.assertIn("qa_run_tests", sub_full_names)
+        self.assertIn("qa_http_audit", sub_full_names)
+        self.assertIn("qa_browser_audit", sub_full_names)
+        self.assertIn("report_to_orchestrator", sub_full_names)
+        self.assertNotIn("qa_submit_report", sub_full_names)
+        self.assertIn("browse_project", sub_full_names)
+        self.assertNotIn("call_subagent", sub_full_names)
 
-    def test_call_tester_and_confirm_minor_fixes_orchestration(self) -> None:
+    def test_call_tester_disabled_and_subagent_qa_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
             sandbox_mod.write_file(root, "demo/index.html", "<!doctype html><title>Demo</title><h1>Hi</h1>")
             events: list[tuple[str, dict]] = []
-            approval_requests: list[dict] = []
 
-            def fake_approval(req: dict) -> dict:
-                approval_requests.append(req)
-                if req.get("kind") == "tester_minor_fixes":
-                    return {"approved": True, "note": "Можно добавить favicon"}
-                return {"approved": True}
+            with self.assertRaises(agent_mod.AgentError) as ctx_err:
+                agent_mod.run_tool(
+                    "call_tester",
+                    {"sandbox_project": "demo", "summary": "Собран сайт demo"},
+                    trust_level="verified",
+                    sandbox_root=root,
+                )
+            self.assertIn("удалён", str(ctx_err.exception))
 
             fake_replies = iter(
                 [
@@ -181,19 +199,13 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                             {
                                 "message": {
                                     "content": "",
-                                    "reasoning_content": "Отправляю отчёт с мелким замечанием",
+                                    "reasoning_content": "Отправляю summary Оркестратору",
                                     "tool_calls": [
                                         {
                                             "id": "tc2",
                                             "function": {
-                                                "name": "qa_submit_report",
-                                                "arguments": (
-                                                    '{"status":"minor_issues",'
-                                                    '"summary":"Мелкое замечание по favicon",'
-                                                    '"critical_issues":[],'
-                                                    '"minor_issues":[{"title":"Нет favicon","file":"index.html"}],'
-                                                    '"checks_run":[{"name":"qa_static_review","status":"pass","details":"OK"}]}'
-                                                ),
+                                                "name": "report_to_orchestrator",
+                                                "arguments": '{"status":"completed","summary":"Мелкое замечание по favicon","files_touched":["demo/index.html"]}',
                                             },
                                         }
                                     ],
@@ -202,21 +214,8 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                         ],
                         "usage": {"prompt_tokens": 80, "completion_tokens": 30, "total_tokens": 110},
                     },
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": "Проверка завершена: критики нет, есть 1 мелкое замечание.",
-                                    "reasoning_content": "",
-                                    "tool_calls": [],
-                                }
-                            }
-                        ],
-                        "usage": {"prompt_tokens": 40, "completion_tokens": 20, "total_tokens": 60},
-                    },
                 ]
             )
-
             call_count = 0
 
             def _fake_call_model(*_a: object, **_kw: object) -> dict:
@@ -224,59 +223,38 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                 call_count += 1
                 return next(fake_replies)
 
+            sub_ctx = {
+                "emit_sse": lambda ev, data: events.append((ev, data)),
+                "base_url": "http://127.0.0.1:8888/v1",
+                "api_key": "",
+                "model": "o3-mini",
+                "params": {},
+                "subagents": [
+                    {
+                        "id": 11,
+                        "slug": "qa-audit",
+                        "name": "QA Аудитор",
+                        "orchestratorCanCall": True,
+                        "toolProfile": "full",
+                    }
+                ],
+            }
             with mock.patch.object(agent_mod, "call_model", side_effect=_fake_call_model):
-                tester_ctx = {
-                    "emit_sse": lambda ev, data: events.append((ev, data)),
-                    "base_url": "http://127.0.0.1:8888/v1",
-                    "api_key": "",
-                    "model": "o3-mini",
-                    "params": {},
-                    "recent_reports": [],
-                }
                 result_text, result_events = agent_mod.run_tool(
-                    "call_tester",
-                    {"sandbox_project": "demo", "summary": "Собран сайт demo"},
+                    "call_subagent",
+                    {"subagent": "qa-audit", "sandbox_project": "demo", "summary": "Собран сайт demo", "task": "Проверь сайт"},
                     trust_level="verified",
                     sandbox_root=root,
-                    approval_fn=fake_approval,
-                    tester_ctx=tester_ctx,
+                    subagent_ctx=sub_ctx,
                 )
 
-            # После qa_submit_report цикл Тестировщика завершается немедленно без лишнего шага call_model.
             self.assertEqual(call_count, 2)
-            self.assertIn("minor_issues", result_text)
-            self.assertIn("токены нового QA-чата=195", result_text)
-            self.assertTrue(any(ev == "tester_start" for ev, _ in events))
-            done_ev = next(data for ev, data in events if ev == "tester_done")
+            self.assertIn("Мелкое замечание по favicon", result_text)
+            self.assertIn("токенов: 195", result_text)
+            self.assertTrue(any(ev == "subagent_start" for ev, _ in events))
+            done_ev = next(data for ev, data in events if ev == "subagent_done")
             self.assertEqual(done_ev["usage"]["total"], 195)
-            # tester_done уходит ДО approval_fn с minorDecision="pending" (чтобы прогон закрылся в БД),
-            # а решение человека приходит следующим событием tester_decision.
-            self.assertEqual(done_ev["minorDecision"], "pending")
-            dec_ev = next(data for ev, data in events if ev == "tester_decision")
-            self.assertEqual(dec_ev["decision"], "approved")
-            self.assertEqual(len(tester_ctx["recent_reports"]), 1)
-            self.assertEqual(tester_ctx["recent_reports"][0]["minorDecision"], "approved")
-            self.assertEqual(result_events[0]["type"], "tester_report")
-            self.assertEqual(approval_requests[0]["kind"], "tester_minor_fixes")
-
-            # Агент также умеет вызывать confirm_minor_fixes отдельно после исправления критики
-            approval_requests.clear()
-            dec_text, dec_events = agent_mod.run_tool(
-                "confirm_minor_fixes",
-                {
-                    "tester_run_key": done_ev["runKey"],
-                    "summary": "Поправить отступ кнопки?",
-                    "minor_issues": ["Отступ на кнопке (index.html)"],
-                },
-                trust_level="verified",
-                sandbox_root=root,
-                approval_fn=lambda req: (approval_requests.append(req) or {"approved": False, "note": "не надо"}),
-                tester_ctx=tester_ctx,
-            )
-            self.assertEqual(approval_requests[0]["kind"], "tester_minor_fixes")
-            self.assertIn("ОТКЛОНИЛ", dec_text)
-            self.assertFalse(dec_events[0]["approved"])
-            self.assertTrue(any(ev == "tester_decision" for ev, _ in events))
+            self.assertEqual(result_events[0]["type"], "subagent_report")
 
     def test_call_model_completes_after_finish_reason_without_done_or_with_keepalives(self) -> None:
         class _TailHandler(http.server.BaseHTTPRequestHandler):
@@ -367,10 +345,28 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
-    def test_tester_recovers_text_protocol_orphan_think_and_trailing_reasoning_report(self) -> None:
+    def test_subagent_recovers_text_protocol_orphan_think_and_nudge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
             sandbox_mod.write_file(root, "app/index.html", "<!doctype html><title>App</title><h1>OK</h1>")
+
+            def _make_sub_ctx(events_sink: list) -> dict:
+                return {
+                    "emit_sse": lambda ev, data: events_sink.append((ev, data)),
+                    "base_url": "http://127.0.0.1:8888/v1",
+                    "api_key": "",
+                    "model": "m",
+                    "params": {},
+                    "subagents": [
+                        {
+                            "id": 12,
+                            "slug": "qa-sub",
+                            "name": "QA Субагент",
+                            "orchestratorCanCall": True,
+                            "toolProfile": "full",
+                        }
+                    ],
+                }
 
             # 1) Текстовый режим (use_tools=False после 400 на tools) + сиротский `</think>` + parameters
             events_a: list[tuple[str, dict]] = []
@@ -383,8 +379,8 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                                 "message": {
                                     "content": (
                                         'Проверил всё, {"tool": "draft"} это черновик.\n</think>\n'
-                                        '```json\n{"name": "qa_submit_report", "parameters": '
-                                        '{"status": "passed", "summary": "Проверено в text-режиме"}}\n```'
+                                        '```json\n{"name": "report_to_orchestrator", "parameters": '
+                                        '{"status": "completed", "summary": "Проверено в text-режиме"}}\n```'
                                     ),
                                     "tool_calls": [],
                                 }
@@ -403,64 +399,18 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
 
             with mock.patch.object(agent_mod, "call_model", side_effect=_side_a):
                 txt_a, _ = agent_mod.run_tool(
-                    "call_tester",
-                    {"sandbox_project": "app", "summary": "Проверка text-protocol"},
+                    "call_subagent",
+                    {"subagent": "qa-sub", "sandbox_project": "app", "summary": "Проверка text-protocol", "task": "Проверь"},
                     trust_level="full",
                     sandbox_root=root,
-                    tester_ctx={
-                        "emit_sse": lambda ev, data: events_a.append((ev, data)),
-                        "base_url": "http://127.0.0.1:8888/v1",
-                        "api_key": "",
-                        "model": "m",
-                        "params": {},
-                        "recent_reports": [],
-                    },
+                    subagent_ctx=_make_sub_ctx(events_a),
                 )
             self.assertIn("Проверено в text-режиме", txt_a)
-            done_a = next(d for e, d in events_a if e == "tester_done")
-            self.assertEqual(done_a["status"], "passed")
+            done_a = next(d for e, d in events_a if e == "subagent_done")
+            self.assertEqual(done_a["status"], "completed")
             self.assertIn("черновик", done_a["reasoning"])
 
-            # 2) Пустой content после завершения рассуждений с qa_submit_report в хвосте reasoning_content
-            events_b: list[tuple[str, dict]] = []
-            reply_b = {
-                "choices": [
-                    {
-                        "message": {
-                            "content": "",
-                            "reasoning_content": (
-                                "Анализ завершён.\n"
-                                '{"tool": "qa_submit_report", "status": "critical_issues", '
-                                '"summary": "Сломан обработчик", '
-                                '"critical_issues": [{"title": "Crash", "description": "500 error"}]}'
-                            ),
-                            "tool_calls": [],
-                        }
-                    }
-                ],
-                "usage": {"total_tokens": 70},
-            }
-            with mock.patch.object(agent_mod, "call_model", return_value=reply_b):
-                txt_b, _ = agent_mod.run_tool(
-                    "call_tester",
-                    {"sandbox_project": "app", "summary": "Проверка trailing reasoning"},
-                    trust_level="full",
-                    sandbox_root=root,
-                    tester_ctx={
-                        "emit_sse": lambda ev, data: events_b.append((ev, data)),
-                        "base_url": "http://127.0.0.1:8888/v1",
-                        "api_key": "",
-                        "model": "m",
-                        "params": {},
-                        "recent_reports": [],
-                    },
-                )
-            self.assertIn("Сломан обработчик", txt_b)
-            self.assertIn("Crash", txt_b)
-            done_b = next(d for e, d in events_b if e == "tester_done")
-            self.assertEqual(done_b["status"], "critical_issues")
-
-            # 3) Пустой content без tool_calls -> однократное напоминание и передача результата Агенту
+            # 2) Пустой content без tool_calls -> однократное напоминание и передача результата Оркестратору
             events_c: list[tuple[str, dict]] = []
             replies_c = iter(
                 [
@@ -485,8 +435,8 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                                         {
                                             "id": "tc_nudge",
                                             "function": {
-                                                "name": "qa_submit_report",
-                                                "arguments": '{"status":"passed","summary":"Передано после nudge"}',
+                                                "name": "report_to_orchestrator",
+                                                "arguments": '{"status":"completed","summary":"Передано после nudge"}',
                                             },
                                         }
                                     ],
@@ -499,18 +449,11 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
             )
             with mock.patch.object(agent_mod, "call_model", side_effect=lambda *_a, **_kw: next(replies_c)):
                 txt_c, _ = agent_mod.run_tool(
-                    "call_tester",
-                    {"sandbox_project": "app", "summary": "Проверка nudge"},
+                    "call_subagent",
+                    {"subagent": "qa-sub", "sandbox_project": "app", "summary": "Проверка nudge", "task": "Проверь"},
                     trust_level="full",
                     sandbox_root=root,
-                    tester_ctx={
-                        "emit_sse": lambda ev, data: events_c.append((ev, data)),
-                        "base_url": "http://127.0.0.1:8888/v1",
-                        "api_key": "",
-                        "model": "m",
-                        "params": {},
-                        "recent_reports": [],
-                    },
+                    subagent_ctx=_make_sub_ctx(events_c),
                 )
             self.assertIn("Передано после nudge", txt_c)
 
@@ -598,7 +541,7 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
 
-    def test_tester_isolates_browser_emits_done_handoff_and_handles_image_limit(self) -> None:
+    def test_subagent_isolates_browser_emits_done_handoff_and_handles_image_limit(self) -> None:
         import browser_inspector
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -648,8 +591,8 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                                     {
                                         "id": "tc_submit",
                                         "function": {
-                                            "name": "qa_submit_report",
-                                            "arguments": '{"status":"passed","summary":"Браузерный аудит пройден"}',
+                                            "name": "report_to_orchestrator",
+                                            "arguments": '{"status":"completed","summary":"Браузерный аудит пройден"}',
                                         },
                                     }
                                 ],
@@ -682,28 +625,36 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                     }
                 ]
 
+            sub_ctx = {
+                "emit_sse": lambda ev, data: events.append((ev, data)),
+                "base_url": "http://127.0.0.1:8888/v1",
+                "api_key": "",
+                "model": "vlm",
+                "params": {},
+                "subagents": [
+                    {
+                        "id": 13,
+                        "slug": "qa-vlm",
+                        "name": "QA VLM",
+                        "orchestratorCanCall": True,
+                        "toolProfile": "full",
+                    }
+                ],
+            }
             with (
                 mock.patch.object(agent_mod, "call_model", side_effect=_fake_model),
                 mock.patch.object(browser_inspector, "execute_browse_action", side_effect=_fake_exec),
             ):
                 txt, _ = agent_mod.run_tool(
-                    "call_tester",
-                    {"sandbox_project": "app", "summary": "Проверь UI"},
+                    "call_subagent",
+                    {"subagent": "qa-vlm", "sandbox_project": "app", "summary": "Проверь UI", "task": "Проверь в браузере"},
                     trust_level="verified",
                     sandbox_root=root,
                     browser_manager=agent_mgr,
-                    tester_ctx={
-                        "emit_sse": lambda ev, data: events.append((ev, data)),
-                        "base_url": "http://127.0.0.1:8888/v1",
-                        "api_key": "",
-                        "model": "vlm",
-                        "params": {},
-                        "recent_reports": [],
-                    },
+                    subagent_ctx=sub_ctx,
                 )
 
             self.assertIn("Браузерный аудит пройден", txt)
-            # Сессия родительского Агента не пострадала.
             self.assertIn("default", agent_mgr._sessions)
             agent_sess.close.assert_not_called()
 
@@ -711,19 +662,19 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
             self.assertEqual(agent_mod._count_message_images(model_calls[1]), 2)
             self.assertEqual(agent_mod._count_message_images(model_calls[2]), 1)
 
-            # Эмитнулся явный tester_status с done=True, а из tester_done.actions удалены base64 preview.
+            # Эмитнулся явный subagent_status с done=True, а из subagent_done.actions удалены base64 preview.
             self.assertTrue(
                 any(
-                    ev == "tester_status" and d.get("source") == "browser_inspector" and d.get("done") is True
+                    ev == "subagent_status" and d.get("source") == "browser_inspector" and d.get("done") is True
                     for ev, d in events
                 )
             )
-            done_ev = next(d for ev, d in events if ev == "tester_done")
+            done_ev = next(d for ev, d in events if ev == "subagent_done")
             self.assertTrue(done_ev["actions"])
             for act in done_ev["actions"]:
                 self.assertNotIn("preview", act)
 
-    def test_tester_emits_live_actions_and_actors_for_all_tools_including_sandbox_and_code_tools(self) -> None:
+    def test_subagent_emits_live_actions_and_actors_for_all_tools_including_sandbox_and_code_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
             sandbox_mod.write_file(root, "app/index.html", "<!doctype html><h1>Hello QA</h1>")
@@ -739,7 +690,6 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                 if callable(on_status):
                     on_status("Модель рассуждает (30 симв., 5 с)…")
                 if step_idx <= 7:
-                    # 7 шагов по 8 инструментов (sandbox_list, sandbox_read_file, code_search) = 56 > старый срез 50
                     calls = []
                     for i in range(8):
                         tool_name = ("sandbox_list", "sandbox_read_file", "code_search")[i % 3]
@@ -768,8 +718,8 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                                     {
                                         "id": "tc_submit",
                                         "function": {
-                                            "name": "qa_submit_report",
-                                            "arguments": '{"status":"passed","summary":"Все 56+ чтений проверены"}',
+                                            "name": "report_to_orchestrator",
+                                            "arguments": '{"status":"completed","summary":"Все 56+ чтений проверены"}',
                                         },
                                     }
                                 ],
@@ -779,35 +729,43 @@ class TesterAgentOrchestrationTests(unittest.TestCase):
                     "usage": {"total_tokens": 25},
                 }
 
+            sub_ctx = {
+                "emit_sse": lambda ev, data: events.append((ev, data)),
+                "base_url": "http://127.0.0.1:8888/v1",
+                "api_key": "",
+                "model": "qwen3",
+                "params": {},
+                "subagents": [
+                    {
+                        "id": 14,
+                        "slug": "code-sub",
+                        "name": "Code Sub",
+                        "orchestratorCanCall": True,
+                        "toolProfile": "restricted",
+                    }
+                ],
+            }
             with mock.patch.object(agent_mod, "call_model", side_effect=_fake_model):
                 txt, _ = agent_mod.run_tool(
-                    "call_tester",
-                    {"sandbox_project": "app", "summary": "Проверь код и файлы"},
+                    "call_subagent",
+                    {"subagent": "code-sub", "sandbox_project": "app", "summary": "Проверь код и файлы", "task": "Проверь"},
                     trust_level="verified",
                     sandbox_root=root,
-                    tester_ctx={
-                        "emit_sse": lambda ev, data: events.append((ev, data)),
-                        "base_url": "http://127.0.0.1:8888/v1",
-                        "api_key": "",
-                        "model": "qwen3",
-                        "params": {},
-                        "recent_reports": [],
-                    },
+                    subagent_ctx=sub_ctx,
                 )
 
             self.assertIn("Все 56+ чтений проверены", txt)
-            action_evs = [d["action"] for ev, d in events if ev == "tester_action"]
+            action_evs = [d["action"] for ev, d in events if ev == "subagent_action"]
             self.assertTrue(
-                any(a.get("type") == "tester_tool" and a.get("status") == "running" and a.get("tool") == "sandbox_list" for a in action_evs)
+                any(a.get("type") == "subagent_tool" and a.get("status") == "running" and a.get("tool") == "sandbox_list" for a in action_evs)
             )
             self.assertTrue(
-                any(a.get("type") == "tester_tool" and a.get("status") == "ok" and a.get("tool") == "code_search" and isinstance(a.get("durationMs"), int) for a in action_evs)
+                any(a.get("type") == "subagent_tool" and a.get("status") == "ok" and a.get("tool") == "code_search" and isinstance(a.get("durationMs"), int) for a in action_evs)
             )
-            statuses = [d for ev, d in events if ev == "tester_status"]
-            self.assertTrue(any(s.get("actor") == "tester_llm" and s.get("step") == 1 for s in statuses))
-            self.assertTrue(any(s.get("actor") == "tester_tool" and s.get("tool") == "sandbox_read_file" for s in statuses))
-            done_ev = next(d for ev, d in events if ev == "tester_done")
-            # 7 * 8 + 1 qa_submit_report = 57 действий, больше старого среза 50!
+            statuses = [d for ev, d in events if ev == "subagent_status"]
+            self.assertTrue(any(s.get("actor") == "subagent_llm" and s.get("step") == 1 for s in statuses))
+            self.assertTrue(any(s.get("actor") == "subagent" and s.get("tool") == "sandbox_read_file" for s in statuses))
+            done_ev = next(d for ev, d in events if ev == "subagent_done")
             self.assertEqual(len(done_ev["actions"]), 57)
 
     def test_direct_tester_emits_tester_tool_actions_and_actor_statuses(self) -> None:

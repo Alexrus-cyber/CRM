@@ -49,6 +49,7 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
   let subagentsStore: Subagent[];
   let runsStore: SubagentRun[];
   let conversationsStore: SubagentConversation[];
+  let messagesByConvStore: Record<number, Array<Record<string, unknown>>>;
   let getSubagentsCalls: string[];
   let chatTokensTotal: number;
   let putTreePayloads: Array<Record<string, unknown>>;
@@ -120,6 +121,34 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
         updatedAt: "2026-11-17T10:02:00.000Z",
       },
     ];
+    messagesByConvStore = {
+      201: [
+        {
+          id: 1,
+          conversationId: 201,
+          role: "user",
+          content: "Проверь форму входа",
+          reasoning: "",
+          attachments: [],
+          actions: [],
+          files: [],
+          error: "",
+          createdAt: "2026-11-17T10:01:00.000Z",
+        },
+        {
+          id: 2,
+          conversationId: 201,
+          role: "assistant",
+          content: "Форма входа проверена, ошибок нет.",
+          reasoning: "Проверил валидацию полей и фокус.",
+          attachments: [],
+          actions: [],
+          files: [],
+          error: "",
+          createdAt: "2026-11-17T10:02:00.000Z",
+        },
+      ],
+    };
     getSubagentsCalls = [];
     chatTokensTotal = 500;
     putTreePayloads = [];
@@ -150,35 +179,14 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
         if (url.startsWith("/api/agent/subagents") && method === "GET") {
           getSubagentsCalls.push(url);
           if (url.includes("onlyConversation=1")) {
+            const convMatch = url.match(/conversationId=(\d+)/);
+            const convId = convMatch ? Number(convMatch[1]) : 201;
+            const convObj =
+              conversationsStore.find((c) => c.id === convId) ?? conversationsStore[0];
             return json({
               selectedConversation: {
-                conversation: conversationsStore[0],
-                messages: [
-                  {
-                    id: 1,
-                    conversationId: 201,
-                    role: "user",
-                    content: "Проверь форму входа",
-                    reasoning: "",
-                    attachments: [],
-                    actions: [],
-                    files: [],
-                    error: "",
-                    createdAt: "2026-11-17T10:01:00.000Z",
-                  },
-                  {
-                    id: 2,
-                    conversationId: 201,
-                    role: "assistant",
-                    content: "Форма входа проверена, ошибок нет.",
-                    reasoning: "Проверил валидацию полей и фокус.",
-                    attachments: [],
-                    actions: [],
-                    files: [],
-                    error: "",
-                    createdAt: "2026-11-17T10:02:00.000Z",
-                  },
-                ],
+                conversation: convObj,
+                messages: messagesByConvStore[convId] ?? [],
                 tokens: { prompt: 320, completion: 180, total: chatTokensTotal },
               },
             });
@@ -225,6 +233,7 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
             slug: String(body.slug || "sec-auditor"),
             name: String(body.name || "Аудитор"),
             roleTitle: String(body.roleTitle || ""),
+            toolProfile: body.toolProfile === "full" ? "full" : "restricted",
             unlockApi: Boolean(body.unlockApi),
             provider: String(body.provider || "local"),
             baseUrl: String(body.baseUrl || ""),
@@ -246,6 +255,43 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
           const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
           patchSubagentPayloads.push({ id, body });
           return json({ ok: true, subagent: subagentsStore.find((s) => s.id === id) });
+        }
+
+        if (url === "/api/agent/conversations" && method === "POST") {
+          const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          const nextId = 200 + conversationsStore.length + 1;
+          const created: SubagentConversation = {
+            id: nextId,
+            kind: "subagent",
+            subagentId: Number(body.subagentId ?? 1),
+            title: String(body.title ?? "Новый чат субагента"),
+            messagesCount: 0,
+            createdAt: "2026-11-17T10:05:00.000Z",
+            updatedAt: "2026-11-17T10:05:00.000Z",
+          };
+          conversationsStore = [created, ...conversationsStore];
+          messagesByConvStore[nextId] = [];
+          return json({ conversation: created });
+        }
+
+        const msgSaveMatch = url.match(/^\/api\/agent\/conversations\/(\d+)\/messages$/);
+        if (msgSaveMatch && method === "POST") {
+          const cid = Number(msgSaveMatch[1]);
+          const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          const savedMsg = {
+            id: Date.now(),
+            conversationId: cid,
+            role: body.role === "assistant" ? "assistant" : "user",
+            content: String(body.content ?? ""),
+            reasoning: "",
+            attachments: Array.isArray(body.attachments) ? body.attachments : [],
+            actions: [],
+            files: [],
+            error: "",
+            createdAt: "2026-11-17T10:05:00.000Z",
+          };
+          messagesByConvStore[cid] = [...(messagesByConvStore[cid] ?? []), savedMsg];
+          return json({ message: savedMsg });
         }
 
         if (url === "/api/ai/agent" && method === "POST") {
@@ -605,5 +651,181 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
     await waitFor(() => {
       expect(screen.getByLabelText("Токены: 610")).toBeTruthy();
     });
+  });
+
+  it("выбирает профиль инструментов (Урезанные / Полные) при создании и не упоминает Тестировщика в Надсмотрщике", async () => {
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="verified"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByText("QA-инженер").length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^Надсмотрщик$/i }));
+    const ovCard = await screen.findByText(/Агент-Надсмотрщик \(Guard безопасности\)/i);
+    expect(ovCard).toBeTruthy();
+    expect(screen.queryByText(/встроенного Тестировщика/i)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /Создать субагента/i }));
+    fireEvent.change(screen.getByPlaceholderText("Например: QA-инженер"), {
+      target: { value: "Браузер-аудитор" },
+    });
+    const profileSelect = screen.getByLabelText("Профиль инструментов субагента") as HTMLSelectElement;
+    expect(profileSelect.value).toBe("restricted");
+    fireEvent.change(profileSelect, { target: { value: "full" } });
+    expect(screen.getByText(/Субагенту доступны browse_project/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Создать$/i }));
+    await waitFor(() => {
+      expect(postSubagentPayloads.length).toBe(1);
+    });
+    expect(postSubagentPayloads[0].toolProfile).toBe("full");
+    expect(await screen.findByText("Полные инструменты")).toBeTruthy();
+  });
+
+  it("перетаскивает узлы дерева свободно по холсту, сохраняет posX/posY и сбрасывает раскладку", async () => {
+    subagentsStore = [
+      makeSubagent({ id: 1, slug: "qa-lead", name: "QA-инженер", posX: 350, posY: 240 }),
+      makeSubagent({ id: 2, slug: "ui-architect", name: "UI-архитектор", parentSubagentId: 1 }),
+    ];
+
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="verified"
+      />,
+    );
+
+    const svg = await screen.findByRole("img", { name: "Схема зависимостей Оркестратора и субагентов" });
+    vi.spyOn(svg, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 900,
+      height: 500,
+      right: 900,
+      bottom: 500,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    // Кнопка «Сбросить раскладку» активна, пока есть сохранённые пользовательские координаты posX/posY
+    expect(screen.getByRole("button", { name: /Сбросить раскладку/i })).toBeTruthy();
+
+    const qaGroup = screen.getByRole("button", { name: "Субагент QA-инженер" });
+    fireEvent.pointerDown(qaGroup, { button: 0, clientX: 350, clientY: 240, pointerId: 1 });
+    fireEvent.pointerMove(svg, { clientX: 520, clientY: 310, pointerId: 1 });
+    fireEvent.pointerUp(svg, { clientX: 520, clientY: 310, pointerId: 1 });
+
+    fireEvent.click(screen.getByRole("button", { name: /Сохранить дерево/i }));
+    await waitFor(() => {
+      expect(putTreePayloads.length).toBe(1);
+    });
+    const savedNodes = putTreePayloads[0].nodes as Array<{ id: number; posX: number | null; posY: number | null }>;
+    const qaNode = savedNodes.find((n) => n.id === 1)!;
+    expect(typeof qaNode.posX).toBe("number");
+    expect(qaNode.posX).not.toBe(350);
+
+    // Сброс раскладки обнуляет координаты posX/posY и orchestratorPos
+    fireEvent.click(screen.getByRole("button", { name: /Сбросить раскладку/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Сохранить дерево/i }));
+    await waitFor(() => {
+      expect(putTreePayloads.length).toBe(2);
+    });
+    const resetNodes = putTreePayloads[1].nodes as Array<{ id: number; posX: number | null; posY: number | null }>;
+    expect(resetNodes.find((n) => n.id === 1)?.posX).toBeNull();
+    expect(putTreePayloads[1].orchestratorPos).toEqual({ x: null, y: null });
+  });
+
+  it("в прямом чате субагента прикрепляет файлы с fromHistory и переносит диалог при subagent_handoff_new_chat", async () => {
+    const sentBodies: Array<Record<string, unknown>> = [];
+    sseResponder = (body) => {
+      sentBodies.push(body);
+      const sse =
+        sentBodies.length === 1
+          ? [
+              `event: subagent_start\ndata: ${JSON.stringify({ subagentConversationId: 201 })}\n\n`,
+              `event: subagent_text\ndata: ${JSON.stringify({ text: "Достигнут лимит шагов, переношу в новый чат." })}\n\n`,
+              `event: subagent_handoff_new_chat\ndata: ${JSON.stringify({
+                stepsCompleted: 300,
+                summary: "Готов макет шапки, продолжить с подвала.",
+                continuationPrompt: "Продолжи вёрстку подвала",
+              })}\n\n`,
+              `event: subagent_done\ndata: ${JSON.stringify({ subagentConversationId: 201, usage: { prompt: 100, completion: 50, total: 150 } })}\n\n`,
+            ].join("")
+          : (() => {
+              messagesByConvStore[202] = [
+                ...(messagesByConvStore[202] ?? []),
+                {
+                  id: 999,
+                  conversationId: 202,
+                  role: "assistant",
+                  content: "Подвал доделан в новом чате!",
+                  reasoning: "",
+                  attachments: [],
+                  actions: [],
+                  files: [],
+                  error: "",
+                  createdAt: "2026-11-17T10:06:00.000Z",
+                },
+              ];
+              return [
+                `event: subagent_start\ndata: ${JSON.stringify({ subagentConversationId: 202 })}\n\n`,
+                `event: subagent_text\ndata: ${JSON.stringify({ text: "Подвал доделан в новом чате!" })}\n\n`,
+                `event: subagent_done\ndata: ${JSON.stringify({ subagentConversationId: 202, usage: { prompt: 50, completion: 30, total: 80 } })}\n\n`,
+              ].join("");
+            })();
+      return new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="verified"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Чаты \(1\)/i })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Чаты \(1\)/i }));
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Файлы для субагента")).toBeTruthy();
+    });
+
+    const fileInput = screen.getByLabelText("Файлы для субагента") as HTMLInputElement;
+    const mockFile = new File(["body { color: #111; }"], "theme.css", { type: "text/css" });
+    Object.defineProperty(fileInput, "files", { value: [mockFile], configurable: true });
+    fireEvent.change(fileInput);
+    expect(await screen.findByText(/theme\.css/i)).toBeTruthy();
+
+    fireEvent.change(screen.getByPlaceholderText(/Сообщение субагенту/i), {
+      target: { value: "Сверстай страницу" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Отправить/i }));
+
+    // При subagent_handoff_new_chat создаётся новый чат (202) и передаётся вложение из сессии (fromHistory: true)
+    await waitFor(() => {
+      expect(sentBodies.length).toBe(2);
+    });
+    expect(sentBodies[0].subagentConversationId).toBe(201);
+    expect((sentBodies[0].attachments as Array<Record<string, unknown>>)?.[0]).toMatchObject({
+      name: "theme.css",
+      fromHistory: false,
+    });
+    expect(sentBodies[1].subagentConversationId).toBe(202);
+    expect((sentBodies[1].attachments as Array<Record<string, unknown>>)?.[0]).toMatchObject({
+      name: "theme.css",
+      fromHistory: true,
+    });
+    expect(await screen.findByText(/Подвал доделан в новом чате!/i)).toBeTruthy();
   });
 });

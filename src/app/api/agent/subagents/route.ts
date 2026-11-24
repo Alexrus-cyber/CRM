@@ -93,6 +93,10 @@ export async function GET(req: Request) {
       conversations,
       selectedConversation,
       routingMode: orchestration.routingMode,
+      orchestratorPos: {
+        x: orchestration.orchestratorPosX,
+        y: orchestration.orchestratorPosY,
+      },
       overseer: orchestration.overseer,
       limits: {
         maxStored: MAX_SUBAGENTS_STORED,
@@ -187,26 +191,45 @@ export async function PUT(req: Request) {
     | {
         nodes?: DependencyTreeNodeUpdate[];
         routingMode?: SubagentRoutingMode;
+        orchestratorPos?: { x?: number | null; y?: number | null } | null;
       }
     | null;
-  if (!body || (!Array.isArray(body.nodes) && body.routingMode === undefined)) {
-    return Response.json({ error: "Укажите массив узлов дерева nodes или routingMode" }, { status: 400 });
+  if (
+    !body ||
+    (!Array.isArray(body.nodes) && body.routingMode === undefined && body.orchestratorPos === undefined)
+  ) {
+    return Response.json(
+      { error: "Укажите массив узлов дерева nodes, routingMode или orchestratorPos" },
+      { status: 400 },
+    );
   }
 
   try {
     const subagents = Array.isArray(body.nodes)
       ? await updateSubagentsDependencyTree(user.id, body.nodes)
       : await listSubagentsPublic(user.id);
-    const orchestration =
-      body.routingMode !== undefined
-        ? await upsertAgentOrchestrationConfig(user.id, { routingMode: body.routingMode })
-        : await getAgentOrchestrationConfigPublic(user.id);
+    const shouldUpsertOrch = body.routingMode !== undefined || body.orchestratorPos !== undefined;
+    const orchestration = shouldUpsertOrch
+      ? await upsertAgentOrchestrationConfig(user.id, {
+          ...(body.routingMode !== undefined ? { routingMode: body.routingMode } : {}),
+          ...(body.orchestratorPos !== undefined
+            ? {
+                orchestratorPosX: body.orchestratorPos?.x ?? null,
+                orchestratorPosY: body.orchestratorPos?.y ?? null,
+              }
+            : {}),
+        })
+      : await getAgentOrchestrationConfigPublic(user.id);
     const counts = await countSubagents(user.id);
     return Response.json(
       {
         ok: true,
         subagents,
         routingMode: orchestration.routingMode,
+        orchestratorPos: {
+          x: orchestration.orchestratorPosX,
+          y: orchestration.orchestratorPosY,
+        },
         overseer: orchestration.overseer,
         limits: {
           maxStored: MAX_SUBAGENTS_STORED,

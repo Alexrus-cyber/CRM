@@ -1,5 +1,6 @@
 export type SubagentRoutingMode = "linear" | "layered";
 export type OverseerMode = "strict" | "rules_only";
+export type SubagentToolProfile = "full" | "restricted";
 
 export type OverseerConfig = {
   enabled: boolean;
@@ -33,7 +34,6 @@ export type OverseerVerdictMeta = {
 export type AgentLiveActorKind =
   | "orchestrator"
   | "subagent"
-  | "tester"
   | "overseer"
   | "browser_inspector"
   | "approval";
@@ -51,6 +51,9 @@ export type Subagent = {
   parentSubagentId: number | null;
   orchestratorCanCall: boolean;
   allowedCallees: string[];
+  toolProfile?: SubagentToolProfile;
+  posX?: number | null;
+  posY?: number | null;
   unlockApi: boolean;
   provider: string;
   baseUrl: string;
@@ -102,14 +105,28 @@ export type SubagentConversation = {
   updatedAt: string;
 };
 
+export type SubagentMessageAttachment = {
+  name: string;
+  size?: number;
+  mime?: string;
+  note?: string;
+  sandboxPath?: string;
+  image?: string;
+};
+
+export type SubagentMessageAction = {
+  type?: string;
+  [key: string]: unknown;
+};
+
 export type SubagentMessage = {
   id: number;
   conversationId: number;
   role: "user" | "assistant";
   content: string;
   reasoning: string;
-  attachments: string[];
-  actions: string[];
+  attachments: Array<string | SubagentMessageAttachment>;
+  actions: Array<string | SubagentMessageAction>;
   files: string[];
   error: string;
   createdAt: string;
@@ -127,6 +144,8 @@ export type TreeNodeDraft = {
   parentSubagentId: number | null;
   orchestratorCanCall: boolean;
   allowedCalleesText: string;
+  posX?: number | null;
+  posY?: number | null;
 };
 
 export function parseCalleesList(text: string): string[] {

@@ -18,6 +18,7 @@ export type SubagentCallerKind = "orchestrator" | "subagent" | "user";
 export type SubagentRunStatus = "running" | "completed" | "handoff" | "blocked" | "error";
 export type SubagentRoutingMode = "linear" | "layered";
 export type OverseerMode = "strict" | "rules_only";
+export type SubagentToolProfile = "full" | "restricted";
 
 export type OverseerConfigPublic = {
   enabled: boolean;
@@ -37,11 +38,15 @@ export type OverseerConfigSecret = OverseerConfigPublic & {
 
 export type AgentOrchestrationConfigPublic = {
   routingMode: SubagentRoutingMode;
+  orchestratorPosX: number | null;
+  orchestratorPosY: number | null;
   overseer: OverseerConfigPublic;
 };
 
 export type AgentOrchestrationConfigSecret = {
   routingMode: SubagentRoutingMode;
+  orchestratorPosX: number | null;
+  orchestratorPosY: number | null;
   overseer: OverseerConfigSecret;
 };
 
@@ -59,6 +64,10 @@ export type AgentSubagentPublic = {
   orchestratorCanCall: boolean;
   /** `["*"]` — может просить Оркестратора вызвать любого активного субагента; `[]` — только возврат summary Оркестратору; либо список slug/id. */
   allowedCallees: string[];
+  /** `'full'` — все инструменты (включая `browser_inspector` и браузер); `'restricted'` — урезанный профиль без браузера. */
+  toolProfile: SubagentToolProfile;
+  posX: number | null;
+  posY: number | null;
   /** Галочка «Разблокировать API»: `false` = используется заблокированный API Агента (Оркестратора); `true` = используется своё API субагента. */
   unlockApi: boolean;
   provider: string;
@@ -168,6 +177,17 @@ function normalizeColor(raw: unknown): string {
   return "#8b5cf6";
 }
 
+export function normalizeToolProfile(raw: unknown): SubagentToolProfile {
+  return String(raw ?? "").trim().toLowerCase() === "full" ? "full" : "restricted";
+}
+
+function normalizeCoord(raw: unknown): number | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  const num = Number(raw);
+  if (!Number.isFinite(num)) return null;
+  return Math.max(-2000, Math.min(8000, Math.round(num * 10) / 10));
+}
+
 function mapSubagentPublic(row: Raw): AgentSubagentPublic {
   const encrypted = String(row.api_key_encrypted ?? "");
   const parentRaw = row.parent_subagent_id;
@@ -184,6 +204,9 @@ function mapSubagentPublic(row: Raw): AgentSubagentPublic {
     parentSubagentId: parentRaw === null || parentRaw === undefined ? null : toNum(parentRaw) || null,
     orchestratorCanCall: row.orchestrator_can_call === undefined ? true : toBool(row.orchestrator_can_call),
     allowedCallees: parseStringArray(row.allowed_callees, ["*"]),
+    toolProfile: normalizeToolProfile(row.tool_profile),
+    posX: normalizeCoord(row.pos_x),
+    posY: normalizeCoord(row.pos_y),
     unlockApi: toBool(row.unlock_api),
     provider: String(row.provider ?? "custom") || "custom",
     baseUrl: String(row.base_url ?? ""),
@@ -388,6 +411,9 @@ export type CreateSubagentInput = {
   parentSubagentId?: number | null;
   orchestratorCanCall?: boolean;
   allowedCallees?: string[] | string;
+  toolProfile?: SubagentToolProfile;
+  posX?: number | null;
+  posY?: number | null;
   unlockApi?: boolean;
   provider?: string;
   baseUrl?: string;
@@ -438,6 +464,9 @@ export async function createSubagent(
   const allowedCallees = normalizeAllowedCallees(input.allowedCallees).filter(
     (item) => item !== slug,
   );
+  const toolProfile = normalizeToolProfile(input.toolProfile);
+  const posX = normalizeCoord(input.posX);
+  const posY = normalizeCoord(input.posY);
   const unlockApi = Boolean(input.unlockApi);
   const provider = String(input.provider ?? "custom").trim().slice(0, 40) || "custom";
   const baseUrl = input.baseUrl ? normalizeBaseUrl(String(input.baseUrl).slice(0, 400)) : "";
@@ -452,11 +481,13 @@ export async function createSubagent(
     insert into agent_subagents (
       user_id, slug, name, role_title, description, system_prompt, color,
       is_active, parent_subagent_id, orchestrator_can_call, allowed_callees,
+      tool_profile, pos_x, pos_y,
       unlock_api, provider, base_url, model, api_key_encrypted, api_key_hint,
       reasoning_mode, created_at, updated_at
     ) values (
       ${userId}, ${slug}, ${name}, ${roleTitle}, ${description}, ${systemPrompt}, ${color},
       ${wantActive}, ${parentId}, ${orchestratorCanCall}, ${JSON.stringify(allowedCallees)},
+      ${toolProfile}, ${posX}, ${posY},
       ${unlockApi}, ${provider}, ${baseUrl}, ${model}, ${encryptedKey}, ${keyHint},
       ${reasoningMode}, ${now}, ${now}
     ) returning id`);
@@ -476,6 +507,9 @@ export type UpdateSubagentInput = {
   parentSubagentId?: number | null;
   orchestratorCanCall?: boolean;
   allowedCallees?: string[] | string;
+  toolProfile?: SubagentToolProfile;
+  posX?: number | null;
+  posY?: number | null;
   unlockApi?: boolean;
   provider?: string;
   baseUrl?: string;
@@ -553,6 +587,10 @@ export async function updateSubagent(
       ? normalizeAllowedCallees(patch.allowedCallees)
       : current.allowedCallees
   ).filter((item) => item !== nextSlug && item !== String(id));
+  const nextToolProfile =
+    patch.toolProfile !== undefined ? normalizeToolProfile(patch.toolProfile) : current.toolProfile;
+  const nextPosX = patch.posX !== undefined ? normalizeCoord(patch.posX) : current.posX;
+  const nextPosY = patch.posY !== undefined ? normalizeCoord(patch.posY) : current.posY;
   const nextUnlockApi =
     patch.unlockApi !== undefined ? Boolean(patch.unlockApi) : current.unlockApi;
   const nextProvider =
@@ -596,6 +634,9 @@ export async function updateSubagent(
         parent_subagent_id = ${nextParentId},
         orchestrator_can_call = ${nextOrchestratorCanCall},
         allowed_callees = ${JSON.stringify(nextAllowedCallees)},
+        tool_profile = ${nextToolProfile},
+        pos_x = ${nextPosX},
+        pos_y = ${nextPosY},
         unlock_api = ${nextUnlockApi},
         provider = ${nextProvider},
         base_url = ${nextBaseUrl},
@@ -629,6 +670,8 @@ export type DependencyTreeNodeUpdate = {
   parentSubagentId?: number | null;
   orchestratorCanCall?: boolean;
   allowedCallees?: string[];
+  posX?: number | null;
+  posY?: number | null;
 };
 
 /**
@@ -644,6 +687,8 @@ export async function updateSubagentsDependencyTree(
   const nextParentMap = new Map<number, number | null>(all.map((s) => [s.id, s.parentSubagentId]));
   const nextOrchMap = new Map<number, boolean>(all.map((s) => [s.id, s.orchestratorCanCall]));
   const nextCalleesMap = new Map<number, string[]>(all.map((s) => [s.id, s.allowedCallees]));
+  const nextPosXMap = new Map<number, number | null>(all.map((s) => [s.id, s.posX]));
+  const nextPosYMap = new Map<number, number | null>(all.map((s) => [s.id, s.posY]));
 
   for (const upd of updates) {
     const id = Number(upd.id);
@@ -668,6 +713,12 @@ export async function updateSubagentsDependencyTree(
         ),
       );
     }
+    if (upd.posX !== undefined) {
+      nextPosXMap.set(id, normalizeCoord(upd.posX));
+    }
+    if (upd.posY !== undefined) {
+      nextPosYMap.set(id, normalizeCoord(upd.posY));
+    }
   }
 
   const totalActive = Array.from(nextActiveMap.values()).filter(Boolean).length;
@@ -686,6 +737,8 @@ export async function updateSubagentsDependencyTree(
           parent_subagent_id = ${nextParentMap.get(s.id) ?? null},
           orchestrator_can_call = ${nextOrchMap.get(s.id) ?? s.orchestratorCanCall},
           allowed_callees = ${JSON.stringify(nextCalleesMap.get(s.id) ?? s.allowedCallees)},
+          pos_x = ${nextPosXMap.get(s.id) ?? null},
+          pos_y = ${nextPosYMap.get(s.id) ?? null},
           updated_at = ${now}
       where id = ${s.id} and user_id = ${userId}`);
   }
@@ -986,6 +1039,8 @@ export function normalizeOverseerMode(raw: unknown): OverseerMode {
 
 const DEFAULT_ORCHESTRATION_PUBLIC: AgentOrchestrationConfigPublic = {
   routingMode: "linear",
+  orchestratorPosX: null,
+  orchestratorPosY: null,
   overseer: {
     enabled: true,
     mode: "strict",
@@ -1003,12 +1058,16 @@ function mapOrchestrationPublic(row: Raw | null | undefined): AgentOrchestration
   if (!row) {
     return {
       routingMode: DEFAULT_ORCHESTRATION_PUBLIC.routingMode,
+      orchestratorPosX: null,
+      orchestratorPosY: null,
       overseer: { ...DEFAULT_ORCHESTRATION_PUBLIC.overseer },
     };
   }
   const encrypted = String(row.overseer_api_key_encrypted ?? "");
   return {
     routingMode: normalizeSubagentRoutingMode(row.subagent_routing_mode),
+    orchestratorPosX: normalizeCoord(row.orchestrator_pos_x),
+    orchestratorPosY: normalizeCoord(row.orchestrator_pos_y),
     overseer: {
       enabled: row.overseer_enabled === undefined ? true : toBool(row.overseer_enabled),
       mode: normalizeOverseerMode(row.overseer_mode),
@@ -1028,6 +1087,8 @@ export async function getAgentOrchestrationConfigPublic(
 ): Promise<AgentOrchestrationConfigPublic> {
   const row = await q1(sql`
     select subagent_routing_mode,
+           orchestrator_pos_x,
+           orchestrator_pos_y,
            overseer_enabled,
            overseer_mode,
            overseer_system_prompt,
@@ -1048,6 +1109,8 @@ export async function getAgentOrchestrationConfigSecret(
 ): Promise<AgentOrchestrationConfigSecret> {
   const row = await q1(sql`
     select subagent_routing_mode,
+           orchestrator_pos_x,
+           orchestrator_pos_y,
            overseer_enabled,
            overseer_mode,
            overseer_system_prompt,
@@ -1071,6 +1134,8 @@ export async function getAgentOrchestrationConfigSecret(
   }
   return {
     routingMode: pub.routingMode,
+    orchestratorPosX: pub.orchestratorPosX,
+    orchestratorPosY: pub.orchestratorPosY,
     overseer: {
       ...pub.overseer,
       apiKey,
@@ -1080,6 +1145,8 @@ export async function getAgentOrchestrationConfigSecret(
 
 export type UpsertAgentOrchestrationInput = {
   routingMode?: SubagentRoutingMode;
+  orchestratorPosX?: number | null;
+  orchestratorPosY?: number | null;
   overseer?: {
     enabled?: boolean;
     mode?: OverseerMode;
@@ -1101,6 +1168,8 @@ export async function upsertAgentOrchestrationConfig(
   const existing = await q1(sql`
     select id,
            subagent_routing_mode,
+           orchestrator_pos_x,
+           orchestrator_pos_y,
            overseer_enabled,
            overseer_mode,
            overseer_system_prompt,
@@ -1119,6 +1188,10 @@ export async function upsertAgentOrchestrationConfig(
     input.routingMode !== undefined
       ? normalizeSubagentRoutingMode(input.routingMode)
       : cur.routingMode;
+  const nextOrchPosX =
+    input.orchestratorPosX !== undefined ? normalizeCoord(input.orchestratorPosX) : cur.orchestratorPosX;
+  const nextOrchPosY =
+    input.orchestratorPosY !== undefined ? normalizeCoord(input.orchestratorPosY) : cur.orchestratorPosY;
 
   const ov = input.overseer ?? {};
   // Надсмотрщик всегда остаётся активным для защиты Sandbox; режим можно выбрать ('strict' | 'rules_only').
@@ -1160,6 +1233,8 @@ export async function upsertAgentOrchestrationConfig(
     await q(sql`
       update ai_user_settings
       set subagent_routing_mode = ${nextRouting},
+          orchestrator_pos_x = ${nextOrchPosX},
+          orchestrator_pos_y = ${nextOrchPosY},
           overseer_enabled = ${nextEnabled},
           overseer_mode = ${nextMode},
           overseer_system_prompt = ${nextPrompt},
@@ -1175,12 +1250,14 @@ export async function upsertAgentOrchestrationConfig(
     await q(sql`
       insert into ai_user_settings (
         user_id, base_url, api_key_encrypted, api_key_hint, model,
-        subagent_routing_mode, overseer_enabled, overseer_mode, overseer_system_prompt,
+        subagent_routing_mode, orchestrator_pos_x, orchestrator_pos_y,
+        overseer_enabled, overseer_mode, overseer_system_prompt,
         overseer_unlock_api, overseer_provider, overseer_base_url, overseer_model,
         overseer_api_key_encrypted, overseer_api_key_hint, created_at, updated_at
       ) values (
         ${userId}, '', '', '', '',
-        ${nextRouting}, ${nextEnabled}, ${nextMode}, ${nextPrompt},
+        ${nextRouting}, ${nextOrchPosX}, ${nextOrchPosY},
+        ${nextEnabled}, ${nextMode}, ${nextPrompt},
         ${nextUnlockApi}, ${nextProvider}, ${nextBaseUrl}, ${nextModel},
         ${nextEncrypted}, ${nextHint}, ${now}, ${now}
       )`);

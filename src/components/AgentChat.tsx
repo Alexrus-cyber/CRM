@@ -88,20 +88,6 @@ import {
 } from "./operator/shared";
 import { ApprovalToast } from "./ApprovalToast";
 import { GithubIcon, GithubIntegrationPanel, type GithubAccountPublic } from "./agent/GithubIntegrationPanel";
-import {
-  TesterActionsList,
-  TesterPanel,
-  resolveLiveTesterActorMeta,
-  upsertLiveTesterAction,
-  type LiveTesterActionItem,
-  type LiveTesterActor,
-  type LiveTesterState,
-  type TesterChatFileItem,
-  type TesterChatMessage,
-  type TesterConversationItem,
-  type TesterIssueItem,
-  type TesterRunItem,
-} from "./agent/TesterPanel";
 import { SubagentsPanel } from "./agent/SubagentsPanel";
 import type {
   AgentLiveActorKind,
@@ -145,6 +131,7 @@ type AgentAction = {
     | "qa_check"
     | "subagent_report"
     | "subagent_handoff"
+    | "subagent_chat_rotated"
     | "overseer_verdict";
   action?: string;
   kind?: string;
@@ -226,7 +213,7 @@ type Turn = {
   content: string;
   actions: AgentAction[];
   files: AgentFile[];
-  attached?: Array<{ name: string; size: number }>;
+  attached?: Array<{ name: string; size: number; note?: string; sandboxPath?: string }>;
   reasoning?: string;
   error?: string;
 };
@@ -246,7 +233,7 @@ type StoredTurn = {
   content: string;
   reasoning?: string;
   error?: string;
-  attachments?: Array<{ name?: string; size?: number }>;
+  attachments?: Array<{ name?: string; size?: number; mime?: string; note?: string; sandboxPath?: string }>;
   actions?: AgentAction[];
   files?: Array<{ name?: string; mime?: string; size?: number }>;
 };
@@ -292,10 +279,6 @@ type PendingApproval = {
   coachAfterEachStep?: boolean;
   operatorTrustLevel?: string;
   sandboxProject?: string;
-  testerRunKey?: string;
-  testerRunId?: number;
-  testerConversationId?: number;
-  minorIssues?: TesterIssueItem[];
   overseer?: OverseerVerdictMeta;
   github?: {
     login?: string;
@@ -462,57 +445,9 @@ type TranscriptMeta = {
   createdAt: string;
 };
 
-function parseLiveTesterActionItem(raw: Record<string, unknown>): LiveTesterActionItem {
-  return {
-    type: String(raw.type ?? "qa_check"),
-    callId: raw.callId ? String(raw.callId) : undefined,
-    step: typeof raw.step === "number" ? raw.step : undefined,
-    tool: raw.tool ? String(raw.tool) : undefined,
-    status: raw.status ? String(raw.status) : undefined,
-    durationMs: typeof raw.durationMs === "number" ? raw.durationMs : undefined,
-    label: raw.label ? String(raw.label) : undefined,
-    command: raw.command ? String(raw.command) : undefined,
-    url: raw.url ? String(raw.url) : undefined,
-    action: raw.action ? String(raw.action) : undefined,
-    viewport: raw.viewport ? String(raw.viewport) : undefined,
-    summary: raw.summary ? String(raw.summary) : undefined,
-    error: raw.error ? String(raw.error) : undefined,
-    trace: Array.isArray(raw.trace) ? raw.trace.map(String).slice(-80) : undefined,
-    path: raw.path ? String(raw.path) : undefined,
-    project: raw.project ? String(raw.project) : undefined,
-    sandboxProject: raw.sandboxProject ? String(raw.sandboxProject) : undefined,
-    reportSummary: raw.reportSummary ? String(raw.reportSummary) : undefined,
-    criticalCount: typeof raw.criticalCount === "number" ? raw.criticalCount : undefined,
-    minorCount: typeof raw.minorCount === "number" ? raw.minorCount : undefined,
-    errorsCount: typeof raw.errorsCount === "number" ? raw.errorsCount : undefined,
-    issuesCount: typeof raw.issuesCount === "number" ? raw.issuesCount : undefined,
-    animationsCount: typeof raw.animationsCount === "number" ? raw.animationsCount : undefined,
-  };
-}
-
-function parseLiveTesterActor(data: Record<string, unknown>): LiveTesterActor | undefined {
-  const raw = String(data.actor ?? data.source ?? "");
-  if (
-    raw === "browser_inspector" ||
-    raw === "tester_llm" ||
-    raw === "tester_tool" ||
-    raw === "approval" ||
-    raw === "tester"
-  ) {
-    return raw;
-  }
-  if (data.tool === "browse_project" || data.tool === "qa_browser_audit") {
-    return "browser_inspector";
-  }
-  return undefined;
-}
-
 type StatusActor =
   | "agent_llm"
   | "agent_tool"
-  | "tester"
-  | "tester_llm"
-  | "tester_tool"
   | "subagent"
   | "subagent_llm"
   | "overseer"
@@ -546,9 +481,6 @@ function parseStatusActor(data: Record<string, unknown>, fallback?: StatusActor)
   if (
     raw === "agent_llm" ||
     raw === "agent_tool" ||
-    raw === "tester" ||
-    raw === "tester_llm" ||
-    raw === "tester_tool" ||
     raw === "subagent" ||
     raw === "subagent_llm" ||
     raw === "overseer" ||
@@ -580,7 +512,12 @@ function decodeStoredTurn(message: StoredTurn): Turn {
         }))
       : [],
     attached: Array.isArray(message.attachments)
-      ? message.attachments.map((file) => ({ name: String(file.name ?? "файл"), size: Number(file.size ?? 0) }))
+      ? message.attachments.map((file) => ({
+          name: String(file.name ?? "файл"),
+          size: Number(file.size ?? 0),
+          ...(typeof file.note === "string" && file.note ? { note: file.note } : {}),
+          ...(typeof file.sandboxPath === "string" && file.sandboxPath ? { sandboxPath: file.sandboxPath } : {}),
+        }))
       : [],
   };
 }
@@ -608,13 +545,12 @@ const EXAMPLES = [
 const DEFAULT_RAG_PREFS: RagPrefs = { folderId: 0, ragFull: false, ragChunks: 12 };
 
 type AgentLayoutMode = "tabs" | "classic";
-type AgentTabId = "model" | "knowledge" | "workspace" | "tester" | "subagents" | "chat";
+type AgentTabId = "model" | "knowledge" | "workspace" | "subagents" | "chat";
 
 const AGENT_TABS: Array<{ id: AgentTabId; label: string; hint: string }> = [
   { id: "model", label: "Модель и генерация", hint: "Подключение, выбор модели, возможности, раздумья и системный промпт" },
   { id: "knowledge", label: "Доверие и RAG", hint: "Уровень доверия ИИ, RAG-база знаний, контекст и архив переписок" },
   { id: "workspace", label: "Sandbox и Оператор", hint: "Изолированная папка Sandbox, экспорт на ПК и совместная работа с Оператором" },
-  { id: "tester", label: "Тестировщик", hint: "Независимый QA-тестировщик в отдельном чате с теми же настройками модели" },
   { id: "subagents", label: "Субагенты", hint: "Оркестратор и специализированные субагенты: дерево зависимостей, изолированные чаты и своё API" },
   { id: "chat", label: "Чат", hint: "История переписок, диалог с Агентом, вложения и запуск" },
 ];
@@ -729,6 +665,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const [turns, setTurns] = useState<Turn[]>([]);
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<OperatorAttachment[]>([]);
+  const [sessionAttachments, setSessionAttachments] = useState<OperatorAttachment[]>([]);
   const [reading, setReading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
@@ -798,16 +735,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const [transcriptsOpen, setTranscriptsOpen] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
 
-  // Под-агент Тестировщик (QA): отдельные чаты, отчёты в БД, живой поток и мелкие правки по согласию человека.
-  const [testerRuns, setTesterRuns] = useState<TesterRunItem[]>([]);
-  const [testerConversations, setTesterConversations] = useState<TesterConversationItem[]>([]);
-  const [selectedTesterConvId, setSelectedTesterConvId] = useState<number | null>(null);
-  const [selectedTesterMessages, setSelectedTesterMessages] = useState<TesterChatMessage[]>([]);
-  const [testerLoading, setTesterLoading] = useState(false);
-  const [testerDirectRunning, setTesterDirectRunning] = useState(false);
-  const [testerDirectPrompt, setTesterDirectPrompt] = useState("");
-  const [testerDirectProject, setTesterDirectProject] = useState(".");
-  const [liveTester, setLiveTester] = useState<LiveTesterState | null>(null);
+  // Живой статус исполнителя (Оркестратор / Субагент / Надсмотрщик / Инспектор браузера).
   const [liveStatusActor, setLiveStatusActor] = useState<StatusActor | null>(null);
   const [activeLiveActor, setActiveLiveActor] = useState<ActiveLiveActor | null>(null);
   const prevActorBeforeOverseerRef = useRef<{
@@ -815,8 +743,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     liveActor: ActiveLiveActor | null;
   } | null>(null);
   const [liveBrowserLog, setLiveBrowserLog] = useState<string[]>([]);
-  const [testerError, setTesterError] = useState<string | null>(null);
-  const [testerDecisionBusy, setTesterDecisionBusy] = useState<number | null>(null);
   const [subagentStats, setSubagentStats] = useState<{
     totalCount: number;
     activeCount: number;
@@ -857,7 +783,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     setLiveBrowserLog([]);
   }, []);
   const conversationIdRef = useRef<number | null>(null);
-  const selectedTesterConvIdRef = useRef<number | null>(null);
   const opTaskRef = useRef<OperatorTask | null>(null);
   const dismissedOpTaskIdsRef = useRef<Set<number>>(new Set());
   const runningRef = useRef(false);
@@ -869,9 +794,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   useEffect(() => {
     conversationIdRef.current = conversationId;
   }, [conversationId]);
-  useEffect(() => {
-    selectedTesterConvIdRef.current = selectedTesterConvId;
-  }, [selectedTesterConvId]);
   useEffect(() => {
     opTaskRef.current = opTask;
   }, [opTask]);
@@ -1032,69 +954,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     }
   }, []);
 
-  const loadTesterConversationMessages = useCallback(async (convId: number) => {
-    try {
-      const res = await fetch(`/api/agent/conversations/${convId}`, { cache: "no-store" });
-      if (!res.ok) return;
-      const data = (await res.json().catch(() => null)) as { messages?: StoredTurn[] } | null;
-      if (data && Array.isArray(data.messages)) {
-        setSelectedTesterMessages(
-          data.messages.map((m): TesterChatMessage => {
-            const decoded = decodeStoredTurn(m);
-            return {
-              id: decoded.id,
-              role: decoded.role,
-              content: decoded.content,
-              reasoning: decoded.reasoning,
-              actions: decoded.actions as LiveTesterActionItem[],
-              files: decoded.files,
-              error: decoded.error,
-            };
-          }),
-        );
-      }
-    } catch {
-      /* фоновая загрузка */
-    }
-  }, []);
-
-  const refreshTesterData = useCallback(
-    async (preferConvId?: number | null) => {
-      try {
-        const res = await fetch("/api/agent/tester", { cache: "no-store" });
-        if (!res.ok) return;
-        const data = (await res.json().catch(() => null)) as {
-          runs?: TesterRunItem[];
-          conversations?: TesterConversationItem[];
-        } | null;
-        if (!data) return;
-        const nextRuns = Array.isArray(data.runs) ? data.runs : [];
-        const nextConvs = Array.isArray(data.conversations) ? data.conversations : [];
-        setTesterRuns(nextRuns);
-        setTesterConversations(nextConvs);
-        const targetId =
-          preferConvId && nextConvs.some((c) => c.id === preferConvId)
-            ? preferConvId
-            : selectedTesterConvIdRef.current && nextConvs.some((c) => c.id === selectedTesterConvIdRef.current)
-              ? selectedTesterConvIdRef.current
-              : nextConvs[0]?.id ?? null;
-        setSelectedTesterConvId(targetId);
-        if (targetId) {
-          await loadTesterConversationMessages(targetId);
-        } else {
-          setSelectedTesterMessages([]);
-        }
-      } catch {
-        /* фоновая синхронизация тестировщика */
-      }
-    },
-    [loadTesterConversationMessages],
-  );
-
-  useEffect(() => {
-    void refreshTesterData();
-  }, [refreshTesterData]);
-
   const refreshGithubConnection = useCallback(async () => {
     try {
       const res = await fetch("/api/github/connection", { cache: "no-store" });
@@ -1199,6 +1058,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     setConversationId(id);
     setTurns((data.messages ?? []).map(decodeStoredTurn));
     setAttachments([]);
+    setSessionAttachments([]);
     setText("");
     counter.current = 0;
     setError(null);
@@ -1221,6 +1081,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     setConversationId(conversation.id);
     setTurns([]);
     setAttachments([]);
+    setSessionAttachments([]);
     setText("");
     setError(null);
     setStatus(null);
@@ -1237,7 +1098,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         content: string;
         reasoning?: string;
         error?: string;
-        attachments?: Array<{ name: string; size: number }>;
+        attachments?: Array<{ name: string; size: number; mime?: string; note?: string; sandboxPath?: string }>;
         actions?: AgentAction[];
         files?: Array<{ name: string; mime: string; size: number }>;
       },
@@ -1967,25 +1828,10 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         setError(data.error ?? "Не удалось отправить подтверждение");
         return;
       }
-      if (pendingApproval.kind === "tester_minor_fixes" && pendingApproval.testerRunId) {
-        const runId = pendingApproval.testerRunId;
-        const decVal = approved ? "approved" : "rejected";
-        setTesterRuns((prev) => prev.map((r) => (r.id === runId ? { ...r, minorDecision: decVal } : r)));
-        void fetch(`/api/agent/tester/${runId}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ decision: decVal }),
-        }).catch(() => undefined);
-      }
       setScreenCapture(null);
       setPendingApproval(null);
       setApprovalDest("");
       setApprovalTaskDraft("");
-      setLiveTester((prev) =>
-        prev
-          ? { ...prev, actor: "tester", statusText: "Тестировщик: продолжаю проверку…" }
-          : prev,
-      );
       if (launchedTaskId !== undefined) {
         void refreshOpTask(launchedTaskId);
       }
@@ -2262,482 +2108,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     return () => window.clearInterval(timer);
   }, [running, scrollDown]);
 
-  const selectTesterConversation = async (id: number) => {
-    setSelectedTesterConvId(id);
-    setTesterLoading(true);
-    try {
-      await loadTesterConversationMessages(id);
-    } finally {
-      setTesterLoading(false);
-    }
-  };
-
-  const createNewTesterChat = async () => {
-    if (testerDirectRunning || running) return;
-    setTesterLoading(true);
-    setTesterError(null);
-    try {
-      const res = await fetch("/api/agent/conversations", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kind: "tester", title: "Новый чат тестировщика" }),
-      });
-      const data = (await res.json().catch(() => ({}))) as {
-        conversation?: TesterConversationItem;
-        error?: string;
-      };
-      if (!res.ok || !data.conversation) {
-        throw new Error(data.error ?? "Не удалось создать чат тестировщика");
-      }
-      const created = data.conversation;
-      setTesterConversations((prev) => [created, ...prev.filter((c) => c.id !== created.id)]);
-      setSelectedTesterConvId(created.id);
-      setSelectedTesterMessages([]);
-    } catch (caught) {
-      setTesterError(caught instanceof Error ? caught.message : "Ошибка создания чата тестировщика");
-    } finally {
-      setTesterLoading(false);
-    }
-  };
-
-  const deleteTesterChat = async (id: number) => {
-    if (testerDirectRunning || running) return;
-    setTesterLoading(true);
-    setTesterError(null);
-    try {
-      const res = await fetch(`/api/agent/conversations/${id}`, { method: "DELETE" });
-      if (!res.ok) throw new Error("Не удалось удалить чат тестировщика");
-      const nextConvs = testerConversations.filter((c) => c.id !== id);
-      setTesterConversations(nextConvs);
-      setTesterRuns((prev) => prev.filter((r) => r.testerConversationId !== id));
-      const fallback = nextConvs[0]?.id ?? null;
-      setSelectedTesterConvId(fallback);
-      if (fallback) {
-        await loadTesterConversationMessages(fallback);
-      } else {
-        setSelectedTesterMessages([]);
-      }
-    } catch (caught) {
-      setTesterError(caught instanceof Error ? caught.message : "Ошибка удаления чата тестировщика");
-    } finally {
-      setTesterLoading(false);
-    }
-  };
-
-  const decideTesterMinor = async (runId: number, decision: "approved" | "rejected") => {
-    setTesterDecisionBusy(runId);
-    setTesterError(null);
-    try {
-      const res = await fetch(`/api/agent/tester/${runId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decision }),
-      });
-      const data = (await res.json().catch(() => ({}))) as { run?: TesterRunItem; error?: string };
-      if (!res.ok || !data.run) throw new Error(data.error ?? "Не удалось сохранить решение");
-      setTesterRuns((prev) => prev.map((r) => (r.id === runId ? data.run! : r)));
-      await refreshTesterData(data.run.testerConversationId);
-    } catch (caught) {
-      setTesterError(caught instanceof Error ? caught.message : "Ошибка сохранения решения");
-    } finally {
-      setTesterDecisionBusy(null);
-    }
-  };
-
-  const openAgentChatFromTester = async (agentConvId: number) => {
-    if (!agentConvId || running || historyLoading) return;
-    try {
-      await openConversation(agentConvId);
-      if (layoutMode === "tabs") setActiveTab("chat");
-    } catch (caught) {
-      setTesterError(caught instanceof Error ? caught.message : "Исходный чат Агента не найден");
-    }
-  };
-
-  const sendTesterDirect = async () => {
-    const promptText = testerDirectPrompt.trim();
-    if (!promptText || testerDirectRunning || running) return;
-    setTesterError(null);
-    setTesterDirectPrompt("");
-    setTesterDirectRunning(true);
-
-    let targetConvId = selectedTesterConvId;
-    let persistedByServer = false;
-    const draftId = `td_${Date.now()}`;
-    const testerAbortCtrl = new AbortController();
-    let testerIdleTimer: number | null = null;
-    let testerStalled = false;
-    const clearTesterWatchdog = () => {
-      if (testerIdleTimer !== null) {
-        window.clearTimeout(testerIdleTimer);
-        testerIdleTimer = null;
-      }
-    };
-    const armTesterWatchdog = () => {
-      clearTesterWatchdog();
-      testerIdleTimer = window.setTimeout(() => {
-        if (pendingApprovalRef.current !== null) {
-          armTesterWatchdog();
-          return;
-        }
-        testerStalled = true;
-        testerAbortCtrl.abort();
-      }, SSE_IDLE_TIMEOUT_MS);
-    };
-
-    try {
-      if (!targetConvId) {
-        const res = await fetch("/api/agent/conversations", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            kind: "tester",
-            title:
-              testerDirectProject && testerDirectProject !== "."
-                ? `Тест: ${testerDirectProject}`
-                : promptText.slice(0, 60),
-          }),
-        });
-        const data = (await res.json().catch(() => ({}))) as {
-          conversation?: TesterConversationItem;
-          error?: string;
-        };
-        if (!res.ok || !data.conversation) {
-          throw new Error(data.error ?? "Не удалось создать новый чат тестировщика");
-        }
-        targetConvId = data.conversation.id;
-        setTesterConversations((prev) => [data.conversation!, ...prev]);
-        setSelectedTesterConvId(targetConvId);
-      }
-
-      const userSavedRes = await fetch(`/api/agent/conversations/${targetConvId}/messages`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role: "user", content: promptText }),
-      });
-      if (!userSavedRes.ok) throw new Error("Не удалось сохранить запрос в чат тестировщика");
-
-      const nextHistory: TesterChatMessage[] = [
-        ...selectedTesterMessages,
-        { id: `tu_${Date.now()}`, role: "user", content: promptText },
-      ];
-      setSelectedTesterMessages([
-        ...nextHistory,
-        { id: draftId, role: "assistant", content: "", reasoning: "" },
-      ]);
-
-      await persistSettings();
-      const res = await fetch("/api/ai/agent", {
-        method: "POST",
-        signal: testerAbortCtrl.signal,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          agentRole: "tester",
-          testerConversationId: targetConvId,
-          sandboxProject: testerDirectProject || ".",
-          messages: nextHistory.map((m) => ({ role: m.role, content: m.content })),
-          settings: { baseUrl: settings.baseUrl, model: settings.model },
-          params,
-          trustLevel,
-          maxSteps: maxSteps <= 0 ? 0 : Math.floor(maxSteps),
-          contextLimit,
-          ...(modelCapabilities?.contextLength ? { modelContextLength: modelCapabilities.contextLength } : {}),
-          ...(ghAccount && ghAccount.enabled && ghAccount.selectedOwner && ghAccount.selectedRepo
-            ? {
-                githubEnabled: true,
-                githubOwner: ghAccount.selectedOwner,
-                githubRepo: ghAccount.selectedRepo,
-                githubBranch: ghAccount.selectedBranch || "main",
-              }
-            : { githubEnabled: false }),
-        }),
-      });
-
-      if (!res.ok || !res.body) {
-        const errData = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(errData.error ?? "Тестировщик недоступен");
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let trailingCr = false;
-      let sawTesterDone = false;
-      let sawTesterError = false;
-      let assistantText = "";
-      let assistantReason = "";
-      let draftActions: LiveTesterActionItem[] = [];
-      const draftFiles: TesterChatFileItem[] = [];
-
-      const appendChunk = (chunkText: string) => {
-        if (!chunkText) return;
-        let normalized = (trailingCr ? "\r" : "") + chunkText;
-        trailingCr = normalized.endsWith("\r");
-        if (trailingCr) normalized = normalized.slice(0, -1);
-        buffer += normalized.replace(/\r\n/g, "\n");
-      };
-
-      const processFrame = (raw: string) => {
-        const lines = raw.split("\n");
-        const eventLine = lines.find((l) => l.startsWith("event:"));
-        const dataLines = lines.filter((l) => l.startsWith("data:"));
-        if (dataLines.length === 0) return;
-        const ev = eventLine ? eventLine.slice(6).trim() : "message";
-        const dataText = dataLines.map((l) => l.slice(5).trimStart()).join("\n");
-        let data: Record<string, unknown>;
-        try {
-          data = JSON.parse(dataText) as Record<string, unknown>;
-        } catch {
-          return;
-        }
-
-        if (ev === "tester_run") {
-          const createdConv =
-            data.conversation && typeof data.conversation === "object"
-              ? (data.conversation as TesterConversationItem)
-              : null;
-          const createdRun =
-            data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
-          if (createdConv) {
-            setTesterConversations((prev) => [
-              createdConv,
-              ...prev.filter((c) => c.id !== createdConv.id),
-            ]);
-          }
-          if (createdRun) {
-            setTesterRuns((prev) => [createdRun, ...prev.filter((r) => r.id !== createdRun.id)]);
-          }
-          clearLiveBrowserLog();
-          setLiveTester({
-            runKey: String(data.runKey ?? "direct"),
-            runId: typeof data.runId === "number" ? data.runId : createdRun?.id,
-            testerConversationId:
-              typeof data.testerConversationId === "number"
-                ? data.testerConversationId
-                : createdConv?.id ?? targetConvId ?? undefined,
-            sandboxProject: String(createdRun?.sandboxProject ?? testerDirectProject ?? "."),
-            summary: promptText,
-            model: String(createdRun?.model ?? settings.model ?? ""),
-            statusText: "Тестировщик начал проверку…",
-            actor: "tester",
-            reasoning: "",
-            content: "",
-            browserLog: [],
-            actions: [],
-          });
-        } else if (ev === "status") {
-          const st = String(data.text ?? "");
-          const actor = parseLiveTesterActor(data);
-          const step = typeof data.step === "number" ? data.step : undefined;
-          const isBrowserStep =
-            data.source === "browser_inspector" ||
-            data.tool === "browse_project" ||
-            data.tool === "qa_browser_audit";
-          if (isBrowserStep && data.done === true) {
-            clearLiveBrowserLog();
-            setLiveTester((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    statusText: st,
-                    actor: actor ?? "tester",
-                    ...(step !== undefined ? { step } : {}),
-                    browserLog: [],
-                  }
-                : prev,
-            );
-          } else if (isBrowserStep && st) {
-            const isBrowserStart =
-              st.startsWith("Вызываю инструмент: browse_project") ||
-              st.startsWith("Вызываю инструмент: qa_browser_audit") ||
-              st.startsWith("BrowserInspector:") ||
-              st.startsWith("Тестировщик: browse_project") ||
-              st.startsWith("Тестировщик: qa_browser_audit");
-            const logLine = pushLiveBrowserLog(st, isBrowserStart);
-            setLiveTester((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    statusText: st,
-                    actor: "browser_inspector",
-                    ...(step !== undefined ? { step } : {}),
-                    browserLog: (isBrowserStart ? [] : prev.browserLog ?? []).concat(logLine).slice(-60),
-                  }
-                : prev,
-            );
-          } else {
-            if (st) clearLiveBrowserLog();
-            setLiveTester((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    statusText: st,
-                    ...(actor ? { actor } : {}),
-                    ...(step !== undefined ? { step } : {}),
-                    ...(st ? { browserLog: [] } : {}),
-                  }
-                : prev,
-            );
-          }
-        } else if (ev === "reasoning") {
-          assistantReason = String(data.text ?? "");
-          setLiveTester((prev) => (prev ? { ...prev, reasoning: assistantReason, actor: "tester_llm" } : prev));
-          setSelectedTesterMessages((prev) =>
-            prev.map((m) => (m.id === draftId ? { ...m, reasoning: assistantReason } : m)),
-          );
-        } else if (ev === "text") {
-          clearLiveBrowserLog();
-          assistantText = String(data.text ?? "");
-          setLiveTester((prev) => (prev ? { ...prev, content: assistantText } : prev));
-          setSelectedTesterMessages((prev) =>
-            prev.map((m) => (m.id === draftId ? { ...m, content: assistantText } : m)),
-          );
-        } else if (ev === "action") {
-          if (data.type === "file") {
-            const fileItem: TesterChatFileItem = {
-              name: String(data.name ?? "файл"),
-              mime: String(data.mime ?? "application/octet-stream"),
-              size: Number(data.size ?? 0),
-              data: typeof data.data === "string" ? data.data : undefined,
-            };
-            draftFiles.push(fileItem);
-            setSelectedTesterMessages((prev) =>
-              prev.map((m) => (m.id === draftId ? { ...m, files: [...draftFiles] } : m)),
-            );
-          } else {
-            const actItem = parseLiveTesterActionItem(data);
-            if (actItem.type === "browser_inspect") {
-              clearLiveBrowserLog();
-            }
-            draftActions = upsertLiveTesterAction(draftActions, actItem);
-            setLiveTester((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    ...(actItem.type === "browser_inspect" ? { browserLog: [] } : {}),
-                    actions: upsertLiveTesterAction(prev.actions, actItem),
-                  }
-                : prev,
-            );
-            setSelectedTesterMessages((prev) =>
-              prev.map((m) => (m.id === draftId ? { ...m, actions: draftActions } : m)),
-            );
-          }
-        } else if (ev === "approval_required") {
-          setPendingApproval({
-            approvalId: String(data.approvalId ?? ""),
-            kind: String(data.kind ?? "command"),
-            title: String(data.title ?? "Требуется подтверждение"),
-            description: String(data.description ?? data.reason ?? ""),
-            command: data.command ? String(data.command) : undefined,
-            cwd: data.cwd ? String(data.cwd) : undefined,
-            sandboxProject: data.sandboxProject ? String(data.sandboxProject) : undefined,
-            testerRunKey: data.testerRunKey ? String(data.testerRunKey) : undefined,
-            testerRunId: typeof data.testerRunId === "number" ? data.testerRunId : undefined,
-            testerConversationId:
-              typeof data.testerConversationId === "number" ? data.testerConversationId : undefined,
-            minorIssues: Array.isArray(data.minorIssues)
-              ? (data.minorIssues as TesterIssueItem[])
-              : undefined,
-            overseer:
-              data.overseer && typeof data.overseer === "object"
-                ? (data.overseer as OverseerVerdictMeta)
-                : undefined,
-          });
-          setLiveTester((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  actor: "approval",
-                  statusText: "Тестировщик ждёт вашего подтверждения на сайте…",
-                }
-              : prev,
-          );
-        } else if (ev === "overseer_start" || ev === "overseer_status") {
-          const st = String(data.text ?? `Надсмотрщик проверяет ${String(data.tool ?? "")}…`);
-          setLiveTester((prev) => (prev ? { ...prev, statusText: st } : prev));
-        } else if (ev === "overseer_reasoning") {
-          const ovR = String(data.text ?? "");
-          setLiveTester((prev) => (prev ? { ...prev, reasoning: ovR } : prev));
-        } else if (ev === "tester_done") {
-          clearLiveBrowserLog();
-          const savedRun =
-            data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
-          if (savedRun) {
-            persistedByServer = true;
-            setTesterRuns((prev) => [savedRun, ...prev.filter((r) => r.id !== savedRun.id)]);
-          }
-        } else if (ev === "done") {
-          sawTesterDone = true;
-          clearLiveBrowserLog();
-          setPendingApproval(null);
-        } else if (ev === "error") {
-          sawTesterError = true;
-          clearLiveBrowserLog();
-          const errTxt = String(data.error ?? "Ошибка тестировщика");
-          setTesterError(errTxt);
-        }
-      };
-
-      armTesterWatchdog();
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          appendChunk(decoder.decode());
-          if (trailingCr) {
-            trailingCr = false;
-            buffer += "\r";
-          }
-          break;
-        }
-        armTesterWatchdog();
-        appendChunk(decoder.decode(value, { stream: true }));
-        let boundary = buffer.indexOf("\n\n");
-        while (boundary !== -1) {
-          const raw = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
-          boundary = buffer.indexOf("\n\n");
-          if (raw.trim()) processFrame(raw);
-        }
-      }
-      clearTesterWatchdog();
-      if (buffer.trim()) {
-        for (const leftover of buffer.split("\n\n")) {
-          if (leftover.trim()) processFrame(leftover);
-        }
-      }
-      if (!sawTesterDone && !sawTesterError) {
-        setTesterError("Поток ответа от Тестировщика оборвался без завершения");
-      }
-
-      if (!persistedByServer && targetConvId && (assistantText || draftActions.length > 0 || assistantReason)) {
-        await fetch(`/api/agent/conversations/${targetConvId}/messages`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            role: "assistant",
-            content: assistantText || "Проверка завершена.",
-            reasoning: assistantReason,
-            actions: draftActions,
-            files: draftFiles.map(({ name, mime, size }) => ({ name, mime, size })),
-          }),
-        }).catch(() => undefined);
-      }
-      await refreshTesterData(targetConvId);
-    } catch (caught) {
-      if (testerStalled) {
-        setTesterError("Тестировщик не отвечает (нет данных по SSE более 120 с)");
-      } else {
-        setTesterError(caught instanceof Error ? caught.message : "Не удалось запустить Тестировщика");
-      }
-    } finally {
-      clearTesterWatchdog();
-      clearLiveBrowserLog();
-      setLiveTester(null);
-      setTesterDirectRunning(false);
-    }
-  };
-
   const addAgentFiles = useCallback(
     (incoming: File[]) => {
       if (incoming.length === 0 || running || reading || historyLoading || conversationId === null) return;
@@ -2913,11 +2283,50 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     };
 
     try {
+      const mergedSessionAtts = [...sessionAttachments];
+      for (const f of attachments) {
+        if (!mergedSessionAtts.some((x) => x.name === f.name && x.size === f.size)) {
+          mergedSessionAtts.push(f);
+        }
+      }
+      if (attachments.length > 0) {
+        setSessionAttachments(mergedSessionAtts.slice(-12));
+      }
+      const freshKeys = new Set(attachments.map((f) => `${f.name}:${f.size}`));
+      const sessionHistoryAtts = mergedSessionAtts
+        .filter((f) => !freshKeys.has(`${f.name}:${f.size}`))
+        .map((file) => ({
+          name: file.name,
+          mime: file.mime,
+          size: file.size,
+          note: file.note,
+          text: file.text,
+          data: file.data,
+          ...(file.image ? { image: file.image } : {}),
+          fromHistory: true,
+        }));
+      const freshAttsPayload = attachments.map((file) => ({
+        name: file.name,
+        mime: file.mime,
+        size: file.size,
+        note: file.note,
+        text: file.text,
+        data: file.data,
+        ...(file.image ? { image: file.image } : {}),
+        fromHistory: false,
+      }));
+      const combinedAttachmentsPayload = [...freshAttsPayload, ...sessionHistoryAtts].slice(0, 12);
+
       setStatus("Сохраняю переписку…");
       const storedUser = await saveConversationMessage(activeId, {
         role: "user",
         content: userTurn.content,
-        attachments: attachedTurn,
+        attachments: attachments.map((file) => ({
+          name: file.name,
+          size: file.size,
+          mime: file.mime,
+          note: file.note,
+        })),
       });
       userSaved = true;
       storedUserForRollover = storedUser;
@@ -2955,12 +2364,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 githubBranch: ghAccount.selectedBranch || "main",
               }
             : { githubEnabled: false }),
-          attachments: attachments.map((file) => ({
-            name: file.name,
-            note: file.note,
-            text: file.text,
-            ...(file.image ? { image: file.image } : {}),
-          })),
+          attachments: combinedAttachmentsPayload,
         }),
       });
       setAttachments([]);
@@ -3054,20 +2458,16 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             const mappedKind: AgentLiveActorKind =
               cKind === "subagent"
                 ? "subagent"
-                : cKind === "tester"
-                  ? "tester"
-                  : cKind === "overseer"
-                    ? "overseer"
-                    : "orchestrator";
+                : cKind === "overseer"
+                  ? "overseer"
+                  : "orchestrator";
             setActiveLiveActor((prev) => ({
               kind: mappedKind,
               name: String(
                 data.name ??
                   (mappedKind === "subagent"
                     ? "Субагент"
-                    : mappedKind === "tester"
-                      ? "Тестировщик"
-                      : "Оркестратор"),
+                    : "Оркестратор"),
               ),
               roleTitle: data.roleTitle ? String(data.roleTitle) : undefined,
               color: data.color ? String(data.color) : undefined,
@@ -3116,7 +2516,42 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             }));
           } else if (event === "subagent_status") {
             const st = String(data.text ?? "");
-            if (st) {
+            const isSubBrowser =
+              data.source === "browser_inspector" ||
+              data.tool === "browse_project" ||
+              data.tool === "qa_browser_audit";
+            if (isSubBrowser && data.done === true) {
+              clearLiveBrowserLog();
+              setLiveStatusActor("subagent");
+              if (st) setStatus(st);
+              setActiveLiveActor((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      kind: "subagent",
+                      name: String(data.subagentName ?? prev.name ?? "Субагент"),
+                      statusText: st || prev.statusText,
+                    }
+                  : prev,
+              );
+            } else if (isSubBrowser && st) {
+              setLiveStatusActor("browser_inspector");
+              pushLiveBrowserLog(
+                st,
+                st.startsWith("Вызываю инструмент:") || st.startsWith("BrowserInspector:"),
+              );
+              setStatus(st);
+              setActiveLiveActor((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      kind: "subagent",
+                      name: String(data.subagentName ?? prev.name ?? "Субагент"),
+                      statusText: st,
+                    }
+                  : prev,
+              );
+            } else if (st) {
               setLiveStatusActor("subagent");
               setStatus(st);
               setActiveLiveActor((prev) =>
@@ -3147,6 +2582,10 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             const c = String(data.text ?? "");
             setActiveLiveActor((prev) => (prev ? { ...prev, content: c } : prev));
           } else if (event === "subagent_action") {
+            const subAct = data.action as Record<string, unknown> | undefined;
+            if (subAct?.type === "browser_inspect") {
+              clearLiveBrowserLog();
+            }
             void refreshSandbox(false);
           } else if (event === "subagent_handoff") {
             const fromName = String(data.fromSubagentName ?? "Субагент");
@@ -3164,6 +2603,21 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             };
             assistantDraft.actions.push(hAct);
             patch((t) => ({ ...t, actions: [...t.actions, hAct] }));
+          } else if (event === "subagent_chat_rotated") {
+            const rName = String(data.subagentName ?? "Субагент");
+            const rSteps = Number(data.steps ?? 300) || 300;
+            const rMsg = `Чат субагента «${rName}» перенесён в новую сессию (${rSteps} шагов)`;
+            setStatus(rMsg);
+            setSubagentRefreshKey((k) => k + 1);
+            const rAct: AgentAction = {
+              type: "subagent_chat_rotated",
+              subagentName: rName,
+              label: rMsg,
+              summary: data.summary ? String(data.summary) : undefined,
+              maxSteps: rSteps,
+            };
+            assistantDraft.actions.push(rAct);
+            patch((t) => ({ ...t, actions: [...t.actions, rAct] }));
           } else if (event === "subagent_done") {
             setSubagentRefreshKey((k) => k + 1);
             setLiveStatusActor("agent_llm");
@@ -3184,11 +2638,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 const derivedStatusActor: StatusActor =
                   prev?.kind === "subagent"
                     ? "subagent"
-                    : prev?.kind === "tester"
-                      ? "tester"
-                      : prev?.kind === "browser_inspector"
-                        ? "browser_inspector"
-                        : "agent_llm";
+                    : prev?.kind === "browser_inspector"
+                      ? "browser_inspector"
+                      : "agent_llm";
                 prevActorBeforeOverseerRef.current = {
                   statusActor: derivedStatusActor,
                   liveActor: prev,
@@ -3290,13 +2742,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 typeof data.coachAfterEachStep === "boolean" ? data.coachAfterEachStep : true,
               operatorTrustLevel: data.operatorTrustLevel ? String(data.operatorTrustLevel) : undefined,
               sandboxProject: data.sandboxProject ? String(data.sandboxProject) : undefined,
-              testerRunKey: data.testerRunKey ? String(data.testerRunKey) : undefined,
-              testerRunId: typeof data.testerRunId === "number" ? data.testerRunId : undefined,
-              testerConversationId:
-                typeof data.testerConversationId === "number" ? data.testerConversationId : undefined,
-              minorIssues: Array.isArray(data.minorIssues)
-                ? (data.minorIssues as TesterIssueItem[])
-                : undefined,
               overseer: ovPayload,
               github: ghPayload
                 ? {
@@ -3343,15 +2788,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               const mm = req.github?.mergeMethod;
               setApprovalGhMergeMethod(mm === "squash" || mm === "rebase" ? mm : "merge");
             }
-            setLiveTester((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    actor: "approval",
-                    statusText: "Тестировщик ждёт вашего подтверждения на сайте…",
-                  }
-                : prev,
-            );
             setLiveStatusActor("approval");
             setActiveLiveActor((prev) => ({
               ...(prev ?? { name: ovPayload ? "Надсмотрщик безопасности" : "Ожидает подтверждения", reasoning: "", content: "" }),
@@ -3383,179 +2819,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             setNotice(
               `RAG «${String(data.folderName ?? "папка")}»: подключено ${Number(data.hits ?? 0)} из ${Number(data.totalChunks ?? 0)} фрагментов${data.truncated ? " (обрезано по лимиту контекста)" : ""}.`,
             );
-          } else if (event === "tester_run") {
-            const createdConv =
-              data.conversation && typeof data.conversation === "object"
-                ? (data.conversation as TesterConversationItem)
-                : null;
-            const createdRun =
-              data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
-            if (createdConv) {
-              setTesterConversations((prev) => [
-                createdConv,
-                ...prev.filter((c) => c.id !== createdConv.id),
-              ]);
-              setSelectedTesterConvId(createdConv.id);
-            }
-            if (createdRun) {
-              setTesterRuns((prev) => [createdRun, ...prev.filter((r) => r.id !== createdRun.id)]);
-            }
-            setLiveStatusActor("tester");
-            setActiveLiveActor((prev) => ({
-              kind: "tester",
-              name: "Тестировщик",
-              model: String(createdRun?.model ?? data.model ?? settings.model ?? ""),
-              routingMode: prev?.routingMode,
-              statusText: "Тестировщик запущен в новом чате…",
-              reasoning: "",
-              content: "",
-              overseerVerdict: prev?.overseerVerdict ?? null,
-            }));
-            setLiveTester({
-              runKey: String(data.runKey ?? "default"),
-              runId: typeof data.runId === "number" ? data.runId : createdRun?.id,
-              testerConversationId:
-                typeof data.testerConversationId === "number"
-                  ? data.testerConversationId
-                  : createdConv?.id,
-              sandboxProject: String(createdRun?.sandboxProject ?? data.sandboxProject ?? "."),
-              summary: String(createdRun?.summary ?? data.summary ?? ""),
-              model: String(createdRun?.model ?? data.model ?? settings.model ?? ""),
-              statusText: "Тестировщик запущен в новом чате…",
-              actor: "tester",
-              reasoning: "",
-              content: "",
-              browserLog: [],
-              actions: [],
-            });
-          } else if (event === "tester_status") {
-            const st = String(data.text ?? "");
-            const testerActor = parseLiveTesterActor(data);
-            const step = typeof data.step === "number" ? data.step : undefined;
-            const statusActor = parseStatusActor(data, "tester");
-            const isBrowserStep =
-              data.source === "browser_inspector" ||
-              data.tool === "browse_project" ||
-              data.tool === "qa_browser_audit";
-            if (statusActor) setLiveStatusActor(statusActor);
-            setStatus(st);
-            if (st) {
-              setActiveLiveActor((prev) => ({
-                ...(prev ?? { name: "Тестировщик", reasoning: "", content: "" }),
-                kind: isBrowserStep && data.done !== true ? "browser_inspector" : "tester",
-                name: isBrowserStep && data.done !== true ? "BrowserInspector" : "Тестировщик",
-                statusText: st,
-              }));
-            }
-            if (isBrowserStep && data.done === true) {
-              clearLiveBrowserLog();
-              setLiveTester((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      statusText: st,
-                      actor: testerActor ?? "tester",
-                      ...(step !== undefined ? { step } : {}),
-                      browserLog: [],
-                    }
-                  : prev,
-              );
-            } else if (isBrowserStep && st) {
-              const isBrowserStart =
-                st.startsWith("Тестировщик: browse_project") ||
-                st.startsWith("Тестировщик: qa_browser_audit") ||
-                st.startsWith("BrowserInspector:");
-              const logLine = pushLiveBrowserLog(st, isBrowserStart);
-              setLiveTester((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      statusText: st,
-                      actor: "browser_inspector",
-                      ...(step !== undefined ? { step } : {}),
-                      browserLog: (isBrowserStart ? [] : prev.browserLog ?? []).concat(logLine).slice(-60),
-                    }
-                  : prev,
-              );
-            } else {
-              if (st) clearLiveBrowserLog();
-              setLiveTester((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      statusText: st,
-                      ...(testerActor ? { actor: testerActor } : {}),
-                      ...(step !== undefined ? { step } : {}),
-                      ...(st ? { browserLog: [] } : {}),
-                    }
-                  : prev,
-              );
-            }
-          } else if (event === "tester_reasoning") {
-            const r = String(data.text ?? "");
-            setLiveStatusActor("tester_llm");
-            setLiveTester((prev) => (prev ? { ...prev, reasoning: r, actor: "tester_llm" } : prev));
-            setActiveLiveActor((prev) =>
-              prev ? { ...prev, kind: "tester", name: "Тестировщик", reasoning: r } : prev,
-            );
-          } else if (event === "tester_text") {
-            const c = String(data.text ?? "");
-            setLiveTester((prev) => (prev ? { ...prev, content: c } : prev));
-            setActiveLiveActor((prev) => (prev ? { ...prev, content: c } : prev));
-          } else if (event === "tester_action") {
-            const act =
-              data.action && typeof data.action === "object"
-                ? (data.action as Record<string, unknown>)
-                : null;
-            if (act) {
-              const actItem = parseLiveTesterActionItem(act);
-              if (actItem.type === "browser_inspect") {
-                clearLiveBrowserLog();
-              }
-              setLiveTester((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      ...(actItem.type === "browser_inspect" ? { browserLog: [] } : {}),
-                      actions: upsertLiveTesterAction(prev.actions, actItem),
-                    }
-                  : prev,
-              );
-            }
-          } else if (event === "tester_done") {
-            clearLiveBrowserLog();
-            setLiveStatusActor("agent_llm");
-            setActiveLiveActor((prev) => ({
-              kind: "orchestrator",
-              name: "Оркестратор",
-              routingMode: prev?.routingMode,
-              model: settings.model.trim() || undefined,
-              statusText: "Тестировщик завершил — Оркестратор анализирует отчёт…",
-              reasoning: "",
-              content: "",
-              overseerVerdict: prev?.overseerVerdict ?? null,
-            }));
-            const savedRun =
-              data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
-            if (savedRun) {
-              setTesterRuns((prev) => [savedRun, ...prev.filter((r) => r.id !== savedRun.id)]);
-            }
-            const tConvId =
-              typeof data.testerConversationId === "number"
-                ? data.testerConversationId
-                : savedRun?.testerConversationId;
-            setLiveTester(null);
-            if (tConvId) {
-              void refreshTesterData(tConvId);
-            } else {
-              void refreshTesterData();
-            }
-          } else if (event === "tester_decision") {
-            const updRun =
-              data.run && typeof data.run === "object" ? (data.run as TesterRunItem) : null;
-            if (updRun) {
-              setTesterRuns((prev) => prev.map((r) => (r.id === updRun.id ? updRun : r)));
-            }
           } else if (event === "reasoning") {
             assistantDraft.reasoning = String(data.text ?? "");
             patch((t) => ({ ...t, reasoning: assistantDraft.reasoning }));
@@ -3580,7 +2843,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             prevActorBeforeOverseerRef.current = null;
             setPendingApproval(null);
             setScreenCapture(null);
-            setLiveTester(null);
             browserRunStartRef.current = 0;
           } else if (event === "action") {
             if (data.type === "file") {
@@ -3720,7 +2982,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
             prevActorBeforeOverseerRef.current = null;
             setPendingApproval(null);
             setScreenCapture(null);
-            setLiveTester(null);
             setLiveBrowserLog([]);
             browserRunStartRef.current = 0;
             void refreshSandbox(true);
@@ -3762,7 +3023,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         prevActorBeforeOverseerRef.current = null;
         setPendingApproval(null);
         setScreenCapture(null);
-        setLiveTester(null);
         clearLiveBrowserLog();
         assistantDraft.error = "Поток ответа от агента оборвался без завершения";
         patch((t) => ({ ...t, error: assistantDraft.error }));
@@ -3775,7 +3035,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         prevActorBeforeOverseerRef.current = null;
         setPendingApproval(null);
         setScreenCapture(null);
-        setLiveTester(null);
         clearLiveBrowserLog();
         assistantDraft.error = "Агент не отвечает (нет данных по SSE более 120 с)";
         patch((t) => ({ ...t, error: assistantDraft.error }));
@@ -3836,7 +3095,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
       setRunning(false);
       setPendingApproval(null);
       setScreenCapture(null);
-      setLiveTester(null);
       setLiveStatusActor(null);
       setActiveLiveActor(null);
       prevActorBeforeOverseerRef.current = null;
@@ -4019,18 +3277,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                 {tab.id === "workspace" && (opTask || (sandbox?.items?.length ?? 0) > 0) && (
                   <span className="rounded bg-card2 px-1 py-0.5 text-[10px] text-muted">
                     {opTask ? `#${opTask.id}` : sandbox?.items?.length ?? 0}
-                  </span>
-                )}
-                {tab.id === "tester" && (liveTester || testerRuns.length > 0) && (
-                  <span
-                    className={cn(
-                      "rounded px-1 py-0.5 text-[10px]",
-                      liveTester
-                        ? "bg-violet-500/20 text-violet-300"
-                        : "bg-card2 text-muted",
-                    )}
-                  >
-                    {liveTester ? "…" : testerRuns.length}
                   </span>
                 )}
                 {tab.id === "subagents" && (subagentStats.activeCount > 0 || subagentStats.runs > 0 || subagentStats.overseerEnabled) && (
@@ -5044,45 +4290,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         );
       })()}
 
-      {/* Вкладка 4: Под-агент Тестировщик (QA) с теми же настройками модели */}
-      <div
-        role={isTabs ? "tabpanel" : undefined}
-        aria-label="Тестировщик"
-        hidden={isTabs && activeTab !== "tester"}
-        className="space-y-3"
-      >
-        <TesterPanel
-          settings={settings}
-          params={params}
-          sandboxProjects={sandbox?.projects ?? []}
-          runs={testerRuns}
-          conversations={testerConversations}
-          selectedConvId={selectedTesterConvId}
-          messages={selectedTesterMessages}
-          loading={testerLoading}
-          directRunning={testerDirectRunning}
-          directPrompt={testerDirectPrompt}
-          directProject={testerDirectProject}
-          liveTester={liveTester}
-          decisionBusyRunId={testerDecisionBusy}
-          agentRunning={running}
-          error={testerError}
-          onSelectConv={(id) => void selectTesterConversation(id)}
-          onNewChat={() => void createNewTesterChat()}
-          onDeleteChat={(id) => void deleteTesterChat(id)}
-          onRefresh={() => void refreshTesterData()}
-          onChangePrompt={setTesterDirectPrompt}
-          onChangeProject={setTesterDirectProject}
-          onRunDirect={() => void sendTesterDirect()}
-          onDecideMinor={(runId, decision) => void decideTesterMinor(runId, decision)}
-          onOpenModelTab={() => {
-            if (isTabs) setActiveTab("model");
-          }}
-          onOpenAgentChat={(convId) => void openAgentChatFromTester(convId)}
-        />
-      </div>
-
-      {/* Вкладка 4.5: Оркестратор и Субагенты (дерево зависимостей, изолированные чаты, своё API) */}
+      {/* Вкладка 4: Оркестратор и Субагенты (дерево зависимостей, изолированные чаты, своё API) */}
       <div
         role={isTabs ? "tabpanel" : undefined}
         aria-label="Субагенты"
@@ -5143,13 +4351,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               className="rounded-md border border-border bg-card2 px-2 py-0.5 hover:text-text"
             >
               Sandbox: {sandbox?.items?.length ?? 0}
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveTab("tester")}
-              className="rounded-md border border-border bg-card2 px-2 py-0.5 hover:text-text"
-            >
-              Тестировщик: {testerRuns.length}
             </button>
             <button
               type="button"
@@ -5300,12 +4501,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   {turn.content ? (
                     <p className="whitespace-pre-wrap break-words leading-relaxed">{turn.content}</p>
                   ) : turn.role === "assistant" && running ? (
-                    isStreamingTurn && liveTester ? (
-                      <p className="flex items-center gap-1.5 text-muted">
-                        <FlaskConical size={12} className="text-violet-400" />
-                        Основной Агент передал проверку Тестировщику и ждёт отчёт…
-                      </p>
-                    ) : isStreamingTurn && liveBrowserLog.length > 0 ? (
+                    isStreamingTurn && liveBrowserLog.length > 0 ? (
                       <p className="flex items-center gap-1.5 text-muted">
                         <Compass size={12} className="animate-pulse text-cyan-400" />
                         Основной Агент ждёт отчёт BrowserInspector…
@@ -5322,14 +4518,13 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                       text={turn.reasoning}
                       streaming={
                         isStreamingTurn &&
-                        !liveTester &&
                         liveBrowserLog.length === 0 &&
                         (!activeLiveActor || activeLiveActor.kind === "orchestrator")
                       }
                     />
                   )}
 
-                  {isStreamingTurn && activeLiveActor && (!liveTester || activeLiveActor.kind === "overseer" || activeLiveActor.kind === "subagent") && (
+                  {isStreamingTurn && activeLiveActor && (
                     <div
                       data-testid="live-actor-card"
                       className={cn(
@@ -5427,66 +4622,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                     </div>
                   )}
 
-                  {isStreamingTurn && liveTester && (
-                    <div className="space-y-1.5 rounded-xl border border-violet-500/40 bg-violet-500/10 p-2.5 text-[11px]">
-                      {(() => {
-                        const actorMeta = resolveLiveTesterActorMeta(liveTester);
-                        return (
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <div className="flex flex-wrap items-center gap-1.5">
-                              <span className="flex items-center gap-1.5 font-semibold text-violet-300">
-                                <Loader2 size={12} className="animate-spin" />
-                                Тестировщик · {liveTester.sandboxProject || "."}
-                              </span>
-                              <span
-                                className={cn(
-                                  "inline-flex items-center rounded-md border px-1.5 py-0.5 text-[10px] font-semibold",
-                                  actorMeta.badgeClass,
-                                )}
-                              >
-                                {actorMeta.label}
-                              </span>
-                            </div>
-                            {isTabs && (
-                              <button
-                                type="button"
-                                onClick={() => setActiveTab("tester")}
-                                className="rounded-md border border-violet-500/40 bg-card px-2 py-0.5 text-[10px] font-medium text-violet-300 hover:bg-violet-500/20"
-                              >
-                                Открыть Тестировщик
-                              </button>
-                            )}
-                          </div>
-                        );
-                      })()}
-                      <p className="text-[10px] text-muted">{liveTester.statusText}</p>
-                      {liveTester.browserLog && liveTester.browserLog.length > 0 && (
-                        <div className="space-y-0.5 rounded-lg border border-cyan-500/30 bg-card/70 px-2 py-1.5">
-                          <p className="text-[10px] font-semibold text-cyan-400">
-                            Ход BrowserInspector ({liveTester.browserLog.length})
-                          </p>
-                          <pre className="max-h-28 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-muted">
-                            {liveTester.browserLog.slice(-14).join("\n")}
-                          </pre>
-                        </div>
-                      )}
-                      {liveTester.reasoning && (
-                        <LiveReasoningBox
-                          text={liveTester.reasoning}
-                          streaming={liveTester.actor !== "browser_inspector" && !liveTester.browserLog?.length}
-                          defaultOpen
-                          badgeLabel="Тестировщик · в эфире"
-                        />
-                      )}
-                      {liveTester.content && (
-                        <p className="whitespace-pre-wrap rounded-lg border border-border bg-card/70 px-2 py-1.5 text-[10px] text-text">
-                          {liveTester.content}
-                        </p>
-                      )}
-                      <TesterActionsList actions={liveTester.actions} maxHeightClass="max-h-48" />
-                    </div>
-                  )}
-
                   {turn.attached && turn.attached.length > 0 && (
                     <div className="flex flex-wrap gap-1">
                       {turn.attached.map((file, index) => (
@@ -5495,6 +4630,11 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                           className="flex items-center gap-1 rounded-lg border border-border bg-card px-1.5 py-0.5 text-[10px] text-muted"
                         >
                           <FileText size={10} /> {file.name} · {formatBytes(file.size)}
+                          {file.sandboxPath && (
+                            <code className="rounded bg-card2 px-1 text-[9px] text-cyan-300">
+                              {file.sandboxPath}
+                            </code>
+                          )}
                         </span>
                       ))}
                     </div>
@@ -5871,18 +5011,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                           {action.reportSummary && (
                             <p className="text-[10px] text-muted">{action.reportSummary}</p>
                           )}
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (action.testerConversationId) {
-                                void selectTesterConversation(action.testerConversationId);
-                              }
-                              if (isTabs) setActiveTab("tester");
-                            }}
-                            className="inline-flex items-center gap-1 rounded-lg border border-border bg-card px-2 py-0.5 text-[10px] font-medium text-accent2 hover:underline"
-                          >
-                            Открыть отчёт в Тестировщике
-                          </button>
+                          <span className="inline-block text-[10px] text-muted">
+                            Архивный отчёт (история)
+                          </span>
                         </div>
                       );
                     }
@@ -5897,6 +5028,23 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                             {action.label || action.tool || action.type}
                             {action.summary ? ` — ${action.summary}` : ""}
                           </span>
+                        </div>
+                      );
+                    }
+                    if (action.type === "subagent_chat_rotated") {
+                      return (
+                        <div
+                          key={`sub-rot-${index}`}
+                          className="space-y-1 rounded-xl border border-violet-500/35 bg-violet-500/10 px-2.5 py-2 text-[11px]"
+                        >
+                          <div className="flex flex-wrap items-center gap-1.5 font-medium text-text">
+                            <Sparkles size={12} className="text-violet-300" />
+                            <span>
+                              {action.label ||
+                                `Чат субагента «${action.subagentName || "Субагент"}» перенесён в новый чат (${action.maxSteps ?? 300} шагов)`}
+                            </span>
+                          </div>
+                          {action.summary && <p className="text-[10px] text-muted">{action.summary}</p>}
                         </div>
                       );
                     }
@@ -6098,11 +5246,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                         ? "border-rose-500/45 bg-rose-500/15 text-rose-300"
                         : liveStatusActor === "subagent" || liveStatusActor === "subagent_llm"
                           ? "border-cyan-500/45 bg-cyan-500/15 text-cyan-200"
-                          : liveStatusActor === "tester" || liveStatusActor === "tester_llm" || liveStatusActor === "tester_tool"
-                            ? "border-violet-500/40 bg-violet-500/15 text-violet-300"
-                            : liveStatusActor === "approval"
-                              ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
-                              : "border-border bg-card2 text-text",
+                          : liveStatusActor === "approval"
+                            ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
+                            : "border-border bg-card2 text-text",
                   )}
                 >
                   {liveStatusActor === "browser_inspector"
@@ -6113,11 +5259,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                         ? activeLiveActor?.kind === "subagent"
                           ? `Субагент · ${activeLiveActor.name}`
                           : "Субагент"
-                        : liveStatusActor === "tester" || liveStatusActor === "tester_llm" || liveStatusActor === "tester_tool"
-                          ? "Тестировщик"
-                          : liveStatusActor === "approval"
-                            ? "Ожидает подтверждения"
-                            : "Оркестратор"}
+                        : liveStatusActor === "approval"
+                          ? "Ожидает подтверждения"
+                          : "Оркестратор"}
                 </span>
               )}
               <span>{status}</span>
@@ -6125,7 +5269,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
           )}
           {notice && <p className="mb-2 text-[11px] text-emerald-500">{notice}</p>}
           {error && <p className="mb-2 text-[11px] text-red-500">{error}</p>}
-          {attachments.length > 0 && (
+          {(attachments.length > 0 || sessionAttachments.length > 0) && (
             <div className="mb-2 flex flex-wrap gap-1">
               {attachments.map((file, idx) => (
                 <span
@@ -6149,6 +5293,31 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   </button>
                 </span>
               ))}
+              {sessionAttachments
+                .filter((sa) => !attachments.some((a) => a.name === sa.name && a.size === sa.size))
+                .map((sa, idx) => (
+                  <span
+                    key={`sess-${sa.name}-${sa.size}-${idx}`}
+                    className="flex items-center gap-1 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 text-[10px] text-cyan-200"
+                    title="Файл из текущего чата — передаётся в _shared_files и доступен Оркестратору и субагентам"
+                  >
+                    <Paperclip size={10} />
+                    <span className="max-w-[130px] truncate">{sa.name}</span>
+                    <span className="text-[9px] opacity-70">в сессии</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSessionAttachments((prev) =>
+                          prev.filter((item) => !(item.name === sa.name && item.size === sa.size)),
+                        )
+                      }
+                      className="text-cyan-200/70 transition hover:text-red-400"
+                      aria-label={`Убрать из сессии ${sa.name}`}
+                    >
+                      <X size={10} />
+                    </button>
+                  </span>
+                ))}
             </div>
           )}
           <div className="flex min-w-0 items-end gap-2">
@@ -6254,11 +5423,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                     ? "Осмотр внешнего сайта"
                     : pendingApproval.kind === "call_operator"
                       ? "Запуск Оператора"
-                      : pendingApproval.kind === "tester_minor_fixes"
-                        ? "Тестировщик · мелкие замечания"
-                        : pendingApproval.kind.startsWith("github_")
-                          ? `GitHub · @${pendingApproval.github?.login || ghAccount?.login || "аккаунт"}`
-                          : "Запрос разрешения"
+                      : pendingApproval.kind.startsWith("github_")
+                        ? `GitHub · @${pendingApproval.github?.login || ghAccount?.login || "аккаунт"}`
+                        : "Запрос разрешения"
           }
           title={pendingApproval.title}
           description={pendingApproval.description}
@@ -6327,15 +5494,13 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   <Check size={12} />{" "}
                   {pendingApproval.kind === "call_operator"
                     ? "Разрешить и запустить Оператора"
-                    : pendingApproval.kind === "tester_minor_fixes"
-                      ? "Внести мелкие изменения"
-                      : pendingApproval.kind === "github_commit"
-                        ? `Подтвердить Commit${pendingApproval.github?.push ? " и Push" : ""} от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
-                        : pendingApproval.kind === "github_pr"
-                          ? `Создать PR от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
-                          : pendingApproval.kind === "github_merge"
-                            ? `Подтвердить Merge от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
-                            : "Разрешить"}
+                    : pendingApproval.kind === "github_commit"
+                      ? `Подтвердить Commit${pendingApproval.github?.push ? " и Push" : ""} от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
+                      : pendingApproval.kind === "github_pr"
+                        ? `Создать PR от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
+                        : pendingApproval.kind === "github_merge"
+                          ? `Подтвердить Merge от @${pendingApproval.github?.login || ghAccount?.login || "себя"}`
+                          : "Разрешить"}
                 </button>
                 <button
                   type="button"
@@ -6343,10 +5508,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   disabled={approvalBusy}
                   className="flex items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-medium text-red-500 hover:bg-red-500/20 disabled:opacity-50"
                 >
-                  <X size={12} />{" "}
-                  {pendingApproval.kind === "tester_minor_fixes"
-                    ? "Не вносить (оставить как есть)"
-                    : "Отклонить"}
+                  <X size={12} /> Отклонить
                 </button>
               </>
             )
@@ -6388,19 +5550,6 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               {pendingApproval.url}
             </p>
           )}
-          {pendingApproval.kind === "tester_minor_fixes" &&
-            pendingApproval.minorIssues &&
-            pendingApproval.minorIssues.length > 0 && (
-              <div className="max-h-36 space-y-1 overflow-auto rounded-lg border border-amber-500/30 bg-card2 p-2 text-[10px]">
-                {pendingApproval.minorIssues.map((iss, idx) => (
-                  <p key={`minor-apr-${idx}`} className="text-text">
-                    • <b>{iss.title}</b>
-                    {iss.file ? ` (${iss.file})` : ""}
-                    {iss.description && iss.description !== iss.title ? `: ${iss.description}` : ""}
-                  </p>
-                ))}
-              </div>
-            )}
           {pendingApproval.kind === "sandbox_export" && (
             <div className="space-y-1.5">
               <p className="text-[11px] text-muted">

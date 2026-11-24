@@ -505,7 +505,7 @@ class AgentAuthSecretsAndSharedBrowserTests(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
 
-    def test_call_tester_reuses_browser_manager_with_isolated_session_id(self) -> None:
+    def test_full_profile_subagent_reuses_browser_manager_with_isolated_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
             sandbox_mod.write_file(root, "app/index.html", "<h1>App</h1>")
@@ -550,8 +550,8 @@ class AgentAuthSecretsAndSharedBrowserTests(unittest.TestCase):
                                     {
                                         "id": "tc2",
                                         "function": {
-                                            "name": "qa_submit_report",
-                                            "arguments": '{"status":"passed","summary":"OK"}',
+                                            "name": "report_to_orchestrator",
+                                            "arguments": '{"status":"completed","summary":"OK"}',
                                         },
                                     }
                                 ],
@@ -570,22 +570,37 @@ class AgentAuthSecretsAndSharedBrowserTests(unittest.TestCase):
                 mgr._sessions[sid] = s
                 return "OK", [{"type": "browser_inspect", "action": "open", "errorsCount": 0, "issuesCount": 0}]
 
+            sub_ctx = {
+                "base_url": "http://127.0.0.1:8888/v1",
+                "api_key": "",
+                "model": "m",
+                "params": {},
+                "subagents": [
+                    {
+                        "id": 1,
+                        "slug": "qa-browser",
+                        "name": "QA Браузер",
+                        "orchestratorCanCall": True,
+                        "toolProfile": "full",
+                    }
+                ],
+            }
             with (
                 mock.patch.object(agent_mod, "call_model", side_effect=_fake_model),
                 mock.patch.object(browser_inspector, "execute_browse_action", side_effect=_fake_browse),
             ):
                 txt, _ = agent_mod.run_tool(
-                    "call_tester",
-                    {"sandbox_project": "app", "summary": "Проверь"},
+                    "call_subagent",
+                    {"subagent": "qa-browser", "sandbox_project": "app", "summary": "Проверь", "task": "Открой app"},
                     trust_level="verified",
                     sandbox_root=root,
                     browser_manager=agent_mgr,
-                    tester_ctx={"base_url": "http://127.0.0.1:8888/v1", "model": "m", "params": {}},
+                    subagent_ctx=sub_ctx,
                 )
 
             self.assertIn("OK", txt)
             self.assertEqual(len(seen_sessions), 1)
-            self.assertTrue(seen_sessions[0].startswith("tester_"))
+            self.assertTrue(seen_sessions[0].startswith("subagent_"))
             self.assertNotIn(seen_sessions[0], agent_mgr._sessions)
             self.assertIn("default", agent_mgr._sessions)
             default_sess.close.assert_not_called()

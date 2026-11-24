@@ -291,7 +291,7 @@ class _MockCDPServer:
 
 
 class AllToolsRegistryCoverageTests(unittest.TestCase):
-    """Гарантирует, что тест покрывает 100% имён инструментов Агента, Тестировщика, Code, QA и GitHub."""
+    """Гарантирует, что тест покрывает 100% имён инструментов Агента, Субагентов, Code, QA и GitHub."""
 
     EXPECTED_ALL_TOOLS = {
         # Base (4)
@@ -313,14 +313,12 @@ class AllToolsRegistryCoverageTests(unittest.TestCase):
         "export_from_sandbox",
         # Browser (1)
         "browse_project",
-        # Tester orchestration (3)
-        "call_tester",
-        "confirm_minor_fixes",
-        "list_tester_reports",
-        # Sub-Agent orchestration (2)
+        # Sub-Agent orchestration (4)
         "list_subagents",
         "call_subagent",
-        # QA (8)
+        "report_to_orchestrator",
+        "request_subagent",
+        # QA (7)
         "qa_static_review",
         "qa_run_tests",
         "qa_http_audit",
@@ -328,7 +326,6 @@ class AllToolsRegistryCoverageTests(unittest.TestCase):
         "qa_auth_matrix_audit",
         "qa_schema_audit",
         "qa_browser_audit",
-        "qa_submit_report",
         # Code (14)
         "code_search",
         "code_read_files",
@@ -366,12 +363,17 @@ class AllToolsRegistryCoverageTests(unittest.TestCase):
         "github_merge_pr",
     }
 
-    def test_exact_inventory_of_all_61_tools(self) -> None:
+    def test_exact_inventory_of_all_59_tools(self) -> None:
         agent_tools = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", has_github=True, role="agent")}
-        tester_tools = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", has_github=True, role="tester")}
-        actual_all = agent_tools | tester_tools
+        sub_full_tools = {
+            t["function"]["name"]
+            for t in agent_mod.tools_for_trust(
+                "full", has_github=True, role="subagent", subagent_tool_profile="full"
+            )
+        }
+        actual_all = agent_tools | sub_full_tools
         self.assertEqual(actual_all, self.EXPECTED_ALL_TOOLS)
-        self.assertEqual(len(actual_all), 61)
+        self.assertEqual(len(actual_all), 59)
 
 
 class BaseOperatorSandboxToolsTests(unittest.TestCase):
@@ -807,74 +809,91 @@ class CodeQaAndTesterToolsTests(unittest.TestCase):
             )
             self.assertEqual(qa_state["report"]["status"], "passed")
 
-    def test_tester_steps_cap_fallback_and_list_tester_reports(self) -> None:
+    def test_removed_tester_tools_rejected_and_qa_works_via_full_subagent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
             sandbox_mod.write_file(root, "app/index.html", "<!doctype html><h1>App</h1>")
+
+            for legacy_tool in ("call_tester", "list_tester_reports", "confirm_minor_fixes"):
+                with self.assertRaises(agent_mod.AgentError):
+                    agent_mod.run_tool(
+                        legacy_tool,
+                        {"sandbox_project": "app"},
+                        trust_level="verified",
+                        sandbox_root=root,
+                    )
+
+            # Субагент с профилем "full" имеет доступ к QA-инструментам (qa_static_review, qa_browser_audit и т.д.)
             events: list[tuple[str, dict]] = []
-
-            # Модель всё время вызывает qa_static_review до исчерпания steps_cap=2 без qa_submit_report
-            def always_tool(*_a: Any, **_kw: Any) -> Dict[str, Any]:
-                return {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "",
-                                "tool_calls": [
-                                    {"id": "t1", "function": {"name": "qa_static_review", "arguments": '{"sandbox_project":"app"}'}}
-                                ],
+            replies = iter(
+                [
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "t1",
+                                            "function": {
+                                                "name": "qa_static_review",
+                                                "arguments": '{"sandbox_project":"app"}',
+                                            },
+                                        }
+                                    ],
+                                }
                             }
-                        }
-                    ],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-                }
-
-            tester_ctx = {
+                        ],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                    },
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "t2",
+                                            "function": {
+                                                "name": "report_to_orchestrator",
+                                                "arguments": '{"status":"completed","summary":"Статическая проверка пройдена"}',
+                                            },
+                                        }
+                                    ],
+                                }
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
+                    },
+                ]
+            )
+            sub_ctx = {
                 "emit_sse": lambda ev, data: events.append((ev, data)),
                 "base_url": "http://127.0.0.1:8888/v1",
                 "api_key": "",
                 "model": "test-model",
                 "params": {},
-                "recent_reports": [],
-                "tester_max_steps": 2,
+                "subagents": [
+                    {
+                        "id": 1,
+                        "slug": "qa-engineer",
+                        "name": "QA-инженер",
+                        "orchestratorCanCall": True,
+                        "toolProfile": "full",
+                    }
+                ],
             }
-            with mock.patch.object(agent_mod, "call_model", side_effect=always_tool):
+            with mock.patch.object(agent_mod, "call_model", side_effect=lambda *_a, **_kw: next(replies)):
                 txt, _ = agent_mod.run_tool(
-                    "call_tester",
-                    {"sandbox_project": "app", "summary": "Проверка"},
+                    "call_subagent",
+                    {"subagent": "qa-engineer", "sandbox_project": "app", "summary": "Проверка", "task": "Проверь app"},
                     trust_level="verified",
                     sandbox_root=root,
-                    tester_ctx=tester_ctx,
+                    subagent_ctx=sub_ctx,
                 )
-            self.assertIn("лимит шагов Тестировщика", txt)
-            done_ev = next(d for e, d in events if e == "tester_done")
-            self.assertGreater(len(done_ev["checksRun"]), 0)
-
-            # list_tester_reports
-            list_txt, _ = agent_mod.run_tool(
-                "list_tester_reports",
-                {},
-                trust_level="verified",
-                sandbox_root=root,
-                tester_ctx=tester_ctx,
-            )
-            self.assertIn("Недавние отчёты Тестировщика", list_txt)
-
-            # confirm_minor_fixes
-            minor_txt, minor_evs = agent_mod.run_tool(
-                "confirm_minor_fixes",
-                {
-                    "tester_run_key": done_ev["runKey"],
-                    "minor_issues": ["Мелкая опечатка в index.html"],
-                },
-                trust_level="verified",
-                approval_fn=lambda _req: {"approved": True},
-                sandbox_root=root,
-                tester_ctx=tester_ctx,
-            )
-            self.assertIn("одобрил", minor_txt.lower())
-            self.assertEqual(minor_evs[0]["type"], "tester_minor_decision")
-            self.assertTrue(any(e == "tester_decision" and d.get("decision") == "approved" for e, d in events))
+            self.assertIn("Статическая проверка пройдена", txt)
+            done_ev = next(d for e, d in events if e == "subagent_done")
+            self.assertEqual(done_ev["toolProfile"], "full")
 
 
 class All19GithubToolsTests(unittest.TestCase):

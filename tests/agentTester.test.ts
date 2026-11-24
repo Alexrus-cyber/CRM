@@ -280,7 +280,7 @@ describe("Tester sub-agent DB, token isolation & API orchestration", () => {
     expect(shopRun?.criticalIssues[0]?.title).toBe("NaN в итоге");
     expect(shopRun?.totalTokens).toBe(300);
 
-    // Повторный запуск Агента получает recentTesterReports из БД
+    // Повторный запуск Агента больше НЕ передаёт recentTesterReports Оркестратору (встроенный Тестировщик отключён)
     await agentRoute.POST(
       new Request("http://localhost/api/ai/agent", {
         method: "POST",
@@ -293,9 +293,7 @@ describe("Tester sub-agent DB, token isolation & API orchestration", () => {
       }),
     );
     const injectedContext = (capturedBody.context ?? {}) as Record<string, unknown>;
-    const injectedReports = injectedContext.recentTesterReports as Array<Record<string, unknown>>;
-    expect(Array.isArray(injectedReports)).toBe(true);
-    expect(injectedReports.some((r) => r.sandboxProject === "shop")).toBe(true);
+    expect(injectedContext.recentTesterReports).toBeUndefined();
 
     // Прямой запуск agentRole="tester" в существующем QA-чате не создаёт дубликат user-сообщения
     const directConv = await repo.createAgentConversation(userA, "tester", "Прямой QA");
