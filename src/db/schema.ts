@@ -529,13 +529,17 @@ export const agentConversations = pgTable(
     userId: integer("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    kind: text("kind").$type<"plan" | "agent" | "tester">().notNull(),
+    kind: text("kind").$type<"plan" | "agent" | "tester" | "subagent">().notNull(),
+    subagentId: integer("subagent_id"),
     title: text("title").notNull().default("Новый чат"),
     systemPrompt: text("system_prompt").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index("agent_conversations_user_kind_idx").on(t.userId, t.kind, t.updatedAt)],
+  (t) => [
+    index("agent_conversations_user_kind_idx").on(t.userId, t.kind, t.updatedAt),
+    index("agent_conversations_subagent_idx").on(t.userId, t.subagentId, t.updatedAt),
+  ],
 );
 
 export const agentConversationMessages = pgTable(
@@ -693,6 +697,78 @@ export const githubConnections = pgTable("github_connections", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const agentSubagents = pgTable(
+  "agent_subagents",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    slug: text("slug").notNull(),
+    name: text("name").notNull(),
+    roleTitle: text("role_title").notNull().default(""),
+    description: text("description").notNull().default(""),
+    systemPrompt: text("system_prompt").notNull().default(""),
+    color: text("color").notNull().default("#8b5cf6"),
+    isActive: boolean("is_active").notNull().default(true),
+    parentSubagentId: integer("parent_subagent_id"),
+    orchestratorCanCall: boolean("orchestrator_can_call").notNull().default(true),
+    allowedCallees: text("allowed_callees").notNull().default('["*"]'),
+    unlockApi: boolean("unlock_api").notNull().default(false),
+    provider: text("provider").notNull().default("custom"),
+    baseUrl: text("base_url").notNull().default(""),
+    model: text("model").notNull().default(""),
+    apiKeyEncrypted: text("api_key_encrypted").notNull().default(""),
+    apiKeyHint: text("api_key_hint").notNull().default(""),
+    reasoningMode: text("reasoning_mode").notNull().default("default"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("agent_subagents_user_slug_uq").on(t.userId, t.slug),
+    index("agent_subagents_user_active_idx").on(t.userId, t.isActive, t.id),
+  ],
+);
+
+export const agentSubagentRuns = pgTable(
+  "agent_subagent_runs",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    subagentId: integer("subagent_id")
+      .notNull()
+      .references(() => agentSubagents.id, { onDelete: "cascade" }),
+    agentConversationId: integer("agent_conversation_id"),
+    subagentConversationId: integer("subagent_conversation_id")
+      .notNull()
+      .references(() => agentConversations.id, { onDelete: "cascade" }),
+    callerKind: text("caller_kind").notNull().default("orchestrator"),
+    callerSubagentId: integer("caller_subagent_id"),
+    sandboxProject: text("sandbox_project").notNull().default(""),
+    inputSummary: text("input_summary").notNull().default(""),
+    outputSummary: text("output_summary").notNull().default(""),
+    status: text("status").notNull().default("running"),
+    requestedCalleeSlug: text("requested_callee_slug").notNull().default(""),
+    requestedCalleeTask: text("requested_callee_task").notNull().default(""),
+    actionsCount: integer("actions_count").notNull().default(0),
+    filesTouched: text("files_touched").notNull().default("[]"),
+    promptTokens: integer("prompt_tokens").notNull().default(0),
+    completionTokens: integer("completion_tokens").notNull().default(0),
+    totalTokens: integer("total_tokens").notNull().default(0),
+    model: text("model").notNull().default(""),
+    usedCustomApi: boolean("used_custom_api").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("agent_subagent_runs_user_idx").on(t.userId, t.createdAt),
+    index("agent_subagent_runs_subagent_idx").on(t.subagentId, t.id),
+    index("agent_subagent_runs_conv_idx").on(t.subagentConversationId),
+  ],
+);
+
 export type User = typeof users.$inferSelect;
 export type GithubConnection = typeof githubConnections.$inferSelect;
 export type AiUserSettingsRow = typeof aiUserSettings.$inferSelect;
@@ -704,6 +780,8 @@ export type ChatRoomMember = typeof chatRoomMembers.$inferSelect;
 export type AiBotConfig = typeof aiBotConfigs.$inferSelect;
 export type AgentUsageEvent = typeof agentUsageEvents.$inferSelect;
 export type AgentTesterRun = typeof agentTesterRuns.$inferSelect;
+export type AgentSubagent = typeof agentSubagents.$inferSelect;
+export type AgentSubagentRun = typeof agentSubagentRuns.$inferSelect;
 export type TaskMessage = typeof taskMessages.$inferSelect;
 export type AgentTask = typeof agentTasks.$inferSelect;
 export type AgentEvent = typeof agentEvents.$inferSelect;

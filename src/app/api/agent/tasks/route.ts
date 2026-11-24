@@ -1,7 +1,7 @@
 import { addAgentEvent, createAgentTask, listAgentTasks, syncOperatorTaskToConversation } from "@/db/repo";
-import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
+import { hasAgentAccess, hasOperatorAccess, isUnlimitedAiRole } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
-import { isUnlimitedStepsRole, resolveStepsForRole } from "@/lib/genParams";
+import { resolveStepsForRole } from "@/lib/genParams";
 import { normalizeCoachMode, normalizeTaskMode, normalizeTaskSource } from "@/lib/operatorModes";
 import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 import { normalizeTrustLevel } from "@/lib/trust";
@@ -57,15 +57,19 @@ export async function POST(req: Request) {
     return Response.json({ error: "Доступ к Оператору не выдан главным администратором" }, { status: 403 });
   }
 
-  const unlimited = isUnlimitedStepsRole(me.role);
+  const unlimitedPayload = isUnlimitedAiRole(me.role);
   const prompt = (body?.prompt ?? "").trim();
   if (!prompt) return Response.json({ error: "Опишите задание для агента" }, { status: 400 });
-  if (!unlimited && prompt.length > MAX_PROMPT) {
+  if (!unlimitedPayload && prompt.length > MAX_PROMPT) {
     return Response.json({ error: "Слишком длинное задание" }, { status: 400 });
   }
 
   // Файлы задания: их прочитает бот (текст, docx/xlsx, csv…) — для главного админа без ограничений.
-  const incoming = Array.isArray(body?.files) ? (unlimited ? body.files : body.files.slice(0, MAX_FILES)) : [];
+  const incoming = Array.isArray(body?.files)
+    ? unlimitedPayload
+      ? body.files
+      : body.files.slice(0, MAX_FILES)
+    : [];
   const files: Array<{ name: string; mime: string; data: string; size: number }> = [];
   for (const item of incoming) {
     const data = String(item?.data ?? "");
@@ -74,15 +78,11 @@ export async function POST(req: Request) {
     if (!data) continue;
     const bytes = Buffer.from(data, "base64");
     if (!bytes.length) continue;
-    if (!unlimited && bytes.length > MAX_FILE_BYTES) continue;
+    if (!unlimitedPayload && bytes.length > MAX_FILE_BYTES) continue;
     files.push({ name, mime, data, size: bytes.length });
   }
 
-  const maxSteps = resolveStepsForRole(
-    me.role,
-    body?.maxSteps,
-    isUnlimitedStepsRole(me.role) ? 0 : 15,
-  );
+  const maxSteps = resolveStepsForRole(me.role, body?.maxSteps, 0);
   const trustLevel = normalizeTrustLevel(body?.trustLevel);
   const taskMode = normalizeTaskMode(body?.taskMode ?? body?.mode);
   const coachMode = normalizeCoachMode(body?.coachMode);
