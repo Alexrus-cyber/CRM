@@ -108,7 +108,7 @@ export type AgentTokenRow = {
   expiringSoon?: boolean;
 };
 
-export type AgentConversationKind = "plan" | "agent" | "tester";
+export type AgentConversationKind = "plan" | "agent" | "tester" | "subagent";
 
 export type TesterIssue = {
   title: string;
@@ -155,6 +155,7 @@ export type AgentConversationRow = {
   id: number;
   userId: number;
   kind: AgentConversationKind;
+  subagentId?: number | null;
   title: string;
   systemPrompt: string;
   messagesCount: number;
@@ -947,19 +948,12 @@ export async function respondAgentTaskApproval(
   const unlimited = isUnlimitedStepsRole(ownerRole);
   const id = input.approvalId || task.pendingApproval?.id || `appr_${Date.now()}`;
   const requestedAdd = Math.max(1, Math.round(input.extraSteps || 15));
-  const addSteps =
-    input.decision === "extend_steps"
-      ? unlimited
-        ? requestedAdd
-        : Math.max(0, Math.min(AGENT_MAX_STEPS - task.maxSteps, requestedAdd))
-      : 0;
+  const addSteps = input.decision === "extend_steps" ? (unlimited ? requestedAdd : 0) : 0;
   const nextMaxSteps =
     input.decision === "extend_steps"
-      ? unlimited
-        ? task.maxSteps === 0
-          ? 0
-          : task.maxSteps + addSteps
-        : Math.min(AGENT_MAX_STEPS, task.maxSteps + addSteps)
+      ? task.maxSteps === 0
+        ? 0
+        : task.maxSteps + addSteps
       : task.maxSteps;
   const decisionPayload: AgentTaskApprovalDecision = {
     id,
@@ -1000,11 +994,10 @@ export async function extendAgentTaskSteps(
   const ownerRole = await getUserRoleById(userId);
   const unlimited = isUnlimitedStepsRole(ownerRole);
   const addSteps = Math.max(1, Math.round(addStepsRaw || 15));
-  const nextMaxSteps = unlimited
-    ? task.maxSteps === 0
+  const nextMaxSteps =
+    unlimited && task.maxSteps === 0
       ? 0
-      : Math.max(task.maxSteps + addSteps, task.steps + 1)
-    : Math.min(AGENT_MAX_STEPS, Math.max(task.maxSteps + addSteps, task.steps + 1));
+      : Math.max(task.maxSteps + addSteps, task.steps + 1);
   const actualAdded = nextMaxSteps - task.maxSteps;
   if (task.pendingApproval?.kind === "step_limit") {
     return respondAgentTaskApproval(taskId, userId, {
@@ -1165,11 +1158,19 @@ function parseStoredArray(value: unknown): unknown[] {
 function mapAgentConversation(row: Raw): AgentConversationRow {
   const rawKind = String(row.kind ?? "agent");
   const kind: AgentConversationKind =
-    rawKind === "plan" ? "plan" : rawKind === "tester" ? "tester" : "agent";
+    rawKind === "plan"
+      ? "plan"
+      : rawKind === "tester"
+        ? "tester"
+        : rawKind === "subagent"
+          ? "subagent"
+          : "agent";
+  const rawSubId = row.subagent_id;
   return {
     id: toNum(row.id),
     userId: toNum(row.user_id),
     kind,
+    subagentId: rawSubId === null || rawSubId === undefined ? null : toNum(rawSubId) || null,
     title: String(row.title ?? "Новый чат"),
     systemPrompt: String(row.system_prompt ?? ""),
     messagesCount: toNum(row.messages_count),
@@ -1182,12 +1183,20 @@ export async function listAgentConversations(
   userId: number,
   kind: AgentConversationKind,
   limit = 500,
+  subagentId?: number | null,
 ): Promise<AgentConversationRow[]> {
-  const rows = await q(sql`select c.*,
-      (select count(*) from agent_conversation_messages m where m.conversation_id = c.id) as messages_count
-    from agent_conversations c
-    where c.user_id = ${userId} and c.kind = ${kind}
-    order by c.updated_at desc, c.id desc limit ${Math.max(1, Math.floor(limit))}`);
+  const safeSubId = subagentId && Number.isFinite(subagentId) && subagentId > 0 ? Math.floor(subagentId) : null;
+  const rows = safeSubId
+    ? await q(sql`select c.*,
+          (select count(*) from agent_conversation_messages m where m.conversation_id = c.id) as messages_count
+        from agent_conversations c
+        where c.user_id = ${userId} and c.kind = ${kind} and c.subagent_id = ${safeSubId}
+        order by c.updated_at desc, c.id desc limit ${Math.max(1, Math.floor(limit))}`)
+    : await q(sql`select c.*,
+          (select count(*) from agent_conversation_messages m where m.conversation_id = c.id) as messages_count
+        from agent_conversations c
+        where c.user_id = ${userId} and c.kind = ${kind}
+        order by c.updated_at desc, c.id desc limit ${Math.max(1, Math.floor(limit))}`);
   return rows.map(mapAgentConversation);
 }
 
@@ -1201,17 +1210,26 @@ export async function getAgentConversation(userId: number, id: number): Promise<
 export async function createAgentConversation(
   userId: number,
   kind: AgentConversationKind,
-  title = kind === "plan" ? "Новый план" : kind === "tester" ? "Тестирование" : "Новый чат",
+  title = kind === "plan"
+    ? "Новый план"
+    : kind === "tester"
+      ? "Тестирование"
+      : kind === "subagent"
+        ? "Чат субагента"
+        : "Новый чат",
   systemPrompt = "",
+  subagentId: number | null = null,
 ): Promise<AgentConversationRow> {
   const now = nowIso();
+  const safeSubId = subagentId && Number.isFinite(subagentId) && subagentId > 0 ? Math.floor(subagentId) : null;
   const row = await q1<{ id: number }>(sql`insert into agent_conversations
-      (user_id, kind, title, system_prompt, created_at, updated_at)
-    values (${userId}, ${kind}, ${title.slice(0, 120)}, ${systemPrompt}, ${now}, ${now}) returning id`);
+      (user_id, kind, subagent_id, title, system_prompt, created_at, updated_at)
+    values (${userId}, ${kind}, ${safeSubId}, ${title.slice(0, 120)}, ${systemPrompt}, ${now}, ${now}) returning id`);
   return {
     id: toNum(row?.id),
     userId,
     kind,
+    subagentId: safeSubId,
     title: title.slice(0, 120),
     systemPrompt,
     messagesCount: 0,
@@ -1239,6 +1257,7 @@ export async function deleteAgentConversation(userId: number, id: number): Promi
   const current = await getAgentConversation(userId, id);
   if (!current) return false;
   await q(sql`delete from agent_tester_runs where tester_conversation_id = ${id} and user_id = ${userId}`);
+  await q(sql`delete from agent_subagent_runs where subagent_conversation_id = ${id} and user_id = ${userId}`);
   await q(sql`delete from agent_conversation_messages where conversation_id = ${id}`);
   await q(sql`delete from agent_conversations where id = ${id} and user_id = ${userId}`);
   return true;
@@ -1664,6 +1683,27 @@ export async function getAgentUsage(userId: number, month = aiMonthKey()): Promi
       operator: allOperator,
       total: sumAgentUsageTotals(allAgent, allOperator),
     },
+  };
+}
+
+export async function getAgentConversationUsage(
+  userId: number,
+  conversationId: number,
+): Promise<{ prompt: number; completion: number; total: number; events: number }> {
+  const rows = await q(sql`
+    select
+      coalesce(sum(prompt_tokens), 0) as prompt,
+      coalesce(sum(completion_tokens), 0) as completion,
+      coalesce(sum(total_tokens), 0) as total,
+      count(*) as events
+    from agent_usage_events
+    where user_id = ${userId} and ref_id = ${conversationId}`);
+  const row = rows[0] ?? {};
+  return {
+    prompt: toNum(row.prompt),
+    completion: toNum(row.completion),
+    total: toNum(row.total),
+    events: toNum(row.events),
   };
 }
 

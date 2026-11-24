@@ -28,6 +28,7 @@ export const SCHEMA_TABLES = [
   "agent_connections",
   "agent_connection_tokens",
   "agent_tokens",
+  "agent_subagents",
   "agent_conversations",
   "agent_conversation_messages",
   "agent_tasks",
@@ -42,6 +43,7 @@ export const SCHEMA_TABLES = [
   "ai_rag_terms",
   "agent_usage_events",
   "agent_tester_runs",
+  "agent_subagent_runs",
   "github_connections",
 ];
 
@@ -152,6 +154,10 @@ async function convertPostgresIntegerBooleans(executor) {
     ["ai_bot_configs", "is_active", true],
     ["agent_connections", "is_default", false],
     ["github_connections", "enabled", true],
+    ["agent_subagents", "is_active", true],
+    ["agent_subagents", "orchestrator_can_call", true],
+    ["agent_subagents", "unlock_api", false],
+    ["agent_subagent_runs", "used_custom_api", false],
   ];
   for (const [table, column, defVal] of targets) {
     const rows = await executor.queryRaw(

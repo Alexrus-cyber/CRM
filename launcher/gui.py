@@ -777,7 +777,8 @@ class LauncherApp:
         if signed_in:
             limits = crm_client.profile_limits(self.settings.crm_profile)
             unlimited = bool(limits.get("unlimited"))
-            steps_label = "без лимита" if unlimited else f"до {limits.get('maxSteps') or 500}"
+            max_steps_val = limits.get("maxSteps")
+            steps_label = "без лимита" if (unlimited or not max_steps_val) else f"до {max_steps_val}"
             self.crm_account_summary_var.set(
                 f"CRM: {user.get('name') or user.get('email')} ({user.get('roleLabel') or user.get('role')}) · "
                 f"Агент: {'да' if user.get('canUseAgent') else 'нет'} · "

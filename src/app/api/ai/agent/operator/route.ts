@@ -1,5 +1,5 @@
 import { addAgentEvent, createAgentTask, getAiUserSettingsSecret, recordAgentUsage } from "@/db/repo";
-import { hasAgentAccess, hasOperatorAccess } from "@/lib/aiPolicy";
+import { hasAgentAccess, hasOperatorAccess, isUnlimitedAiRole } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { aiAuthHeaders, aiEndpoint, estimateTokens, normalizeBaseUrl } from "@/lib/ai";
 import { isUnlimitedStepsRole, resolveStepsForRole } from "@/lib/genParams";
@@ -176,7 +176,7 @@ export async function POST(req: Request) {
   // Запуск задачи Оператора после явного разрешения пользователя.
   const prompt = String(body?.prompt ?? "").trim();
   if (!prompt) return Response.json({ error: "Укажите задачу для Оператора" }, { status: 400 });
-  if (!isUnlimitedStepsRole(me.role) && prompt.length > MAX_PROMPT) {
+  if (!isUnlimitedAiRole(me.role) && prompt.length > MAX_PROMPT) {
     return Response.json({ error: "Слишком длинное задание" }, { status: 400 });
   }
 

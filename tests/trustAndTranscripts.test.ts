@@ -80,7 +80,7 @@ describe("уровни доверия ИИ и оценка контекста/Su
 });
 
 describe("БД: подтверждения оператора, расширение шагов на месте и архив переписок", () => {
-  it("управляет очередью подтверждений, безлимитными шагами для super_admin, пределом 500 для admin и активностью бота", async () => {
+  it("управляет очередью подтверждений, безлимитными шагами для всех ролей и активностью бота", async () => {
     const conn = await repo.createAgentConnection(userId, "Локальный", "http://localhost:3000");
     const createdToken = await repo.createAgentConnectionToken(userId, conn.id, "Тест");
     await repo.findAgentTokenOwner(createdToken!.token);
@@ -127,11 +127,11 @@ describe("БД: подтверждения оператора, расширен�
     const superUnlimited = await repo.createAgentTask(userId, "Безлимитная задача", 0, "full");
     expect(superUnlimited.maxSteps).toBe(0);
 
-    // Обычный администратор (admin) ограничен пределом AGENT_MAX_STEPS = 500.
+    // Обычный администратор (admin) теперь тоже без лимита шагов: явное число принимается без потолка.
     const adminTask = await repo.createAgentTask(regularAdminId, "Задача обычного админа", 900, "verified");
-    expect(adminTask.maxSteps).toBe(AGENT_MAX_STEPS);
+    expect(adminTask.maxSteps).toBe(900);
     const adminExtended = await repo.extendAgentTaskSteps(adminTask.id, regularAdminId, 200);
-    expect(adminExtended?.maxSteps).toBe(AGENT_MAX_STEPS);
+    expect(adminExtended?.maxSteps).toBe(1100);
   });
 
   it("сохраняет полные стенограммы переписки с изоляцией по пользователям", async () => {

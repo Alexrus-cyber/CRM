@@ -268,23 +268,21 @@ def extract_attachment_text(name: str, data: bytes, limit: int = 4000) -> str:
 
 # Заведомо текстовые модели: картинок не понимают, координаты «придумывают».
 # У DeepSeek картинки понимает deepseek-flash; deepseek-chat и deepseek-v4-pro — текст.
-MAX_STEPS_LIMIT = 500  # предел шагов для всех ролей, кроме главного администратора
+MAX_STEPS_LIMIT = 0  # лимит шагов снят для всех ролей (0 — без потолка)
 APPROVAL_WAIT_TIMEOUT = 900  # 15 минут ожидания ответа человека на сайте
 
 
-def resolve_operator_steps(raw_steps: Any, unlimited: bool = False, default_steps: int = 15) -> int:
-    """Вычислить лимит шагов оператора: для главного админа (unlimited=True) 0 = без лимита, иначе потолок 500."""
+def resolve_operator_steps(raw_steps: Any, unlimited: bool = False, default_steps: int = 0) -> int:
+    """Вычислить лимит шагов оператора: у всех ролей лимита шагов нет (0 = без лимита, >0 = без потолка)."""
     try:
         parsed = int(raw_steps) if raw_steps is not None and raw_steps != "" else None
     except (TypeError, ValueError):
         parsed = None
-    if unlimited:
-        if parsed is None or parsed <= 0:
-            return 0
-        return parsed
-    if parsed is None or parsed <= 0:
-        return min(MAX_STEPS_LIMIT, max(1, int(default_steps or 15)))
-    return min(MAX_STEPS_LIMIT, max(1, parsed))
+    if parsed is None:
+        return 0 if unlimited or default_steps <= 0 else int(default_steps)
+    if parsed <= 0:
+        return 0
+    return parsed
 
 VERIFY_PROMPT = """Ты проверяешь результат действия бота на рабочем столе.
 Тебе дают цель шага, описание действия, его результат и свежий скриншот.
@@ -2124,12 +2122,12 @@ def self_test() -> int:
     unlim_op.model_http = UnlimModelHttp()  # type: ignore[assignment]
     unlim_op.execute = lambda act: "waited"  # type: ignore[method-assign]
     unlim_op.request_website_approval = lambda *a, **kw: (unlim_state.__setitem__("step_limit_asked", True) or {"decision": "reject"})  # type: ignore[method-assign]
-    unlim_ok = unlim_op.run(88, "Безлимитная задача главного админа", 0, unlimited=True)
-    check("resolve_operator_steps и безлимитный режим: super_admin (maxSteps=0) идёт без step_limit, остальные <= 500",
+    unlim_ok = unlim_op.run(88, "Безлимитная задача для любой роли", 0, unlimited=False)
+    check("resolve_operator_steps и безлимитный режим: все роли поддерживают maxSteps=0 и >500 без потолка",
           resolve_operator_steps(0, True) == 0
           and resolve_operator_steps(1200, True) == 1200
-          and resolve_operator_steps(0, False) == 15
-          and resolve_operator_steps(1200, False) == MAX_STEPS_LIMIT
+          and resolve_operator_steps(0, False) == 0
+          and resolve_operator_steps(1200, False) == 1200
           and unlim_ok and unlim_state["finished"] and unlim_state["step"] == 4
           and not unlim_state["step_limit_asked"])
 
@@ -4335,31 +4333,22 @@ class Operator:
                 if task_info:
                     if "unlimited" in task_info:
                         self._task_unlimited = bool(task_info.get("unlimited"))
-                    if self._task_unlimited:
-                        if task_info.get("maxSteps") == 0:
-                            if current_max_steps != 0:
-                                log("Лимит шагов снят на сайте — продолжаю без лимита")
-                                current_max_steps = 0
-                        elif task_info.get("maxSteps"):
-                            server_max = resolve_operator_steps(task_info["maxSteps"], True, 0)
-                            if current_max_steps > 0 and server_max > current_max_steps:
-                                log("Лимит шагов увеличен на сайте: {} → {}".format(current_max_steps, server_max))
-                                current_max_steps = server_max
-                                if self.max_steps_cap and self.max_steps_cap < server_max:
-                                    self.max_steps_cap = server_max
+                    if task_info.get("maxSteps") == 0:
+                        if current_max_steps != 0:
+                            log("Лимит шагов снят на сайте — продолжаю без лимита")
+                            current_max_steps = 0
                     elif task_info.get("maxSteps"):
-                        server_max = resolve_operator_steps(task_info["maxSteps"], False, current_max_steps or 15)
-                        if server_max > current_max_steps:
+                        server_max = resolve_operator_steps(task_info["maxSteps"], True, 0)
+                        if current_max_steps > 0 and server_max > current_max_steps:
                             log("Лимит шагов увеличен на сайте: {} → {}".format(current_max_steps, server_max))
                             current_max_steps = server_max
                             if self.max_steps_cap and self.max_steps_cap < server_max:
                                 self.max_steps_cap = server_max
 
             if current_max_steps > 0 and index >= current_max_steps:
-                # Достигнут заданный лимит шагов: спрашиваем на сайте разрешение продолжить,
-                # если роль безлимитная (super_admin) или предел 500 ещё не достигнут.
-                if self.has_crm and task_id and (self._task_unlimited or current_max_steps < MAX_STEPS_LIMIT):
-                    extra = 20 if self._task_unlimited else min(20, MAX_STEPS_LIMIT - current_max_steps)
+                # Достигнут явно заданный пользователем лимит шагов: спрашиваем на сайте разрешение продолжить (без потолка).
+                if self.has_crm and task_id:
+                    extra = 20
                     resp = self.request_website_approval(
                         task_id,
                         kind="step_limit",
@@ -4371,11 +4360,7 @@ class Operator:
                     decision = str(resp.get("decision") or "reject").lower()
                     if decision in ("approve", "approved", "extend", "extend_steps", "allow"):
                         added = max(1, int(resp.get("extraSteps") or extra))
-                        current_max_steps = (
-                            current_max_steps + added
-                            if self._task_unlimited
-                            else min(MAX_STEPS_LIMIT, current_max_steps + added)
-                        )
+                        current_max_steps = current_max_steps + added
                         if self.max_steps_cap:
                             self.max_steps_cap = max(self.max_steps_cap, current_max_steps)
                         self.report("info", "Лимит продлён до {} шагов — продолжаю с шага {}".format(

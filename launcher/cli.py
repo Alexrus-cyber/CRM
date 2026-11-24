@@ -396,9 +396,10 @@ def _crm_auth_checks(check) -> None:
     except crm_client.CrmClientError:
         http_rejected = True
     check("crm_client: запрещает незашифрованный http:// для удалённого CRM (P1-22)", http_rejected)
-    check("crm_client: ограничивает max_steps для обычных ролей",
-          crm_client.clamp_max_steps(999, 500, False) == 500
-          and crm_client.clamp_max_steps(0, 500, False) == 500
+    check("crm_client: max_steps без лимита при maxSteps=None и учитывает явный лимит",
+          crm_client.clamp_max_steps(999, None, False) == 999
+          and crm_client.clamp_max_steps(0, None, False) == 0
+          and crm_client.clamp_max_steps(999, 500, False) == 500
           and crm_client.clamp_max_steps(999, 500, True) == 999)
     check("crm_client: ограничивает reasoning по политике роли",
           crm_client.clamp_reasoning("max", ["default", "low"]) == "default"
@@ -423,7 +424,7 @@ def _crm_auth_checks(check) -> None:
         },
         "limits": {
             "unlimited": False,
-            "maxSteps": 500,
+            "maxSteps": None,
             "reasoning": ["default", "low"],
         },
         "operator": {
@@ -437,16 +438,16 @@ def _crm_auth_checks(check) -> None:
           and crm_client.can_launch_agent("chat_agent", limited.crm_profile)[0])
     op_args = commands.agent_args(operator, limited)
     op_sec = commands.agent_secrets(operator, limited)
-    check("crm_client: оператор получает автотокен в изолированный файл секретов и потолок шагов",
+    check("crm_client: оператор получает автотокен в изолированный файл секретов и шаги без потолка",
           "--token" not in op_args
           and op_sec.get("CRM_AGENT_TOKEN") == "crmop_auto_token"
-          and "--max-steps" in op_args and op_args[op_args.index("--max-steps") + 1] == "500")
+          and "--max-steps" in op_args and op_args[op_args.index("--max-steps") + 1] == "900")
     check("crm_client: reasoning сбрасывается до разрешённого уровня",
           "--reasoning" not in op_args
           and crm_client.clamp_reasoning("max", ["low", "medium"]) == "low")
     agent_env = commands.agent_env(chat_agent, limited)
-    check("crm_client: AGENT_MAX_STEPS режется лимитом роли",
-          agent_env.get("AGENT_MAX_STEPS") == "500")
+    check("crm_client: AGENT_MAX_STEPS передаётся без урезания для всех ролей",
+          agent_env.get("AGENT_MAX_STEPS") == "900")
 
 
 def _gui_smoke(check) -> None:

@@ -259,9 +259,9 @@ def clamp_reasoning(requested: str, allowed: Optional[Iterable[str]]) -> str:
 
 
 def clamp_max_steps(requested: Optional[int], limit_max_steps: Optional[int], unlimited: bool) -> Optional[int]:
-    if unlimited:
+    if unlimited or limit_max_steps is None or int(limit_max_steps) <= 0:
         return requested
-    cap = int(limit_max_steps) if limit_max_steps and int(limit_max_steps) > 0 else 500
+    cap = int(limit_max_steps)
     if requested is None or int(requested) <= 0:
         return cap
     return min(int(requested), cap)

@@ -1,8 +1,8 @@
 import { recordAgentUsage } from "@/db/repo";
-import { hasOperatorAccess } from "@/lib/aiPolicy";
+import { hasOperatorAccess, isUnlimitedAiRole } from "@/lib/aiPolicy";
 import { getCurrentUser } from "@/lib/auth";
 import { estimateTokens, normalizeBaseUrl } from "@/lib/ai";
-import { applyGenParams, isUnlimitedStepsRole, normalizeGenParams } from "@/lib/genParams";
+import { applyGenParams, normalizeGenParams } from "@/lib/genParams";
 import { DEFAULT_PLAN_PROMPT } from "@/lib/operatorPlan";
 import { checkApiRateLimit, extractClientIp, rateLimitErrorResponse } from "@/lib/rateLimit";
 import { assertSafeAiUrl, safeAiFetch } from "@/lib/ssrf";
@@ -122,7 +122,7 @@ export async function POST(req: Request) {
     }
   }
 
-  const unlimited = isUnlimitedStepsRole(me.role);
+  const unlimited = isUnlimitedAiRole(me.role);
   const payload: Record<string, unknown> = {
     model,
     messages: [{ role: "system", content: systemPrompt }, ...messages],

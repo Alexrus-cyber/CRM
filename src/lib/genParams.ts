@@ -12,7 +12,6 @@
  */
 
 import { AI_MAX_GENERATION_TOKENS, AI_REASONING_MODES, type ReasoningMode } from "./ai";
-import { isSuperAdminRole } from "./permissions";
 
 export type GenParams = {
   /** Сколько «думать»: reasoning_effort у OpenAI-совместимых серверов. */
@@ -37,39 +36,35 @@ export const GEN_DEFAULT_PARAMS: GenParams = {
   seed: null,
 };
 
-/** Предел шагов агента и оператора для всех ролей, кроме главного администратора. */
-export const AGENT_MAX_STEPS = 500;
-/** Жёсткий потолок при расширении лимита шагов «на месте» (кроме главного администратора). */
-export const OPERATOR_MAX_EXTEND_STEPS = 2000;
+/** Лимит шагов снят для всех ролей: `0` означает «без лимита». */
+export const AGENT_MAX_STEPS = 0;
+/** Потолок при расширении шагов Оператора снят для всех ролей (`0` — без потолка). */
+export const OPERATOR_MAX_EXTEND_STEPS = 0;
 
-export function isUnlimitedStepsRole(role: string | null | undefined): boolean {
-  return isSuperAdminRole(role);
+export function isUnlimitedStepsRole(_role: string | null | undefined): boolean {
+  return true;
 }
 
-export function maxStepsCapForRole(role: string | null | undefined): number | null {
-  return isUnlimitedStepsRole(role) ? null : AGENT_MAX_STEPS;
+export function maxStepsCapForRole(_role: string | null | undefined): number | null {
+  return null;
 }
 
 /**
- * Нормализует лимит шагов в зависимости от роли пользователя:
- * - у главного администратора (`super_admin`) лимита нет: `0` означает «без лимита»,
- *   а любое положительное число (`>= 1`) принимается без потолка 500/2000;
- * - у всех остальных ролей (включая обычных `admin`) предел строго 500 шагов.
+ * Нормализует лимит шагов:
+ * лимита шагов нет ни у одной роли в Агенте, субагентах и Операторе —
+ * `0` означает «без лимита», а любое положительное число (`>= 1`) принимается без потолка.
  */
 export function resolveStepsForRole(
-  role: string | null | undefined,
+  _role: string | null | undefined,
   raw: unknown,
-  fallback: number,
+  fallback = 0,
 ): number {
   const parsed = typeof raw === "number" ? raw : Number(raw);
-  if (isUnlimitedStepsRole(role)) {
-    if (raw === 0 || raw === "0" || raw === null) return 0;
-    if (!Number.isFinite(parsed)) return fallback <= 0 ? 0 : Math.floor(fallback);
-    return parsed <= 0 ? 0 : Math.floor(parsed);
+  if (raw === 0 || raw === "0" || raw === null) return 0;
+  if (raw === undefined || raw === "" || !Number.isFinite(parsed)) {
+    return fallback <= 0 ? 0 : Math.floor(fallback);
   }
-  const safeFallback = Math.min(AGENT_MAX_STEPS, Math.max(1, Math.floor(fallback) || 15));
-  if (!Number.isFinite(parsed) || parsed <= 0) return safeFallback;
-  return Math.min(AGENT_MAX_STEPS, Math.max(1, Math.floor(parsed)));
+  return parsed <= 0 ? 0 : Math.floor(parsed);
 }
 
 export type NormalizeGenParamsOptions = {
