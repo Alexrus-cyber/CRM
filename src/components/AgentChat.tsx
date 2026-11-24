@@ -863,6 +863,8 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const runningRef = useRef(false);
   const pendingApprovalRef = useRef<PendingApproval | null>(null);
   const chatAbortRef = useRef<AbortController | null>(null);
+  const previewWindowRef = useRef<Window | null>(null);
+  const openedExternalUrlsInTurnRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     conversationIdRef.current = conversationId;
@@ -2787,8 +2789,47 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     if (dropped.length > 0) addAgentFiles(dropped);
   };
 
-  const openUrl = (url: string) => {
-    const win = window.open(url, "_blank", "noopener,noreferrer");
+  const isSandboxOrLocalPreviewUrl = (url: string) => {
+    const trimmed = url.trim();
+    if (!trimmed) return false;
+    if (trimmed.startsWith("/api/ai/agent/sandbox/")) return true;
+    try {
+      const parsed = new URL(trimmed, window.location.origin);
+      if (parsed.pathname.startsWith("/api/ai/agent/sandbox/")) return true;
+      const host = parsed.hostname.toLowerCase();
+      return host === "127.0.0.1" || host === "localhost" || host === "0.0.0.0";
+    } catch {
+      return false;
+    }
+  };
+
+  const openUrl = (url: string, opts?: { deduplicateExternalInTurn?: boolean }) => {
+    const trimmed = url.trim();
+    if (!trimmed) return false;
+    if (isSandboxOrLocalPreviewUrl(trimmed)) {
+      const existing = previewWindowRef.current;
+      if (existing && !existing.closed) {
+        try {
+          existing.location.href = trimmed;
+          existing.focus?.();
+          return true;
+        } catch {
+          try {
+            existing.close();
+          } catch {
+            // ignore cross-origin close restrictions
+          }
+        }
+      }
+      const win = window.open(trimmed, "crm_sandbox_preview");
+      if (win) previewWindowRef.current = win;
+      return Boolean(win);
+    }
+    if (opts?.deduplicateExternalInTurn) {
+      if (openedExternalUrlsInTurnRef.current.has(trimmed)) return true;
+      openedExternalUrlsInTurnRef.current.add(trimmed);
+    }
+    const win = window.open(trimmed, "_blank", "noopener,noreferrer");
     return Boolean(win);
   };
 
@@ -2832,6 +2873,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     prevActorBeforeOverseerRef.current = null;
     setLiveBrowserLog([]);
     browserRunStartRef.current = 0;
+    openedExternalUrlsInTurnRef.current.clear();
     autoScrollPausedRef.current = false;
     scrollDown(true);
 
@@ -3565,7 +3607,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
               };
               assistantDraft.actions.push(action);
               patch((t) => ({ ...t, actions: [...t.actions, action] }));
-              if (action.url) openUrl(action.url);
+              if (action.url) openUrl(action.url, { deduplicateExternalInTurn: true });
             } else {
               const action: AgentAction = {
                 type: String(data.type ?? "command_result") as AgentAction["type"],
@@ -5461,12 +5503,21 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                   {turn.actions.map((action, index) => {
                     if (action.type === "open_url" && action.url) {
                       const openTarget = toSandboxProxyUrl(action.url, action.port) ?? action.url;
+                      const isPreviewTarget = isSandboxOrLocalPreviewUrl(openTarget);
                       return (
                         <a
                           key={`${openTarget}-${index}`}
                           href={openTarget}
-                          target="_blank"
-                          rel="noopener noreferrer"
+                          target={isPreviewTarget ? "crm_sandbox_preview" : "_blank"}
+                          rel={isPreviewTarget ? undefined : "noopener noreferrer"}
+                          onClick={
+                            isPreviewTarget
+                              ? (e) => {
+                                  e.preventDefault();
+                                  openUrl(openTarget);
+                                }
+                              : undefined
+                          }
                           className="flex items-center gap-2 rounded-xl border border-accent/40 bg-accent/10 px-2.5 py-2 font-medium text-accent2 transition hover:bg-accent/20"
                         >
                           {action.autoplay ? <PlayCircle size={14} /> : <ExternalLink size={14} />}
@@ -5488,8 +5539,11 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
                             {cmdProxyUrl && (
                               <a
                                 href={cmdProxyUrl}
-                                target="_blank"
-                                rel="noopener noreferrer"
+                                target="crm_sandbox_preview"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  openUrl(cmdProxyUrl);
+                                }}
                                 className="inline-flex shrink-0 items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 font-sans text-[10px] text-emerald-400 hover:bg-emerald-500/20"
                               >
                                 <ExternalLink size={10} /> Открыть

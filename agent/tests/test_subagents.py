@@ -68,9 +68,20 @@ class SubagentOrchestratorTests(unittest.TestCase):
     def test_tools_for_trust_subagent_excludes_orchestrator_only_tools(self):
         sub_names = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", role="subagent")}
         agent_names = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", role="agent")}
+        tester_names = {t["function"]["name"] for t in agent_mod.tools_for_trust("full", role="tester")}
         self.assertIn("report_to_orchestrator", sub_names)
         self.assertIn("request_subagent", sub_names)
+        self.assertIn("list_tester_reports", sub_names)
         self.assertNotIn("call_subagent", sub_names)
+        # browser_inspector и браузер доступны только Тестировщику и Оркестратору, но НЕ субагенту
+        self.assertNotIn("browse_project", sub_names)
+        self.assertNotIn("qa_browser_audit", sub_names)
+        self.assertNotIn("open_website", sub_names)
+        self.assertNotIn("play_youtube", sub_names)
+        self.assertNotIn("call_tester", sub_names)
+        self.assertIn("browse_project", agent_names)
+        self.assertIn("browse_project", tester_names)
+        self.assertIn("qa_browser_audit", tester_names)
         self.assertIn("call_subagent", agent_names)
         self.assertIn("list_subagents", agent_names)
 
@@ -344,6 +355,151 @@ class SubagentLayeredRoutingTests(unittest.TestCase):
         self.assertEqual(visited_slugs, ["arch", "backend", "frontend"])
         self.assertIn("backend", res["agentText"])
         self.assertIn("frontend", res["agentText"])
+
+
+class SubagentRestrictionsAndTesterOrderTests(unittest.TestCase):
+    def test_subagent_blocked_from_browser_inspector_and_browser_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            sub_caller = {"agentKind": "subagent", "agentName": "Frontend"}
+            for blocked_tool in ("browse_project", "qa_browser_audit", "open_website", "play_youtube", "call_tester"):
+                with self.assertRaises(agent_mod.AgentError):
+                    agent_mod.run_tool(
+                        blocked_tool,
+                        {"action": "open", "url": "http://127.0.0.1:3000"},
+                        trust_level="full",
+                        sandbox_root=root,
+                        caller_info=sub_caller,
+                    )
+
+            with self.assertRaises(agent_mod.AgentError):
+                agent_mod.run_tool(
+                    "run_command",
+                    {"command": "chromium --headless http://127.0.0.1:3000", "cwd": "."},
+                    trust_level="full",
+                    sandbox_root=root,
+                    caller_info=sub_caller,
+                )
+
+    def test_subagent_run_command_does_not_emit_open_url_while_main_agent_does(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            fake_run = {
+                "background": True,
+                "pid": 1234,
+                "cwd": "app",
+                "output": "listening on http://127.0.0.1:4100",
+                "url": "http://127.0.0.1:4100",
+                "replacedCount": 1,
+            }
+            with mock.patch("agent.sandbox_mod.run_command", return_value=fake_run):
+                sub_txt, sub_evs = agent_mod.run_tool(
+                    "run_command",
+                    {"command": "python -m http.server 4100", "cwd": "app", "background": True},
+                    trust_level="full",
+                    sandbox_root=root,
+                    caller_info={"agentKind": "subagent", "agentName": "Backend"},
+                    subagent_state={"subagent": {"slug": "backend"}, "runKey": "k1"},
+                )
+                self.assertIn("предыдущих фоновых процессов этого проекта/порта остановлено: 1", sub_txt)
+                self.assertFalse(any(e.get("type") == "open_url" for e in sub_evs))
+
+                orch_txt, orch_evs = agent_mod.run_tool(
+                    "run_command",
+                    {"command": "python -m http.server 4100", "cwd": "app", "background": True},
+                    trust_level="full",
+                    sandbox_root=root,
+                )
+                self.assertIn("PID 1234", orch_txt)
+                self.assertTrue(any(e.get("type") == "open_url" for e in orch_evs))
+
+    def test_subagent_fixes_blocked_until_tester_report_then_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            agent_mod.sandbox_mod.mkdir(root, "shop")
+            tester_ctx = {"session_reports": [], "recent_reports": []}
+            sub_ctx = {
+                "base_url": "http://orch.local/v1",
+                "api_key": "k",
+                "model": "m",
+                "subagents": [
+                    {"id": 1, "slug": "dev", "name": "Разработчик", "orchestratorCanCall": True},
+                    {"id": 2, "slug": "fixer", "name": "Фиксер", "orchestratorCanCall": True},
+                ],
+                "tester_ctx": tester_ctx,
+                "written_projects": set(),
+                "subagent_runs_by_project": {},
+            }
+            tester_ctx["subagent_ctx_ref"] = sub_ctx
+
+            model_calls = []
+
+            def _fake_model(*args, **kwargs):
+                model_calls.append(1)
+                return {
+                    "choices": [{"message": {"content": "Исправление внесено.", "tool_calls": []}}],
+                    "usage": {"total_tokens": 10},
+                }
+
+            real_model = agent_mod.call_model
+            agent_mod.call_model = _fake_model
+            try:
+                # 1. До отчёта Тестировщика запрос на исправление багов блокируется без вызова модели
+                blocked = agent_mod.run_subagent_session(
+                    target_ref="fixer",
+                    summary="Проект shop собран, но есть ошибка.",
+                    task="Исправь баги и почини форму заказа",
+                    sandbox_project="shop",
+                    caller_kind="orchestrator",
+                    trust_level="full",
+                    sandbox_root=root,
+                    tester_ctx=tester_ctx,
+                    subagent_ctx=sub_ctx,
+                )
+                self.assertIn("ТОЛЬКО ПОСЛЕ", blocked["agentText"])
+                self.assertIn("call_tester", blocked["agentText"])
+                self.assertEqual(len(model_calls), 0)
+
+                # 2. Первичная разработка (не исправление) разрешена до Тестировщика
+                created = agent_mod.run_subagent_session(
+                    target_ref="dev",
+                    summary="Новый проект интернет-магазина",
+                    task="Создай каркас каталога товаров",
+                    sandbox_project="shop",
+                    caller_kind="orchestrator",
+                    trust_level="full",
+                    sandbox_root=root,
+                    tester_ctx=tester_ctx,
+                    subagent_ctx=sub_ctx,
+                )
+                self.assertIn("Исправление внесено.", created["agentText"])
+                self.assertEqual(len(model_calls), 1)
+
+                # 3. После отчёта Тестировщика исправления субагентами разрешаются
+                tester_ctx["session_reports"].insert(
+                    0,
+                    {
+                        "runKey": "qa-1",
+                        "sandboxProject": "shop",
+                        "status": "critical_issues",
+                        "criticalIssues": [{"title": "404"}],
+                    },
+                )
+                allowed = agent_mod.run_subagent_session(
+                    target_ref="fixer",
+                    summary="Отчёт Тестировщика qa-1: ошибка 404 на форме.",
+                    task="Исправь баги из отчёта Тестировщика",
+                    sandbox_project="shop",
+                    caller_kind="orchestrator",
+                    trust_level="full",
+                    sandbox_root=root,
+                    tester_ctx=tester_ctx,
+                    subagent_ctx=sub_ctx,
+                )
+                self.assertIn("Исправление внесено.", allowed["agentText"])
+                self.assertEqual(len(model_calls), 2)
+            finally:
+                agent_mod.call_model = real_model
 
 
 if __name__ == "__main__":

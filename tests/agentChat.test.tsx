@@ -1855,4 +1855,50 @@ describe("вкладка «Агент»", () => {
     expect(screen.getByText(/Надсмотрщик заблокировал run_command/i)).toBeTruthy();
     expect(screen.getByText(/Отчёт субагента · Стили/i)).toBeTruthy();
   });
+
+  it("переиспользует единую вкладку crm_sandbox_preview при повторных open_url на проект", async () => {
+    const fakePreviewWin = {
+      closed: false,
+      location: { href: "" },
+      focus: vi.fn(),
+      close: vi.fn(),
+    } as unknown as Window;
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(fakePreviewWin);
+
+    render(<AgentChat userName="Тест" />);
+    const textarea = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    await waitFor(() => expect((textarea as HTMLTextAreaElement).disabled).toBe(false));
+
+    const encoder = new TextEncoder();
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              'event: action\ndata: {"type":"open_url","url":"/api/ai/agent/sandbox/proxy/4100","label":"Первый старт"}\n\n',
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              'event: action\ndata: {"type":"open_url","url":"/api/ai/agent/sandbox/proxy/4101","label":"Перезапуск"}\n\n',
+            ),
+          );
+          controller.enqueue(encoder.encode('event: text\ndata: {"text":"Проект перезапущен."}\n\n'));
+          controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    fireEvent.change(textarea, { target: { value: "запусти и перезапусти проект" } });
+    fireEvent.click(screen.getByText("Запустить"));
+
+    expect(await screen.findByText(/Проект перезапущен\./i)).toBeTruthy();
+    // window.open вызван ТОЛЬКО 1 раз с именем вкладки crm_sandbox_preview, второй URL обновил ту же вкладку
+    expect(openSpy).toHaveBeenCalledTimes(1);
+    expect(openSpy).toHaveBeenCalledWith("/api/ai/agent/sandbox/proxy/4100", "crm_sandbox_preview");
+    expect(fakePreviewWin.location.href).toBe("/api/ai/agent/sandbox/proxy/4101");
+    openSpy.mockRestore();
+  });
 });
