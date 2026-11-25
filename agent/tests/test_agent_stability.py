@@ -1002,6 +1002,37 @@ class WindowsCompatibilityAndSpecTests(unittest.TestCase):
         spec_text = (REPO_ROOT / "launcher" / "launcher.spec").read_text(encoding="utf-8")
         self.assertIn("code_tools.py", spec_text)
         self.assertIn("qa_tools.py", spec_text)
+        self.assertIn("overseer.py", spec_text)
+        self.assertIn('"uuid"', spec_text)
+
+    def test_launcher_spec_bundles_all_agent_modules_and_stdlib_hiddenimports(self) -> None:
+        spec = REPO_ROOT / "launcher" / "launcher.spec"
+        captured: dict = {}
+
+        class StubAnalysis:
+            def __init__(self, scripts, **kwargs):
+                captured["datas"] = kwargs.get("datas") or []
+                captured["hiddenimports"] = kwargs.get("hiddenimports") or []
+                self.pure: list = []
+                self.scripts: list = []
+                self.binaries: list = []
+                self.datas: list = []
+
+        ns = {
+            "__name__": "launcher_spec_test",
+            "Analysis": StubAnalysis,
+            "PYZ": lambda pure: "pyz",
+            "EXE": lambda *a, **kw: None,
+            "COLLECT": lambda *a, **kw: None,
+        }
+        exec(compile(spec.read_text(encoding="utf-8"), str(spec), "exec"), ns)
+
+        bundled = {Path(src).name for src, dest in captured["datas"] if dest == "agents"}
+        expected = {p.name for p in (REPO_ROOT / "agent").glob("*.py")}
+        self.assertTrue(expected.issubset(bundled), f"missing agent modules: {expected - bundled}")
+        hidden = set(captured["hiddenimports"])
+        for req in ("uuid", "hmac", "http.client", "http.server", "socketserver", "xml.sax.saxutils", "zipfile", "csv", "ast", "ipaddress", "ssl"):
+            self.assertIn(req, hidden)
 
     def test_health_does_not_spawn_subprocess_and_frozen_skips_playwright_cli(self) -> None:
         import shutil

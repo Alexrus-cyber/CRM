@@ -379,9 +379,18 @@ def _spec_checks(check) -> None:
           any(str(item).endswith("cli.py") for item in captured.get("scripts", [])))
     check("сборка: скрипты агентов попадают в datas",
           any(destination == "agents" for _source, destination in captured.get("datas", [])))
+    agent_dir = Path(__file__).resolve().parent.parent / "agent"
+    bundled_agent_files = {
+        Path(src).name for src, dest in captured.get("datas", []) if dest == "agents"
+    }
+    expected_agent_py = {p.name for p in agent_dir.glob("*.py")}
+    check("сборка: все модули agent/*.py (вкл. overseer.py) попадают в datas",
+          expected_agent_py <= bundled_agent_files and "overseer.py" in bundled_agent_files)
+    hidden = set(captured.get("hiddenimports", []))
     check("сборка: tkinter и зависимости в hiddenimports",
-          {"tkinter", "pyautogui", "PIL", "pyperclip", "launcher.crm_client"}
-          <= set(captured.get("hiddenimports", [])))
+          {"tkinter", "pyautogui", "PIL", "pyperclip", "launcher.crm_client"} <= hidden)
+    check("сборка: stdlib-модули агентов (uuid, http.server, hmac, xml.sax.saxutils, zipfile) в hiddenimports",
+          {"uuid", "hmac", "http.client", "http.server", "socketserver", "xml.sax.saxutils", "zipfile", "csv", "ast", "ipaddress", "ssl"} <= hidden)
     check("сборка: exe оконный (без консоли)", captured.get("exe", {}).get("console") is False)
 
 
