@@ -151,7 +151,24 @@ describe("zod validation & Excel/CSV helpers", () => {
     expect(counterpartyInputSchema.safeParse({ name: "ООО Тест" }).success).toBe(true);
     expect(aiSettingsUpdateSchema.safeParse({ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3" }).success).toBe(true);
     expect(chatBotCreateSchema.safeParse({ name: "Бот" }).success).toBe(true);
-    expect(chatRoomCreateSchema.safeParse({ name: "Отдел продаж", kind: "group" }).success).toBe(true);
+    // Форма ChatClient при пустом поле bio отправляет bio: null
+    expect(
+      chatBotCreateSchema.safeParse({
+        name: "Помощник",
+        position: "ИИ-помощник",
+        bio: null,
+        avatarColor: "#06b6d4",
+        provider: "local",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        model: "qwen3:8b",
+        systemPrompt: "Ты помощник",
+        replyMode: "mention",
+        isActive: true,
+      }).success,
+    ).toBe(true);
+    expect(
+      chatRoomCreateSchema.safeParse({ name: "Отдел продаж", description: null, kind: "group" }).success,
+    ).toBe(true);
   });
 
   it("roundtrips Excel via write-excel-file/read-excel-file and parses CSV counterparties", async () => {

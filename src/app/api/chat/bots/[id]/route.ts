@@ -41,7 +41,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
   }
 
   const avatarColor =
-    body.avatarColor !== undefined && /^#[0-9a-fA-F]{6}$/.test(body.avatarColor)
+    body.avatarColor != null && /^#[0-9a-fA-F]{6}$/.test(body.avatarColor)
       ? body.avatarColor
       : undefined;
 
@@ -50,16 +50,16 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     ...(body.position !== undefined ? { position: body.position } : {}),
     ...(body.bio !== undefined ? { bio: body.bio } : {}),
     ...(avatarColor ? { avatarColor } : {}),
-    ...(body.provider !== undefined ? { provider: body.provider } : {}),
-    ...(body.baseUrl !== undefined ? { baseUrl: body.baseUrl } : {}),
-    ...(body.apiKey !== undefined ? { apiKey: body.apiKey } : {}),
+    ...(body.provider != null ? { provider: body.provider } : {}),
+    ...(body.baseUrl != null ? { baseUrl: body.baseUrl } : {}),
+    ...(body.apiKey != null ? { apiKey: body.apiKey } : {}),
     ...(body.clearApiKey ? { clearApiKey: true } : {}),
-    ...(body.model !== undefined ? { model: body.model } : {}),
-    ...(body.systemPrompt !== undefined ? { systemPrompt: body.systemPrompt } : {}),
+    ...(body.model != null ? { model: body.model } : {}),
+    ...(body.systemPrompt != null ? { systemPrompt: body.systemPrompt } : {}),
     ...(body.params !== undefined
       ? { paramsJson: JSON.stringify(normalizeGenParams(body.params, { unlimited: true })) }
       : {}),
-    ...(body.replyMode !== undefined
+    ...(body.replyMode != null
       ? { replyMode: body.replyMode === "always" ? "always" : "mention" }
       : {}),
     ...(body.isActive !== undefined ? { isActive: Boolean(body.isActive) } : {}),
