@@ -2079,6 +2079,10 @@ def run_tool(
                 sandbox_mod.safe_resolve(sandbox_root, sandbox_proj, allow_root=True)
             except sandbox_mod.SandboxError as error:
                 raise AgentError(str(error)) from error
+        call_ctx = {
+            **(subagent_ctx or {}),
+            "session_deadline": time.monotonic() + SUBAGENT_SESSION_SECONDS,
+        }
         sub_res = run_subagent_session(
             target_ref=target_ref,
             summary=summary_txt,
@@ -2094,7 +2098,7 @@ def run_tool(
             github_ctx=github_ctx,
             unlimited=unlimited,
             tester_ctx=tester_ctx,
-            subagent_ctx=subagent_ctx,
+            subagent_ctx=call_ctx,
         )
         events.extend(sub_res.get("agentEvents") or [])
         return str(sub_res.get("agentText") or "Субагент завершил работу."), events
@@ -2113,6 +2117,10 @@ def run_tool(
         if not next_task_txt:
             raise AgentError("Укажите next_task — что должен сделать целевой субагент")
         caller_meta = (subagent_state or {}).get("subagent") if isinstance(subagent_state, dict) else None
+        req_ctx = {
+            **(subagent_ctx or {}),
+            "session_deadline": time.monotonic() + SUBAGENT_SESSION_SECONDS,
+        }
         sub_res = run_subagent_session(
             target_ref=target_ref,
             summary=summary_txt,
@@ -2128,7 +2136,7 @@ def run_tool(
             github_ctx=github_ctx,
             unlimited=unlimited,
             tester_ctx=tester_ctx,
-            subagent_ctx=subagent_ctx,
+            subagent_ctx=req_ctx,
         )
         events.extend(sub_res.get("agentEvents") or [])
         return str(sub_res.get("agentText") or "Целевой субагент завершил работу."), events
@@ -6464,6 +6472,7 @@ def run_subagent_session(
         **ctx,
         "chain_depth": chain_depth + 1,
     }
+    deadline_state = {"deadline": session_deadline}
 
     handoff_steps_threshold = max(1, int(ctx.get("handoff_steps") or SUBAGENT_HANDOFF_STEPS))
     use_tools = True
@@ -6506,9 +6515,14 @@ def run_subagent_session(
                 "actor": "approval",
             },
         )
+        wait_started = time.monotonic()
         try:
             return approval_fn(enriched_req)
         finally:
+            if deadline_state["deadline"] > 0:
+                waited_sec = max(0.0, time.monotonic() - wait_started)
+                deadline_state["deadline"] += waited_sec
+                nested_subagent_ctx["session_deadline"] = deadline_state["deadline"]
             _emit(
                 "subagent_status",
                 {
@@ -6525,7 +6539,8 @@ def run_subagent_session(
 
     try:
         while steps_cap == 0 or steps < steps_cap:
-            if session_deadline and time.monotonic() > session_deadline:
+            cur_deadline = deadline_state["deadline"]
+            if cur_deadline and time.monotonic() > cur_deadline:
                 run_error = (
                     f"Превышен лимит времени сеанса субагента "
                     f"({max(1, SUBAGENT_SESSION_SECONDS // 60)} мин) — работа остановлена, "
@@ -8834,7 +8849,9 @@ class Handler(BaseHTTPRequestHandler):
             "cancel_check": _is_disconnected,
             "chain_depth": 1 if agent_role == "subagent" else 0,
             "subagent_max_steps": SUBAGENT_MAX_STEPS_TOTAL,
-            "session_deadline": time.monotonic() + SUBAGENT_SESSION_SECONDS,
+            # Для Главного Агента (Оркестратора) общий session_deadline не выставляется на весь запрос:
+            # каждый субагент получает свой 30-минутный бюджет времени с момента своего запуска.
+            "session_deadline": (time.monotonic() + SUBAGENT_SESSION_SECONDS) if agent_role == "subagent" else None,
             "overseer_ctx": overseer_ctx,
             "tester_ctx": tester_ctx,
             "written_projects": set(),
