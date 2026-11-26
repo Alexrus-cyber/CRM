@@ -1,3 +1,4 @@
+import http from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -135,6 +136,37 @@ describe("agentConfig loopback resilience", () => {
       if (prevUserProfile === undefined) delete process.env.USERPROFILE;
       else process.env.USERPROFILE = prevUserProfile;
       rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("fetchAgent uses long-timeout Node HTTP transport when timeoutMs > 300_000 and forwards SSE chunks & abort", async () => {
+    process.env.AGENT_HTTP_TOKEN = "long-tok";
+    let sawAuth = "";
+    const srv = http.createServer((req, res) => {
+      sawAuth = String(req.headers.authorization ?? "");
+      res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      res.write(": keepalive\n\n");
+      res.end('event: done\ndata: {"ok":true}\n\n');
+    });
+    await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    const addr = srv.address();
+    if (!addr || typeof addr === "string") throw new Error("Expected numeric port");
+
+    try {
+      const ctrl = new AbortController();
+      const { response } = await fetchAgent(
+        `http://127.0.0.1:${addr.port}`,
+        "/run",
+        { method: "POST", body: JSON.stringify({ ping: true }) },
+        { timeoutMs: 1_200_000, reqSignal: ctrl.signal },
+      );
+      expect(response.status).toBe(200);
+      expect(sawAuth).toBe("Bearer long-tok");
+      const text = await response.text();
+      expect(text).toContain(": keepalive");
+      expect(text).toContain("event: done");
+    } finally {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
     }
   });
 });

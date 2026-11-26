@@ -32,6 +32,8 @@ import {
 } from "lucide-react";
 import { ApprovalToast } from "../ApprovalToast";
 import { LiveReasoningBox } from "../LiveReasoningBox";
+
+export const SUBAGENT_SSE_IDLE_TIMEOUT_MS = 1_200_000;
 import {
   formatFileSize,
   readOperatorFiles,
@@ -2024,6 +2026,8 @@ function SubagentChatViewer({
   const streamAbortRef = useRef<AbortController | null>(null);
   const convAbortRef = useRef<AbortController | null>(null);
   const streamRunningRef = useRef(false);
+  const subApprovalRef = useRef(subApproval);
+  subApprovalRef.current = subApproval;
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -2312,6 +2316,34 @@ function SubagentChatViewer({
     const ctrl = new AbortController();
     streamAbortRef.current = ctrl;
     streamRunningRef.current = true;
+    let subIdleTimer: number | null = null;
+    let subStalled = false;
+    let lastSubSseAt = Date.now();
+    const clearSubWatchdog = () => {
+      if (subIdleTimer !== null) {
+        window.clearTimeout(subIdleTimer);
+        subIdleTimer = null;
+      }
+    };
+    const armSubWatchdog = (delayMs = SUBAGENT_SSE_IDLE_TIMEOUT_MS, markActivity = true) => {
+      if (markActivity) {
+        lastSubSseAt = Date.now();
+      }
+      clearSubWatchdog();
+      subIdleTimer = window.setTimeout(() => {
+        if (subApprovalRef.current !== null) {
+          armSubWatchdog(SUBAGENT_SSE_IDLE_TIMEOUT_MS, true);
+          return;
+        }
+        const silentMs = Date.now() - lastSubSseAt;
+        if (silentMs < SUBAGENT_SSE_IDLE_TIMEOUT_MS) {
+          armSubWatchdog(Math.max(1_000, SUBAGENT_SSE_IDLE_TIMEOUT_MS - silentMs), false);
+          return;
+        }
+        subStalled = true;
+        ctrl.abort();
+      }, delayMs);
+    };
     let resolvedConvId: number | null = targetConvId;
     let pendingHandoff: { summary: string; continuationPrompt: string; steps: number } | null = null;
 
@@ -2491,15 +2523,30 @@ function SubagentChatViewer({
         }
       };
 
+      armSubWatchdog();
       for (;;) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          append(decoder.decode());
+          if (trailingCr) {
+            trailingCr = false;
+            buffer += "\r";
+          }
+          break;
+        }
+        armSubWatchdog();
         append(decoder.decode(value, { stream: true }));
         let idx: number;
         while ((idx = buffer.indexOf("\n\n")) >= 0) {
           const frame = buffer.slice(0, idx);
           buffer = buffer.slice(idx + 2);
           if (frame.trim()) process(frame);
+        }
+      }
+      clearSubWatchdog();
+      if (buffer.trim()) {
+        for (const leftover of buffer.split("\n\n")) {
+          if (leftover.trim()) process(leftover);
         }
       }
 
@@ -2543,12 +2590,15 @@ function SubagentChatViewer({
         await loadConversation(resolvedConvId);
       }
     } catch (e) {
-      if (!ctrl.signal.aborted) {
+      if (subStalled) {
+        setChatError(`Субагент не отвечает (нет данных по SSE более ${Math.round(SUBAGENT_SSE_IDLE_TIMEOUT_MS / 1000)} с)`);
+      } else if (!ctrl.signal.aborted) {
         setChatError(e instanceof Error ? e.message : "Ошибка");
       }
       setLive({ reasoning: "", text: "", status: "", actorLabel: "", overseerReasoning: "" });
       setSubApproval(null);
     } finally {
+      clearSubWatchdog();
       streamRunningRef.current = false;
       setRunning(false);
     }

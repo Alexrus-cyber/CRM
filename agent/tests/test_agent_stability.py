@@ -1733,6 +1733,40 @@ class WindowsCompatibilityAndSpecTests(unittest.TestCase):
             self.assertNotIn("tester_done", emitted)
             self.assertEqual(approvals_called, 0)
 
+    def test_adaptive_stream_interval_reentrant_keepalive_and_tcp_nodelay(self) -> None:
+        self.assertTrue(agent_mod.Handler.disable_nagle_algorithm)
+        self.assertGreaterEqual(agent_mod.HEADER_TIMEOUT, 120)
+        self.assertEqual(agent_mod._adaptive_stream_emit_interval(500), 0.2)
+        self.assertEqual(agent_mod._adaptive_stream_emit_interval(10_000), 0.5)
+        self.assertEqual(agent_mod._adaptive_stream_emit_interval(50_000), 1.0)
+        self.assertEqual(agent_mod._adaptive_stream_emit_interval(100_000), 1.5)
+
+        chunks: list[bytes] = []
+        lock = threading.Lock()
+
+        class Writer:
+            def write(self, data: bytes) -> int:
+                with lock:
+                    chunks.append(data)
+                return len(data)
+
+            def flush(self) -> None:
+                pass
+
+        h = agent_mod.Handler.__new__(agent_mod.Handler)
+        h.wfile = Writer()  # type: ignore[assignment]
+        h._client_disconnected = False
+
+        # Вложенный _sse_keepalive использует уже активный поток без дублирования и корректно сбрасывает depth.
+        with h._sse_keepalive(interval=0.04):
+            self.assertEqual(h._keepalive_depth, 1)
+            with h._sse_keepalive(interval=0.04):
+                self.assertEqual(h._keepalive_depth, 2)
+                time.sleep(0.1)
+            self.assertEqual(h._keepalive_depth, 1)
+        self.assertEqual(h._keepalive_depth, 0)
+        self.assertTrue(any(b": keepalive\n\n" in c for c in chunks))
+
 
 if __name__ == "__main__":
     unittest.main()

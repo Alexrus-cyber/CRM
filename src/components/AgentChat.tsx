@@ -95,7 +95,7 @@ import type {
   SubagentRoutingMode,
 } from "./agent/subagentTypes";
 
-const SSE_IDLE_TIMEOUT_MS = 120_000;
+export const SSE_IDLE_TIMEOUT_MS = 1_200_000;
 
 /**
  * Вкладка «Агент» блока ИИ (только главный администратор).
@@ -901,6 +901,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
   const sandboxInFlightRef = useRef<Promise<void> | null>(null);
   const sandboxQueuedRef = useRef(false);
   const lastSandboxAtRef = useRef(0);
+  const lastScrollAtRef = useRef(0);
   const sandboxTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -2092,6 +2093,9 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     const el = listRef.current;
     if (!el) return;
     if (!force && autoScrollPausedRef.current) return;
+    const now = Date.now();
+    if (!force && now - lastScrollAtRef.current < 140) return;
+    lastScrollAtRef.current = now;
     const apply = () => {
       if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
     };
@@ -2275,22 +2279,31 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
     chatAbortRef.current = abortCtrl;
     let chatIdleTimer: number | null = null;
     let chatStalled = false;
+    let lastSseActivityAt = Date.now();
     const clearChatWatchdog = () => {
       if (chatIdleTimer !== null) {
         window.clearTimeout(chatIdleTimer);
         chatIdleTimer = null;
       }
     };
-    const armChatWatchdog = () => {
+    const armChatWatchdog = (delayMs = SSE_IDLE_TIMEOUT_MS, markActivity = true) => {
+      if (markActivity) {
+        lastSseActivityAt = Date.now();
+      }
       clearChatWatchdog();
       chatIdleTimer = window.setTimeout(() => {
         if (pendingApprovalRef.current !== null) {
-          armChatWatchdog();
+          armChatWatchdog(SSE_IDLE_TIMEOUT_MS, true);
+          return;
+        }
+        const silentMs = Date.now() - lastSseActivityAt;
+        if (silentMs < SSE_IDLE_TIMEOUT_MS) {
+          armChatWatchdog(Math.max(1_000, SSE_IDLE_TIMEOUT_MS - silentMs), false);
           return;
         }
         chatStalled = true;
         abortCtrl.abort();
-      }, SSE_IDLE_TIMEOUT_MS);
+      }, delayMs);
     };
 
     try {
@@ -3064,7 +3077,7 @@ export function AgentChat({ userName, unlimited = true }: { userName: string; un
         setPendingApproval(null);
         setScreenCapture(null);
         clearLiveBrowserLog();
-        assistantDraft.error = "Агент не отвечает (нет данных по SSE более 120 с)";
+        assistantDraft.error = `Агент не отвечает (нет данных по SSE более ${Math.round(SSE_IDLE_TIMEOUT_MS / 1000)} с)`;
         patch((t) => ({ ...t, error: assistantDraft.error }));
       } else if (caught instanceof DOMException && caught.name === "AbortError") {
         if (!assistantDraft.content.trim()) {
