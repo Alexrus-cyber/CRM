@@ -289,3 +289,49 @@ def can_launch_agent(agent_id: str, profile: Optional[Mapping[str, Any]]) -> Tup
     if not (can_agent or can_operator):
         return False, "У вашего аккаунта нет доступа ни к Агенту, ни к Оператору CRM."
     return True, ""
+
+
+def is_local_model_url(raw_url: str) -> bool:
+    """True, если адрес модели указывает на локальный ПК или локальную сеть (LM Studio/Ollama)."""
+    clean = (raw_url or "").strip()
+    if not clean:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(clean if "://" in clean else f"http://{clean}")
+        return _is_local_or_lan_host(parsed.hostname or "")
+    except ValueError:
+        return False
+
+
+def open_crm_stream(
+    method: str,
+    server_url: str,
+    path_and_query: str,
+    *,
+    bearer_token: str = "",
+    body: Optional[bytes] = None,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 120.0,
+):
+    """Открывает сырой HTTP-ответ от CRM (для проксирования JSON, SSE и файлов)."""
+    base = normalize_server_url(server_url)
+    if not base:
+        raise CrmClientError("Не указан адрес сервера CRM")
+    rel = path_and_query if path_and_query.startswith("/") else f"/{path_and_query}"
+    full_url = f"{base}{rel}"
+    _assert_safe_crm_transport(full_url)
+
+    req = urllib.request.Request(full_url, data=body, method=method.upper())
+    for k, v in (headers or {}).items():
+        if k.lower() in ("host", "cookie", "authorization", "content-length", "connection"):
+            continue
+        req.add_header(k, v)
+    if bearer_token.strip():
+        req.add_header("Authorization", f"Bearer {bearer_token.strip()}")
+
+    host = urllib.parse.urlparse(full_url).hostname or ""
+    opener = _NO_REDIRECT_LOCAL_OPENER if _is_local_or_lan_host(host) else _NO_REDIRECT_OPENER
+    if urllib.request.urlopen is _ORIG_URLOPEN:
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+

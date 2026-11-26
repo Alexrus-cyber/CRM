@@ -144,6 +144,8 @@ class LaunchSettings:
     crm_email: str = ""
     crm_session_token: str = ""
     crm_profile: Dict[str, Any] = field(default_factory=dict)
+    theme: str = "dark"
+    harness_state: Dict[str, Any] = field(default_factory=dict)
 
     def clear_crm_auth(self) -> None:
         self.crm_session_token = ""
@@ -216,6 +218,8 @@ class LaunchSettings:
             "crm_url": self.crm_url,
             "crm_email": self.crm_email,
             "crm_profile": safe_profile,
+            "theme": self.theme if self.theme in ("dark", "light") else "dark",
+            "harness_state": dict(self.harness_state) if isinstance(self.harness_state, dict) else {},
         }
         # Ключ и токен сессии CRM не пишутся на диск без явного согласия пользователя (remember_key),
         # а на Windows дополнительно шифруются через DPAPI.
@@ -242,6 +246,11 @@ class LaunchSettings:
         settings.crm_url = str(raw.get("crm_url") or "http://localhost:3000")
         settings.crm_email = str(raw.get("crm_email") or "")
         settings.crm_session_token = _unprotect_secret(str(raw.get("crm_session_token") or ""))
+        raw_theme = str(raw.get("theme") or "dark").lower()
+        settings.theme = raw_theme if raw_theme in ("dark", "light") else "dark"
+        raw_harness = raw.get("harness_state")
+        if isinstance(raw_harness, dict):
+            settings.harness_state = dict(raw_harness)
         raw_profile = raw.get("crm_profile")
         if isinstance(raw_profile, dict):
             settings.crm_profile = dict(raw_profile)

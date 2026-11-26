@@ -6,10 +6,12 @@ import {
   getAiUsage,
   listAgentConnections,
   listAgentTokens,
+  listAiChats,
   reissueAgentConnectionToken,
   type UserLite,
 } from "@/db/repo";
 import {
+  AI_ROLE_POLICY,
   aiPolicyFor,
   canViewAgentUsage,
   hasAgentAccess,
@@ -32,13 +34,16 @@ export async function buildLauncherProfile(
   fallbackOrigin: string,
   options?: { issueToken?: boolean },
 ) {
-  const [override, aiUsage] = await Promise.all([
+  const isSuperAdmin = user.role === "super_admin";
+  const [override, aiUsage, chats] = await Promise.all([
     getAiQuotaOverride(user.id),
     getAiUsage(user.id),
+    listAiChats(user.id, isSuperAdmin ? 1000 : 200),
   ]);
   const policy = aiPolicyFor(user.role, override?.monthlyLimit ?? null);
   const canUseAgent = hasAgentAccess(user);
   const canUseOperator = hasOperatorAccess(user);
+  const canSeeAgentUsage = canViewAgentUsage(user);
   const unlimited = isUnlimitedAiRole(user.role);
 
   let operatorServerUrl = fallbackOrigin;
@@ -80,7 +85,12 @@ export async function buildLauncherProfile(
     }
   }
 
-  const agentUsage = canViewAgentUsage(user) ? await getAgentUsage(user.id) : null;
+  const agentUsage = canSeeAgentUsage ? await getAgentUsage(user.id) : null;
+
+  const rolePolicies = Object.values(AI_ROLE_POLICY).map((row) => ({
+    ...row,
+    roleLabel: ROLE_LABELS[row.role] ?? row.role,
+  }));
 
   return {
     ok: true,
@@ -92,6 +102,7 @@ export async function buildLauncherProfile(
       roleLabel: ROLE_LABELS[user.role] ?? user.role,
       canUseAgent,
       canUseOperator,
+      canViewAgentUsage: canSeeAgentUsage,
       mustChangePassword: user.mustChangePassword,
       totpEnabled: user.totpEnabled,
     },
@@ -100,11 +111,15 @@ export async function buildLauncherProfile(
       perChatTokens: policy.perChatTokens,
       monthlyTokens: policy.monthlyTokens,
       monthlyUsed: aiUsage.month.total,
+      allUsed: aiUsage.all.total,
+      chatsCount: chats.length,
+      overrideMonthlyLimit: override?.monthlyLimit ?? null,
       maxSteps: policy.maxSteps,
       rag: policy.rag,
       reasoning: policy.reasoning,
       summary: policy.summary,
     },
+    rolePolicies,
     operator: {
       enabled: canUseOperator,
       serverUrl: operatorServerUrl,

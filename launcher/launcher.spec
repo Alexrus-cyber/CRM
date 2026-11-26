@@ -117,15 +117,35 @@ wheels = ROOT / "wheels"
 if wheels.is_dir():
     datas.append((str(wheels), "wheels"))
 
+ui_src = ROOT / "ui"
+if ui_src.is_dir():
+    for ui_file in sorted(ui_src.rglob("*")):
+        if ui_file.is_file():
+            rel_parent = ui_file.relative_to(ui_src).parent
+            dest = "ui" if str(rel_parent) == "." else f"ui/{rel_parent.as_posix()}"
+            datas.append((str(ui_file), dest))
+
+_webview_hidden: list[str] = []
+try:
+    from PyInstaller.utils.hooks import collect_submodules  # type: ignore[import-not-found]
+    _webview_hidden = collect_submodules("webview")
+except ImportError:
+    _webview_hidden = []
+
 _base_hiddenimports = [
     "launcher.catalog",
     "launcher.commands",
     "launcher.crm_client",
+    "launcher.desktop_window",
+    "launcher.file_extract",
     "launcher.gui",
+    "launcher.harness_server",
     "launcher.runner",
     "launcher.settings",
     "launcher.deps",
     "launcher.bundle",
+    "webview",
+    *_webview_hidden,
     "tkinter",
     "tkinter.ttk",
     "tkinter.filedialog",
