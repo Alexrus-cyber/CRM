@@ -23,7 +23,7 @@ from launcher import APP_NAME, settings as settings_mod
 
 
 def _app_profile_dir() -> Path:
-    base = settings_mod.default_path().parent / "browser_profile"
+    base = settings_mod.config_dir() / "browser_profile"
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -61,7 +61,7 @@ def open_with_pywebview(url: str, title: str = "CRM ИИ и Агенты") -> bo
         return False
 
     try:
-        storage_dir = str(settings_mod.default_path().parent / "webview_storage")
+        storage_dir = str(settings_mod.config_dir() / "webview_storage")
         Path(storage_dir).mkdir(parents=True, exist_ok=True)
         webview.create_window(
             title,
@@ -95,7 +95,13 @@ def open_with_browser_app(url: str) -> bool:
         ]
         try:
             proc = subprocess.Popen(cmd)
-            proc.wait()
+            rc = proc.wait()
+            if rc != 0:
+                print(
+                    f"[{APP_NAME}] браузер {Path(exe).name} завершился с кодом {rc}, пробую следующий вариант",
+                    file=sys.stderr,
+                )
+                continue
             return True
         except OSError:
             continue

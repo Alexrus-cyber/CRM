@@ -526,9 +526,9 @@ class HarnessServer:
             cwd.mkdir(parents=True, exist_ok=True)
             self.settings.set_value("chat_agent", "workspace", str(cwd))
 
-            script = commands.script_path(chat_spec, bundle.agents_dir())
-            if not script.is_file():
-                raise RuntimeError(f"Не найден файл Агента: {script}")
+            script = commands.script_path(chat_spec, self.settings, bundle.agents_dir())
+            if script is None or not script.is_file():
+                raise RuntimeError(f"Не найден файл Агента: {script or chat_spec.script}")
 
             args = commands.agent_args(chat_spec, self.settings)
             env_vars = commands.agent_env(chat_spec, self.settings)
@@ -606,7 +606,9 @@ class HarnessServer:
             if warnings:
                 raise ValueError("; ".join(warnings))
 
-            script = commands.script_path(op_spec, bundle.agents_dir())
+            script = commands.script_path(op_spec, self.settings, bundle.agents_dir())
+            if script is None or not script.is_file():
+                raise RuntimeError(f"Не найден файл Оператора: {script or op_spec.script}")
             args = commands.agent_args(op_spec, self.settings)
             env_vars = commands.agent_env(op_spec, self.settings)
             sec = commands.agent_secrets(op_spec, self.settings)
@@ -930,7 +932,19 @@ class HarnessServer:
                 chosen = self._pick_folder_cb() or ""
             except Exception:
                 chosen = ""
-        elif sys.modules.get("tkinter") or os.environ.get("DISPLAY") or sys.platform.startswith("win"):
+        elif sys.modules.get("webview") and getattr(sys.modules["webview"], "windows", None):
+            try:
+                wv = sys.modules["webview"]
+                win = wv.windows[0]
+                folder_mode = getattr(getattr(wv, "FileDialog", None), "FOLDER", None) or getattr(wv, "FOLDER_DIALOG", 20)
+                picked = win.create_file_dialog(folder_mode)
+                if isinstance(picked, (list, tuple)) and picked:
+                    chosen = str(picked[0] or "")
+                elif isinstance(picked, str):
+                    chosen = picked
+            except Exception:
+                chosen = ""
+        if not chosen and self._pick_folder_cb is None and (sys.modules.get("tkinter") or os.environ.get("DISPLAY") or sys.platform.startswith("win")):
             try:
                 import tkinter as tk  # type: ignore
                 from tkinter import filedialog  # type: ignore

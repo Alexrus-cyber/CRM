@@ -126,11 +126,15 @@ if ui_src.is_dir():
             datas.append((str(ui_file), dest))
 
 _webview_hidden: list[str] = []
+_webview_datas: list[tuple[str, str]] = []
 try:
-    from PyInstaller.utils.hooks import collect_submodules  # type: ignore[import-not-found]
+    from PyInstaller.utils.hooks import collect_data_files, collect_submodules  # type: ignore[import-not-found]
     _webview_hidden = collect_submodules("webview")
-except ImportError:
+    _webview_datas = collect_data_files("webview")
+except Exception:
     _webview_hidden = []
+    _webview_datas = []
+datas.extend(_webview_datas)
 
 _base_hiddenimports = [
     "launcher.catalog",

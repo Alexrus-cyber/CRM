@@ -231,6 +231,145 @@ class TestLauncherHarness(unittest.TestCase, FakeServersMixin):
                     os.environ["CRM_LAUNCHER_CONFIG"] = prev_cfg
         self.assertEqual(called, [])
 
+    def test_desktop_window_browser_app_and_pywebview_paths(self) -> None:
+        import sys
+        import types
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prev_cfg = os.environ.get("CRM_LAUNCHER_CONFIG")
+            os.environ["CRM_LAUNCHER_CONFIG"] = str(Path(tmp) / "settings.json")
+            try:
+                profile_dir = desktop_window._app_profile_dir()
+                self.assertTrue(profile_dir.is_dir())
+                self.assertEqual(profile_dir.parent, Path(tmp).resolve())
+
+                # 1. Проверка open_with_browser_app: при ненулевом коде первого браузера пробует следующий
+                seen_cmds: List[List[str]] = []
+
+                class FakeProc:
+                    def __init__(self, rc: int) -> None:
+                        self._rc = rc
+
+                    def wait(self) -> int:
+                        return self._rc
+
+                rcs = [1, 0]
+
+                def fake_popen(cmd, **_kwargs):
+                    seen_cmds.append(list(cmd))
+                    return FakeProc(rcs.pop(0))
+
+                with (
+                    patch.object(desktop_window, "_candidate_app_browsers", return_value=["/fake/edge", "/fake/chrome"]),
+                    patch.object(desktop_window.subprocess, "Popen", side_effect=fake_popen),
+                ):
+                    ok = desktop_window.open_with_browser_app("http://127.0.0.1:9999/?ht=tok")
+                self.assertTrue(ok)
+                self.assertEqual(len(seen_cmds), 2)
+                self.assertEqual(seen_cmds[1][0], "/fake/chrome")
+                self.assertIn("--app=http://127.0.0.1:9999/?ht=tok", seen_cmds[1])
+                self.assertIn(f"--user-data-dir={profile_dir}", seen_cmds[1])
+
+                # 2. Проверка open_with_pywebview без AttributeError и с storage_path внутри config_dir()
+                wv_calls: Dict[str, Any] = {}
+                fake_wv = types.ModuleType("webview")
+                fake_wv.create_window = lambda title, url, **kw: wv_calls.update({"title": title, "url": url, **kw})  # type: ignore[attr-defined]
+                fake_wv.start = lambda **kw: wv_calls.update({"start": kw})  # type: ignore[attr-defined]
+                prev_wv = sys.modules.get("webview")
+                sys.modules["webview"] = fake_wv
+                try:
+                    self.assertTrue(desktop_window.open_with_pywebview("http://127.0.0.1:9999/?ht=tok"))
+                    storage_path = Path(wv_calls["start"]["storage_path"])
+                    self.assertTrue(storage_path.is_dir())
+                    self.assertEqual(storage_path.parent, Path(tmp).resolve())
+                    self.assertEqual(wv_calls["url"], "http://127.0.0.1:9999/?ht=tok")
+                finally:
+                    if prev_wv is None:
+                        sys.modules.pop("webview", None)
+                    else:
+                        sys.modules["webview"] = prev_wv
+            finally:
+                if prev_cfg is None:
+                    os.environ.pop("CRM_LAUNCHER_CONFIG", None)
+                else:
+                    os.environ["CRM_LAUNCHER_CONFIG"] = prev_cfg
+
+    def test_harness_start_agent_and_operator_processes(self) -> None:
+        from unittest.mock import patch
+
+        launched: List[Dict[str, Any]] = []
+
+        class FakeAgentRun:
+            def __init__(self, *, agent_id: str, command, cwd: Path, env, secrets=None) -> None:
+                self.agent_id = agent_id
+                self.command = list(command)
+                self.cwd = cwd
+                self.env = dict(env)
+                self.secrets = dict(secrets or {})
+                self.started_at = 1234.0
+                self._running = True
+                launched.append({
+                    "agent_id": agent_id,
+                    "command": self.command,
+                    "cwd": self.cwd,
+                    "env": self.env,
+                    "secrets": self.secrets,
+                })
+
+            def start(self) -> None:
+                return
+
+            def is_running(self) -> bool:
+                return self._running
+
+            def poll_lines(self, limit: int = 1000) -> List[str]:
+                return []
+
+            def stop(self, timeout: float = 3.0) -> None:
+                self._running = False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prev_cfg = os.environ.get("CRM_LAUNCHER_CONFIG")
+            os.environ["CRM_LAUNCHER_CONFIG"] = str(Path(tmp) / "settings.json")
+            srv = harness_server.HarnessServer(port=0)
+            srv.settings.crm_url = "https://crm.example.com"
+            srv.settings.crm_session_token = "sess-ok"
+            srv.settings.crm_profile = {
+                "user": {"id": 1, "role": "super_admin", "canUseAgent": True, "canUseOperator": True},
+                "limits": {"unlimited": True, "maxSteps": None, "reasoning": ["default", "max"]},
+                "operator": {"enabled": True, "serverUrl": "https://crm.example.com", "token": "crmop_test_tok"},
+            }
+            srv.settings.provider = "local"
+            srv.settings.base_url = "http://127.0.0.1:1234/v1"
+            srv.settings.model = "qwen3-vl-8b"
+            try:
+                with (
+                    patch.object(harness_server, "AgentRun", FakeAgentRun),
+                    patch.object(srv, "agent_health", return_value={"available": True, "running": True, "port": 8899}),
+                ):
+                    ag_res = srv.start_agent_process({"workspace": tmp})
+                    self.assertTrue(ag_res["available"])
+
+                    op_res = srv.start_operator_process({"mode": "watch"})
+                    self.assertTrue(op_res["running"])
+
+                self.assertEqual(len(launched), 2)
+                self.assertEqual(launched[0]["agent_id"], "chat_agent")
+                self.assertTrue(any(str(c).endswith("agent.py") for c in launched[0]["command"]))
+                self.assertIn("AGENT_HTTP_TOKEN", launched[0]["secrets"])
+
+                self.assertEqual(launched[1]["agent_id"], "operator")
+                self.assertTrue(any(str(c).endswith("desktop_operator.py") for c in launched[1]["command"]))
+                self.assertEqual(launched[1]["secrets"].get("CRM_AGENT_TOKEN"), "crmop_test_tok")
+                self.assertIn("--watch", launched[1]["command"])
+            finally:
+                srv.shutdown()
+                if prev_cfg is None:
+                    os.environ.pop("CRM_LAUNCHER_CONFIG", None)
+                else:
+                    os.environ["CRM_LAUNCHER_CONFIG"] = prev_cfg
+
 
 if __name__ == "__main__":
     unittest.main()

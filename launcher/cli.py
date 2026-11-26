@@ -467,6 +467,9 @@ def _harness_checks(check) -> None:
         os.environ["CRM_LAUNCHER_CONFIG"] = str(Path(tmp) / "settings.json")
         srv = None
         try:
+            prof_dir = desktop_window._app_profile_dir()
+            check("desktop_window: папка профиля браузера создаётся в config_dir",
+                  prof_dir.is_dir() and prof_dir.parent == settings_mod.config_dir())
             srv = harness_server.HarnessServer(port=0)
             srv.start()
             base = srv.base_url()
