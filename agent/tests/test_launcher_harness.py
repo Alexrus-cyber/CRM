@@ -370,6 +370,84 @@ class TestLauncherHarness(unittest.TestCase, FakeServersMixin):
                 else:
                     os.environ["CRM_LAUNCHER_CONFIG"] = prev_cfg
 
+    def test_crm_client_sends_cookie_and_bearer_and_fallback_prepare(self) -> None:
+        seen_reqs: List[Dict[str, Any]] = []
+
+        def legacy_crm_handler(h: BaseHTTPRequestHandler, method: str, path: str, body: bytes) -> None:
+            auth = h.headers.get("Authorization") or ""
+            cookie = h.headers.get("Cookie") or ""
+            seen_reqs.append({"method": method, "path": path, "auth": auth, "cookie": cookie})
+            # Имитируем старый сервер CRM: роуты принимают только Cookie crm_session,
+            # а /api/launcher/agent/prepare возвращает 404.
+            if path.startswith("/api/launcher/agent/"):
+                raw = json.dumps({"error": "Not found"}).encode("utf-8")
+                h.send_response(404)
+                h.send_header("Content-Type", "application/json")
+                h.send_header("Content-Length", str(len(raw)))
+                h.end_headers()
+                h.wfile.write(raw)
+                return
+            if "crm_session=tok_legacy_99" not in cookie:
+                raw = json.dumps({"error": "Unauthorized"}).encode("utf-8")
+                h.send_response(401)
+                h.send_header("Content-Type", "application/json")
+                h.send_header("Content-Length", str(len(raw)))
+                h.end_headers()
+                h.wfile.write(raw)
+                return
+            if path == "/api/ai/settings":
+                resp = {"settings": {"baseUrl": "https://api.openai.com/v1", "model": "gpt-4o-mini"}}
+            elif path == "/api/agent/subagents":
+                resp = {"subagents": [], "routingMode": "linear", "overseer": {"enabled": False}}
+            else:
+                resp = {"ok": True}
+            raw = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+            h.send_response(200)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(raw)))
+            h.end_headers()
+            h.wfile.write(raw)
+
+        crm_srv, crm_port = self.start_json_server(legacy_crm_handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            prev_cfg = os.environ.get("CRM_LAUNCHER_CONFIG")
+            os.environ["CRM_LAUNCHER_CONFIG"] = str(Path(tmp) / "settings.json")
+            srv = harness_server.HarnessServer(port=0)
+            try:
+                srv.start()
+                srv.settings.crm_url = f"http://127.0.0.1:{crm_port}"
+                srv.settings.crm_session_token = "tok_legacy_99"
+
+                # 1. Прокси к /api/ai/settings работает даже на сервере, требующем Cookie crm_session
+                req = urllib.request.Request(
+                    f"{srv.base_url()}/api/ai/settings",
+                    headers={"X-Harness-Token": srv.token},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    settings_data = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(settings_data["settings"]["model"], "gpt-4o-mini")
+
+                # 2. Fallback сборки payload при 404 от /api/launcher/agent/prepare
+                prep = srv._fallback_prepare_agent({"messages": [{"role": "user", "content": "Привет"}]})
+                self.assertEqual(prep["payload"]["settings"]["model"], "gpt-4o-mini")
+                self.assertEqual(prep["payload"]["settings"]["baseUrl"], "https://api.openai.com/v1")
+
+                # 3. Fallback отправки usage при 404 от /api/launcher/agent/events -> /api/launcher/usage
+                res_ev = srv._sync_agent_event({"action": "usage", "kind": "agent", "model": "gpt-4o-mini", "totalTokens": 10})
+                self.assertTrue(res_ev.get("ok"))
+                self.assertTrue(any(r["path"] == "/api/launcher/usage" for r in seen_reqs))
+                self.assertTrue(all(
+                    r["auth"] == "Bearer tok_legacy_99" and "crm_session=tok_legacy_99" in r["cookie"]
+                    for r in seen_reqs
+                ))
+            finally:
+                srv.shutdown()
+                crm_srv.shutdown()
+                if prev_cfg is None:
+                    os.environ.pop("CRM_LAUNCHER_CONFIG", None)
+                else:
+                    os.environ["CRM_LAUNCHER_CONFIG"] = prev_cfg
+
 
 if __name__ == "__main__":
     unittest.main()

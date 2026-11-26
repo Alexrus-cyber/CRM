@@ -539,6 +539,29 @@ def _harness_checks(check) -> None:
                 th_json = json.loads(resp.read().decode("utf-8"))
                 check("harness_server: переключение темы сохраняется",
                       th_json.get("theme") == "light" and srv.settings.theme == "light")
+
+            # 5. crm_client отправляет и Authorization: Bearer, и Cookie: crm_session
+            captured_headers: Dict[str, str] = {}
+            class FakeResp:
+                status = 200
+                headers = {}
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def read(self): return b'{"ok":true}'
+            orig_urlopen = crm_client.urllib.request.urlopen
+            try:
+                def spy_open(req, timeout=10):
+                    for k, v in req.header_items():
+                        captured_headers[k.lower()] = v
+                    return FakeResp()
+                crm_client.urllib.request.urlopen = spy_open  # type: ignore[assignment]
+                with crm_client.open_crm_stream("GET", "http://localhost:3000", "/api/ai/settings", bearer_token="tok_cookie_123"):
+                    pass
+                check("crm_client: open_crm_stream передаёт и Bearer, и Cookie crm_session",
+                      captured_headers.get("authorization") == "Bearer tok_cookie_123"
+                      and "crm_session=tok_cookie_123" in captured_headers.get("cookie", ""))
+            finally:
+                crm_client.urllib.request.urlopen = orig_urlopen  # type: ignore[assignment]
         finally:
             if srv is not None:
                 srv.shutdown()

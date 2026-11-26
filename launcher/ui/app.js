@@ -22,6 +22,35 @@ export async function apiFetch(url, options = {}) {
   return res;
 }
 
+let authRecoverPromise = null;
+let authBannerNotice = "";
+
+async function handleUnexpectedUnauthorized() {
+  if (authRecoverPromise) return authRecoverPromise;
+  authRecoverPromise = (async () => {
+    try {
+      const checkRes = await apiFetch("/api/app/crm/refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (checkRes.status === 401) {
+        if (appState.eventsSource) {
+          try { appState.eventsSource.close(); } catch {}
+          appState.eventsSource = null;
+        }
+        authBannerNotice = "Сессия CRM истекла или недействительна — войдите заново.";
+        await boot({ skipRefresh: true });
+      }
+    } catch {
+      /* сеть временно недоступна */
+    } finally {
+      setTimeout(() => { authRecoverPromise = null; }, 2000);
+    }
+  })();
+  return authRecoverPromise;
+}
+
 export async function apiJson(url, options = {}) {
   const headers = new Headers(options.headers || {});
   if (options.body && typeof options.body === "string" && !headers.has("Content-Type")) {
@@ -40,6 +69,9 @@ export async function apiJson(url, options = {}) {
     const err = new Error(msg);
     err.status = res.status;
     err.data = data;
+    if (res.status === 401 && !String(url).startsWith("/api/app/crm/")) {
+      handleUnexpectedUnauthorized();
+    }
     throw err;
   }
   return data;
@@ -352,7 +384,7 @@ function renderLogin(state) {
             <span>Запомнить сессию и ключи на этом компьютере</span>
           </label>
 
-          <div id="login-error" class="alert-box alert-error" style="display:none;"></div>
+          <div id="login-error" class="alert-box alert-error" style="${authBannerNotice ? "display:block;" : "display:none;"}">${authBannerNotice ? esc(authBannerNotice) : ""}</div>
 
           <button type="submit" id="btn-login-submit" class="btn btn-primary mt-2" style="width:100%; padding:10px;">
             Войти в Nova CRM Harness
@@ -398,6 +430,7 @@ function renderLogin(state) {
 
   document.getElementById("login-form").onsubmit = async (ev) => {
     ev.preventDefault();
+    authBannerNotice = "";
     errEl.style.display = "none";
     const btn = document.getElementById("btn-login-submit");
     btn.disabled = true;
@@ -589,16 +622,36 @@ function renderMain(state) {
   startEventsStream();
 }
 
-async function boot() {
+async function boot(opts = {}) {
   const state = await apiJson("/api/app/state");
   appState.boot = state;
   if (state.harnessState?.activeTab) {
     appState.activeTab = state.harnessState.activeTab;
   }
+  if (state.authenticated && !opts.skipRefresh) {
+    try {
+      const refRes = await apiFetch("/api/app/crm/refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (refRes.status === 401) {
+        state.authenticated = false;
+        state.profile = null;
+        authBannerNotice = "Сессия CRM истекла или была сброшена — войдите снова.";
+      } else if (refRes.ok) {
+        const refData = await refRes.json().catch(() => null);
+        if (refData?.profile) state.profile = refData.profile;
+      }
+    } catch {
+      /* сервер временно недоступен — используем сохранённый профиль */
+    }
+  }
   if (!state.authenticated) {
     renderLogin(state);
     return;
   }
+  authBannerNotice = "";
   renderMain(state);
 }
 

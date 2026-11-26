@@ -874,7 +874,7 @@ export function mountAgentTab(root, ctx) {
   root.querySelector("#ag-save-cfg-btn").onclick = async () => {
     syncAgentSettingsFromDom();
     try {
-      await apiJson("/api/ai/settings", {
+      const saved = await apiJson("/api/ai/settings", {
         method: "PUT",
         body: JSON.stringify({
           baseUrl: st.settings.baseUrl,
@@ -882,11 +882,45 @@ export function mountAgentTab(root, ctx) {
           ...(st.settings.apiKey ? { apiKey: st.settings.apiKey } : {}),
         }),
       });
+      await apiJson("/api/app/prefs", {
+        method: "POST",
+        body: JSON.stringify({
+          localModel: { baseUrl: st.settings.baseUrl, model: st.settings.model, apiKey: st.settings.apiKey },
+        }),
+      }).catch(() => {});
+      const s = saved?.settings || {};
+      const keyInp = root.querySelector("#ag-api-key");
+      if (keyInp) {
+        keyInp.placeholder = s.hasApiKey ? `В БД CRM: ${s.apiKeyHint || "сохранён"} (оставьте пустым чтобы использовать)` : "Пусто — из БД CRM или без ключа";
+      }
       showToast("Настройки Агента сохранены в БД CRM", "ok");
     } catch (err) {
       showToast(err.message, "error");
     }
   };
+
+  async function loadSavedAgentSettings() {
+    try {
+      const res = await apiJson("/api/ai/settings");
+      const s = res?.settings || {};
+      if (s.baseUrl) {
+        st.settings.baseUrl = s.baseUrl;
+        const el = root.querySelector("#ag-base-url");
+        if (el) el.value = s.baseUrl;
+      }
+      if (s.model) {
+        st.settings.model = s.model;
+        const el = root.querySelector("#ag-model");
+        if (el) el.value = s.model;
+      }
+      const keyInp = root.querySelector("#ag-api-key");
+      if (keyInp && s.hasApiKey) {
+        keyInp.placeholder = `В БД CRM: ${s.apiKeyHint || "сохранён"} (оставьте пустым чтобы использовать)`;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
 
   async function loadRagAndGithub() {
     if (limits.rag !== false) {
@@ -907,15 +941,16 @@ export function mountAgentTab(root, ctx) {
         box.innerHTML = `GitHub не подключён в профиле CRM. Подключите его на сайте CRM, после чего выберите репозиторий здесь.`;
         return;
       }
-      st.github.enabled = Boolean(gh.connection?.enabled);
-      st.github.owner = gh.connection?.selectedOwner || "";
-      st.github.repo = gh.connection?.selectedRepo || "";
-      st.github.branch = gh.connection?.selectedBranch || "main";
+      const acc = gh.account || gh.connection || {};
+      st.github.enabled = Boolean(acc.enabled);
+      st.github.owner = acc.selectedOwner || "";
+      st.github.repo = acc.selectedRepo || "";
+      st.github.branch = acc.selectedBranch || "main";
       const reposRes = await apiJson("/api/github/repos").catch(() => ({ repos: [] }));
       st.github.repos = reposRes.repos || [];
       box.innerHTML = `
         <div class="row mb-2">
-          <span class="badge badge-emerald">✓ @${esc(gh.connection?.login || "")}</span>
+          <span class="badge badge-emerald">✓ @${esc(acc.login || "")}</span>
           <label class="row" style="font-size:11.5px; cursor:pointer;">
             <input id="ag-gh-en" type="checkbox" ${st.github.enabled ? "checked" : ""} /> Включить контекст репозитория
           </label>
@@ -1484,6 +1519,7 @@ export function mountAgentTab(root, ctx) {
 
   refreshConvs();
   renderAgentMessages();
+  loadSavedAgentSettings();
   loadRagAndGithub();
   apiJson("/api/ai/agent").then(renderAgentHealth).catch(() => {});
 

@@ -111,7 +111,9 @@ def _request_json(
     if payload is not None:
         req.add_header("Content-Type", "application/json")
     if bearer_token.strip():
-        req.add_header("Authorization", f"Bearer {bearer_token.strip()}")
+        tok = bearer_token.strip()
+        req.add_header("Authorization", f"Bearer {tok}")
+        req.add_header("Cookie", f"crm_session={tok}")
 
     try:
         host = urllib.parse.urlparse(url).hostname or ""
@@ -327,7 +329,9 @@ def open_crm_stream(
             continue
         req.add_header(k, v)
     if bearer_token.strip():
-        req.add_header("Authorization", f"Bearer {bearer_token.strip()}")
+        tok = bearer_token.strip()
+        req.add_header("Authorization", f"Bearer {tok}")
+        req.add_header("Cookie", f"crm_session={tok}")
 
     host = urllib.parse.urlparse(full_url).hostname or ""
     opener = _NO_REDIRECT_LOCAL_OPENER if _is_local_or_lan_host(host) else _NO_REDIRECT_OPENER

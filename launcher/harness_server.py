@@ -1180,8 +1180,18 @@ class HarnessServer:
             ) as resp:
                 prep = json.loads(resp.read().decode("utf-8", "replace") or "{}")
         except urllib.error.HTTPError as exc:
-            handler._send_bytes(int(exc.code), "application/json; charset=utf-8", exc.read())  # type: ignore[attr-defined]
-            return
+            if exc.code in (404, 405):
+                # Совместимость со старым сервером CRM (без /api/launcher/chat)
+                prep = {
+                    "chat": {"id": int(body.get("chatId") or 0)},
+                    "params": body.get("params") if isinstance(body.get("params"), dict) else {},
+                    "ragContext": "",
+                    "ragHits": 0,
+                    "ragFull": None,
+                }
+            else:
+                handler._send_bytes(int(exc.code), "application/json; charset=utf-8", exc.read())  # type: ignore[attr-defined]
+                return
         except Exception as exc:
             handler._send_json(502, {"error": f"Ошибка подготовки чата в CRM: {exc}"})  # type: ignore[attr-defined]
             return
@@ -1382,8 +1392,116 @@ class HarnessServer:
             ) as resp:
                 data = json.loads(resp.read().decode("utf-8", "replace") or "{}")
                 return data if isinstance(data, dict) else {}
+        except urllib.error.HTTPError as exc:
+            if exc.code in (404, 405) and payload.get("action") == "usage":
+                try:
+                    with crm_client.open_crm_stream(
+                        "POST",
+                        crm_url,
+                        "/api/launcher/usage",
+                        bearer_token=crm_token,
+                        body=json.dumps(
+                            {
+                                "kind": payload.get("kind") or "agent",
+                                "refId": payload.get("refId") or 0,
+                                "model": payload.get("model") or "",
+                                "promptTokens": payload.get("promptTokens") or 0,
+                                "completionTokens": payload.get("completionTokens") or 0,
+                                "totalTokens": payload.get("totalTokens") or 0,
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        timeout=15.0,
+                    ):
+                        return {"ok": True}
+                except Exception:
+                    return {}
+            return {}
         except Exception:
             return {}
+
+    def _crm_get_json_quiet(self, rel_path: str, timeout: float = 10.0) -> Dict[str, Any]:
+        crm_url, crm_token = self._crm_auth()
+        try:
+            with crm_client.open_crm_stream("GET", crm_url, rel_path, bearer_token=crm_token, timeout=timeout) as resp:
+                parsed = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+                return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _fallback_prepare_agent(self, body: Mapping[str, Any]) -> Dict[str, Any]:
+        """Совместимая сборка payload для agent.py, если сервер CRM ещё без /api/launcher/agent/prepare."""
+        req_s = body.get("settings") if isinstance(body.get("settings"), Mapping) else {}
+        saved = self._crm_get_json_quiet("/api/ai/settings").get("settings") or {}
+        base_url = _normalize_ai_base(
+            str(req_s.get("baseUrl") or saved.get("baseUrl") or self.settings.resolved_base_url())
+        )
+        model = str(req_s.get("model") or saved.get("model") or self.settings.resolved_model()).strip()
+        api_key = str(req_s.get("apiKey") or self.settings.api_key or "").strip()
+        if not base_url or not model:
+            raise ValueError("Не указан Base URL или модель Агента")
+
+        agent_role = str(body.get("agentRole") or "agent")
+        trust_level = str(body.get("trustLevel") or "verified")
+        max_steps = int(body.get("maxSteps") or 60)
+        sandbox_project = str(body.get("sandboxProject") or "").strip()
+        messages = [dict(m) for m in (body.get("messages") or []) if isinstance(m, Mapping)]
+
+        sub_data = self._crm_get_json_quiet("/api/agent/subagents")
+        subagents_list = sub_data.get("subagents") if isinstance(sub_data.get("subagents"), list) else []
+        overseer_raw = sub_data.get("overseer") if isinstance(sub_data.get("overseer"), Mapping) else {}
+        routing_mode = str(sub_data.get("routingMode") or "linear")
+
+        subagent_id = body.get("subagentId")
+        subagent_spec = None
+        if agent_role == "subagent" and subagent_id:
+            for s in subagents_list:
+                if isinstance(s, Mapping) and str(s.get("id")) == str(subagent_id):
+                    subagent_spec = dict(s)
+                    break
+
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "settings": {
+                "baseUrl": base_url,
+                "apiKey": api_key,
+                "model": model,
+                "temperature": req_s.get("temperature"),
+                "topP": req_s.get("topP"),
+                "maxTokens": req_s.get("maxTokens"),
+                "reasoning": req_s.get("reasoning") or self.settings.reasoning or "default",
+                "systemPrompt": req_s.get("systemPrompt") or "",
+            },
+            "agentRole": agent_role,
+            "trustLevel": trust_level,
+            "maxSteps": max_steps,
+            "sandboxProject": sandbox_project,
+            "routingMode": routing_mode,
+            "subagents": subagents_list,
+            "overseer": {
+                "enabled": bool(overseer_raw.get("enabled", False)),
+                "mode": str(overseer_raw.get("mode") or "strict"),
+                "systemPrompt": str(overseer_raw.get("systemPrompt") or ""),
+            },
+        }
+        if subagent_spec is not None:
+            payload["subagent"] = subagent_spec
+
+        return {
+            "ok": True,
+            "payload": payload,
+            "meta": {
+                "model": model,
+                "promptEst": _estimate_tokens(messages),
+                "agentRole": agent_role,
+                "sandboxProject": sandbox_project,
+                "subagentId": subagent_id,
+                "agentConversationId": body.get("agentConversationId"),
+                "testerConversationId": body.get("testerConversationId"),
+                "subagentConversationId": body.get("subagentConversationId"),
+            },
+        }
 
     def _api_agent_run(self, handler: BaseHTTPRequestHandler) -> None:
         raw = handler._read_body()  # type: ignore[attr-defined]
@@ -1407,8 +1525,15 @@ class HarnessServer:
             ) as prep_resp:
                 prep = json.loads(prep_resp.read().decode("utf-8", "replace") or "{}")
         except urllib.error.HTTPError as exc:
-            handler._send_bytes(int(exc.code), "application/json; charset=utf-8", exc.read())  # type: ignore[attr-defined]
-            return
+            if exc.code in (404, 405):
+                try:
+                    prep = self._fallback_prepare_agent(body)
+                except ValueError as verr:
+                    handler._send_json(400, {"error": str(verr)})  # type: ignore[attr-defined]
+                    return
+            else:
+                handler._send_bytes(int(exc.code), "application/json; charset=utf-8", exc.read())  # type: ignore[attr-defined]
+                return
         except Exception as exc:
             handler._send_json(502, {"error": f"Ошибка подготовки запуска в CRM: {exc}"})  # type: ignore[attr-defined]
             return

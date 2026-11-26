@@ -667,6 +667,16 @@ export function mountOperatorTab(root, ctx) {
     }
   });
 
+  apiJson("/api/ai/settings").then((res) => {
+    const s = res?.settings || {};
+    const uEl = root.querySelector("#op-cfg-url");
+    const mEl = root.querySelector("#op-cfg-model");
+    const kEl = root.querySelector("#op-cfg-key");
+    if (uEl && !uEl.value.trim() && s.baseUrl) uEl.value = s.baseUrl;
+    if (mEl && !mEl.value.trim() && s.model) mEl.value = s.model;
+    if (kEl && s.hasApiKey) kEl.placeholder = `В БД CRM: ${s.apiKeyHint || "сохранён"}`;
+  }).catch(() => {});
+
   refreshTasks();
   return { refresh: refreshTasks };
 }
