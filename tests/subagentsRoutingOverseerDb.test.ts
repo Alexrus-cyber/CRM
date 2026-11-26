@@ -77,6 +77,20 @@ describe("SQLite DB + миграция 0006 для routingMode и Надсмот
     });
     expect(cleared.overseer.hasApiKey).toBe(false);
     expect(cleared.overseer.apiKeyHint).toBe("");
+
+    // Отключение Надсмотрщика сохраняется в БД и возвращается в getAgentOrchestrationConfigSecret
+    const disabled = await subagentsRepo.upsertAgentOrchestrationConfig(userId, {
+      overseer: { enabled: false },
+    });
+    expect(disabled.overseer.enabled).toBe(false);
+    const disabledSecret = await subagentsRepo.getAgentOrchestrationConfigSecret(userId);
+    expect(disabledSecret.overseer.enabled).toBe(false);
+
+    // Повторное включение
+    const reEnabled = await subagentsRepo.upsertAgentOrchestrationConfig(userId, {
+      overseer: { enabled: true },
+    });
+    expect(reEnabled.overseer.enabled).toBe(true);
   });
 
   it("миграция 0007: хранит toolProfile, posX/posY узлов и orchestratorPos", async () => {

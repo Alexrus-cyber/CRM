@@ -672,13 +672,13 @@ export function SubagentsPanel({
 
   const saveOverseer = useCallback(
     async (payload: {
-      enabled: boolean;
-      mode: OverseerMode;
-      systemPrompt: string;
-      unlockApi: boolean;
-      provider: string;
-      baseUrl: string;
-      model: string;
+      enabled?: boolean;
+      mode?: OverseerMode;
+      systemPrompt?: string;
+      unlockApi?: boolean;
+      provider?: string;
+      baseUrl?: string;
+      model?: string;
       apiKey?: string;
       clearApiKey?: boolean;
     }) => {
@@ -1679,13 +1679,13 @@ function OverseerConfigCard({
   onOpenModelTab?: () => void;
   onClose: () => void;
   onSave: (payload: {
-    enabled: boolean;
-    mode: OverseerMode;
-    systemPrompt: string;
-    unlockApi: boolean;
-    provider: string;
-    baseUrl: string;
-    model: string;
+    enabled?: boolean;
+    mode?: OverseerMode;
+    systemPrompt?: string;
+    unlockApi?: boolean;
+    provider?: string;
+    baseUrl?: string;
+    model?: string;
     apiKey?: string;
     clearApiKey?: boolean;
   }) => Promise<void>;
@@ -1700,6 +1700,7 @@ function OverseerConfigCard({
   const [apiKey, setApiKey] = useState("");
   const [clearApiKey, setClearApiKey] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [togglingEnabled, setTogglingEnabled] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
 
@@ -1710,6 +1711,23 @@ function OverseerConfigCard({
     setProvider(p.id);
     if (p.id !== "custom") setBaseUrl(p.baseUrl);
     if (p.model) setModel(p.model);
+  };
+
+  const handleToggleEnabled = async (nextEnabled: boolean) => {
+    const prev = enabled;
+    setEnabled(nextEnabled);
+    setTogglingEnabled(true);
+    setErr(null);
+    setSavedMsg(null);
+    try {
+      await onSave({ enabled: nextEnabled });
+      setSavedMsg(nextEnabled ? "Надсмотрщик включён" : "Надсмотрщик отключён");
+    } catch (e) {
+      setEnabled(prev);
+      setErr(e instanceof Error ? e.message : "Не удалось переключить Надсмотрщика");
+    } finally {
+      setTogglingEnabled(false);
+    }
   };
 
   const handleSave = async () => {
@@ -1782,13 +1800,14 @@ function OverseerConfigCard({
             <input
               type="checkbox"
               checked={enabled}
-              onChange={(e) => setEnabled(e.target.checked)}
+              disabled={togglingEnabled || busy}
+              onChange={(e) => void handleToggleEnabled(e.target.checked)}
               className="mt-0.5 h-4 w-4 accent-[#10b981]"
             />
             <div>
               <div className="text-xs font-semibold text-text">Включить Надсмотрщика</div>
               <div className="mt-0.5 text-[11px] text-muted">
-                При угрозе или сомнительной операции запрашивает явное решение человека в окне подтверждения на сайте.
+                Переключается и сохраняется сразу. Когда включён — проверяет сомнительные действия и запрашивает решение человека на сайте; когда выключен — не следит за агентами.
               </div>
             </div>
           </label>
@@ -1937,7 +1956,7 @@ function OverseerConfigCard({
       </div>
 
       <div className="mt-3 flex justify-end border-t border-border pt-3">
-        <Button size="md" variant="primary" onClick={() => void handleSave()} disabled={busy}>
+        <Button size="md" variant="primary" onClick={() => void handleSave()} disabled={busy || togglingEnabled}>
           {busy ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
           {busy ? "Сохраняю…" : "Сохранить Надсмотрщика"}
         </Button>

@@ -8520,8 +8520,17 @@ class Handler(BaseHTTPRequestHandler):
             if overseer_unlocked
             else orch_model
         )
+        raw_ov_enabled = raw_overseer.get("enabled", True)
+        if isinstance(raw_ov_enabled, bool):
+            ov_enabled = raw_ov_enabled
+        elif raw_ov_enabled is None:
+            ov_enabled = True
+        elif isinstance(raw_ov_enabled, (int, float)):
+            ov_enabled = raw_ov_enabled != 0
+        else:
+            ov_enabled = str(raw_ov_enabled).strip().lower() not in ("false", "0", "no", "off", "")
         overseer_cfg: Dict[str, Any] = {
-            "enabled": raw_overseer.get("enabled", True) is not False,
+            "enabled": ov_enabled,
             "mode": str(raw_overseer.get("mode") or "strict").strip().lower(),
             "systemPrompt": str(raw_overseer.get("systemPrompt") or "").strip(),
             "unlockApi": overseer_unlocked,

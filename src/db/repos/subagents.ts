@@ -1091,7 +1091,10 @@ function mapOrchestrationPublic(row: Raw | null | undefined): AgentOrchestration
     orchestratorPosX: normalizeCoord(row.orchestrator_pos_x),
     orchestratorPosY: normalizeCoord(row.orchestrator_pos_y),
     overseer: {
-      enabled: row.overseer_enabled === undefined ? true : toBool(row.overseer_enabled),
+      enabled:
+        row.overseer_enabled === undefined || row.overseer_enabled === null
+          ? true
+          : toBool(row.overseer_enabled),
       mode: normalizeOverseerMode(row.overseer_mode),
       systemPrompt: String(row.overseer_system_prompt ?? ""),
       unlockApi: toBool(row.overseer_unlock_api),
@@ -1216,7 +1219,7 @@ export async function upsertAgentOrchestrationConfig(
     input.orchestratorPosY !== undefined ? normalizeCoord(input.orchestratorPosY) : cur.orchestratorPosY;
 
   const ov = input.overseer ?? {};
-  // Надсмотрщик всегда остаётся активным для защиты Sandbox; режим можно выбрать ('strict' | 'rules_only').
+  // Пользователь может включать/выключать Надсмотрщика и выбирать режим ('strict' | 'rules_only').
   const nextEnabled = ov.enabled !== undefined ? Boolean(ov.enabled) : cur.overseer.enabled;
   const nextMode = ov.mode !== undefined ? normalizeOverseerMode(ov.mode) : cur.overseer.mode;
   const nextPrompt =

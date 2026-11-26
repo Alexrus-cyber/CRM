@@ -602,6 +602,39 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
     expect(ov.mode).toBe("rules_only");
   });
 
+  it("мгновенно сохраняет отключение Надсмотрщика при снятии галочки и обновляет статистику", async () => {
+    const onStats = vi.fn();
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="full"
+        onStats={onStats}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/Надсмотрщик: строгий/i)).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^Надсмотрщик$/i }));
+    const checkbox = (await screen.findByLabelText(/Включить Надсмотрщика/i)) as HTMLInputElement;
+    expect(checkbox.checked).toBe(true);
+
+    // Снимаем галочку — PATCH должен уйти сразу, без нажатия нижней кнопки «Сохранить Надсмотрщика»
+    fireEvent.click(checkbox);
+
+    await waitFor(() => {
+      expect(patchRootPayloads.some((p) => (p.overseer as Record<string, unknown> | undefined)?.enabled === false)).toBe(true);
+    });
+    expect(await screen.findByText(/Надсмотрщик: выкл/i)).toBeTruthy();
+    expect(onStats).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        overseerEnabled: false,
+      }),
+    );
+  });
+
   it("в чате субагента показывает проверку Надсмотрщика и отправляет решение ApprovalToast", async () => {
     const encoder = new TextEncoder();
     const ctrlRef: { current: ReadableStreamDefaultController<Uint8Array> | null } = { current: null };
