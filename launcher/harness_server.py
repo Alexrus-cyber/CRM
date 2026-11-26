@@ -1005,6 +1005,334 @@ class HarnessServer:
         )
 
     # ------------------------------------------------------------------
+    # Локальный автономный fallback для старых серверов CRM (404 маршрута)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_missing_crm_route_404(exc: urllib.error.HTTPError, raw_err: bytes) -> bool:
+        if int(getattr(exc, "code", 0) or 0) != 404:
+            return False
+        ct = (exc.headers.get("Content-Type") if exc.headers else "") or ""
+        if "application/json" in ct.lower():
+            try:
+                parsed = json.loads(raw_err.decode("utf-8", "replace") or "{}")
+                if isinstance(parsed, dict) and parsed.get("error"):
+                    err_txt = str(parsed["error"]).strip().lower()
+                    # «Not found» / «Маршрут...» считаем отсутствием роута, а русские доменные ошибки («Субагент не найден») — бизнес-ответом
+                    return err_txt in ("not found", "route not found")
+            except Exception:
+                return True
+        return True
+
+    def _local_store_path(self, filename: str) -> Path:
+        base_dir = self.settings_path.parent if self.settings_path else settings_mod.config_dir()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return base_dir / filename
+
+    def _load_local_subagents_store(self) -> Dict[str, Any]:
+        default_store: Dict[str, Any] = {
+            "nextId": 1,
+            "routingMode": "linear",
+            "overseer": {
+                "enabled": False,
+                "mode": "strict",
+                "systemPrompt": "",
+                "unlockApi": False,
+                "baseUrl": "",
+                "model": "",
+                "hasApiKey": False,
+                "apiKeyHint": "",
+                "apiKey": "",
+            },
+            "subagents": [],
+            "runs": [],
+        }
+        p = self._local_store_path("subagents_local.json")
+        if not p.is_file():
+            return default_store
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8") or "{}")
+            if isinstance(loaded, dict):
+                default_store.update({k: v for k, v in loaded.items() if k in default_store})
+                if not isinstance(default_store["overseer"], dict):
+                    default_store["overseer"] = {}
+                if not isinstance(default_store["subagents"], list):
+                    default_store["subagents"] = []
+                if not isinstance(default_store["runs"], list):
+                    default_store["runs"] = []
+        except Exception:
+            pass
+        return default_store
+
+    def _save_local_subagents_store(self, store: Mapping[str, Any]) -> None:
+        p = self._local_store_path("subagents_local.json")
+        try:
+            p.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _public_local_overseer(ov: Mapping[str, Any]) -> Dict[str, Any]:
+        key = str(ov.get("apiKey") or "")
+        hint = str(ov.get("apiKeyHint") or "")
+        if key and not hint:
+            hint = f"{key[:4]}…{key[-2:]}" if len(key) >= 8 else "сохранён"
+        return {
+            "enabled": bool(ov.get("enabled", False)),
+            "mode": str(ov.get("mode") or "strict"),
+            "systemPrompt": str(ov.get("systemPrompt") or ""),
+            "unlockApi": bool(ov.get("unlockApi", False)),
+            "baseUrl": str(ov.get("baseUrl") or ""),
+            "model": str(ov.get("model") or ""),
+            "hasApiKey": bool(key or ov.get("hasApiKey")),
+            "apiKeyHint": hint,
+        }
+
+    def _handle_local_subagents_api(
+        self,
+        handler: BaseHTTPRequestHandler,
+        method: str,
+        path: str,
+        query: str,
+        raw_body: bytes,
+    ) -> None:
+        crm_url, _ = self._crm_auth()
+        store = self._load_local_subagents_store()
+        notice = (
+            f"На сервере CRM ({crm_url}) отсутствует маршрут {path} (HTTP 404) — "
+            "вероятно, сервер запущен на старой сборке. Субагенты и Надсмотрщик работают в автономном локальном режиме."
+        )
+        try:
+            body = json.loads(raw_body.decode("utf-8") or "{}") if raw_body else {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        if path == "/api/agent/subagents" and method == "GET":
+            qs = urllib.parse.parse_qs(query, keep_blank_values=True)
+            sub_id_raw = (qs.get("subagentId") or [""])[0].strip()
+            conv_id_raw = (qs.get("conversationId") or [""])[0].strip()
+            subagents = list(store.get("subagents") or [])
+            convs = self._load_local_conversations_store().get("conversations") or []
+            sub_convs = [
+                c for c in convs
+                if isinstance(c, dict) and c.get("kind") == "subagent"
+                and (not sub_id_raw or str(c.get("subagentId") or "") == sub_id_raw)
+            ]
+            sel_conv = None
+            if conv_id_raw:
+                for c in sub_convs:
+                    if str(c.get("id")) == conv_id_raw:
+                        sel_conv = {"conversation": c, "messages": c.get("messages") or []}
+                        break
+            active_count = sum(1 for s in subagents if isinstance(s, dict) and s.get("isActive", True))
+            handler._send_json(  # type: ignore[attr-defined]
+                200,
+                {
+                    "ok": True,
+                    "localFallback": True,
+                    "fallbackNotice": notice,
+                    "subagents": subagents,
+                    "runs": list(store.get("runs") or []),
+                    "conversations": sub_convs,
+                    "selectedConversation": sel_conv,
+                    "routingMode": str(store.get("routingMode") or "linear"),
+                    "overseer": self._public_local_overseer(store.get("overseer") or {}),
+                    "limits": {
+                        "maxStored": 50,
+                        "maxActive": 10,
+                        "totalCount": len(subagents),
+                        "activeCount": active_count,
+                    },
+                },
+            )
+            return
+
+        if path == "/api/agent/subagents" and method == "POST":
+            name = str(body.get("name") or "").strip()
+            if not name:
+                handler._send_json(400, {"error": "Укажите имя субагента"})  # type: ignore[attr-defined]
+                return
+            sid = int(store.get("nextId") or 1)
+            store["nextId"] = sid + 1
+            slug_raw = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-") or f"subagent-{sid}"
+            item = {
+                "id": sid,
+                "slug": f"{slug_raw}-{sid}" if any(s.get("slug") == slug_raw for s in store["subagents"]) else slug_raw,
+                "name": name,
+                "roleTitle": str(body.get("roleTitle") or "").strip(),
+                "toolProfile": "restricted" if body.get("toolProfile") == "restricted" else "full",
+                "color": str(body.get("color") or "#7c5cff"),
+                "isActive": bool(body.get("isActive", True)),
+                "systemPrompt": str(body.get("systemPrompt") or ""),
+                "parentSubagentId": body.get("parentSubagentId"),
+            }
+            store["subagents"].append(item)
+            self._save_local_subagents_store(store)
+            handler._send_json(201, {"ok": True, "localFallback": True, "subagent": item})  # type: ignore[attr-defined]
+            return
+
+        if path == "/api/agent/subagents" and method == "PATCH":
+            if "routingMode" in body:
+                rm = str(body.get("routingMode") or "linear")
+                if rm in ("linear", "layered", "cascade"):
+                    store["routingMode"] = rm
+            if isinstance(body.get("overseer"), dict):
+                ov = dict(store.get("overseer") or {})
+                in_ov = body["overseer"]
+                for k in ("enabled", "mode", "systemPrompt", "unlockApi", "baseUrl", "model"):
+                    if k in in_ov:
+                        ov[k] = in_ov[k]
+                if in_ov.get("apiKey"):
+                    kval = str(in_ov["apiKey"]).strip()
+                    ov["apiKey"] = kval
+                    ov["hasApiKey"] = True
+                    ov["apiKeyHint"] = f"{kval[:4]}…{kval[-2:]}" if len(kval) >= 8 else "сохранён"
+                store["overseer"] = ov
+            self._save_local_subagents_store(store)
+            handler._send_json(  # type: ignore[attr-defined]
+                200,
+                {
+                    "ok": True,
+                    "localFallback": True,
+                    "routingMode": store["routingMode"],
+                    "overseer": self._public_local_overseer(store.get("overseer") or {}),
+                },
+            )
+            return
+
+        m_id = re.fullmatch(r"/api/agent/subagents/(\d+)", path)
+        if m_id and method in ("PATCH", "DELETE"):
+            target_id = int(m_id.group(1))
+            subs = list(store.get("subagents") or [])
+            idx = next((i for i, s in enumerate(subs) if int(s.get("id") or 0) == target_id), -1)
+            if idx < 0:
+                handler._send_json(404, {"error": "Субагент не найден"})  # type: ignore[attr-defined]
+                return
+            if method == "DELETE":
+                subs.pop(idx)
+                store["subagents"] = subs
+                self._save_local_subagents_store(store)
+                handler._send_json(200, {"ok": True, "localFallback": True})  # type: ignore[attr-defined]
+                return
+            item = dict(subs[idx])
+            for k in ("name", "roleTitle", "toolProfile", "color", "isActive", "systemPrompt", "parentSubagentId"):
+                if k in body:
+                    item[k] = body[k]
+            subs[idx] = item
+            store["subagents"] = subs
+            self._save_local_subagents_store(store)
+            handler._send_json(200, {"ok": True, "localFallback": True, "subagent": item})  # type: ignore[attr-defined]
+            return
+
+        handler._send_json(200, {"ok": True, "localFallback": True, "fallbackNotice": notice})  # type: ignore[attr-defined]
+
+    def _load_local_conversations_store(self) -> Dict[str, Any]:
+        default_store: Dict[str, Any] = {"nextId": 1, "conversations": []}
+        p = self._local_store_path("conversations_local.json")
+        if not p.is_file():
+            return default_store
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8") or "{}")
+            if isinstance(loaded, dict) and isinstance(loaded.get("conversations"), list):
+                return {"nextId": int(loaded.get("nextId") or 1), "conversations": loaded["conversations"]}
+        except Exception:
+            pass
+        return default_store
+
+    def _save_local_conversations_store(self, store: Mapping[str, Any]) -> None:
+        p = self._local_store_path("conversations_local.json")
+        try:
+            p.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _handle_local_conversations_api(
+        self,
+        handler: BaseHTTPRequestHandler,
+        method: str,
+        path: str,
+        query: str,
+        raw_body: bytes,
+    ) -> None:
+        store = self._load_local_conversations_store()
+        convs: List[Dict[str, Any]] = list(store.get("conversations") or [])
+        try:
+            body = json.loads(raw_body.decode("utf-8") or "{}") if raw_body else {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        if path == "/api/agent/conversations" and method == "GET":
+            qs = urllib.parse.parse_qs(query, keep_blank_values=True)
+            kind = (qs.get("kind") or [""])[0].strip()
+            filtered = [
+                {k: v for k, v in c.items() if k != "messages"}
+                for c in convs
+                if not kind or c.get("kind") == kind
+            ]
+            handler._send_json(200, {"ok": True, "localFallback": True, "conversations": filtered})  # type: ignore[attr-defined]
+            return
+
+        if path == "/api/agent/conversations" and method == "POST":
+            cid = int(store.get("nextId") or 1)
+            store["nextId"] = cid + 1
+            item = {
+                "id": cid,
+                "kind": str(body.get("kind") or "agent"),
+                "subagentId": body.get("subagentId"),
+                "title": str(body.get("title") or "Локальный чат").strip() or "Локальный чат",
+                "messages": [],
+                "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            convs.insert(0, item)
+            store["conversations"] = convs
+            self._save_local_conversations_store(store)
+            handler._send_json(201, {"ok": True, "localFallback": True, "conversation": item})  # type: ignore[attr-defined]
+            return
+
+        m_cid = re.fullmatch(r"/api/agent/conversations/(\d+)", path)
+        if m_cid:
+            cid = int(m_cid.group(1))
+            idx = next((i for i, c in enumerate(convs) if int(c.get("id") or 0) == cid), -1)
+            if idx < 0:
+                handler._send_json(404, {"error": "Чат не найден"})  # type: ignore[attr-defined]
+                return
+            if method == "GET":
+                c = convs[idx]
+                handler._send_json(200, {"ok": True, "localFallback": True, "conversation": c, "messages": c.get("messages") or []})  # type: ignore[attr-defined]
+                return
+            if method == "DELETE":
+                convs.pop(idx)
+                store["conversations"] = convs
+                self._save_local_conversations_store(store)
+                handler._send_json(200, {"ok": True, "localFallback": True})  # type: ignore[attr-defined]
+                return
+
+        m_msg = re.fullmatch(r"/api/agent/conversations/(\d+)/messages", path)
+        if m_msg and method == "POST":
+            cid = int(m_msg.group(1))
+            for c in convs:
+                if int(c.get("id") or 0) == cid:
+                    msgs = list(c.get("messages") or [])
+                    msgs.append({
+                        "role": str(body.get("role") or "user"),
+                        "content": str(body.get("content") or ""),
+                        "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    })
+                    c["messages"] = msgs
+                    c["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    store["conversations"] = convs
+                    self._save_local_conversations_store(store)
+                    handler._send_json(201, {"ok": True, "localFallback": True})  # type: ignore[attr-defined]
+                    return
+            handler._send_json(404, {"error": "Чат не найден"})  # type: ignore[attr-defined]
+            return
+
+        handler._send_json(200, {"ok": True, "localFallback": True})  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------
     # Прокси к БД CRM
     # ------------------------------------------------------------------
     def _proxy_crm_request(self, handler: BaseHTTPRequestHandler, full_rel: str) -> None:
@@ -1041,6 +1369,23 @@ class HarnessServer:
                 handler._send_bytes(int(getattr(resp, "status", 200) or 200), ct, data, extra)  # type: ignore[attr-defined]
         except urllib.error.HTTPError as exc:
             raw_err = exc.read()
+            if self._is_missing_crm_route_404(exc, raw_err):
+                parsed = urllib.parse.urlparse(full_rel)
+                req_path = parsed.path or "/"
+                if req_path == "/api/agent/subagents" or req_path.startswith("/api/agent/subagents/"):
+                    self._handle_local_subagents_api(handler, handler.command.upper(), req_path, parsed.query, raw_body)
+                    return
+                if req_path == "/api/agent/conversations" or req_path.startswith("/api/agent/conversations/"):
+                    self._handle_local_conversations_api(handler, handler.command.upper(), req_path, parsed.query, raw_body)
+                    return
+                handler._send_json(  # type: ignore[attr-defined]
+                    404,
+                    {
+                        "error": f"Маршрут {req_path} не найден на сервере CRM ({crm_url}) — возможно, сервер не обновлён или не пересобран",
+                        "missingRoute": True,
+                    },
+                )
+                return
             ct = exc.headers.get("Content-Type") if exc.headers else "application/json; charset=utf-8"
             handler._send_bytes(int(exc.code), ct or "application/json; charset=utf-8", raw_err)  # type: ignore[attr-defined]
         except crm_client.CrmClientError as exc:
@@ -1449,6 +1794,8 @@ class HarnessServer:
         messages = [dict(m) for m in (body.get("messages") or []) if isinstance(m, Mapping)]
 
         sub_data = self._crm_get_json_quiet("/api/agent/subagents")
+        if not sub_data:
+            sub_data = self._load_local_subagents_store()
         subagents_list = sub_data.get("subagents") if isinstance(sub_data.get("subagents"), list) else []
         overseer_raw = sub_data.get("overseer") if isinstance(sub_data.get("overseer"), Mapping) else {}
         routing_mode = str(sub_data.get("routingMode") or "linear")
@@ -1483,6 +1830,10 @@ class HarnessServer:
                 "enabled": bool(overseer_raw.get("enabled", False)),
                 "mode": str(overseer_raw.get("mode") or "strict"),
                 "systemPrompt": str(overseer_raw.get("systemPrompt") or ""),
+                "unlockApi": bool(overseer_raw.get("unlockApi", False)),
+                "baseUrl": str(overseer_raw.get("baseUrl") or ""),
+                "model": str(overseer_raw.get("model") or ""),
+                "apiKey": str(overseer_raw.get("apiKey") or ""),
             },
         }
         if subagent_spec is not None:

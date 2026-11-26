@@ -65,7 +65,11 @@ export async function apiJson(url, options = {}) {
     data = { raw: text };
   }
   if (!res.ok) {
-    const msg = (data && (data.error || data.message)) || `HTTP ${res.status}`;
+    const cleanUrl = String(url || "").split("?")[0];
+    const fallbackMsg = res.status === 404
+      ? `Маршрут ${cleanUrl} не найден на сервере CRM (HTTP 404)`
+      : `HTTP ${res.status} (${cleanUrl})`;
+    const msg = (data && (data.error || data.message)) || fallbackMsg;
     const err = new Error(msg);
     err.status = res.status;
     err.data = data;
@@ -80,9 +84,16 @@ export async function apiJson(url, options = {}) {
 export function showToast(message, kind = "info", timeoutMs = 4200) {
   const host = document.getElementById("toast-container");
   if (!host) return;
+  const text = String(message || "");
+  const cls = `toast ${kind === "error" ? "toast-error" : kind === "ok" ? "toast-ok" : ""}`;
+  for (const existing of host.children) {
+    if (existing.className === cls && existing.textContent === text) {
+      return;
+    }
+  }
   const el = document.createElement("div");
-  el.className = `toast ${kind === "error" ? "toast-error" : kind === "ok" ? "toast-ok" : ""}`;
-  el.textContent = String(message || "");
+  el.className = cls;
+  el.textContent = text;
   host.appendChild(el);
   setTimeout(() => {
     el.remove();

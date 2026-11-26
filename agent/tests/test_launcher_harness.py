@@ -36,6 +36,15 @@ class FakeServersMixin:
             def do_POST(self):  # noqa: N802
                 self._call()
 
+            def do_PATCH(self):  # noqa: N802
+                self._call()
+
+            def do_PUT(self):  # noqa: N802
+                self._call()
+
+            def do_DELETE(self):  # noqa: N802
+                self._call()
+
             def _call(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length > 0 else b""
@@ -440,6 +449,110 @@ class TestLauncherHarness(unittest.TestCase, FakeServersMixin):
                     r["auth"] == "Bearer tok_legacy_99" and "crm_session=tok_legacy_99" in r["cookie"]
                     for r in seen_reqs
                 ))
+            finally:
+                srv.shutdown()
+                crm_srv.shutdown()
+                if prev_cfg is None:
+                    os.environ.pop("CRM_LAUNCHER_CONFIG", None)
+                else:
+                    os.environ["CRM_LAUNCHER_CONFIG"] = prev_cfg
+
+    def test_missing_route_404_falls_back_to_local_subagents_while_domain_404_passes_through(self) -> None:
+        def old_crm_handler(h: BaseHTTPRequestHandler, method: str, path: str, body: bytes) -> None:
+            # Имитируем старый сервер CRM: Next.js отдаёт HTML 404 для отсутствующих роутов
+            # /api/agent/subagents и /api/agent/conversations, а бизнес-404 для /api/agent/tasks/999 — JSON.
+            if path == "/api/agent/tasks/999":
+                raw = json.dumps({"error": "Задание не найдено"}, ensure_ascii=False).encode("utf-8")
+                h.send_response(404)
+                h.send_header("Content-Type", "application/json; charset=utf-8")
+                h.send_header("Content-Length", str(len(raw)))
+                h.end_headers()
+                h.wfile.write(raw)
+                return
+            if path == "/api/ai/settings":
+                raw = json.dumps({"settings": {"baseUrl": "https://api.openai.com/v1", "model": "gpt-4o-mini"}}).encode("utf-8")
+                h.send_response(200)
+                h.send_header("Content-Type", "application/json")
+                h.send_header("Content-Length", str(len(raw)))
+                h.end_headers()
+                h.wfile.write(raw)
+                return
+            html = b"<!DOCTYPE html><html><body>404 This page could not be found.</body></html>"
+            h.send_response(404)
+            h.send_header("Content-Type", "text/html; charset=utf-8")
+            h.send_header("Content-Length", str(len(html)))
+            h.end_headers()
+            h.wfile.write(html)
+
+        crm_srv, crm_port = self.start_json_server(old_crm_handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            prev_cfg = os.environ.get("CRM_LAUNCHER_CONFIG")
+            os.environ["CRM_LAUNCHER_CONFIG"] = str(Path(tmp) / "settings.json")
+            srv = harness_server.HarnessServer(port=0)
+            try:
+                srv.start()
+                srv.settings.crm_url = f"http://127.0.0.1:{crm_port}"
+                srv.settings.crm_session_token = "tok_old_crm"
+
+                def call(method: str, path: str, payload: Any = None) -> tuple[int, Dict[str, Any]]:
+                    raw = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    hdrs = {"X-Harness-Token": srv.token}
+                    if raw is not None:
+                        hdrs["Content-Type"] = "application/json"
+                    req = urllib.request.Request(f"{srv.base_url()}{path}", data=raw, headers=hdrs, method=method)
+                    try:
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            return resp.status, json.loads(resp.read().decode("utf-8"))
+                    except urllib.error.HTTPError as e:
+                        return e.code, json.loads(e.read().decode("utf-8"))
+
+                # 1. GET /api/agent/subagents -> локальный fallback (200)
+                st, data = call("GET", "/api/agent/subagents")
+                self.assertEqual(st, 200)
+                self.assertTrue(data.get("localFallback"))
+                self.assertEqual(data.get("subagents"), [])
+
+                # 2. POST /api/agent/subagents -> создаёт локального субагента
+                st, created = call("POST", "/api/agent/subagents", {
+                    "name": "Кодер",
+                    "roleTitle": "Backend",
+                    "toolProfile": "restricted",
+                    "systemPrompt": "Пиши тесты",
+                })
+                self.assertEqual(st, 201)
+                sub_id = created["subagent"]["id"]
+
+                # 3. PATCH /api/agent/subagents -> включает Надсмотрщика и layered
+                st, patched = call("PATCH", "/api/agent/subagents", {
+                    "routingMode": "layered",
+                    "overseer": {"enabled": True, "mode": "strict"},
+                })
+                self.assertEqual(st, 200)
+                self.assertTrue(patched["overseer"]["enabled"])
+                self.assertEqual(patched["routingMode"], "layered")
+
+                # 4. _fallback_prepare_agent подхватывает локальных субагентов и Надсмотрщика
+                prep = srv._fallback_prepare_agent({"messages": [{"role": "user", "content": "Тест"}]})
+                self.assertEqual(prep["payload"]["routingMode"], "layered")
+                self.assertTrue(prep["payload"]["overseer"]["enabled"])
+                self.assertEqual(len(prep["payload"]["subagents"]), 1)
+                self.assertEqual(prep["payload"]["subagents"][0]["name"], "Кодер")
+
+                # 5. Локальные чаты /api/agent/conversations также работают без 404
+                st, c_res = call("POST", "/api/agent/conversations", {"kind": "subagent", "subagentId": sub_id, "title": "Чат"})
+                self.assertEqual(st, 201)
+                st, c_list = call("GET", "/api/agent/conversations?kind=subagent")
+                self.assertEqual(st, 200)
+                self.assertEqual(len(c_list["conversations"]), 1)
+
+                # 6. DELETE /api/agent/subagents/{id}
+                st, _ = call("DELETE", f"/api/agent/subagents/{sub_id}")
+                self.assertEqual(st, 200)
+
+                # 7. Доменная JSON-404 ошибка от CRM не подменяется
+                st, dom_err = call("GET", "/api/agent/tasks/999")
+                self.assertEqual(st, 404)
+                self.assertEqual(dom_err.get("error"), "Задание не найдено")
             finally:
                 srv.shutdown()
                 crm_srv.shutdown()

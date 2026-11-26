@@ -1069,6 +1069,7 @@ export function mountAgentTab(root, ctx) {
 
   // ---- Субагенты и Надсмотрщик ----
   async function refreshSubagents() {
+    const host = root.querySelector("#ag-subagents-host");
     try {
       const qs = st.selectedSubId ? `?subagentId=${st.selectedSubId}${st.activeSubConvId ? `&conversationId=${st.activeSubConvId}` : ""}` : "";
       const data = await apiJson(`/api/agent/subagents${qs}`);
@@ -1078,6 +1079,23 @@ export function mountAgentTab(root, ctx) {
       }
       renderSubagentsPanel();
     } catch (err) {
+      if (host) {
+        host.innerHTML = `
+          <div class="card">
+            <div class="alert-box alert-error" style="display:block;">
+              <b>Не удалось загрузить субагентов и Надсмотрщика:</b> ${esc(err.message || "Неизвестная ошибка")}
+              <div class="muted mt-1" style="font-size:11.5px;">
+                Если вы подключены к локальному серверу CRM (<code>${esc(bootState.crmUrl || "")}</code>), убедитесь, что сервер обновлён и запущен с актуальной веткой/сборкой.
+              </div>
+            </div>
+            <div class="row mt-2">
+              <button type="button" id="sa-retry-load" class="btn btn-sm btn-primary">↻ Повторить</button>
+            </div>
+          </div>
+        `;
+        const btn = host.querySelector("#sa-retry-load");
+        if (btn) btn.onclick = refreshSubagents;
+      }
       showToast(err.message, "error");
     }
   }
@@ -1122,8 +1140,14 @@ export function mountAgentTab(root, ctx) {
     const ov = st.subagentsData.overseer || {};
     const routingMode = st.subagentsData.routingMode || "linear";
     const editing = st.editingSubagentId ? subagents.find((s) => s.id === st.editingSubagentId) : null;
+    const fallbackBanner = st.subagentsData?.localFallback
+      ? `<div class="alert-box mb-2" style="display:block; border-color:rgba(245,158,11,0.45); background:rgba(245,158,11,0.08); color:var(--text);">
+           <b>Автономный локальный режим:</b> ${esc(st.subagentsData.fallbackNotice || "Сервер CRM не поддерживает /api/agent/subagents (HTTP 404). Субагенты и Надсмотрщик сохраняются локально и работают со встроенным Агентом.")}
+         </div>`
+      : "";
 
     host.innerHTML = `
+      ${fallbackBanner}
       <div class="grid-2">
         <!-- Карточка режима маршрутизации и Надсмотрщика -->
         <div class="card">
@@ -1331,8 +1355,12 @@ export function mountAgentTab(root, ctx) {
     host.querySelectorAll("[data-sa-del]").forEach((b) => {
       b.onclick = async () => {
         const id = Number(b.getAttribute("data-sa-del"));
-        await apiJson(`/api/agent/subagents/${id}`, { method: "DELETE" });
-        await refreshSubagents();
+        try {
+          await apiJson(`/api/agent/subagents/${id}`, { method: "DELETE" });
+          if (st.editingSubagentId === id) st.editingSubagentId = 0;
+          if (st.selectedSubId === id) { st.selectedSubId = 0; st.activeSubConvId = 0; st.subMessages = []; }
+          await refreshSubagents();
+        } catch (err) { showToast(err.message, "error"); }
       };
     });
     host.querySelector("#sa-save-form").onclick = async () => {
@@ -1372,18 +1400,22 @@ export function mountAgentTab(root, ctx) {
     };
     host.querySelectorAll("[data-run-cancel]").forEach((b) => {
       b.onclick = async () => {
-        await apiJson(`/api/agent/subagents/runs/${b.getAttribute("data-run-cancel")}/cancel`, { method: "POST", body: "{}" });
-        await refreshSubagents();
+        try {
+          await apiJson(`/api/agent/subagents/runs/${b.getAttribute("data-run-cancel")}/cancel`, { method: "POST", body: "{}" });
+          await refreshSubagents();
+        } catch (err) { showToast(err.message, "error"); }
       };
     });
     host.querySelectorAll("[data-run-retry]").forEach((b) => {
       b.onclick = async () => {
-        const res = await apiJson(`/api/agent/subagents/runs/${b.getAttribute("data-run-retry")}/retry`, { method: "POST", body: "{}" });
-        showToast("Запуск подготовлен к повтору", "ok");
-        const subId = res.run?.subagentId || res.subagentId;
-        if (subId) { st.selectedSubId = subId; }
-        if (res.conversation?.id) { st.activeSubConvId = res.conversation.id; }
-        await refreshSubagents();
+        try {
+          const res = await apiJson(`/api/agent/subagents/runs/${b.getAttribute("data-run-retry")}/retry`, { method: "POST", body: "{}" });
+          showToast("Запуск подготовлен к повтору", "ok");
+          const subId = res.run?.subagentId || res.subagentId;
+          if (subId) { st.selectedSubId = subId; }
+          if (res.conversation?.id) { st.activeSubConvId = res.conversation.id; }
+          await refreshSubagents();
+        } catch (err) { showToast(err.message, "error"); }
       };
     });
 
