@@ -17,15 +17,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import importlib.util
 import json
 import mimetypes
 import os
 import re
 import secrets
+import shutil
 import socket
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -76,6 +79,26 @@ def _estimate_tokens(text: Any) -> int:
     if not text:
         return 0
     return max(1, (len(str(text)) + 3) // 4)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+def _local_opener(*, follow_redirects: bool = True) -> urllib.request.OpenerDirector:
+    if follow_redirects:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
 
 
 def _extract_model_capabilities(model_id: str, meta: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -282,10 +305,20 @@ class HarnessServer:
 
         self._operator_run: Optional[AgentRun] = None
         self._operator_logs: List[str] = []
+        self._server_logs: List[str] = []
+        self._sandbox_mod: Any = None
+        self._sandbox_synced_roots: set[str] = set()
 
         # Не-передаваемые в браузер одноразовые nonces для /approve
         self._approval_nonces: Dict[str, str] = {}
         self._pick_folder_cb: Optional[Callable[[], str]] = None
+
+    def _log_server_error(self, msg: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        with self._lock:
+            self._server_logs.append(line)
+            if len(self._server_logs) > 500:
+                del self._server_logs[: len(self._server_logs) - 500]
 
     def set_folder_picker(self, cb: Optional[Callable[[], str]]) -> None:
         self._pick_folder_cb = cb
@@ -310,7 +343,12 @@ class HarnessServer:
             def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
                 return
 
+            def send_response(self, code: int, message: Optional[str] = None) -> None:
+                self._headers_sent = True
+                super().send_response(code, message)
+
             def _read_body(self, max_bytes: int = 64 * 1024 * 1024) -> bytes:
+                self._body_consumed = True
                 raw_len = self.headers.get("Content-Length")
                 if not raw_len:
                     return b""
@@ -321,21 +359,50 @@ class HarnessServer:
                 if length <= 0:
                     return b""
                 if length > max_bytes:
+                    self.close_connection = True
                     raise ValueError("Слишком большой запрос")
                 return self.rfile.read(length)
 
+            def _drain_unread_body(self) -> None:
+                if getattr(self, "_body_consumed", False):
+                    return
+                raw_len = self.headers.get("Content-Length")
+                if not raw_len:
+                    self._body_consumed = True
+                    return
+                try:
+                    length = int(raw_len)
+                except ValueError:
+                    self.close_connection = True
+                    return
+                if length <= 0:
+                    self._body_consumed = True
+                    return
+                if length > 128 * 1024:
+                    self.close_connection = True
+                    return
+                try:
+                    self.rfile.read(length)
+                    self._body_consumed = True
+                except OSError:
+                    self.close_connection = True
+
             def _send_bytes(self, status: int, content_type: str, data: bytes, extra_headers: Optional[Mapping[str, str]] = None) -> None:
-                self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                if extra_headers:
-                    for k, v in extra_headers.items():
-                        self.send_header(k, v)
-                self.end_headers()
-                if data and self.command != "HEAD":
-                    self.wfile.write(data)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    if extra_headers:
+                        for k, v in extra_headers.items():
+                            self.send_header(k, v)
+                    self.end_headers()
+                    if data and self.command != "HEAD":
+                        self.wfile.write(data)
+                    self.wfile.flush()
+                except (OSError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    self.close_connection = True
 
             def _send_json(self, status: int, payload: Any) -> None:
                 raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -366,7 +433,12 @@ class HarnessServer:
                 return False
 
             def do_OPTIONS(self) -> None:  # noqa: N802
-                self._send_bytes(204, "text/plain", b"")
+                self._headers_sent = False
+                self._body_consumed = False
+                try:
+                    self._send_bytes(204, "text/plain", b"")
+                finally:
+                    self._drain_unread_body()
 
             def do_HEAD(self) -> None:  # noqa: N802
                 self._dispatch()
@@ -387,21 +459,38 @@ class HarnessServer:
                 self._dispatch()
 
             def _dispatch(self) -> None:
+                self._headers_sent = False
+                self._body_consumed = False
                 parsed = urllib.parse.urlparse(self.path)
                 path = parsed.path or "/"
 
-                if not path.startswith("/api/"):
-                    self._serve_ui(path)
-                    return
-
-                if not self._is_authorized_api():
-                    self._send_json(403, {"error": "Неверный локальный токен приложения"})
-                    return
-
                 try:
+                    if not path.startswith("/api/"):
+                        self._serve_ui(path)
+                        return
+
+                    if not self._is_authorized_api():
+                        self._send_json(403, {"error": "Неверный локальный токен приложения"})
+                        return
+
                     server.handle_api(self, path, parsed.query)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    self.close_connection = True
                 except Exception as exc:
-                    self._send_json(500, {"error": f"Внутренняя ошибка локального сервера: {exc}"})
+                    self.close_connection = True
+                    tb = traceback.format_exc()
+                    server._log_server_error(f"{self.command} {path}: {exc}\n{tb[-600:]}")
+                    if not getattr(self, "_headers_sent", False):
+                        self._send_json(500, {"error": f"Внутренняя ошибка локального сервера: {exc}"})
+                    else:
+                        try:
+                            err_frame = f"event: error\ndata: {json.dumps({'message': str(exc)}, ensure_ascii=False)}\n\n"
+                            self.wfile.write(err_frame.encode("utf-8"))
+                            self.wfile.flush()
+                        except OSError:
+                            pass
+                finally:
+                    self._drain_unread_body()
 
             def _serve_ui(self, req_path: str) -> None:
                 ui_root = bundle.ui_dir()
@@ -492,7 +581,182 @@ class HarnessServer:
             "port": port,
             "endpoint": f"http://127.0.0.1:{port}",
             "workspace": str(vals.get("workspace") or settings_mod.workspace_dir()),
+            "sandboxRoot": str(self._sandbox_root()),
             **(data if isinstance(data, dict) and status == 200 else {}),
+        }
+
+    def _load_sandbox_module(self) -> Any:
+        if self._sandbox_mod is not None:
+            return self._sandbox_mod
+        sb_path = bundle.agents_dir() / "sandbox.py"
+        if not sb_path.is_file():
+            return None
+        spec = importlib.util.spec_from_file_location("crm_agent_sandbox", str(sb_path))
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self._sandbox_mod = mod
+        return mod
+
+    def _sandbox_root(self, workspace_override: Optional[Path] = None) -> Path:
+        if workspace_override is not None:
+            ws_dir = workspace_override
+        else:
+            chat_spec = agent_by_id(self.catalog, "chat_agent")
+            vals = self.settings.values_for(chat_spec) if chat_spec else {}
+            ws_raw = str(vals.get("workspace") or "").strip()
+            ws_dir = Path(ws_raw).expanduser() if ws_raw else settings_mod.workspace_dir()
+        root = (ws_dir / "sandbox").resolve(strict=False)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        self._sync_legacy_sandbox(root)
+        return root
+
+    def _sync_legacy_sandbox(self, primary_root: Path) -> None:
+        key = str(primary_root)
+        if key in self._sandbox_synced_roots:
+            return
+        self._sandbox_synced_roots.add(key)
+
+        candidates: List[Path] = [
+            primary_root.parent / ".crm_agent_sandbox",
+            settings_mod.workspace_dir() / "sandbox",
+            bundle.agents_dir() / "sandbox",
+            bundle.bundle_root() / "sandbox",
+        ]
+        if getattr(sys, "frozen", False):
+            candidates.append(Path(sys.executable).resolve().parent / "sandbox")
+        else:
+            candidates.append(Path.cwd() / "sandbox")
+
+        p_res = primary_root.resolve(strict=False)
+        for cand in candidates:
+            try:
+                c_res = cand.resolve(strict=False)
+                if c_res == p_res or not c_res.is_dir():
+                    continue
+                # Защита от рекурсивного копирования, если один путь вложен в другой
+                if str(c_res).startswith(str(p_res) + os.sep) or str(p_res).startswith(str(c_res) + os.sep):
+                    continue
+                for entry in c_res.iterdir():
+                    if entry.name.startswith(".tmp") or entry.name == ".DS_Store":
+                        continue
+                    dest = p_res / entry.name
+                    if entry.is_dir():
+                        if not dest.exists():
+                            shutil.copytree(entry, dest, symlinks=False, dirs_exist_ok=True)
+                        else:
+                            # Дополняем только отсутствующие внутри старой папки файлы
+                            for sub_root, sub_dirs, sub_files in os.walk(entry, followlinks=False):
+                                sub_dirs[:] = [d for d in sub_dirs if not d.startswith(".tmp")]
+                                rel_sub = Path(sub_root).relative_to(entry)
+                                (dest / rel_sub).mkdir(parents=True, exist_ok=True)
+                                for fname in sub_files:
+                                    if fname.startswith(".tmp"):
+                                        continue
+                                    src_f = Path(sub_root) / fname
+                                    dst_f = dest / rel_sub / fname
+                                    if not dst_f.exists():
+                                        try:
+                                            shutil.copy2(src_f, dst_f)
+                                        except OSError:
+                                            pass
+                    elif entry.is_file() and not dest.exists():
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            shutil.copy2(entry, dest)
+                        except OSError:
+                            pass
+            except OSError:
+                continue
+
+    @staticmethod
+    def _format_sandbox_listing(root: Path, raw_payload: Mapping[str, Any], *, agent_running: bool) -> Dict[str, Any]:
+        raw_items = list(raw_payload.get("items") or [])
+        raw_projects = list(raw_payload.get("projects") or [])
+        root_res = root.resolve(strict=False)
+
+        # Вычисляем точный размер и число файлов каждого проекта на диске
+        projects: List[Dict[str, Any]] = []
+        seen_proj: set[str] = set()
+        for p in raw_projects:
+            if not isinstance(p, Mapping):
+                continue
+            pname = str(p.get("name") or "").strip()
+            if not pname or pname in seen_proj:
+                continue
+            seen_proj.add(pname)
+            p_dir = root_res / pname
+            f_cnt = _safe_int(p.get("files"), 0)
+            p_size = _safe_int(p.get("size"), 0)
+            if p_dir.is_dir():
+                calc_cnt = 0
+                calc_size = 0
+                for cur, dnames, fnames in os.walk(p_dir, followlinks=False):
+                    dnames[:] = [d for d in dnames if not d.startswith(".tmp") and d not in ("node_modules", ".git", ".next", "dist", "build", "__pycache__", ".venv")]
+                    for fn in fnames:
+                        if fn.startswith(".tmp"):
+                            continue
+                        calc_cnt += 1
+                        try:
+                            calc_size += (Path(cur) / fn).stat().st_size
+                        except OSError:
+                            pass
+                if calc_cnt > f_cnt or f_cnt == 0:
+                    f_cnt = calc_cnt
+                p_size = calc_size
+            projects.append({
+                "name": pname,
+                "files": f_cnt,
+                "filesCount": f_cnt,
+                "size": p_size,
+                "hasIndex": bool(p.get("hasIndex")),
+            })
+
+        items: List[Dict[str, Any]] = []
+        file_items: List[Dict[str, Any]] = []
+        root_files: List[Dict[str, Any]] = []
+        for it in raw_items:
+            if not isinstance(it, Mapping):
+                continue
+            rel_path = str(it.get("path") or "").strip()
+            if not rel_path:
+                continue
+            it_type = str(it.get("type") or "file")
+            it_size = _safe_int(it.get("size"), 0)
+            entry = {
+                "path": rel_path,
+                "name": Path(rel_path).name,
+                "type": it_type,
+                "size": it_size,
+            }
+            items.append(entry)
+            if it_type == "file":
+                file_items.append(entry)
+                if "/" not in rel_path or rel_path.startswith("downloads/"):
+                    root_files.append(entry)
+
+        total_files = len(file_items) if file_items else sum(p["files"] for p in projects)
+        total_size = sum(f["size"] for f in file_items) if file_items else sum(p["size"] for p in projects)
+        return {
+            "available": True,
+            "agentRunning": agent_running,
+            "root": str(root_res),
+            "projects": projects,
+            "items": items,
+            "files": items,
+            "rootFiles": root_files,
+            "processes": list(raw_payload.get("processes") or []),
+            "totalProjects": len(projects),
+            "projectsCount": len(projects),
+            "totalFiles": total_files,
+            "filesCount": total_files,
+            "totalSize": total_size,
+            "totalItems": _safe_int(raw_payload.get("totalItems"), len(items)),
+            "truncated": bool(raw_payload.get("truncated")),
         }
 
     def start_agent_process(self, options: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -516,7 +780,7 @@ class HarnessServer:
                 self.settings.set_value("chat_agent", "trust_level", str(opts["trust_level"]).strip())
 
             vals = self.settings.values_for(chat_spec)
-            preferred_port = int(vals.get("port") or 8899)
+            preferred_port = _safe_int(vals.get("port"), 8899) or 8899
             actual_port = _find_free_port(preferred_port)
             self._agent_port = actual_port
             self.settings.set_value("chat_agent", "port", actual_port)
@@ -525,6 +789,7 @@ class HarnessServer:
             cwd = Path(ws_raw).expanduser() if ws_raw else settings_mod.workspace_dir()
             cwd.mkdir(parents=True, exist_ok=True)
             self.settings.set_value("chat_agent", "workspace", str(cwd))
+            sandbox_root = self._sandbox_root(cwd)
 
             script = commands.script_path(chat_spec, self.settings, bundle.agents_dir())
             if script is None or not script.is_file():
@@ -535,6 +800,7 @@ class HarnessServer:
             env_vars["AGENT_PORT"] = str(actual_port)
             env_vars["AGENT_HOST"] = "127.0.0.1"
             env_vars["AGENT_WORKSPACE"] = str(cwd)
+            env_vars["AGENT_SANDBOX_DIR"] = str(sandbox_root)
 
             token = secrets.token_urlsafe(32)
             self._agent_http_token = token
@@ -543,7 +809,7 @@ class HarnessServer:
 
             child_env = bundle.child_env(env_vars)
             command = bundle.run_agent_args(script, args)
-            self._agent_logs.append(f"[{APP_NAME}] запуск Агента на 127.0.0.1:{actual_port} (папка: {cwd})")
+            self._agent_logs.append(f"[{APP_NAME}] запуск Агента на 127.0.0.1:{actual_port} (папка: {cwd}, sandbox: {sandbox_root})")
             run = AgentRun(agent_id="chat_agent", command=command, cwd=cwd, env=child_env, secrets=sec)
             run.start()
             self._agent_run = run
@@ -558,7 +824,12 @@ class HarnessServer:
             if not self.is_agent_running():
                 break
             time.sleep(0.2)
-        return self.agent_health()
+        final_health = self.agent_health()
+        if not final_health.get("available"):
+            tail = "; ".join(self._agent_logs[-5:])
+            if tail:
+                final_health["error"] = f"Агент не запустился: {tail}"
+        return final_health
 
     def stop_agent_process(self) -> Dict[str, Any]:
         with self._lock:
@@ -761,6 +1032,12 @@ class HarnessServer:
             self._proxy_crm_sse(handler, full_rel)
             return
 
+        # ---- 4.5. Локальное переименование чатов модели (если сервер не поддерживает PATCH) ----
+        m_ai_chat = re.fullmatch(r"/api/ai/chats/(\d+)", path)
+        if m_ai_chat and method == "PATCH":
+            self._api_ai_chat_patch(handler, _safe_int(m_ai_chat.group(1)), full_rel)
+            return
+
         # ---- 5. Прямой прокси к БД CRM ----
         self._proxy_crm_request(handler, full_rel)
 
@@ -926,13 +1203,15 @@ class HarnessServer:
         handler._send_json(200, {"ok": True, "harnessState": self.settings.harness_state})  # type: ignore[attr-defined]
 
     def _api_pick_folder(self, handler: BaseHTTPRequestHandler) -> None:
+        self._read_json(handler)
         chosen = ""
+        has_pywebview = bool(sys.modules.get("webview") and getattr(sys.modules["webview"], "windows", None))
         if self._pick_folder_cb is not None:
             try:
                 chosen = self._pick_folder_cb() or ""
             except Exception:
                 chosen = ""
-        elif sys.modules.get("webview") and getattr(sys.modules["webview"], "windows", None):
+        elif has_pywebview:
             try:
                 wv = sys.modules["webview"]
                 win = wv.windows[0]
@@ -944,7 +1223,7 @@ class HarnessServer:
                     chosen = picked
             except Exception:
                 chosen = ""
-        if not chosen and self._pick_folder_cb is None and (sys.modules.get("tkinter") or os.environ.get("DISPLAY") or sys.platform.startswith("win")):
+        if not chosen and self._pick_folder_cb is None and not has_pywebview and (sys.modules.get("tkinter") or os.environ.get("DISPLAY") or sys.platform.startswith("win")):
             try:
                 import tkinter as tk  # type: ignore
                 from tkinter import filedialog  # type: ignore
@@ -986,6 +1265,7 @@ class HarnessServer:
                 "runtime": bundle.runtime_info(),
                 "configPath": str(self.settings_path),
                 "workspace": str(settings_mod.workspace_dir()),
+                "sandboxRoot": str(self._sandbox_root()),
                 "deps": {
                     "operator": [
                         {
@@ -1001,6 +1281,7 @@ class HarnessServer:
                 "operatorRunning": self.is_operator_running(),
                 "agentLogs": list(self._agent_logs[-300:]),
                 "operatorLogs": list(self._operator_logs[-300:]),
+                "serverLogs": list(self._server_logs[-100:]),
             },
         )
 
@@ -1303,6 +1584,18 @@ class HarnessServer:
                 c = convs[idx]
                 handler._send_json(200, {"ok": True, "localFallback": True, "conversation": c, "messages": c.get("messages") or []})  # type: ignore[attr-defined]
                 return
+            if method == "PATCH":
+                c = dict(convs[idx])
+                if "title" in body and str(body.get("title") or "").strip():
+                    c["title"] = str(body["title"]).strip()[:120]
+                if "systemPrompt" in body:
+                    c["systemPrompt"] = str(body.get("systemPrompt") or "")
+                c["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                convs[idx] = c
+                store["conversations"] = convs
+                self._save_local_conversations_store(store)
+                handler._send_json(200, {"ok": True, "localFallback": True, "conversation": c})  # type: ignore[attr-defined]
+                return
             if method == "DELETE":
                 convs.pop(idx)
                 store["conversations"] = convs
@@ -1319,9 +1612,14 @@ class HarnessServer:
                     msgs.append({
                         "role": str(body.get("role") or "user"),
                         "content": str(body.get("content") or ""),
+                        "reasoning": str(body.get("reasoning") or ""),
+                        "actions": body.get("actions") if isinstance(body.get("actions"), list) else [],
+                        "files": body.get("files") if isinstance(body.get("files"), list) else [],
+                        "error": str(body.get("error") or ""),
                         "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     })
                     c["messages"] = msgs
+                    c["messagesCount"] = len(msgs)
                     c["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                     store["conversations"] = convs
                     self._save_local_conversations_store(store)
@@ -1332,11 +1630,202 @@ class HarnessServer:
 
         handler._send_json(200, {"ok": True, "localFallback": True})  # type: ignore[attr-defined]
 
+    def _load_local_transcripts_store(self) -> Dict[str, Any]:
+        p = self._local_store_path("transcripts_local.json")
+        if not p.is_file():
+            return {"nextId": 1, "transcripts": []}
+        try:
+            data = json.loads(p.read_text(encoding="utf-8") or "{}")
+            if isinstance(data, dict) and isinstance(data.get("transcripts"), list):
+                return data
+        except Exception:
+            pass
+        return {"nextId": 1, "transcripts": []}
+
+    def _save_local_transcripts_store(self, data: Dict[str, Any]) -> None:
+        p = self._local_store_path("transcripts_local.json")
+        try:
+            p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _handle_local_transcripts_api(self, handler: BaseHTTPRequestHandler, method: str, path: str, query: str, raw_body: bytes) -> None:
+        store = self._load_local_transcripts_store()
+        items: List[Dict[str, Any]] = list(store.get("transcripts") or [])
+        body: Dict[str, Any] = {}
+        if raw_body:
+            try:
+                parsed = json.loads(raw_body.decode("utf-8") or "{}")
+                if isinstance(parsed, dict):
+                    body = parsed
+            except json.JSONDecodeError:
+                pass
+
+        if path == "/api/agent/transcripts" and method == "GET":
+            meta_only = [
+                {k: v for k, v in t.items() if k != "content"}
+                for t in items
+            ]
+            handler._send_json(200, {"ok": True, "localFallback": True, "transcripts": meta_only})  # type: ignore[attr-defined]
+            return
+
+        if path == "/api/agent/transcripts" and method == "POST":
+            content = str(body.get("content") or "")
+            if not content.strip():
+                handler._send_json(400, {"error": "Пустое содержимое переписки"})  # type: ignore[attr-defined]
+                return
+            tid = int(store.get("nextId") or 1)
+            store["nextId"] = tid + 1
+            title = str(body.get("title") or "Переписка агента").strip() or "Переписка агента"
+            raw_fname = str(body.get("fileName") or "").strip() or f"transcript-{tid}.md"
+            safe_fname = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "-", Path(raw_fname).name).strip(" .") or f"transcript-{tid}.md"
+            item = {
+                "id": tid,
+                "conversationId": _safe_int(body.get("conversationId"), 0),
+                "title": title[:140],
+                "summary": str(body.get("summary") or ""),
+                "fileName": safe_fname,
+                "content": content,
+                "chars": len(content),
+                "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            items.insert(0, item)
+            store["transcripts"] = items
+            self._save_local_transcripts_store(store)
+            # Дублируем также на диск Sandbox в папку transcripts/
+            try:
+                sb_mod = self._load_sandbox_module()
+                if sb_mod is not None:
+                    sb_mod.write_file(self._sandbox_root(), f"transcripts/{safe_fname}", content, unlimited=True)
+            except Exception:
+                pass
+            meta = {k: v for k, v in item.items() if k != "content"}
+            handler._send_json(201, {"ok": True, "localFallback": True, "transcript": meta})  # type: ignore[attr-defined]
+            return
+
+        m_tid = re.fullmatch(r"/api/agent/transcripts/(\d+)", path)
+        if m_tid:
+            tid = int(m_tid.group(1))
+            idx = next((i for i, t in enumerate(items) if int(t.get("id") or 0) == tid), -1)
+            if idx < 0:
+                handler._send_json(404, {"error": "Файл переписки не найден"})  # type: ignore[attr-defined]
+                return
+            t = items[idx]
+            if method == "GET":
+                qs = urllib.parse.parse_qs(query)
+                if (qs.get("format") or [""])[0] == "json":
+                    handler._send_json(200, {"ok": True, "localFallback": True, "transcript": t})  # type: ignore[attr-defined]
+                    return
+                fname = str(t.get("fileName") or f"transcript-{tid}.md")
+                ascii_name = re.sub(r"[^\x20-\x7e]", "_", fname)
+                disp = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{urllib.parse.quote(fname)}'
+                handler._send_bytes(200, "text/markdown; charset=utf-8", str(t.get("content") or "").encode("utf-8"), {"Content-Disposition": disp})  # type: ignore[attr-defined]
+                return
+            if method == "DELETE":
+                items.pop(idx)
+                store["transcripts"] = items
+                self._save_local_transcripts_store(store)
+                handler._send_json(200, {"ok": True, "localFallback": True})  # type: ignore[attr-defined]
+                return
+
+        handler._send_json(404, {"error": "Not found"})  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------
+    # Локальные названия чатов модели (overlay при отсутствии PATCH в CRM)
+    # ------------------------------------------------------------------
+    def _chat_title_key(self, chat_id: int) -> str:
+        crm_url, _ = self._crm_auth()
+        user_id = (crm_client.profile_user(self.settings.crm_profile) or {}).get("id") or 0
+        return f"{crm_url}|{user_id}|{int(chat_id)}"
+
+    def _load_chat_titles_map(self) -> Dict[str, str]:
+        p = self._local_store_path("chat_titles_local.json")
+        if not p.is_file():
+            return {}
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8") or "{}")
+            return {str(k): str(v) for k, v in loaded.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_chat_titles_map(self, titles: Mapping[str, str]) -> None:
+        p = self._local_store_path("chat_titles_local.json")
+        try:
+            p.write_text(json.dumps(dict(titles), ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _apply_chat_titles_overlay(self, payload: Any) -> Any:
+        if not isinstance(payload, dict):
+            return payload
+        titles = self._load_chat_titles_map()
+        if not titles:
+            return payload
+        if isinstance(payload.get("chats"), list):
+            for c in payload["chats"]:
+                if isinstance(c, dict) and c.get("id"):
+                    ov = titles.get(self._chat_title_key(_safe_int(c.get("id"))))
+                    if ov:
+                        c["title"] = ov
+        if isinstance(payload.get("chat"), dict) and payload["chat"].get("id"):
+            ov = titles.get(self._chat_title_key(_safe_int(payload["chat"].get("id"))))
+            if ov:
+                payload["chat"]["title"] = ov
+        return payload
+
+    def _api_ai_chat_patch(self, handler: BaseHTTPRequestHandler, chat_id: int, full_rel: str) -> None:
+        raw = handler._read_body()  # type: ignore[attr-defined]
+        try:
+            body = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            handler._send_json(400, {"error": "Некорректный JSON"})  # type: ignore[attr-defined]
+            return
+        title = str((body if isinstance(body, dict) else {}).get("title") or "").strip()[:120]
+        if not title:
+            handler._send_json(400, {"error": "Укажите новое название чата"})  # type: ignore[attr-defined]
+            return
+
+        crm_url, crm_token = self._crm_auth()
+        try:
+            with crm_client.open_crm_stream(
+                "PATCH",
+                crm_url,
+                full_rel,
+                bearer_token=crm_token,
+                body=raw,
+                headers={"Content-Type": "application/json"},
+                timeout=20.0,
+            ) as resp:
+                data = resp.read()
+                # Если сервер CRM уже поддержал PATCH — синхронизируем и локально
+                titles = self._load_chat_titles_map()
+                titles.pop(self._chat_title_key(chat_id), None)
+                self._save_chat_titles_map(titles)
+                handler._send_bytes(int(getattr(resp, "status", 200) or 200), "application/json; charset=utf-8", data)  # type: ignore[attr-defined]
+                return
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (404, 405, 501):
+                err_bytes = exc.read()
+                ct_err = (exc.headers.get("Content-Type") if exc.headers else "") or ""
+                if "application/json" in ct_err.lower() and err_bytes.lstrip().startswith(b"{"):
+                    handler._send_bytes(int(exc.code), "application/json; charset=utf-8", err_bytes)  # type: ignore[attr-defined]
+                else:
+                    handler._send_json(int(exc.code), {"error": f"Сервер CRM ответил HTTP {int(exc.code)}"})  # type: ignore[attr-defined]
+                return
+        except Exception:
+            pass
+
+        titles = self._load_chat_titles_map()
+        titles[self._chat_title_key(chat_id)] = title
+        self._save_chat_titles_map(titles)
+        handler._send_json(200, {"ok": True, "localTitle": True, "chat": {"id": chat_id, "title": title}})  # type: ignore[attr-defined]
+
     # ------------------------------------------------------------------
     # Прокси к БД CRM
     # ------------------------------------------------------------------
     def _proxy_crm_request(self, handler: BaseHTTPRequestHandler, full_rel: str) -> None:
         crm_url, crm_token = self._crm_auth()
+        method = handler.command.upper()
         raw_body = b""
         try:
             raw_body = handler._read_body()  # type: ignore[attr-defined]
@@ -1350,33 +1839,68 @@ class HarnessServer:
             if v:
                 in_headers[k] = v
 
+        if method in ("POST", "PUT", "PATCH"):
+            send_body: Optional[bytes] = raw_body
+            if not send_body and "Content-Type" not in in_headers:
+                in_headers["Content-Type"] = "application/json"
+        else:
+            send_body = raw_body if raw_body else None
+            if send_body is None:
+                in_headers.pop("Content-Type", None)
+
+        parsed_rel = urllib.parse.urlparse(full_rel)
+        req_path = parsed_rel.path or "/"
+
         try:
             with crm_client.open_crm_stream(
-                handler.command,
+                method,
                 crm_url,
                 full_rel,
                 bearer_token=crm_token,
-                body=raw_body if handler.command.upper() not in ("GET", "HEAD") and raw_body else None,
+                body=send_body,
                 headers=in_headers,
                 timeout=90.0,
             ) as resp:
                 ct = resp.headers.get("Content-Type") or "application/json; charset=utf-8"
                 data = resp.read()
+                if "application/json" in ct.lower() and (req_path == "/api/ai/chats" or req_path.startswith("/api/ai/chats/")):
+                    if method == "GET":
+                        try:
+                            parsed_json = json.loads(data.decode("utf-8", "replace") or "{}")
+                            patched = self._apply_chat_titles_overlay(parsed_json)
+                            data = json.dumps(patched, ensure_ascii=False).encode("utf-8")
+                        except Exception:
+                            pass
+                    elif method == "DELETE":
+                        qs_del = urllib.parse.parse_qs(parsed_rel.query)
+                        del_id = _safe_int((qs_del.get("id") or [""])[0])
+                        if del_id <= 0:
+                            m_del = re.fullmatch(r"/api/ai/chats/(\d+)", req_path)
+                            if m_del:
+                                del_id = _safe_int(m_del.group(1))
+                        if del_id > 0:
+                            titles = self._load_chat_titles_map()
+                            if titles.pop(self._chat_title_key(del_id), None) is not None:
+                                self._save_chat_titles_map(titles)
                 extra: Dict[str, str] = {}
                 disp = resp.headers.get("Content-Disposition")
                 if disp:
                     extra["Content-Disposition"] = disp
                 handler._send_bytes(int(getattr(resp, "status", 200) or 200), ct, data, extra)  # type: ignore[attr-defined]
         except urllib.error.HTTPError as exc:
-            raw_err = exc.read()
+            try:
+                raw_err = exc.read()
+            except Exception:
+                raw_err = b""
             if self._is_missing_crm_route_404(exc, raw_err):
-                parsed = urllib.parse.urlparse(full_rel)
-                req_path = parsed.path or "/"
                 if req_path == "/api/agent/subagents" or req_path.startswith("/api/agent/subagents/"):
-                    self._handle_local_subagents_api(handler, handler.command.upper(), req_path, parsed.query, raw_body)
+                    self._handle_local_subagents_api(handler, method, req_path, parsed_rel.query, raw_body)
                     return
                 if req_path == "/api/agent/conversations" or req_path.startswith("/api/agent/conversations/"):
-                    self._handle_local_conversations_api(handler, handler.command.upper(), req_path, parsed.query, raw_body)
+                    self._handle_local_conversations_api(handler, method, req_path, parsed_rel.query, raw_body)
+                    return
+                if req_path == "/api/agent/transcripts" or req_path.startswith("/api/agent/transcripts/"):
+                    self._handle_local_transcripts_api(handler, method, req_path, parsed_rel.query, raw_body)
                     return
                 handler._send_json(  # type: ignore[attr-defined]
                     404,
@@ -1386,11 +1910,17 @@ class HarnessServer:
                     },
                 )
                 return
-            ct = exc.headers.get("Content-Type") if exc.headers else "application/json; charset=utf-8"
-            handler._send_bytes(int(exc.code), ct or "application/json; charset=utf-8", raw_err)  # type: ignore[attr-defined]
+            ct = (exc.headers.get("Content-Type") if exc.headers else "") or "application/json; charset=utf-8"
+            code = int(exc.code)
+            if "text/html" in ct.lower() or (code >= 500 and not raw_err.lstrip().startswith(b"{")):
+                self._log_server_error(f"CRM {method} {full_rel} -> HTTP {code}")
+                handler._send_json(code, {"error": f"Сервер CRM ответил HTTP {code} на {req_path}"})  # type: ignore[attr-defined]
+                return
+            handler._send_bytes(code, ct, raw_err)  # type: ignore[attr-defined]
         except crm_client.CrmClientError as exc:
             handler._send_json(502, {"error": str(exc)})  # type: ignore[attr-defined]
         except Exception as exc:
+            self._log_server_error(f"Proxy CRM {method} {full_rel}: {exc}")
             handler._send_json(502, {"error": f"Ошибка связи с CRM: {exc}"})  # type: ignore[attr-defined]
 
     def _proxy_crm_sse(self, handler: BaseHTTPRequestHandler, full_rel: str) -> None:
@@ -1645,9 +2175,9 @@ class HarnessServer:
                     u = parsed.get("usage") if isinstance(parsed.get("usage"), Mapping) else None
                     if u:
                         usage_rep = {
-                            "prompt": int(u.get("prompt_tokens") or 0),
-                            "completion": int(u.get("completion_tokens") or 0),
-                            "total": int(u.get("total_tokens") or 0),
+                            "prompt": _safe_int(u.get("prompt_tokens")),
+                            "completion": _safe_int(u.get("completion_tokens")),
+                            "total": _safe_int(u.get("total_tokens")),
                         }
                     if thinking:
                         push_sse({"reasoning": thinking})
@@ -1680,9 +2210,9 @@ class HarnessServer:
                         u = chunk.get("usage")
                         if isinstance(u, Mapping) and (u.get("prompt_tokens") or u.get("completion_tokens")):
                             usage_rep = {
-                                "prompt": int(u.get("prompt_tokens") or 0),
-                                "completion": int(u.get("completion_tokens") or 0),
-                                "total": int(u.get("total_tokens") or 0),
+                                "prompt": _safe_int(u.get("prompt_tokens")),
+                                "completion": _safe_int(u.get("completion_tokens")),
+                                "total": _safe_int(u.get("total_tokens")),
                             }
                             push_sse({"usage": usage_rep})
 
@@ -1708,13 +2238,16 @@ class HarnessServer:
                     summary = json.loads(rec_resp.read().decode("utf-8", "replace") or "{}")
             except Exception:
                 pass
+            chat_out = summary.get("chat") or chat_info
+            if isinstance(chat_out, dict):
+                chat_out = self._apply_chat_titles_overlay({"chat": dict(chat_out)}).get("chat") or chat_out
             push_sse({
                 "done": True,
                 "ragHits": rag_hits,
                 "ragFull": rag_full,
                 "reasoningDowngraded": bool(prep.get("reasoningDowngraded")),
                 "usage": summary.get("usage") or usage_rep or {"prompt": 0, "completion": 0, "total": 0, "estimated": True},
-                "chat": summary.get("chat") or chat_info,
+                "chat": chat_out,
                 "monthly": summary.get("monthly") or prep.get("monthly"),
             })
         except (OSError, BrokenPipeError, ConnectionResetError):
@@ -1789,7 +2322,7 @@ class HarnessServer:
 
         agent_role = str(body.get("agentRole") or "agent")
         trust_level = str(body.get("trustLevel") or "verified")
-        max_steps = int(body.get("maxSteps") or 60)
+        max_steps = _safe_int(body.get("maxSteps"), 60) or 60
         sandbox_project = str(body.get("sandboxProject") or "").strip()
         messages = [dict(m) for m in (body.get("messages") or []) if isinstance(m, Mapping)]
 
@@ -1882,8 +2415,16 @@ class HarnessServer:
                 except ValueError as verr:
                     handler._send_json(400, {"error": str(verr)})  # type: ignore[attr-defined]
                     return
+                except Exception as ferr:
+                    self._log_server_error(f"_fallback_prepare_agent: {ferr}")
+                    handler._send_json(502, {"error": f"Не удалось подготовить локальный запуск Агента: {ferr}"})  # type: ignore[attr-defined]
+                    return
             else:
-                handler._send_bytes(int(exc.code), "application/json; charset=utf-8", exc.read())  # type: ignore[attr-defined]
+                try:
+                    err_raw = exc.read()
+                except Exception:
+                    err_raw = b""
+                handler._send_bytes(int(exc.code), "application/json; charset=utf-8", err_raw or b"{}")  # type: ignore[attr-defined]
                 return
         except Exception as exc:
             handler._send_json(502, {"error": f"Ошибка подготовки запуска в CRM: {exc}"})  # type: ignore[attr-defined]
@@ -1892,7 +2433,7 @@ class HarnessServer:
         full_payload = prep.get("payload") if isinstance(prep.get("payload"), dict) else {}
         meta = prep.get("meta") if isinstance(prep.get("meta"), dict) else {}
         model_name = str(meta.get("model") or "")
-        prompt_est = int(meta.get("promptEst") or 0)
+        prompt_est = _safe_int(meta.get("promptEst"), 0)
         agent_role = str(meta.get("agentRole") or "agent")
         sandbox_project = str(meta.get("sandboxProject") or "")
         subagent_id = meta.get("subagentId")
@@ -1900,10 +2441,18 @@ class HarnessServer:
         tester_conv_id = meta.get("testerConversationId")
         subagent_conv_id = meta.get("subagentConversationId")
 
-        health = self.ensure_agent_running()
-        if not health.get("available"):
-            handler._send_json(503, {"error": "Не удалось запустить встроенный локальный Агент"})  # type: ignore[attr-defined]
+        try:
+            health = self.ensure_agent_running()
+        except Exception as exc:
+            self._log_server_error(f"ensure_agent_running: {exc}")
+            handler._send_json(503, {"error": f"Не удалось запустить встроенный локальный Агент: {exc}"})  # type: ignore[attr-defined]
             return
+        if not health.get("available"):
+            err_msg = str(health.get("error") or "Не удалось запустить встроенный локальный Агент")
+            handler._send_json(503, {"error": err_msg})  # type: ignore[attr-defined]
+            return
+
+        sandbox_root = self._sandbox_root()
 
         port = self._agent_port
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
@@ -2051,14 +2600,27 @@ class HarnessServer:
                     parsed["subagentId"] = mapped["subagentId"]
                     parsed["subagentConversationId"] = mapped["subagentConversationId"]
                     touch_open_heartbeats()
+                if ev == "subagent_action" and parsed.get("type") == "file":
+                    f_name = parsed.get("name") or parsed.get("fileName")
+                    f_b64 = parsed.get("data") or parsed.get("dataBase64")
+                    if f_name and f_b64:
+                        try:
+                            raw_name = Path(str(f_name)).name
+                            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_name).strip(" .") or "file.bin"
+                            dl_dir = sandbox_root / "downloads"
+                            dl_dir.mkdir(parents=True, exist_ok=True)
+                            (dl_dir / safe_name).write_bytes(base64.b64decode(str(f_b64), validate=False))
+                            parsed["sandboxPath"] = f"downloads/{safe_name}"
+                        except Exception:
+                            pass
                 return f"event: {ev}\ndata: {json.dumps(parsed, ensure_ascii=False)}\n\n"
             elif ev == "subagent_done":
                 rk = str(parsed.get("runKey") or "default")
                 mapped = active_subagents.get(rk)
                 u = parsed.get("usage") if isinstance(parsed.get("usage"), Mapping) else {}
-                sp = max(0, int(round(float(u.get("prompt") or u.get("prompt_tokens") or parsed.get("promptTokens") or 0))))
-                sc = max(0, int(round(float(u.get("completion") or u.get("completion_tokens") or parsed.get("completionTokens") or 0))))
-                st_tok = max(0, int(round(float(u.get("total") or u.get("total_tokens") or parsed.get("totalTokens") or 0))))
+                sp = max(0, _safe_int(u.get("prompt") or u.get("prompt_tokens") or parsed.get("promptTokens"), 0))
+                sc = max(0, _safe_int(u.get("completion") or u.get("completion_tokens") or parsed.get("completionTokens"), 0))
+                st_tok = max(0, _safe_int(u.get("total") or u.get("total_tokens") or parsed.get("totalTokens"), 0))
                 if mapped:
                     closed_subagents.add(rk)
                     synced = self._sync_agent_event({
@@ -2123,6 +2685,20 @@ class HarnessServer:
                     parsed.setdefault("runId", active_subagents[srk]["runId"])
                     parsed.setdefault("subagentId", active_subagents[srk]["subagentId"])
                     parsed.setdefault("subagentConversationId", active_subagents[srk]["subagentConversationId"])
+                if parsed.get("type") == "file":
+                    f_name = parsed.get("name") or parsed.get("fileName")
+                    f_b64 = parsed.get("data") or parsed.get("dataBase64")
+                    if f_name and f_b64:
+                        try:
+                            raw_name = Path(str(f_name)).name
+                            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_name).strip(" .") or "file.bin"
+                            dl_dir = sandbox_root / "downloads"
+                            dl_dir.mkdir(parents=True, exist_ok=True)
+                            file_bytes = base64.b64decode(str(f_b64), validate=False)
+                            (dl_dir / safe_name).write_bytes(file_bytes)
+                            parsed["sandboxPath"] = f"downloads/{safe_name}"
+                        except Exception:
+                            pass
                 return f"event: action\ndata: {json.dumps(parsed, ensure_ascii=False)}\n\n"
             elif ev == "tester_done":
                 rk = str(parsed.get("runKey") or "default")
@@ -2138,9 +2714,9 @@ class HarnessServer:
                         "minorIssues": parsed.get("minorIssues"),
                         "checksRun": parsed.get("checksRun"),
                         "minorDecision": parsed.get("minorDecision"),
-                        "promptTokens": int(u.get("prompt") or u.get("prompt_tokens") or parsed.get("promptTokens") or 0),
-                        "completionTokens": int(u.get("completion") or u.get("completion_tokens") or parsed.get("completionTokens") or 0),
-                        "totalTokens": int(u.get("total") or u.get("total_tokens") or parsed.get("totalTokens") or 0),
+                        "promptTokens": _safe_int(u.get("prompt") or u.get("prompt_tokens") or parsed.get("promptTokens"), 0),
+                        "completionTokens": _safe_int(u.get("completion") or u.get("completion_tokens") or parsed.get("completionTokens"), 0),
+                        "totalTokens": _safe_int(u.get("total") or u.get("total_tokens") or parsed.get("totalTokens"), 0),
                         "model": parsed.get("model") or model_name,
                         "fullResponse": parsed.get("fullResponse") or "",
                         "reasoning": parsed.get("reasoning") or "",
@@ -2173,9 +2749,9 @@ class HarnessServer:
                 return f"event: tester_decision\ndata: {json.dumps(parsed, ensure_ascii=False)}\n\n"
             elif ev == "done" and isinstance(parsed.get("usage"), Mapping):
                 u = parsed["usage"]
-                rep_prompt = max(rep_prompt, int(round(float(u.get("prompt_tokens") or u.get("promptTokens") or u.get("prompt") or 0))))
-                rep_comp = max(rep_comp, int(round(float(u.get("completion_tokens") or u.get("completionTokens") or u.get("completion") or 0))))
-                rep_total = max(rep_total, int(round(float(u.get("total_tokens") or u.get("totalTokens") or u.get("total") or 0))))
+                rep_prompt = max(rep_prompt, _safe_int(u.get("prompt_tokens") or u.get("promptTokens") or u.get("prompt"), 0))
+                rep_comp = max(rep_comp, _safe_int(u.get("completion_tokens") or u.get("completionTokens") or u.get("completion"), 0))
+                rep_total = max(rep_total, _safe_int(u.get("total_tokens") or u.get("totalTokens") or u.get("total"), 0))
             return frame_text + "\n\n"
 
         def flush_usage() -> None:
@@ -2271,15 +2847,70 @@ class HarnessServer:
             return
         handler._send_json(st, data)  # type: ignore[attr-defined]
 
+    def _serve_local_sandbox_preview(self, handler: BaseHTTPRequestHandler, method: str, sandbox_root: Path, tail: str) -> None:
+        sb_mod = self._load_sandbox_module()
+        if sb_mod is None:
+            handler._send_json(503, {"error": "Модуль Sandbox не найден"})  # type: ignore[attr-defined]
+            return
+        clean_tail = urllib.parse.unquote((tail or "").lstrip("/"))
+        parts = [p for p in clean_tail.split("/") if p]
+        if not parts:
+            listing = sb_mod.list_tree(sandbox_root, ".", unlimited=False)
+            projects = listing.get("projects") or []
+            links = "".join(
+                f'<li><a href="/api/ai/agent/sandbox/preview/{urllib.parse.quote(p["name"])}/?ht={urllib.parse.quote(self.app_token)}">{p["name"]}</a></li>'
+                for p in projects
+            )
+            html_idx = f"<!doctype html><html><meta charset='utf-8'><body><h3>Проекты Sandbox</h3><ul>{links}</ul></body></html>".encode("utf-8")
+            handler._send_bytes(200, "text/html; charset=utf-8", html_idx if method != "HEAD" else b"")  # type: ignore[attr-defined]
+            return
+
+        try:
+            target = sb_mod.safe_resolve(sandbox_root, "/".join(parts), allow_root=False)
+        except Exception as exc:
+            handler._send_json(400, {"error": str(exc)})  # type: ignore[attr-defined]
+            return
+
+        if target.is_dir():
+            if not (tail or "").endswith("/"):
+                loc = f"/api/ai/agent/sandbox/preview/{'/'.join(urllib.parse.quote(p) for p in parts)}/?ht={urllib.parse.quote(self.app_token)}"
+                handler._send_bytes(302, "text/plain; charset=utf-8", b"", {"Location": loc})  # type: ignore[attr-defined]
+                return
+            candidate = None
+            for sub in ("index.html", "dist/index.html", "build/index.html", "public/index.html", "out/index.html"):
+                cand = target / sub
+                if cand.is_file():
+                    candidate = cand
+                    break
+            if candidate is None:
+                htmls = sorted(p for p in target.glob("*.html") if p.is_file())
+                candidate = htmls[0] if htmls else None
+            if candidate is None:
+                handler._send_bytes(404, "text/plain; charset=utf-8", "index.html не найден в проекте".encode("utf-8"))  # type: ignore[attr-defined]
+                return
+            target = candidate
+
+        if not target.is_file():
+            handler._send_bytes(404, "text/plain; charset=utf-8", "Файл не найден".encode("utf-8"))  # type: ignore[attr-defined]
+            return
+
+        ct = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        if ct.startswith("text/") or ct in ("application/javascript", "application/json", "image/svg+xml"):
+            if "charset=" not in ct:
+                ct = f"{ct}; charset=utf-8"
+        raw_data = b"" if method == "HEAD" else target.read_bytes()
+        if method != "HEAD" and "text/html" in ct.lower():
+            proj = parts[0]
+            proj_base = f"/api/ai/agent/sandbox/preview/{urllib.parse.quote(proj)}"
+            raw_data = _rewrite_sandbox_preview_html(raw_data.decode("utf-8", "replace"), proj_base, self.app_token).encode("utf-8")
+        handler._send_bytes(200, ct, raw_data)  # type: ignore[attr-defined]
+
     def _api_agent_sandbox(self, handler: BaseHTTPRequestHandler, path: str, query: str) -> None:
         method = handler.command.upper()
         health = self.agent_health()
-        if not health.get("available"):
-            if path == "/api/ai/agent/sandbox" and method == "GET" and not query:
-                handler._send_json(200, {"available": False, "files": [], "projects": [], "processes": []})  # type: ignore[attr-defined]
-                return
-            handler._send_json(503, {"error": "Локальный Агент не запущен"})  # type: ignore[attr-defined]
-            return
+        agent_ok = bool(health.get("available"))
+        sandbox_root = self._sandbox_root()
+        sb_mod = self._load_sandbox_module()
 
         headers: Dict[str, str] = {}
         if self._agent_http_token:
@@ -2289,22 +2920,51 @@ class HarnessServer:
             qs = urllib.parse.parse_qs(query)
             if "download" in qs:
                 dl = qs["download"][0]
-                req = urllib.request.Request(
-                    f"http://127.0.0.1:{self._agent_port}/sandbox/download?path={urllib.parse.quote(dl)}",
-                    headers=headers,
-                )
+                if agent_ok:
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{self._agent_port}/sandbox/download?path={urllib.parse.quote(dl)}",
+                        headers=headers,
+                    )
+                    try:
+                        with _local_opener().open(req, timeout=30.0) as resp:
+                            ct = resp.headers.get("Content-Type") or "application/octet-stream"
+                            extra = {}
+                            if resp.headers.get("Content-Disposition"):
+                                extra["Content-Disposition"] = resp.headers["Content-Disposition"]
+                            handler._send_bytes(200, ct, resp.read(), extra)  # type: ignore[attr-defined]
+                            return
+                    except urllib.error.HTTPError as exc:
+                        if exc.code not in (404, 502, 503):
+                            handler._send_bytes(int(exc.code), "application/json; charset=utf-8", exc.read())  # type: ignore[attr-defined]
+                            return
+                    except Exception:
+                        pass
+                if sb_mod is None:
+                    handler._send_json(503, {"error": "Модуль Sandbox не найден"})  # type: ignore[attr-defined]
+                    return
                 try:
-                    with urllib.request.urlopen(req, timeout=30.0) as resp:
-                        ct = resp.headers.get("Content-Type") or "application/octet-stream"
-                        extra = {}
-                        if resp.headers.get("Content-Disposition"):
-                            extra["Content-Disposition"] = resp.headers["Content-Disposition"]
-                        handler._send_bytes(200, ct, resp.read(), extra)  # type: ignore[attr-defined]
-                except urllib.error.HTTPError as exc:
-                    handler._send_bytes(int(exc.code), "application/json; charset=utf-8", exc.read())  # type: ignore[attr-defined]
+                    data_bytes, dl_name = sb_mod.zip_path(sandbox_root, dl)
+                    ct = mimetypes.guess_type(dl_name)[0] or ("application/zip" if dl_name.endswith(".zip") else "application/octet-stream")
+                    ascii_name = re.sub(r"[^\x20-\x7e]", "_", dl_name)
+                    disp = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{urllib.parse.quote(dl_name)}'
+                    handler._send_bytes(200, ct, data_bytes, {"Content-Disposition": disp})  # type: ignore[attr-defined]
+                except Exception as exc:
+                    handler._send_json(404, {"error": str(exc)})  # type: ignore[attr-defined]
                 return
-            st, data = _http_json_local("GET", f"http://127.0.0.1:{self._agent_port}/sandbox", headers=headers, timeout=12.0)
-            handler._send_json(st or 200, data)  # type: ignore[attr-defined]
+
+            raw_listing: Dict[str, Any] = {}
+            if agent_ok:
+                st, data = _http_json_local("GET", f"http://127.0.0.1:{self._agent_port}/sandbox", headers=headers, timeout=12.0)
+                if st == 200 and isinstance(data, dict):
+                    raw_listing = data
+            if not raw_listing and sb_mod is not None:
+                try:
+                    raw_listing = sb_mod.list_tree(sandbox_root, ".", unlimited=False)
+                except Exception as exc:
+                    self._log_server_error(f"list_tree: {exc}")
+                    raw_listing = {"items": [], "projects": [], "processes": []}
+            formatted = self._format_sandbox_listing(sandbox_root, raw_listing, agent_running=agent_ok)
+            handler._send_json(200, formatted)  # type: ignore[attr-defined]
             return
 
         if path == "/api/ai/agent/sandbox" and method == "POST":
@@ -2320,29 +2980,75 @@ class HarnessServer:
             if not target:
                 handler._send_json(400, {"error": "Неизвестное действие Sandbox"})  # type: ignore[attr-defined]
                 return
-            st, data = _http_json_local("POST", f"http://127.0.0.1:{self._agent_port}{target}", headers=headers, body=body, timeout=20.0)
-            handler._send_json(st or 503, data)  # type: ignore[attr-defined]
+
+            if action == "stop_process":
+                if not agent_ok:
+                    handler._send_json(503, {"error": "Процесс не найден — Агент не запущен"})  # type: ignore[attr-defined]
+                    return
+                body["pid"] = _safe_int(body.get("pid"), 0)
+                st, data = _http_json_local("POST", f"http://127.0.0.1:{self._agent_port}{target}", headers=headers, body=body, timeout=20.0)
+                handler._send_json(st or 503, data)  # type: ignore[attr-defined]
+                return
+
+            if agent_ok:
+                st, data = _http_json_local("POST", f"http://127.0.0.1:{self._agent_port}{target}", headers=headers, body=body, timeout=20.0)
+                if st != 0:
+                    handler._send_json(st, data)  # type: ignore[attr-defined]
+                    return
+
+            if sb_mod is None:
+                handler._send_json(503, {"error": "Модуль Sandbox не найден"})  # type: ignore[attr-defined]
+                return
+            try:
+                if action == "export":
+                    res = sb_mod.export_path(sandbox_root, str(body.get("path") or ""), str(body.get("destination") or ""))
+                    handler._send_json(200, {"ok": True, **res})  # type: ignore[attr-defined]
+                elif action == "delete":
+                    ok = sb_mod.delete_path(sandbox_root, str(body.get("path") or ""))
+                    handler._send_json(200 if ok else 404, {"ok": bool(ok), **({} if ok else {"error": "Не найдено в Sandbox"})})  # type: ignore[attr-defined]
+                elif action == "write_transcript":
+                    raw_tname = str(body.get("path") or body.get("fileName") or "transcript.md").strip()
+                    safe_tname = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(raw_tname).name).strip(" .") or "transcript.md"
+                    target_rel = raw_tname if ("/" in raw_tname or raw_tname.startswith("transcripts")) else f"transcripts/{safe_tname}"
+                    res = sb_mod.write_file(sandbox_root, target_rel, str(body.get("content") or ""), unlimited=True)
+                    handler._send_json(200, {"ok": True, **res})  # type: ignore[attr-defined]
+            except Exception as exc:
+                handler._send_json(400, {"error": str(exc)})  # type: ignore[attr-defined]
             return
 
         if path.startswith("/api/ai/agent/sandbox/preview"):
             tail = path[len("/api/ai/agent/sandbox/preview"):]
-            up_url = f"http://127.0.0.1:{self._agent_port}/sandbox/preview{tail or '/'}" + (f"?{query}" if query else "")
-            req_headers = {**headers, "X-Sandbox-Prefix": "/api/ai/agent/sandbox/preview"}
-            req = urllib.request.Request(up_url, headers=req_headers, method=method)
-            try:
-                with urllib.request.urlopen(req, timeout=20.0) as resp:
-                    ct = resp.headers.get("Content-Type") or "application/octet-stream"
-                    raw_data = resp.read() if method != "HEAD" else b""
-                    if method != "HEAD" and "text/html" in ct.lower():
-                        parts = [p for p in tail.strip("/").split("/") if p]
-                        proj = parts[0] if parts else ""
-                        proj_base = f"/api/ai/agent/sandbox/preview/{urllib.parse.quote(proj)}" if proj else "/api/ai/agent/sandbox/preview"
-                        raw_data = _rewrite_sandbox_preview_html(raw_data.decode("utf-8", "replace"), proj_base, self.app_token).encode("utf-8")
-                    handler._send_bytes(int(getattr(resp, "status", 200) or 200), ct, raw_data)  # type: ignore[attr-defined]
-            except urllib.error.HTTPError as exc:
-                handler._send_bytes(int(exc.code), "text/plain; charset=utf-8", exc.read())  # type: ignore[attr-defined]
-            except Exception as exc:
-                handler._send_json(503, {"error": f"Sandbox preview недоступен: {exc}"})  # type: ignore[attr-defined]
+            if agent_ok:
+                up_url = f"http://127.0.0.1:{self._agent_port}/sandbox/preview{tail or '/'}" + (f"?{query}" if query else "")
+                req_headers = {**headers, "X-Sandbox-Prefix": "/api/ai/agent/sandbox/preview"}
+                req = urllib.request.Request(up_url, headers=req_headers, method=method)
+                try:
+                    with _local_opener(follow_redirects=False).open(req, timeout=20.0) as resp:
+                        ct = resp.headers.get("Content-Type") or "application/octet-stream"
+                        raw_data = resp.read() if method != "HEAD" else b""
+                        if method != "HEAD" and "text/html" in ct.lower():
+                            parts = [p for p in tail.strip("/").split("/") if p]
+                            proj = parts[0] if parts else ""
+                            proj_base = f"/api/ai/agent/sandbox/preview/{urllib.parse.quote(proj)}" if proj else "/api/ai/agent/sandbox/preview"
+                            raw_data = _rewrite_sandbox_preview_html(raw_data.decode("utf-8", "replace"), proj_base, self.app_token).encode("utf-8")
+                        handler._send_bytes(int(getattr(resp, "status", 200) or 200), ct, raw_data)  # type: ignore[attr-defined]
+                        return
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (301, 302, 303, 307, 308):
+                        loc = exc.headers.get("Location") or ""
+                        if loc.startswith("/sandbox/preview"):
+                            loc = "/api/ai/agent/sandbox/preview" + loc[len("/sandbox/preview"):]
+                        if loc.startswith("/api/ai/agent/sandbox/preview") and "ht=" not in loc:
+                            sep = "&" if "?" in loc else "?"
+                            loc = f"{loc}{sep}ht={urllib.parse.quote(self.app_token)}"
+                        handler._send_bytes(int(exc.code), "text/plain; charset=utf-8", b"", {"Location": loc})  # type: ignore[attr-defined]
+                        return
+                    if exc.code not in (502, 503):
+                        handler._send_bytes(int(exc.code), "text/plain; charset=utf-8", exc.read())  # type: ignore[attr-defined]
+                        return
+                except Exception:
+                    pass
+            self._serve_local_sandbox_preview(handler, method, sandbox_root, tail)
             return
 
         if path.startswith("/api/ai/agent/sandbox/proxy/"):
@@ -2354,9 +3060,11 @@ class HarnessServer:
             up_url = f"http://127.0.0.1:{int(port_part)}/{sub_tail}" + (f"?{query}" if query else "")
             req = urllib.request.Request(up_url, method=method)
             try:
-                with urllib.request.urlopen(req, timeout=20.0) as resp:
+                with _local_opener().open(req, timeout=20.0) as resp:
                     ct = resp.headers.get("Content-Type") or "application/octet-stream"
                     handler._send_bytes(int(getattr(resp, "status", 200) or 200), ct, resp.read() if method != "HEAD" else b"")  # type: ignore[attr-defined]
+            except urllib.error.HTTPError as exc:
+                handler._send_bytes(int(exc.code), "text/plain; charset=utf-8", exc.read())  # type: ignore[attr-defined]
             except Exception as exc:
                 handler._send_json(503, {"error": f"Локальный порт {port_part} недоступен: {exc}"})  # type: ignore[attr-defined]
             return
@@ -2485,7 +3193,7 @@ class HarnessServer:
         if not self._should_use_local_model(base_url):
             self._proxy_raw_post(handler, full_rel, raw, timeout=60.0)
             return
-        task_id = int(body.get("taskId") or 0)
+        task_id = _safe_int(body.get("taskId"), 0)
         if not task_id:
             handler._send_json(400, {"error": "Не указан taskId"})  # type: ignore[attr-defined]
             return
@@ -2582,7 +3290,7 @@ class HarnessServer:
                             "prompt": str(parsed.get("prompt") or fallback["prompt"]),
                             "taskMode": str(parsed.get("taskMode") or "copilot"),
                             "coachMode": str(parsed.get("coachMode") or "agent"),
-                            "maxSteps": int(parsed.get("maxSteps") or 30),
+                            "maxSteps": _safe_int(parsed.get("maxSteps"), 30) or 30,
                             "notes": str(parsed.get("notes") or ""),
                             "source": "model",
                         })

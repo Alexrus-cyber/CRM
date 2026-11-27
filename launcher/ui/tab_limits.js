@@ -1,10 +1,10 @@
-import { apiJson, esc, formatTokens, showToast } from "/app.js";
+import { apiJson, esc, formatTokens, showToast, subscribeAppEvents } from "/app.js";
 
 export function mountLimitsTab(root, ctx) {
   root.innerHTML = `<div class="col" id="limits-container"><div class="card muted">Загрузка статистики…</div></div>`;
   const container = root.querySelector("#limits-container");
 
-  async function refresh() {
+  async function refresh(opts = {}) {
     const bootState = ctx.getState();
     const profile = bootState.profile || {};
     const user = profile.user || {};
@@ -25,7 +25,7 @@ export function mountLimitsTab(root, ctx) {
       runtimeData = rt;
       agentUsageData = au || null;
     } catch (err) {
-      showToast(err.message, "error");
+      if (!opts.background) showToast(err.message, "error");
     }
 
     const monthUsed = usageData?.monthly?.used ?? profile.limits?.monthlyUsed ?? 0;
@@ -105,7 +105,7 @@ export function mountLimitsTab(root, ctx) {
         <div class="row-between mb-2">
           <div>
             <div style="font-weight:600; font-size:14px;">🧰 Локальная среда приложения (.exe) и журналы</div>
-            <div class="muted" style="font-size:11px;">Настройки: <span class="mono">${esc(runtimeData.configPath)}</span> · Рабочая папка: <span class="mono">${esc(runtimeData.workspace)}</span></div>
+            <div class="muted" style="font-size:11px;">Настройки: <span class="mono">${esc(runtimeData.configPath)}</span> · Рабочая папка: <span class="mono">${esc(runtimeData.workspace)}</span> · Sandbox: <span class="mono">${esc(runtimeData.sandboxRoot || "—")}</span></div>
           </div>
           <button type="button" id="limits-refresh-runtime" class="btn btn-sm">↻ Обновить</button>
         </div>
@@ -134,6 +134,12 @@ export function mountLimitsTab(root, ctx) {
             <div class="log-console">${esc((runtimeData.operatorLogs || []).join("\n") || "Лог пока пуст")}</div>
           </div>
         </div>
+        ${(runtimeData.serverLogs || []).length ? `
+          <div class="mt-2">
+            <div class="muted mb-1" style="font-size:11px;">Журнал ошибок прокси / локального сервера</div>
+            <div class="log-console">${esc((runtimeData.serverLogs || []).join("\n"))}</div>
+          </div>
+        ` : ""}
       </div>
     ` : "";
 
@@ -234,9 +240,14 @@ export function mountLimitsTab(root, ctx) {
     `;
 
     const rtBtn = container.querySelector("#limits-refresh-runtime");
-    if (rtBtn) rtBtn.onclick = refresh;
+    if (rtBtn) rtBtn.onclick = () => refresh();
   }
 
+  subscribeAppEvents((ev) => {
+    if (!ev || ev._event === "update" || ev.scope === "runtime" || ev.scope === "usage") {
+      refresh({ background: true });
+    }
+  });
   refresh();
   return { refresh };
 }

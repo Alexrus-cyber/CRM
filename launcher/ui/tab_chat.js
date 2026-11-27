@@ -1,14 +1,17 @@
 import {
   apiFetch,
   apiJson,
+  confirmDialog,
   consumeSseStream,
   esc,
   formatBytes,
   formatTokens,
+  promptDialog,
   readBrowserFileToAttachment,
   readClipboardImages,
   renderMarkdown,
   showToast,
+  subscribeAppEvents,
 } from "/app.js";
 
 function splitIntoChunks(text, chunkSize = 1800, overlap = 200) {
@@ -33,8 +36,10 @@ export function mountChatTab(root, ctx) {
 
   const st = {
     chats: [],
+    chatSearch: "",
     activeChatId: 0,
     messages: [],
+    openDetails: new Set(),
     ragFolders: [],
     selectedRagId: 0,
     ragQuery: "",
@@ -81,6 +86,10 @@ export function mountChatTab(root, ctx) {
             </div>
             <button type="button" id="chat-new-btn" class="btn btn-sm btn-primary">+ Новый</button>
           </div>
+          <div class="search-wrap">
+            <input id="chat-search-input" class="input input-sm" placeholder="🔍 Поиск по чатам…" />
+            <button type="button" id="chat-search-clear" class="search-clear" title="Очистить" style="display:none;">✕</button>
+          </div>
           <div id="chat-list" class="item-list"></div>
         </div>
 
@@ -124,6 +133,7 @@ export function mountChatTab(root, ctx) {
           <div class="row-between">
             <div class="row">
               <span id="chat-active-title" style="font-weight:600; font-size:13.5px;">Новый чат</span>
+              <button type="button" id="chat-rename-btn" class="btn btn-xs btn-ghost" title="Переименовать чат" style="display:none;">✎</button>
               <span id="chat-tokens-badge" class="badge">токены: 0</span>
               <span id="chat-monthly-badge" class="badge badge-emerald">месяц: ${esc(formatTokens(st.monthlyUsed))} / ${esc(formatTokens(st.monthlyLimit))}</span>
             </div>
@@ -254,31 +264,87 @@ export function mountChatTab(root, ctx) {
   const elSend = root.querySelector("#chat-send-btn");
   const elStop = root.querySelector("#chat-stop-btn");
 
-  const renderChatList = () => {
-    if (!st.chats.length) {
-      elChats.innerHTML = `<div class="muted" style="font-size:11.5px; padding:6px;">Чатов пока нет</div>`;
+  const elSearchInput = root.querySelector("#chat-search-input");
+  const elSearchClear = root.querySelector("#chat-search-clear");
+  const elRenameBtn = root.querySelector("#chat-rename-btn");
+
+  async function renameChat(chatId, currentTitle) {
+    const nextTitle = await promptDialog({
+      title: "Переименовать чат",
+      defaultValue: currentTitle || "Новый чат",
+      placeholder: "Название чата",
+      confirmLabel: "Сохранить",
+    });
+    if (nextTitle === null) return;
+    const clean = nextTitle.trim();
+    if (!clean) {
+      showToast("Название чата не может быть пустым", "error");
       return;
     }
-    elChats.innerHTML = st.chats.map((c) => `
+    try {
+      await apiJson(`/api/ai/chats/${chatId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: clean }),
+      });
+      const target = st.chats.find((c) => c.id === chatId);
+      if (target) target.title = clean;
+      if (st.activeChatId === chatId) {
+        root.querySelector("#chat-active-title").textContent = clean;
+      }
+      renderChatList();
+      showToast("Название чата обновлено", "ok");
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  }
+
+  const renderChatList = () => {
+    const q = (st.chatSearch || "").trim().toLowerCase();
+    const visible = q
+      ? st.chats.filter((c) => String(c.title || "Новый чат").toLowerCase().includes(q))
+      : st.chats;
+    if (!visible.length) {
+      elChats.innerHTML = `<div class="muted" style="font-size:11.5px; padding:6px;">${q ? "По запросу ничего не найдено" : "Чатов пока нет"}</div>`;
+      return;
+    }
+    elChats.innerHTML = visible.map((c) => `
       <div class="list-item ${c.id === st.activeChatId ? "active" : ""}" data-chat-id="${c.id}">
         <div style="min-width:0; flex:1;">
           <div style="font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(c.title || "Новый чат")}</div>
           <div class="muted" style="font-size:10.5px;">${esc(formatTokens(c.tokensTotal || 0))} ток.${c.tokensLeft !== null && c.tokensLeft !== undefined ? ` · ост. ${esc(formatTokens(c.tokensLeft))}` : ""}</div>
         </div>
-        <button type="button" class="btn btn-xs btn-ghost text-red" data-del-chat="${c.id}" title="Удалить чат">✕</button>
+        <div class="list-item-actions">
+          <button type="button" class="btn btn-xs btn-ghost" data-rename-chat="${c.id}" title="Переименовать чат">✎</button>
+          <button type="button" class="btn btn-xs btn-ghost text-red" data-del-chat="${c.id}" title="Удалить чат">✕</button>
+        </div>
       </div>
     `).join("");
 
     elChats.querySelectorAll("[data-chat-id]").forEach((row) => {
       row.onclick = (ev) => {
-        if (ev.target.closest("[data-del-chat]")) return;
+        if (ev.target.closest("[data-del-chat], [data-rename-chat]")) return;
         loadChat(Number(row.getAttribute("data-chat-id")));
+      };
+    });
+    elChats.querySelectorAll("[data-rename-chat]").forEach((btn) => {
+      btn.onclick = async (ev) => {
+        ev.stopPropagation();
+        const id = Number(btn.getAttribute("data-rename-chat"));
+        const c = st.chats.find((x) => x.id === id);
+        await renameChat(id, c?.title || "");
       };
     });
     elChats.querySelectorAll("[data-del-chat]").forEach((btn) => {
       btn.onclick = async (ev) => {
         ev.stopPropagation();
         const id = Number(btn.getAttribute("data-del-chat"));
+        const c = st.chats.find((x) => x.id === id);
+        const ok = await confirmDialog({
+          title: "Удалить чат?",
+          message: `Удалить диалог «${c?.title || `#${id}`}» и всю историю сообщений?`,
+          confirmLabel: "Удалить",
+        });
+        if (!ok) return;
         try {
           await apiJson(`/api/ai/chats?id=${id}`, { method: "DELETE" });
           if (st.activeChatId === id) {
@@ -287,11 +353,29 @@ export function mountChatTab(root, ctx) {
           }
           await refreshChats();
           renderMessages();
+          showToast("Чат удалён", "ok");
         } catch (err) {
           showToast(err.message, "error");
         }
       };
     });
+  };
+
+  elSearchInput.oninput = () => {
+    st.chatSearch = elSearchInput.value;
+    elSearchClear.style.display = st.chatSearch ? "" : "none";
+    renderChatList();
+  };
+  elSearchClear.onclick = () => {
+    st.chatSearch = "";
+    elSearchInput.value = "";
+    elSearchClear.style.display = "none";
+    renderChatList();
+  };
+  elRenameBtn.onclick = () => {
+    if (!st.activeChatId) return;
+    const active = st.chats.find((c) => c.id === st.activeChatId);
+    renameChat(st.activeChatId, active?.title || "");
   };
 
   const renderRagFolders = () => {
@@ -320,10 +404,18 @@ export function mountChatTab(root, ctx) {
       btn.onclick = async (ev) => {
         ev.stopPropagation();
         const id = Number(btn.getAttribute("data-del-rag"));
+        const folder = st.ragFolders.find((f) => f.id === id);
+        const ok = await confirmDialog({
+          title: "Удалить папку RAG?",
+          message: `Удалить папку базы знаний «${folder?.name || `#${id}`}» и все её фрагменты?`,
+          confirmLabel: "Удалить",
+        });
+        if (!ok) return;
         try {
           await apiJson(`/api/ai/rag?id=${id}`, { method: "DELETE" });
           if (st.selectedRagId === id) st.selectedRagId = 0;
           await refreshRag();
+          showToast("Папка RAG удалена", "ok");
         } catch (err) {
           showToast(err.message, "error");
         }
@@ -351,6 +443,7 @@ export function mountChatTab(root, ctx) {
   const renderMessages = () => {
     const active = st.chats.find((c) => c.id === st.activeChatId);
     root.querySelector("#chat-active-title").textContent = active ? active.title : "Новый чат";
+    elRenameBtn.style.display = active ? "" : "none";
     root.querySelector("#chat-tokens-badge").textContent = `токены: ${formatTokens(active?.tokensTotal || 0)}`;
     root.querySelector("#chat-monthly-badge").textContent = `месяц: ${formatTokens(st.monthlyUsed)} / ${formatTokens(st.monthlyLimit)}`;
 
@@ -367,8 +460,10 @@ export function mountChatTab(root, ctx) {
     elMsgs.innerHTML = st.messages.map((m, idx) => {
       const isUser = m.role === "user";
       const atts = Array.isArray(m.attachments) ? m.attachments : [];
+      const rKey = `chat-r-${idx}`;
+      const isOpen = st.openDetails.has(rKey) || (m.streaming && !m.text);
       const reasoningHtml = !isUser && m.reasoning
-        ? `<details class="reasoning-box" ${m.streaming && !m.text ? "open" : ""}>
+        ? `<details class="reasoning-box" data-reason-key="${rKey}" ${isOpen ? "open" : ""}>
              <summary class="reasoning-toggle">
                <span>🧠 Раздумья модели (${m.reasoning.length} симв.)</span>
                ${m.streaming ? '<span class="dot dot-amber dot-pulse"></span>' : ""}
@@ -394,24 +489,47 @@ export function mountChatTab(root, ctx) {
         </div>
       `;
     }).join("");
+    elMsgs.querySelectorAll("details[data-reason-key]").forEach((det) => {
+      det.ontoggle = () => {
+        const k = det.getAttribute("data-reason-key");
+        if (det.open) st.openDetails.add(k);
+        else st.openDetails.delete(k);
+      };
+    });
     elMsgs.scrollTop = elMsgs.scrollHeight;
   };
 
-  async function refreshChats() {
+  async function refreshChats(opts = {}) {
     try {
       const res = await apiJson("/api/ai/chats");
-      st.chats = res.chats || [];
+      const nextChats = res.chats || [];
+      const prevActive = st.chats.find((c) => c.id === st.activeChatId);
+      const nextActive = nextChats.find((c) => c.id === st.activeChatId);
+      st.chats = nextChats;
       renderChatList();
+      if (nextActive) {
+        root.querySelector("#chat-active-title").textContent = nextActive.title || "Новый чат";
+        root.querySelector("#chat-tokens-badge").textContent = `токены: ${formatTokens(nextActive.tokensTotal || 0)}`;
+        if (
+          opts.syncActive &&
+          !st.streaming &&
+          st.activeChatId &&
+          prevActive &&
+          (prevActive.tokensTotal !== nextActive.tokensTotal || prevActive.updatedAt !== nextActive.updatedAt)
+        ) {
+          await loadChat(st.activeChatId, { quiet: true });
+        }
+      }
     } catch (err) {
-      showToast(err.message, "error");
+      if (!opts.background) showToast(err.message, "error");
     }
   }
 
-  async function loadChat(id) {
+  async function loadChat(id, opts = {}) {
     try {
       const res = await apiJson(`/api/ai/chats/${id}`);
-      st.activeChatId = id;
-      st.messages = (res.messages || []).map((m) => {
+      const prevCount = st.messages.length;
+      const incoming = (res.messages || []).map((m) => {
         let atts = [];
         try { atts = typeof m.attachments === "string" ? JSON.parse(m.attachments || "[]") : (m.attachments || []); } catch {}
         return {
@@ -422,10 +540,15 @@ export function mountChatTab(root, ctx) {
           usage: m.tokens ? { total: m.tokens, prompt: m.promptTokens || 0, completion: m.completionTokens || 0 } : null,
         };
       });
+      if (opts.quiet && st.activeChatId === id && prevCount === incoming.length) {
+        return;
+      }
+      st.activeChatId = id;
+      st.messages = incoming;
       renderChatList();
       renderMessages();
     } catch (err) {
-      showToast(err.message, "error");
+      if (!opts.quiet) showToast(err.message, "error");
     }
   }
 
@@ -635,6 +758,12 @@ export function mountChatTab(root, ctx) {
 
   root.querySelector("#chat-save-crm-settings").onclick = async () => {
     syncSettingsFromDom();
+    await apiJson("/api/app/prefs", {
+      method: "POST",
+      body: JSON.stringify({
+        localModel: { baseUrl: st.settings.baseUrl, model: st.settings.model, apiKey: st.settings.apiKey },
+      }),
+    }).catch(() => {});
     try {
       const res = await apiJson("/api/ai/settings", {
         method: "PUT",
@@ -644,22 +773,28 @@ export function mountChatTab(root, ctx) {
           ...(st.settings.apiKey ? { apiKey: st.settings.apiKey } : {}),
         }),
       });
-      await apiJson("/api/app/prefs", {
-        method: "POST",
-        body: JSON.stringify({
-          localModel: { baseUrl: st.settings.baseUrl, model: st.settings.model, apiKey: st.settings.apiKey },
-        }),
-      }).catch(() => {});
       root.querySelector("#chat-key-hint").textContent = res.settings?.hasApiKey ? `(в БД: ${res.settings.apiKeyHint})` : "";
       showToast("Настройки модели сохранены в БД CRM", "ok");
     } catch (err) {
-      showToast(err.message, "error");
+      if (err.status === 400 && /127\.0\.0\.1|localhost|запрещ/i.test(err.message || "")) {
+        showToast("Локальные настройки модели сохранены в приложении", "ok");
+      } else {
+        showToast(err.message, "error");
+      }
     }
   };
 
   root.querySelector("#chat-new-btn").onclick = async () => {
+    const chosenTitle = await promptDialog({
+      title: "Новый чат",
+      defaultValue: "",
+      placeholder: "Название чата (можно оставить пустым)",
+      confirmLabel: "Создать",
+    });
+    if (chosenTitle === null) return;
     try {
-      const res = await apiJson("/api/ai/chats", { method: "POST", body: "{}" });
+      const payload = chosenTitle.trim() ? { title: chosenTitle.trim() } : {};
+      const res = await apiJson("/api/ai/chats", { method: "POST", body: JSON.stringify(payload) });
       if (res.chat?.id) {
         st.activeChatId = res.chat.id;
         st.messages = [];
@@ -794,9 +929,21 @@ export function mountChatTab(root, ctx) {
     if (st.abortCtrl) st.abortCtrl.abort();
   };
 
+  const refreshAll = async (opts = {}) => {
+    if (st.streaming) return;
+    await Promise.all([
+      refreshChats({ background: Boolean(opts.background), syncActive: true }),
+      refreshRag(),
+    ]);
+  };
+
+  subscribeAppEvents(() => {
+    if (!st.streaming) refreshAll({ background: true });
+  });
+
   refreshChats();
   refreshRag();
   loadSavedAiSettings();
 
-  return { refresh: () => { refreshChats(); refreshRag(); } };
+  return { refresh: refreshAll };
 }

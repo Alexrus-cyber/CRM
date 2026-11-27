@@ -1,7 +1,9 @@
 import {
   apiJson,
+  confirmDialog,
   esc,
   formatDateTime,
+  promptDialog,
   renderMarkdown,
   showToast,
   subscribeAppEvents,
@@ -16,10 +18,12 @@ export function mountOperatorTab(root, ctx) {
   const st = {
     subtab: "desk",
     tasks: [],
+    taskSearch: "",
     selectedTaskId: 0,
     taskDetail: null,
     operatorRunning: Boolean(bootState.operatorRunning),
     planConvs: [],
+    planSearch: "",
     activePlanId: 0,
     planMessages: [],
     planSystemPrompt: "",
@@ -104,6 +108,10 @@ export function mountOperatorTab(root, ctx) {
                 <div style="font-weight:600;">Очередь заданий</div>
                 <button type="button" id="op-tasks-refresh" class="btn btn-xs">↻</button>
               </div>
+              <div class="search-wrap">
+                <input id="op-tasks-search" class="input input-sm" placeholder="🔍 Поиск по заданиям…" />
+                <button type="button" id="op-tasks-search-clear" class="search-clear" title="Очистить" style="display:none;">✕</button>
+              </div>
               <div id="op-tasks-sidebar" class="item-list"></div>
             </div>
           </aside>
@@ -125,6 +133,10 @@ export function mountOperatorTab(root, ctx) {
                 <div style="font-weight:600;">Чаты планирования</div>
                 <button type="button" id="pl-new-btn" class="btn btn-xs btn-primary">+ Новый</button>
               </div>
+              <div class="search-wrap">
+                <input id="pl-conv-search" class="input input-sm" placeholder="🔍 Поиск по планам…" />
+                <button type="button" id="pl-conv-search-clear" class="search-clear" title="Очистить" style="display:none;">✕</button>
+              </div>
               <div id="pl-conv-list" class="item-list"></div>
               <label class="field-label mt-2">Системный промпт чата</label>
               <textarea id="pl-sys-prompt" class="textarea" rows="3"></textarea>
@@ -132,6 +144,12 @@ export function mountOperatorTab(root, ctx) {
             </div>
           </aside>
           <div class="main-col">
+            <div class="card-sm row-between" style="margin-bottom:8px;">
+              <div class="row">
+                <span id="pl-active-title" style="font-weight:600; font-size:13px;">Планировщик</span>
+                <button type="button" id="pl-rename-btn" class="btn btn-xs btn-ghost" title="Переименовать план" style="display:none;">✎</button>
+              </div>
+            </div>
             <div class="chat-box">
               <div id="pl-messages" class="chat-messages"></div>
               <div class="composer">
@@ -223,6 +241,7 @@ export function mountOperatorTab(root, ctx) {
       st.subtab = id;
       root.querySelectorAll("[data-op-subtab]").forEach((b) => b.classList.toggle("active", b.getAttribute("data-op-subtab") === id));
       root.querySelectorAll(".op-subpanel").forEach((p) => { p.hidden = p.id !== `op-panel-${id}`; });
+      if (id === "desk") refreshTasks({ background: true });
       if (id === "planner") refreshPlans();
       if (id === "runs") refreshTasks();
       if (id === "setup") refreshConnections();
@@ -299,7 +318,7 @@ export function mountOperatorTab(root, ctx) {
   };
 
   // ---- Очередь и Пульт ----
-  async function refreshTasks() {
+  async function refreshTasks(opts = {}) {
     try {
       const res = await apiJson("/api/agent/tasks");
       st.tasks = res.tasks || [];
@@ -308,20 +327,30 @@ export function mountOperatorTab(root, ctx) {
       }
       renderTasksSidebar();
       renderRunsTable();
-      if (st.selectedTaskId) await loadTaskDetail(st.selectedTaskId);
-    } catch (err) { showToast(err.message, "error"); }
+      if (st.selectedTaskId) {
+        const guidInput = root.querySelector("#op-td-guidance");
+        const isTypingGuid = Boolean(opts.background && guidInput && document.activeElement === guidInput);
+        if (!isTypingGuid) await loadTaskDetail(st.selectedTaskId);
+      }
+    } catch (err) {
+      if (!opts.background) showToast(err.message, "error");
+    }
   }
 
   function renderTasksSidebar() {
     const host = root.querySelector("#op-tasks-sidebar");
-    host.innerHTML = st.tasks.map((t) => `
+    const q = (st.taskSearch || "").trim().toLowerCase();
+    const visible = q
+      ? st.tasks.filter((t) => `#${t.id} ${t.prompt || ""} ${t.status || ""}`.toLowerCase().includes(q))
+      : st.tasks;
+    host.innerHTML = visible.map((t) => `
       <div class="list-item ${t.id === st.selectedTaskId ? "active" : ""}" data-op-tid="${t.id}">
         <div style="min-width:0; flex:1;">
           <div style="font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">#${t.id} ${esc(t.prompt)}</div>
           <div class="muted" style="font-size:10px;">${esc(t.status)} · шаги: ${t.steps || 0}/${t.maxSteps || "∞"}</div>
         </div>
       </div>
-    `).join("") || `<div class="muted" style="font-size:11px;">Заданий нет</div>`;
+    `).join("") || `<div class="muted" style="font-size:11px;">${q ? "По запросу ничего не найдено" : "Заданий нет"}</div>`;
     host.querySelectorAll("[data-op-tid]").forEach((el) => {
       el.onclick = () => {
         st.selectedTaskId = Number(el.getAttribute("data-op-tid"));
@@ -330,6 +359,20 @@ export function mountOperatorTab(root, ctx) {
       };
     });
   }
+
+  const elTaskSearch = root.querySelector("#op-tasks-search");
+  const elTaskSearchClear = root.querySelector("#op-tasks-search-clear");
+  elTaskSearch.oninput = () => {
+    st.taskSearch = elTaskSearch.value;
+    elTaskSearchClear.style.display = st.taskSearch ? "" : "none";
+    renderTasksSidebar();
+  };
+  elTaskSearchClear.onclick = () => {
+    st.taskSearch = "";
+    elTaskSearch.value = "";
+    elTaskSearchClear.style.display = "none";
+    renderTasksSidebar();
+  };
 
   async function loadTaskDetail(id) {
     try {
@@ -396,7 +439,16 @@ export function mountOperatorTab(root, ctx) {
     `;
 
     const bind = (id, fn) => { const el = card.querySelector(id); if (el) el.onclick = fn; };
-    bind("#op-td-cancel", async () => { await apiJson(`/api/agent/tasks/${task.id}`, { method: "POST", body: JSON.stringify({ action: "cancel" }) }); await loadTaskDetail(task.id); });
+    bind("#op-td-cancel", async () => {
+      const ok = await confirmDialog({
+        title: "Отменить задание Оператора?",
+        message: `Отменить выполнение задания #${task.id}?`,
+        confirmLabel: "Отменить задание",
+      });
+      if (!ok) return;
+      await apiJson(`/api/agent/tasks/${task.id}`, { method: "POST", body: JSON.stringify({ action: "cancel" }) });
+      await loadTaskDetail(task.id);
+    });
     bind("#op-td-extend", async () => { await apiJson(`/api/agent/tasks/${task.id}`, { method: "POST", body: JSON.stringify({ action: "extend_steps", addSteps: 15 }) }); await loadTaskDetail(task.id); });
     bind("#op-td-approve", async () => { await apiJson(`/api/agent/tasks/${task.id}`, { method: "POST", body: JSON.stringify({ action: "approve" }) }); await loadTaskDetail(task.id); });
     bind("#op-td-reject", async () => { await apiJson(`/api/agent/tasks/${task.id}`, { method: "POST", body: JSON.stringify({ action: "reject" }) }); await loadTaskDetail(task.id); });
@@ -478,40 +530,119 @@ export function mountOperatorTab(root, ctx) {
   root.querySelector("#op-runs-refresh").onclick = refreshTasks;
 
   // ---- Планировщик ----
+  async function renamePlan(planId, currentTitle) {
+    const nextTitle = await promptDialog({
+      title: "Переименовать план",
+      defaultValue: currentTitle || "Новый план",
+      placeholder: "Название плана",
+      confirmLabel: "Сохранить",
+    });
+    if (nextTitle === null) return;
+    const clean = nextTitle.trim();
+    if (!clean) {
+      showToast("Название плана не может быть пустым", "error");
+      return;
+    }
+    try {
+      await apiJson(`/api/agent/conversations/${planId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: clean }),
+      });
+      const target = st.planConvs.find((c) => c.id === planId);
+      if (target) target.title = clean;
+      renderPlansList();
+      renderPlanMessages();
+      showToast("Название плана обновлено", "ok");
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  }
+
+  function renderPlansList() {
+    const host = root.querySelector("#pl-conv-list");
+    const q = (st.planSearch || "").trim().toLowerCase();
+    const visible = q
+      ? st.planConvs.filter((c) => String(c.title || "План").toLowerCase().includes(q))
+      : st.planConvs;
+    host.innerHTML = visible.map((c) => `
+      <div class="list-item ${c.id === st.activePlanId ? "active" : ""}" data-pl-id="${c.id}">
+        <div style="flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(c.title)}</div>
+        <div class="list-item-actions">
+          <button type="button" class="btn btn-xs btn-ghost" data-rename-pl="${c.id}" title="Переименовать план">✎</button>
+          <button type="button" class="btn btn-xs btn-ghost text-red" data-del-pl="${c.id}" title="Удалить план">✕</button>
+        </div>
+      </div>
+    `).join("") || `<div class="muted" style="font-size:11px;">${q ? "По запросу ничего не найдено" : "Планов пока нет"}</div>`;
+    host.querySelectorAll("[data-pl-id]").forEach((el) => {
+      el.onclick = async (ev) => {
+        if (ev.target.closest("[data-del-pl], [data-rename-pl]")) return;
+        st.activePlanId = Number(el.getAttribute("data-pl-id"));
+        const det = await apiJson(`/api/agent/conversations/${st.activePlanId}`);
+        st.planMessages = det.messages || [];
+        st.planSystemPrompt = det.conversation?.systemPrompt || "";
+        root.querySelector("#pl-sys-prompt").value = st.planSystemPrompt;
+        renderPlanMessages();
+        renderPlansList();
+      };
+    });
+    host.querySelectorAll("[data-rename-pl]").forEach((b) => {
+      b.onclick = async (ev) => {
+        ev.stopPropagation();
+        const id = Number(b.getAttribute("data-rename-pl"));
+        const c = st.planConvs.find((x) => x.id === id);
+        await renamePlan(id, c?.title || "");
+      };
+    });
+    host.querySelectorAll("[data-del-pl]").forEach((b) => {
+      b.onclick = async (ev) => {
+        ev.stopPropagation();
+        const id = Number(b.getAttribute("data-del-pl"));
+        const c = st.planConvs.find((x) => x.id === id);
+        const ok = await confirmDialog({
+          title: "Удалить чат планировщика?",
+          message: `Удалить план «${c?.title || `#${id}`}» и историю сообщений?`,
+          confirmLabel: "Удалить",
+        });
+        if (!ok) return;
+        await apiJson(`/api/agent/conversations/${id}`, { method: "DELETE" });
+        if (st.activePlanId === id) { st.activePlanId = 0; st.planMessages = []; renderPlanMessages(); }
+        await refreshPlans();
+        showToast("План удалён", "ok");
+      };
+    });
+  }
+
+  const elPlSearch = root.querySelector("#pl-conv-search");
+  const elPlSearchClear = root.querySelector("#pl-conv-search-clear");
+  elPlSearch.oninput = () => {
+    st.planSearch = elPlSearch.value;
+    elPlSearchClear.style.display = st.planSearch ? "" : "none";
+    renderPlansList();
+  };
+  elPlSearchClear.onclick = () => {
+    st.planSearch = "";
+    elPlSearch.value = "";
+    elPlSearchClear.style.display = "none";
+    renderPlansList();
+  };
+  root.querySelector("#pl-rename-btn").onclick = () => {
+    if (!st.activePlanId) return;
+    const active = st.planConvs.find((c) => c.id === st.activePlanId);
+    renamePlan(st.activePlanId, active?.title || "");
+  };
+
   async function refreshPlans() {
     try {
       const res = await apiJson("/api/agent/conversations?kind=plan");
       st.planConvs = res.conversations || [];
-      const host = root.querySelector("#pl-conv-list");
-      host.innerHTML = st.planConvs.map((c) => `
-        <div class="list-item ${c.id === st.activePlanId ? "active" : ""}" data-pl-id="${c.id}">
-          <div style="flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(c.title)}</div>
-          <button type="button" class="btn btn-xs btn-ghost text-red" data-del-pl="${c.id}">✕</button>
-        </div>
-      `).join("") || `<div class="muted" style="font-size:11px;">Планов пока нет</div>`;
-      host.querySelectorAll("[data-pl-id]").forEach((el) => {
-        el.onclick = async (ev) => {
-          if (ev.target.closest("[data-del-pl]")) return;
-          st.activePlanId = Number(el.getAttribute("data-pl-id"));
-          const det = await apiJson(`/api/agent/conversations/${st.activePlanId}`);
-          st.planMessages = det.messages || [];
-          st.planSystemPrompt = det.conversation?.systemPrompt || "";
-          root.querySelector("#pl-sys-prompt").value = st.planSystemPrompt;
-          renderPlanMessages();
-          refreshPlans();
-        };
-      });
-      host.querySelectorAll("[data-del-pl]").forEach((b) => {
-        b.onclick = async (ev) => {
-          ev.stopPropagation();
-          await apiJson(`/api/agent/conversations/${b.getAttribute("data-del-pl")}`, { method: "DELETE" });
-          await refreshPlans();
-        };
-      });
+      renderPlansList();
     } catch {}
   }
 
   function renderPlanMessages() {
+    const active = st.planConvs.find((c) => c.id === st.activePlanId);
+    root.querySelector("#pl-active-title").textContent = active ? active.title : "Планировщик";
+    root.querySelector("#pl-rename-btn").style.display = active ? "" : "none";
     const h = root.querySelector("#pl-messages");
     h.innerHTML = st.planMessages.map((m) => `
       <div class="bubble ${m.role === "user" ? "bubble-user" : "bubble-assistant"}">
@@ -523,7 +654,17 @@ export function mountOperatorTab(root, ctx) {
   }
 
   root.querySelector("#pl-new-btn").onclick = async () => {
-    const res = await apiJson("/api/agent/conversations", { method: "POST", body: JSON.stringify({ kind: "plan", title: "Новый план" }) });
+    const chosen = await promptDialog({
+      title: "Новый план",
+      defaultValue: "",
+      placeholder: "Название плана (можно оставить пустым)",
+      confirmLabel: "Создать",
+    });
+    if (chosen === null) return;
+    const res = await apiJson("/api/agent/conversations", {
+      method: "POST",
+      body: JSON.stringify({ kind: "plan", title: chosen.trim() || "Новый план" }),
+    });
     st.activePlanId = res.conversation.id;
     st.planMessages = [];
     st.planSystemPrompt = res.conversation.systemPrompt || "";
@@ -655,15 +796,37 @@ export function mountOperatorTab(root, ctx) {
     });
     host.querySelectorAll("[data-del-tok]").forEach((b) => {
       b.onclick = async () => {
-        await apiJson(`/api/agent/tokens?id=${b.getAttribute("data-del-tok")}`, { method: "DELETE" });
+        const tid = Number(b.getAttribute("data-del-tok"));
+        const tok = st.tokens.find((t) => t.id === tid);
+        const ok = await confirmDialog({
+          title: "Удалить токен Оператора?",
+          message: `Отозвать токен «${tok?.name || `#${tid}`}»? Подключённый бот перестанет принимать задания.`,
+          confirmLabel: "Удалить",
+        });
+        if (!ok) return;
+        await apiJson(`/api/agent/tokens?id=${tid}`, { method: "DELETE" });
         await refreshConnections();
+        showToast("Токен удалён", "ok");
       };
     });
   }
 
+  async function refreshAll(opts = {}) {
+    if (st.subtab === "planner") {
+      await refreshPlans();
+    } else if (st.subtab === "setup") {
+      const setupPanel = root.querySelector("#op-panel-setup");
+      const actEl = document.activeElement;
+      const typing = Boolean(opts.background && setupPanel && actEl && setupPanel.contains(actEl) && ["INPUT", "TEXTAREA", "SELECT"].includes(actEl.tagName));
+      if (!typing) await refreshConnections();
+    } else {
+      await refreshTasks({ background: Boolean(opts.background) });
+    }
+  }
+
   subscribeAppEvents((ev) => {
-    if (ev?.scope === "agent" || ev?.scope === "operator") {
-      refreshTasks();
+    if (!ev || ev.scope === "agent" || ev.scope === "operator" || ev._event === "update") {
+      refreshAll({ background: true });
     }
   });
 
@@ -678,5 +841,5 @@ export function mountOperatorTab(root, ctx) {
   }).catch(() => {});
 
   refreshTasks();
-  return { refresh: refreshTasks };
+  return { refresh: refreshAll };
 }

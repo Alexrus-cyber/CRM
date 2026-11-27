@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -555,6 +556,293 @@ class TestLauncherHarness(unittest.TestCase, FakeServersMixin):
                 self.assertEqual(dom_err.get("error"), "Задание не найдено")
             finally:
                 srv.shutdown()
+                crm_srv.shutdown()
+                if prev_cfg is None:
+                    os.environ.pop("CRM_LAUNCHER_CONFIG", None)
+                else:
+                    os.environ["CRM_LAUNCHER_CONFIG"] = prev_cfg
+
+    def test_autonomous_sandbox_crud_download_preview_and_transcripts_without_agent(self) -> None:
+        def old_crm_handler(h: BaseHTTPRequestHandler, method: str, path: str, body: bytes) -> None:
+            html = b"<!DOCTYPE html><html><body>404 This page could not be found.</body></html>"
+            h.send_response(404)
+            h.send_header("Content-Type", "text/html; charset=utf-8")
+            h.send_header("Content-Length", str(len(html)))
+            h.end_headers()
+            h.wfile.write(html)
+
+        crm_srv, crm_port = self.start_json_server(old_crm_handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            prev_cfg = os.environ.get("CRM_LAUNCHER_CONFIG")
+            os.environ["CRM_LAUNCHER_CONFIG"] = str(Path(tmp) / "settings.json")
+            ws_dir = Path(tmp) / "workspace"
+            ws_dir.mkdir(parents=True, exist_ok=True)
+            srv = harness_server.HarnessServer(port=0)
+            srv.settings.set_value("chat_agent", "workspace", str(ws_dir))
+            srv.settings.crm_url = f"http://127.0.0.1:{crm_port}"
+            srv.settings.crm_session_token = "tok_sb"
+            try:
+                srv.start()
+
+                # Создаём проект прямо в legacy sandbox чтобы проверить синхронизацию
+                legacy_proj = ws_dir / ".crm_agent_sandbox" / "demo_site"
+                legacy_proj.mkdir(parents=True, exist_ok=True)
+                (legacy_proj / "index.html").write_text("<html><body><a href='/about'>Hello Sandbox</a></body></html>", encoding="utf-8")
+                (legacy_proj / "about.txt").write_text("info", encoding="utf-8")
+
+                # 1. GET /api/ai/agent/sandbox работает автономно, даже если Агент не запущен
+                req = urllib.request.Request(f"{srv.base_url()}/api/ai/agent/sandbox", headers={"X-Harness-Token": srv.token})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    sb = json.loads(resp.read().decode("utf-8"))
+                self.assertFalse(sb.get("agentRunning"))
+                self.assertEqual(sb.get("totalProjects"), 1)
+                self.assertEqual(sb.get("projectsCount"), 1)
+                self.assertEqual(sb["projects"][0]["name"], "demo_site")
+                self.assertGreaterEqual(sb.get("totalFiles", 0), 2)
+
+                # 2. Preview: редирект на /demo_site/ без слеша сохраняет ?ht=... и HTML переписывается
+                class NoRedirect(urllib.request.HTTPRedirectHandler):
+                    def redirect_request(self, req, fp, code, msg, headers, newurl):
+                        return None
+
+                opener = urllib.request.build_opener(NoRedirect)
+                req_no_slash = urllib.request.Request(
+                    f"{srv.base_url()}/api/ai/agent/sandbox/preview/demo_site?ht={urllib.parse.quote(srv.token)}"
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx302:
+                    opener.open(req_no_slash, timeout=5)
+                self.assertEqual(ctx302.exception.code, 302)
+                loc = ctx302.exception.headers.get("Location") or ""
+                self.assertIn("/api/ai/agent/sandbox/preview/demo_site/", loc)
+                self.assertIn(f"ht={urllib.parse.quote(srv.token)}", loc)
+
+                req_idx = urllib.request.Request(
+                    f"{srv.base_url()}/api/ai/agent/sandbox/preview/demo_site/?ht={urllib.parse.quote(srv.token)}"
+                )
+                with urllib.request.urlopen(req_idx, timeout=5) as resp:
+                    html = resp.read().decode("utf-8")
+                self.assertIn("Hello Sandbox", html)
+
+                # 3. Скачивание одного файла и ZIP-архива проекта
+                req_dl = urllib.request.Request(
+                    f"{srv.base_url()}/api/ai/agent/sandbox?download=demo_site/about.txt",
+                    headers={"X-Harness-Token": srv.token},
+                )
+                with urllib.request.urlopen(req_dl, timeout=5) as resp:
+                    self.assertEqual(resp.read(), b"info")
+
+                # 4. Локальные стенограммы (/api/agent/transcripts при 404 CRM) и write_transcript в Sandbox
+                req_tr = urllib.request.Request(
+                    f"{srv.base_url()}/api/agent/transcripts",
+                    data=json.dumps({"title": "Сессия 1", "content": "Текст переписки", "fileName": "s1.md"}).encode("utf-8"),
+                    headers={"X-Harness-Token": srv.token, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_tr, timeout=5) as resp:
+                    tr_res = json.loads(resp.read().decode("utf-8"))
+                tid = tr_res["transcript"]["id"]
+
+                with urllib.request.urlopen(
+                    urllib.request.Request(f"{srv.base_url()}/api/agent/transcripts/{tid}", headers={"X-Harness-Token": srv.token}),
+                    timeout=5,
+                ) as resp:
+                    self.assertEqual(resp.read().decode("utf-8"), "Текст переписки")
+
+                # 5. Удаление файла из Sandbox работает автономно
+                req_del = urllib.request.Request(
+                    f"{srv.base_url()}/api/ai/agent/sandbox",
+                    data=json.dumps({"action": "delete", "path": "demo_site/about.txt"}).encode("utf-8"),
+                    headers={"X-Harness-Token": srv.token, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_del, timeout=5) as resp:
+                    del_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(del_res.get("ok"))
+
+                # 6. stop_process при остановленном агенте и невалидном pid не падает с 500
+                req_stop = urllib.request.Request(
+                    f"{srv.base_url()}/api/ai/agent/sandbox",
+                    data=json.dumps({"action": "stop_process", "pid": "not-an-int"}).encode("utf-8"),
+                    headers={"X-Harness-Token": srv.token, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx_stop:
+                    urllib.request.urlopen(req_stop, timeout=5)
+                self.assertEqual(ctx_stop.exception.code, 503)
+            finally:
+                srv.shutdown()
+                crm_srv.shutdown()
+                if prev_cfg is None:
+                    os.environ.pop("CRM_LAUNCHER_CONFIG", None)
+                else:
+                    os.environ["CRM_LAUNCHER_CONFIG"] = prev_cfg
+
+    def test_chat_rename_patch_overlay_and_error_protection_with_keepalive(self) -> None:
+        import http.client
+
+        chats_db = [{"id": 10, "title": "Старый заголовок", "updatedAt": "2026-01-01T00:00:00Z"}]
+
+        def legacy_crm_handler(h: BaseHTTPRequestHandler, method: str, path: str, body: bytes) -> None:
+            if path == "/api/ai/chats" and method == "GET":
+                raw = json.dumps({"chats": chats_db}, ensure_ascii=False).encode("utf-8")
+                h.send_response(200)
+                h.send_header("Content-Type", "application/json")
+                h.send_header("Content-Length", str(len(raw)))
+                h.end_headers()
+                h.wfile.write(raw)
+                return
+            if path.startswith("/api/ai/chats/") and method == "PATCH":
+                # Старый CRM не поддерживает PATCH -> отдаёт 405
+                raw = json.dumps({"error": "Method Not Allowed"}).encode("utf-8")
+                h.send_response(405)
+                h.send_header("Content-Type", "application/json")
+                h.send_header("Content-Length", str(len(raw)))
+                h.end_headers()
+                h.wfile.write(raw)
+                return
+            if path == "/api/boom-html":
+                html = b"<html><body>Internal Server Error</body></html>"
+                h.send_response(500)
+                h.send_header("Content-Type", "text/html")
+                h.send_header("Content-Length", str(len(html)))
+                h.end_headers()
+                h.wfile.write(html)
+                return
+            raw = json.dumps({"ok": True}).encode("utf-8")
+            h.send_response(200)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(raw)))
+            h.end_headers()
+            h.wfile.write(raw)
+
+        crm_srv, crm_port = self.start_json_server(legacy_crm_handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            prev_cfg = os.environ.get("CRM_LAUNCHER_CONFIG")
+            os.environ["CRM_LAUNCHER_CONFIG"] = str(Path(tmp) / "settings.json")
+            srv = harness_server.HarnessServer(port=0)
+            srv.settings.crm_url = f"http://127.0.0.1:{crm_port}"
+            srv.settings.crm_session_token = "tok_keep"
+            srv.settings.crm_profile = {"user": {"id": 7}}
+            try:
+                srv.start()
+                parsed_base = urllib.parse.urlparse(srv.base_url())
+                conn = http.client.HTTPConnection(parsed_base.hostname, parsed_base.port, timeout=5)
+
+                # Несколько последовательных запросов по ОДНОМУ Keep-Alive соединению
+                conn.request(
+                    "PATCH",
+                    "/api/ai/chats/10",
+                    body=json.dumps({"title": "Мой переименованный чат"}, ensure_ascii=False).encode("utf-8"),
+                    headers={"X-Harness-Token": srv.token, "Content-Type": "application/json"},
+                )
+                r1 = conn.getresponse()
+                d1 = json.loads(r1.read().decode("utf-8"))
+                self.assertEqual(r1.status, 200)
+                self.assertTrue(d1.get("localTitle"))
+
+                # Второй запрос по тому же keep-alive сокету должен вернуть уже новое название
+                conn.request("GET", "/api/ai/chats", headers={"X-Harness-Token": srv.token})
+                r2 = conn.getresponse()
+                d2 = json.loads(r2.read().decode("utf-8"))
+                self.assertEqual(r2.status, 200)
+                self.assertEqual(d2["chats"][0]["title"], "Мой переименованный чат")
+
+                # Запрос с некорректным телом и последующий запрос на тот же keep-alive не ломают соединение
+                conn.request(
+                    "POST",
+                    "/api/ai/agent/coach",
+                    body=b"{not json",
+                    headers={"X-Harness-Token": srv.token, "Content-Type": "application/json"},
+                )
+                r3 = conn.getresponse()
+                d3 = json.loads(r3.read().decode("utf-8"))
+                self.assertEqual(r3.status, 400)
+                self.assertIn("JSON", d3.get("error", ""))
+
+                # HTML-500 проксируется как понятный JSON, а не пустое тело/HTML
+                conn.request("GET", "/api/boom-html", headers={"X-Harness-Token": srv.token})
+                r4 = conn.getresponse()
+                d4 = json.loads(r4.read().decode("utf-8"))
+                self.assertEqual(r4.status, 500)
+                self.assertIn("HTTP 500", d4.get("error", ""))
+                conn.close()
+            finally:
+                srv.shutdown()
+                crm_srv.shutdown()
+                if prev_cfg is None:
+                    os.environ.pop("CRM_LAUNCHER_CONFIG", None)
+                else:
+                    os.environ["CRM_LAUNCHER_CONFIG"] = prev_cfg
+
+    def test_agent_run_persists_generated_files_into_sandbox_downloads(self) -> None:
+        def fake_agent_handler(h: BaseHTTPRequestHandler, method: str, path: str, body: bytes) -> None:
+            if path == "/health":
+                raw = json.dumps({"ok": True}).encode("utf-8")
+                h.send_response(200)
+                h.send_header("Content-Type", "application/json")
+                h.send_header("Content-Length", str(len(raw)))
+                h.end_headers()
+                h.wfile.write(raw)
+                return
+            if path == "/run":
+                payload = json.dumps({
+                    "type": "file",
+                    "name": "отчёт.txt",
+                    "mime": "text/plain",
+                    "data": base64.b64encode("Готовый отчёт".encode("utf-8")).decode("ascii"),
+                }, ensure_ascii=False)
+                sse = (
+                    f"event: action\ndata: {payload}\n\n"
+                    'event: done\ndata: {"ok": true, "usage": {"prompt": 5, "completion": 5, "total": 10}}\n\n'
+                ).encode("utf-8")
+                h.send_response(200)
+                h.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                h.send_header("Content-Length", str(len(sse)))
+                h.end_headers()
+                h.wfile.write(sse)
+                return
+
+        def fake_crm_handler(h: BaseHTTPRequestHandler, method: str, path: str, body: bytes) -> None:
+            if path == "/api/launcher/agent/prepare":
+                resp = {"ok": True, "payload": {"settings": {"baseUrl": "https://api.openai.com/v1", "model": "gpt-4o-mini"}, "subagents": [], "routingMode": "linear"}}
+            else:
+                resp = {"ok": True}
+            raw = json.dumps(resp).encode("utf-8")
+            h.send_response(200)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(raw)))
+            h.end_headers()
+            h.wfile.write(raw)
+
+        ag_srv, ag_port = self.start_json_server(fake_agent_handler)
+        crm_srv, crm_port = self.start_json_server(fake_crm_handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            prev_cfg = os.environ.get("CRM_LAUNCHER_CONFIG")
+            os.environ["CRM_LAUNCHER_CONFIG"] = str(Path(tmp) / "settings.json")
+            ws_dir = Path(tmp) / "ws"
+            ws_dir.mkdir(parents=True, exist_ok=True)
+            srv = harness_server.HarnessServer(port=0)
+            srv.settings.workspace = str(ws_dir)
+            srv.settings.crm_url = f"http://127.0.0.1:{crm_port}"
+            srv.settings.crm_session_token = "tok_ag"
+            srv._agent_port = ag_port
+            try:
+                srv.start()
+                req = urllib.request.Request(
+                    f"{srv.base_url()}/api/ai/agent",
+                    data=json.dumps({"messages": [{"role": "user", "content": "Сделай файл"}]}).encode("utf-8"),
+                    headers={"X-Harness-Token": srv.token, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    sse_out = resp.read().decode("utf-8")
+                self.assertIn('"sandboxPath": "downloads/отчёт.txt"', sse_out)
+                saved = srv._sandbox_root() / "downloads" / "отчёт.txt"
+                self.assertTrue(saved.is_file())
+                self.assertEqual(saved.read_text(encoding="utf-8"), "Готовый отчёт")
+            finally:
+                srv.shutdown()
+                ag_srv.shutdown()
                 crm_srv.shutdown()
                 if prev_cfg is None:
                     os.environ.pop("CRM_LAUNCHER_CONFIG", None)

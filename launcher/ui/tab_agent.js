@@ -1,20 +1,24 @@
 import {
   apiFetch,
   apiJson,
+  confirmDialog,
   consumeSseStream,
   esc,
   formatBytes,
   formatDateTime,
   formatTokens,
+  promptDialog,
   readBrowserFileToAttachment,
   readClipboardImages,
   renderMarkdown,
   showToast,
+  subscribeAppEvents,
+  triggerFileDownload,
   withHtQuery,
 } from "/app.js";
 
 const TOOL_PROFILES = [
-  ["full", "Полный профиль (код, bash, файлы, браузер, QA)"],
+  ["full", "Полный профиль (код, bash, файлы, браузер)"],
   ["restricted", "Ограниченный профиль (без браузера)"],
 ];
 
@@ -29,19 +33,16 @@ export function mountAgentTab(root, ctx) {
     subtab: "chat",
     agentHealth: bootState.agentHealth || { available: false, running: false, port: 8899, workspace: "" },
     conversations: [],
+    convSearch: "",
     activeConvId: 0,
     messages: [],
+    openDetails: new Set(),
     pendingFiles: [],
     streaming: false,
     abortCtrl: null,
     approvals: [],
 
-    testerConvs: [],
-    activeTesterConvId: 0,
-    testerMessages: [],
-    testerStreaming: false,
-
-    sandbox: { available: false, files: [], projects: [], processes: [] },
+    sandbox: { available: false, files: [], items: [], rootFiles: [], projects: [], processes: [], totalProjects: 0, totalFiles: 0, totalSize: 0, root: "" },
     sandboxProject: "",
     ragFolders: [],
     selectedRagId: 0,
@@ -105,7 +106,6 @@ export function mountAgentTab(root, ctx) {
         <button type="button" class="subtab-btn" data-ag-subtab="config">⚙ Модель, Доверие, RAG и GitHub</button>
         <button type="button" class="subtab-btn" data-ag-subtab="sandbox">📦 Рабочий стол (Sandbox) и стенограммы</button>
         <button type="button" class="subtab-btn" data-ag-subtab="subagents">🕸 Субагенты и Надсмотрщик</button>
-        <button type="button" class="subtab-btn" data-ag-subtab="tester">🧪 Тестировщик (QA)</button>
       </div>
 
       <!-- Подвкладка 1: Чат с Агентом -->
@@ -116,6 +116,10 @@ export function mountAgentTab(root, ctx) {
               <div class="row-between mb-2">
                 <div style="font-weight:600;">Сессии Агента</div>
                 <button type="button" id="ag-new-conv" class="btn btn-xs btn-primary">+ Новый</button>
+              </div>
+              <div class="search-wrap">
+                <input id="ag-conv-search" class="input input-sm" placeholder="🔍 Поиск по чатам…" />
+                <button type="button" id="ag-conv-search-clear" class="search-clear" title="Очистить" style="display:none;">✕</button>
               </div>
               <div id="ag-conv-list" class="item-list"></div>
               <button type="button" id="ag-summarize-btn" class="btn btn-sm mt-2" style="width:100%;">📑 Summary → Новый чат</button>
@@ -137,6 +141,13 @@ export function mountAgentTab(root, ctx) {
           </aside>
 
           <div class="main-col">
+            <div class="card-sm row-between" style="margin-bottom:8px;">
+              <div class="row">
+                <span id="ag-conv-title" style="font-weight:600; font-size:13px;">Новый чат Агента</span>
+                <button type="button" id="ag-rename-conv" class="btn btn-xs btn-ghost" title="Переименовать чат" style="display:none;">✎</button>
+              </div>
+              <span id="ag-sb-quick-badge" class="muted" style="font-size:11px;">Sandbox: —</span>
+            </div>
             <div class="chat-box">
               <div id="ag-messages" class="chat-messages"></div>
               <div id="ag-approvals-host" style="padding:0 12px;"></div>
@@ -249,7 +260,8 @@ export function mountAgentTab(root, ctx) {
             <div class="row-between mb-2">
               <div>
                 <div style="font-weight:600; font-size:14px;">📦 Проекты и файлы в Sandbox</div>
-                <div class="muted" style="font-size:11px;">Изолированная рабочая папка локального Агента</div>
+                <div id="ag-sb-stats" class="muted" style="font-size:11px;">Изолированная рабочая папка локального Агента</div>
+                <div id="ag-sb-root-path" class="muted mono" style="font-size:10.5px;"></div>
               </div>
               <div class="row">
                 <a id="ag-sb-dl-all" class="btn btn-xs" href="#">⬇ Всё (ZIP)</a>
@@ -257,6 +269,7 @@ export function mountAgentTab(root, ctx) {
               </div>
             </div>
             <div id="ag-sb-projects" class="col"></div>
+            <div id="ag-sb-files-wrap" class="mt-3"></div>
             <div class="mt-3">
               <div style="font-weight:600; font-size:12.5px;" class="mb-1">Запущенные процессы Sandbox</div>
               <div id="ag-sb-processes" class="col"></div>
@@ -277,32 +290,6 @@ export function mountAgentTab(root, ctx) {
       <div id="ag-panel-subagents" class="ag-subpanel" hidden>
         <div class="col" id="ag-subagents-host"></div>
       </div>
-
-      <!-- Подвкладка 5: Тестировщик -->
-      <div id="ag-panel-tester" class="ag-subpanel" hidden>
-        <div class="split-layout">
-          <aside class="sidebar-col">
-            <div class="card">
-              <div class="row-between mb-2">
-                <div style="font-weight:600;">Сессии QA-Тестировщика</div>
-                <button type="button" id="qa-new-conv" class="btn btn-xs btn-primary">+ Новый</button>
-              </div>
-              <div id="qa-conv-list" class="item-list"></div>
-            </div>
-          </aside>
-          <div class="main-col">
-            <div class="chat-box">
-              <div id="qa-messages" class="chat-messages"></div>
-              <div class="composer">
-                <div class="row">
-                  <textarea id="qa-input" class="textarea" style="flex:1; min-height:44px;" placeholder="Что проверить в Sandbox или коде?"></textarea>
-                  <button type="button" id="qa-send-btn" class="btn btn-primary" style="height:42px;">Проверить</button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
     </div>
   `;
 
@@ -313,9 +300,10 @@ export function mountAgentTab(root, ctx) {
       st.subtab = id;
       root.querySelectorAll("[data-ag-subtab]").forEach((b) => b.classList.toggle("active", b.getAttribute("data-ag-subtab") === id));
       root.querySelectorAll(".ag-subpanel").forEach((p) => { p.hidden = p.id !== `ag-panel-${id}`; });
+      if (id === "chat") { refreshConvs({ background: true, syncActive: true }); }
+      if (id === "config") { loadRagAndGithub(); }
       if (id === "sandbox") { refreshSandbox(); refreshTranscripts(); }
       if (id === "subagents") { refreshSubagents(); }
-      if (id === "tester") { refreshTesterConvs(); }
     };
   });
 
@@ -360,6 +348,7 @@ export function mountAgentTab(root, ctx) {
           body: JSON.stringify({ workspace: res.path }),
         });
         renderAgentHealth(h);
+        await refreshSandbox();
         showToast(`Рабочая папка: ${res.path}`, "ok");
       }
     } catch (err) {
@@ -419,7 +408,49 @@ export function mountAgentTab(root, ctx) {
     });
   }
 
+  function resolveSandboxPathForFile(f) {
+    if (!f) return "";
+    if (f.sandboxPath || f.path) return String(f.sandboxPath || f.path);
+    const items = st.sandbox?.items || st.sandbox?.files || [];
+    const fname = String(f.name || "").trim();
+    if (!fname) return "";
+    const exactDl = items.find((it) => it.type === "file" && it.path === `downloads/${fname}`);
+    if (exactDl) return exactDl.path;
+    const byName = items.find((it) => it.type === "file" && (it.name === fname || String(it.path || "").endsWith(`/${fname}`) || it.path === fname));
+    return byName ? String(byName.path) : "";
+  }
+
+  function upsertFileEntry(targetArr, rawFile) {
+    if (!rawFile || !rawFile.name) return;
+    const norm = {
+      name: String(rawFile.name),
+      mime: String(rawFile.mime || "application/octet-stream"),
+      size: Number(rawFile.size || 0) || 0,
+      ...(rawFile.data ? { data: String(rawFile.data) } : {}),
+      ...(rawFile.sandboxPath ? { sandboxPath: String(rawFile.sandboxPath) } : {}),
+      ...(rawFile.path ? { path: String(rawFile.path) } : {}),
+    };
+    const idx = targetArr.findIndex((x) => x.name === norm.name);
+    if (idx >= 0) targetArr[idx] = { ...targetArr[idx], ...norm };
+    else targetArr.push(norm);
+  }
+
+  let sbRefreshTimer = null;
+  function scheduleRefreshSandbox() {
+    if (sbRefreshTimer) return;
+    sbRefreshTimer = setTimeout(() => {
+      sbRefreshTimer = null;
+      refreshSandbox();
+    }, 300);
+  }
+
   function renderAgentMessages() {
+    const activeConv = st.conversations.find((c) => c.id === st.activeConvId);
+    const titleEl = root.querySelector("#ag-conv-title");
+    const renBtn = root.querySelector("#ag-rename-conv");
+    if (titleEl) titleEl.textContent = activeConv ? activeConv.title : "Новый чат Агента";
+    if (renBtn) renBtn.style.display = activeConv ? "" : "none";
+
     if (!st.messages.length) {
       elMsgs.innerHTML = `
         <div class="card-2" style="padding:18px; text-align:center; margin:auto;">
@@ -433,7 +464,9 @@ export function mountAgentTab(root, ctx) {
       return;
     }
 
-    elMsgs.innerHTML = st.messages.map((m) => {
+    const detailOpen = (key, autoOpen) => (st.openDetails.has(key) ? "open" : (autoOpen ? "open" : ""));
+
+    elMsgs.innerHTML = st.messages.map((m, msgIdx) => {
       if (m.role === "user") {
         return `
           <div class="bubble bubble-user">
@@ -442,34 +475,77 @@ export function mountAgentTab(root, ctx) {
           </div>
         `;
       }
+      const rKey = `ag-r-${msgIdx}`;
       const reasoningHtml = m.reasoning
-        ? `<details class="reasoning-box" ${m.streaming && !m.content ? "open" : ""}>
+        ? `<details class="reasoning-box" data-detail-key="${rKey}" ${detailOpen(rKey, m.streaming && !m.content)}>
              <summary class="reasoning-toggle"><span>🧠 Раздумья (${m.reasoning.length} симв.)</span>${m.streaming ? '<span class="dot dot-amber dot-pulse"></span>' : ""}</summary>
              <div class="reasoning-body">${esc(m.reasoning)}</div>
            </details>`
         : "";
-      const subCards = (m.subagents || []).map((s) => `
-        <div class="subagent-card">
-          <div class="row-between">
-            <div>
-              <strong>🕸 ${esc(s.subagentName || s.subagentSlug || "Субагент")}</strong>
-              <span class="badge ${s.status === "completed" ? "badge-emerald" : s.status === "error" || s.status === "blocked" ? "badge-red" : "badge-accent"}" style="margin-left:6px;">${esc(s.status || "running")}</span>
+      const subCards = (m.subagents || []).map((s, subIdx) => {
+        const srKey = `ag-sub-r-${msgIdx}-${subIdx}`;
+        const saKey = `ag-sub-a-${msgIdx}-${subIdx}`;
+        const isRunning = s.status === "running";
+        const badgeCls = s.status === "completed" ? "badge-emerald" : (s.status === "error" || s.status === "blocked" ? "badge-red" : "badge-accent");
+        const subReason = s.reasoning
+          ? `<details class="reasoning-box mt-2" data-detail-key="${srKey}" ${detailOpen(srKey, isRunning && !s.text)}>
+               <summary class="reasoning-toggle"><span>🧠 Рассуждения субагента (${s.reasoning.length} симв.)</span>${isRunning ? '<span class="dot dot-amber dot-pulse"></span>' : ""}</summary>
+               <div class="reasoning-body">${esc(s.reasoning)}</div>
+             </details>`
+          : "";
+        const subSteps = (s.actions || []).length
+          ? `<details class="mt-2" data-detail-key="${saKey}" ${detailOpen(saKey, false)}>
+               <summary class="muted" style="cursor:pointer; font-size:11px;">🔧 Шаги субагента (${s.actions.length})</summary>
+               <div class="subagent-steps">
+                 ${s.actions.slice(-20).map((act) => `<div>• <b>${esc(act.label || act.tool || act.type || "шаг")}</b>${act.summary ? `: <span class="muted">${esc(act.summary)}</span>` : ""}</div>`).join("")}
+               </div>
+             </details>`
+          : "";
+        const subFiles = (s.files || []).length
+          ? `<div class="file-dl-list">${s.files.map((sf, sfIdx) => {
+              const canDl = Boolean(sf.data || resolveSandboxPathForFile(sf));
+              return `<button type="button" class="file-dl-btn" data-dl-subfile="${msgIdx}:${subIdx}:${sfIdx}" ${canDl ? "" : "disabled"}>⬇ ${esc(sf.name || sf.path)} ${sf.size ? `<span class="muted">(${esc(formatBytes(sf.size))})</span>` : ""}</button>`;
+            }).join("")}</div>`
+          : "";
+        return `
+          <div class="subagent-card">
+            <div class="row-between">
+              <div class="row">
+                ${s.color ? `<span class="dot" style="background:${esc(s.color)}"></span>` : ""}
+                <strong>🕸 ${esc(s.subagentName || s.subagentSlug || "Субагент")}</strong>
+                <span class="badge ${badgeCls}">${esc(s.status || "running")}</span>
+                ${isRunning ? '<span class="dot dot-amber dot-pulse"></span>' : ""}
+              </div>
+              ${s.statusText ? `<span class="muted" style="font-size:11px;">${esc(s.statusText)}</span>` : ""}
             </div>
-            ${s.statusText ? `<span class="muted" style="font-size:11px;">${esc(s.statusText)}</span>` : ""}
+            ${subReason}
+            ${subSteps}
+            ${s.text ? `<div class="mt-2 md-content">${renderMarkdown(s.text)}</div>` : ""}
+            ${s.outputSummary && !s.text ? `<div class="mt-2 muted" style="font-size:11.5px;">${esc(s.outputSummary)}</div>` : ""}
+            ${s.error ? `<div class="mt-2 text-red" style="font-size:11.5px;">Ошибка: ${esc(s.error)}</div>` : ""}
+            ${subFiles}
           </div>
-          ${s.text ? `<div class="mt-2 md-content">${renderMarkdown(s.text)}</div>` : ""}
-          ${s.outputSummary && !s.text ? `<div class="mt-2 muted" style="font-size:11.5px;">${esc(s.outputSummary)}</div>` : ""}
-        </div>
-      `).join("");
-      const ovCards = (m.overseer || []).map((ov) => `
-        <div class="overseer-card">
-          <div class="row-between">
-            <strong>👁 Надсмотрщик</strong>
-            <span class="badge badge-amber">${esc(ov.status || "проверка")}</span>
+        `;
+      }).join("");
+      const ovCards = (m.overseer || []).map((ov, ovIdx) => {
+        const ovKey = `ag-ov-r-${msgIdx}-${ovIdx}`;
+        const ovReason = ov.reasoning
+          ? `<details class="reasoning-box mt-1" data-detail-key="${ovKey}" ${detailOpen(ovKey, ov.status === "проверка")}>
+               <summary class="reasoning-toggle"><span>🧠 Раздумья Надсмотрщика (${ov.reasoning.length} симв.)</span></summary>
+               <div class="reasoning-body">${esc(ov.reasoning)}</div>
+             </details>`
+          : "";
+        return `
+          <div class="overseer-card">
+            <div class="row-between">
+              <strong>👁 Надсмотрщик</strong>
+              <span class="badge badge-amber">${esc(ov.status || "проверка")}</span>
+            </div>
+            ${ovReason}
+            ${ov.text || ov.summary ? `<div class="mt-1">${esc(ov.text || ov.summary || "")}</div>` : ""}
           </div>
-          <div class="mt-1">${esc(ov.text || ov.summary || "")}</div>
-        </div>
-      `).join("");
+        `;
+      }).join("");
       const actCards = (m.actions || []).map((a) => `
         <div class="action-card">
           <div class="row-between">
@@ -481,7 +557,11 @@ export function mountAgentTab(root, ctx) {
         </div>
       `).join("");
       const filesHtml = (m.files || []).length
-        ? `<div class="att-chips mt-2">${m.files.map((f) => `<span class="badge badge-cyan">📄 ${esc(f.name || f.path)}</span>`).join("")}</div>`
+        ? `<div class="file-dl-list">${m.files.map((f, fIdx) => {
+            const resolvedPath = resolveSandboxPathForFile(f);
+            const canDl = Boolean(f.data || resolvedPath);
+            return `<button type="button" class="file-dl-btn" data-dl-msgfile="${msgIdx}:${fIdx}" title="${canDl ? "Скачать файл" : "Файл не найден на диске"}">⬇ ${esc(f.name || f.path)} ${f.size ? `<span class="muted">(${esc(formatBytes(f.size))})</span>` : ""}</button>`;
+          }).join("")}</div>`
         : "";
       return `
         <div class="bubble bubble-assistant ${m.error ? "bubble-error" : ""}">
@@ -498,62 +578,199 @@ export function mountAgentTab(root, ctx) {
         </div>
       `;
     }).join("");
+
+    elMsgs.querySelectorAll("details[data-detail-key]").forEach((det) => {
+      det.ontoggle = () => {
+        const key = det.getAttribute("data-detail-key");
+        if (det.open) st.openDetails.add(key);
+        else st.openDetails.delete(key);
+      };
+    });
+    elMsgs.querySelectorAll("[data-dl-msgfile]").forEach((btn) => {
+      btn.onclick = () => {
+        const [mIdx, fIdx] = btn.getAttribute("data-dl-msgfile").split(":").map(Number);
+        const f = st.messages[mIdx]?.files?.[fIdx];
+        if (!f) return;
+        const resolved = resolveSandboxPathForFile(f);
+        if (!f.data && !resolved) {
+          showToast("Файл отсутствует на диске Sandbox (возможно, был удалён)", "error");
+          return;
+        }
+        triggerFileDownload(resolved ? { ...f, sandboxPath: resolved } : f);
+      };
+    });
+    elMsgs.querySelectorAll("[data-dl-subfile]").forEach((btn) => {
+      btn.onclick = () => {
+        const [mIdx, sIdx, fIdx] = btn.getAttribute("data-dl-subfile").split(":").map(Number);
+        const f = st.messages[mIdx]?.subagents?.[sIdx]?.files?.[fIdx];
+        if (!f) return;
+        const resolved = resolveSandboxPathForFile(f);
+        if (!f.data && !resolved) {
+          showToast("Файл отсутствует на диске Sandbox", "error");
+          return;
+        }
+        triggerFileDownload(resolved ? { ...f, sandboxPath: resolved } : f);
+      };
+    });
     elMsgs.scrollTop = elMsgs.scrollHeight;
   }
 
-  async function refreshConvs() {
-    try {
-      const res = await apiJson("/api/agent/conversations?kind=agent");
-      st.conversations = res.conversations || [];
-      const host = root.querySelector("#ag-conv-list");
-      host.innerHTML = st.conversations.length
-        ? st.conversations.map((c) => `
-            <div class="list-item ${c.id === st.activeConvId ? "active" : ""}" data-ag-conv="${c.id}">
-              <div style="min-width:0; flex:1;">
-                <div style="font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(c.title)}</div>
-                <div class="muted" style="font-size:10px;">${c.messagesCount || 0} сообщ.</div>
-              </div>
-              <button type="button" class="btn btn-xs btn-ghost text-red" data-del-ag-conv="${c.id}">✕</button>
+  function renderConvList() {
+    const host = root.querySelector("#ag-conv-list");
+    if (!host) return;
+    const q = (st.convSearch || "").trim().toLowerCase();
+    const visible = q
+      ? st.conversations.filter((c) => String(c.title || "Чат агента").toLowerCase().includes(q))
+      : st.conversations;
+    host.innerHTML = visible.length
+      ? visible.map((c) => `
+          <div class="list-item ${c.id === st.activeConvId ? "active" : ""}" data-ag-conv="${c.id}">
+            <div style="min-width:0; flex:1;">
+              <div style="font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(c.title)}</div>
+              <div class="muted" style="font-size:10px;">${c.messagesCount || 0} сообщ.</div>
             </div>
-          `).join("")
-        : `<div class="muted" style="font-size:11px;">Чатов агента нет</div>`;
+            <div class="list-item-actions">
+              <button type="button" class="btn btn-xs btn-ghost" data-rename-ag-conv="${c.id}" title="Переименовать чат">✎</button>
+              <button type="button" class="btn btn-xs btn-ghost text-red" data-del-ag-conv="${c.id}" title="Удалить чат">✕</button>
+            </div>
+          </div>
+        `).join("")
+      : `<div class="muted" style="font-size:11px;">${q ? "По запросу ничего не найдено" : "Чатов агента нет"}</div>`;
 
-      host.querySelectorAll("[data-ag-conv]").forEach((row) => {
-        row.onclick = (ev) => {
-          if (ev.target.closest("[data-del-ag-conv]")) return;
-          loadConv(Number(row.getAttribute("data-ag-conv")));
-        };
-      });
-      host.querySelectorAll("[data-del-ag-conv]").forEach((b) => {
-        b.onclick = async (ev) => {
-          ev.stopPropagation();
-          const id = Number(b.getAttribute("data-del-ag-conv"));
+    host.querySelectorAll("[data-ag-conv]").forEach((row) => {
+      row.onclick = (ev) => {
+        if (ev.target.closest("[data-del-ag-conv], [data-rename-ag-conv]")) return;
+        loadConv(Number(row.getAttribute("data-ag-conv")));
+      };
+    });
+    host.querySelectorAll("[data-rename-ag-conv]").forEach((b) => {
+      b.onclick = async (ev) => {
+        ev.stopPropagation();
+        const id = Number(b.getAttribute("data-rename-ag-conv"));
+        const c = st.conversations.find((x) => x.id === id);
+        await renameAgentConv(id, c?.title || "");
+      };
+    });
+    host.querySelectorAll("[data-del-ag-conv]").forEach((b) => {
+      b.onclick = async (ev) => {
+        ev.stopPropagation();
+        const id = Number(b.getAttribute("data-del-ag-conv"));
+        const c = st.conversations.find((x) => x.id === id);
+        const ok = await confirmDialog({
+          title: "Удалить чат Агента?",
+          message: `Удалить сессию «${c?.title || `#${id}`}» и всю историю сообщений?`,
+          confirmLabel: "Удалить",
+        });
+        if (!ok) return;
+        try {
           await apiJson(`/api/agent/conversations/${id}`, { method: "DELETE" });
           if (st.activeConvId === id) { st.activeConvId = 0; st.messages = []; renderAgentMessages(); }
           await refreshConvs();
-        };
+          showToast("Чат Агента удалён", "ok");
+        } catch (err) {
+          showToast(err.message, "error");
+        }
+      };
+    });
+  }
+
+  async function renameAgentConv(convId, currentTitle) {
+    const nextTitle = await promptDialog({
+      title: "Переименовать чат Агента",
+      defaultValue: currentTitle || "Новый чат",
+      placeholder: "Название чата",
+      confirmLabel: "Сохранить",
+    });
+    if (nextTitle === null) return;
+    const clean = nextTitle.trim();
+    if (!clean) {
+      showToast("Название чата не может быть пустым", "error");
+      return;
+    }
+    try {
+      await apiJson(`/api/agent/conversations/${convId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: clean }),
       });
+      const target = st.conversations.find((c) => c.id === convId);
+      if (target) target.title = clean;
+      renderConvList();
+      renderAgentMessages();
+      showToast("Название чата обновлено", "ok");
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  }
+
+  async function refreshConvs(opts = {}) {
+    try {
+      const res = await apiJson("/api/agent/conversations?kind=agent");
+      const nextConvs = res.conversations || [];
+      const prevActive = st.conversations.find((c) => c.id === st.activeConvId);
+      const nextActive = nextConvs.find((c) => c.id === st.activeConvId);
+      st.conversations = nextConvs;
+      renderConvList();
+      if (
+        opts.syncActive &&
+        !st.streaming &&
+        st.activeConvId &&
+        nextActive &&
+        prevActive &&
+        (prevActive.messagesCount !== nextActive.messagesCount || prevActive.updatedAt !== nextActive.updatedAt)
+      ) {
+        await loadConv(st.activeConvId, { quiet: true });
+      }
     } catch {
       /* ignore */
     }
   }
 
-  async function loadConv(id) {
+  async function loadConv(id, opts = {}) {
     try {
       const res = await apiJson(`/api/agent/conversations/${id}`);
+      const prevCount = st.messages.length;
+      const incoming = (res.messages || []).map((m) => {
+        let acts = [];
+        try { acts = typeof m.actions === "string" ? JSON.parse(m.actions || "[]") : (Array.isArray(m.actions) ? m.actions : []); } catch {}
+        let fls = [];
+        try { fls = typeof m.files === "string" ? JSON.parse(m.files || "[]") : (Array.isArray(m.files) ? m.files : []); } catch {}
+        const subagents = [];
+        const visibleActs = [];
+        for (const a of acts) {
+          if (!a || typeof a !== "object") continue;
+          if (a.type === "subagent_report") {
+            subagents.push({
+              runKey: a.runKey || String(a.runId || subagents.length),
+              subagentName: a.subagentName || a.subagentSlug || "Субагент",
+              status: a.status || "completed",
+              statusText: a.statusText || "",
+              reasoning: a.reasoning || "",
+              text: a.text || a.fullResponse || "",
+              outputSummary: a.outputSummary || a.summary || "",
+              actions: Array.isArray(a.actions) ? a.actions : [],
+              files: Array.isArray(a.files) ? a.files : [],
+            });
+          } else {
+            visibleActs.push(a);
+          }
+        }
+        return {
+          role: m.role,
+          content: m.content || "",
+          reasoning: m.reasoning || "",
+          actions: visibleActs,
+          subagents,
+          files: fls,
+          error: Boolean(m.error),
+        };
+      });
+      if (opts.quiet && st.activeConvId === id && prevCount === incoming.length) return;
       st.activeConvId = id;
-      st.messages = (res.messages || []).map((m) => ({
-        role: m.role,
-        content: m.content || "",
-        reasoning: m.reasoning || "",
-        actions: Array.isArray(m.actions) ? m.actions : [],
-        files: Array.isArray(m.files) ? m.files : [],
-        error: Boolean(m.error),
-      }));
-      await refreshConvs();
+      st.messages = incoming;
+      renderConvList();
       renderAgentMessages();
     } catch (err) {
-      showToast(err.message, "error");
+      if (!opts.quiet) showToast(err.message, "error");
     }
   }
 
@@ -561,7 +778,7 @@ export function mountAgentTab(root, ctx) {
     if (st.activeConvId > 0) return st.activeConvId;
     const res = await apiJson("/api/agent/conversations", {
       method: "POST",
-      body: JSON.stringify({ kind: "agent", title: titleHint.slice(0, 60) }),
+      body: JSON.stringify({ kind: "agent", title: titleHint.slice(0, 80) }),
     });
     st.activeConvId = res.conversation.id;
     await refreshConvs();
@@ -582,6 +799,17 @@ export function mountAgentTab(root, ctx) {
     st.selectedRagId = Number(root.querySelector("#ag-quick-rag").value || 0) || 0;
     st.ragChunks = Number(root.querySelector("#ag-cfg-rag-chunks").value || 8) || 0;
     st.ragFull = Boolean(root.querySelector("#ag-cfg-rag-full").checked);
+  }
+
+  function sanitizeActionForDb(a) {
+    if (!a || typeof a !== "object") return null;
+    const out = {};
+    for (const [k, v] of Object.entries(a)) {
+      if (k === "data" || k === "preview" || k === "_image" || k === "_images") continue;
+      if (typeof v === "string" && v.startsWith("data:image/")) continue;
+      out[k] = v;
+    }
+    return out;
   }
 
   async function sendAgentMessage() {
@@ -656,48 +884,157 @@ export function mountAgentTab(root, ctx) {
         throw new Error(err.error || `HTTP ${res.status}`);
       }
 
+      const findSubCard = (d) => {
+        const rk = d.runKey || d.subagentRunKey;
+        if (rk) {
+          const byRk = aMsg.subagents.find((s) => s.runKey === rk);
+          if (byRk) return byRk;
+        }
+        if (d.runId) {
+          const byId = aMsg.subagents.find((s) => s.runId && s.runId === d.runId);
+          if (byId) return byId;
+        }
+        return aMsg.subagents.length ? aMsg.subagents[aMsg.subagents.length - 1] : null;
+      };
+
       await consumeSseStream(res, (ev, data) => {
         if (ev === "__keepalive__" || !data) return;
         if (ev === "status") {
-          aMsg.status = data.message || data.stage || "";
+          aMsg.status = data.message || data.stage || data.text || "";
         } else if (ev === "reasoning") {
           aMsg.reasoning = typeof data.text === "string" ? data.text : aMsg.reasoning + String(data.delta || "");
         } else if (ev === "text") {
           aMsg.content = typeof data.text === "string" ? data.text : aMsg.content + String(data.delta || "");
         } else if (ev === "action") {
-          aMsg.actions.push(data);
+          if (data.type === "file") {
+            upsertFileEntry(aMsg.files, data);
+            scheduleRefreshSandbox();
+          } else {
+            aMsg.actions.push(data);
+            if (data.type === "sandbox_update" || data.type === "sandbox_write_file" || data.type === "sandbox_create_project") {
+              if (data.path && data.kind !== "dir") {
+                upsertFileEntry(aMsg.files, {
+                  name: data.name || String(data.path).split("/").pop(),
+                  size: data.size || 0,
+                  sandboxPath: data.path,
+                });
+              }
+              scheduleRefreshSandbox();
+            }
+          }
         } else if (ev === "approval_required") {
           st.approvals.push(data);
           renderApprovals();
         } else if (ev === "subagent_run") {
-          aMsg.subagents.push({
-            runKey: data.runKey,
-            subagentName: data.subagentName || data.subagentSlug,
-            status: "running",
-            text: "",
-          });
+          const existing = findSubCard(data);
+          if (existing) {
+            if (data.runId) existing.runId = data.runId;
+            if (data.subagentName) existing.subagentName = data.subagentName;
+            if (data.color) existing.color = data.color;
+          } else {
+            aMsg.subagents.push({
+              runKey: data.runKey || String(data.runId || Date.now()),
+              runId: data.runId || null,
+              subagentId: data.subagentId || null,
+              subagentName: data.subagentName || data.subagentSlug || "Субагент",
+              subagentSlug: data.subagentSlug || "",
+              color: data.color || "#7c5cff",
+              status: "running",
+              statusText: "запуск…",
+              reasoning: "",
+              actions: [],
+              files: [],
+              text: "",
+              outputSummary: "",
+            });
+          }
         } else if (ev === "subagent_status") {
-          const card = aMsg.subagents.find((s) => s.runKey === data.runKey);
-          if (card) card.statusText = data.message || data.stage || "";
+          const card = findSubCard(data);
+          if (card) card.statusText = data.text || data.message || data.stage || "";
+        } else if (ev === "subagent_reasoning") {
+          const card = findSubCard(data);
+          if (card) {
+            card.reasoning = typeof data.text === "string"
+              ? data.text
+              : (card.reasoning || "") + String(data.delta || "");
+          }
         } else if (ev === "subagent_text") {
-          const card = aMsg.subagents.find((s) => s.runKey === data.runKey);
-          if (card) card.text = data.text || "";
+          const card = findSubCard(data);
+          if (card) {
+            card.text = typeof data.text === "string"
+              ? data.text
+              : (card.text || "") + String(data.delta || "");
+          }
+        } else if (ev === "subagent_action") {
+          const card = findSubCard(data);
+          const act = data.action || data;
+          if (card && act) {
+            if (act.type === "file") {
+              upsertFileEntry(card.files, act);
+              upsertFileEntry(aMsg.files, act);
+              scheduleRefreshSandbox();
+            } else {
+              card.actions.push(act);
+              if (act.type === "sandbox_update") {
+                if (act.path && act.kind !== "dir") {
+                  const fObj = { name: act.name || String(act.path).split("/").pop(), size: act.size || 0, sandboxPath: act.path };
+                  upsertFileEntry(card.files, fObj);
+                  upsertFileEntry(aMsg.files, fObj);
+                }
+                scheduleRefreshSandbox();
+              }
+            }
+          }
+        } else if (ev === "subagent_handoff" || ev === "subagent_chat_rotated" || ev === "subagent_handoff_new_chat") {
+          const card = findSubCard(data);
+          if (card) {
+            card.statusText = data.message || data.reason || "передача задачи";
+          }
         } else if (ev === "subagent_done") {
-          const card = aMsg.subagents.find((s) => s.runKey === data.runKey);
+          const card = findSubCard(data);
           if (card) {
             card.status = data.status || "completed";
-            card.outputSummary = data.outputSummary || "";
+            card.statusText = card.status === "completed" ? "готово" : card.status;
+            card.outputSummary = data.outputSummary || data.reportSummary || card.outputSummary || "";
             if (data.fullResponse) card.text = data.fullResponse;
+            if (data.reasoning && !card.reasoning) card.reasoning = data.reasoning;
+            if (Array.isArray(data.actions) && !card.actions.length) card.actions = data.actions;
+            if (Array.isArray(data.files)) {
+              for (const sf of data.files) {
+                upsertFileEntry(card.files, sf);
+                upsertFileEntry(aMsg.files, sf);
+              }
+            }
+            if (data.error) card.error = data.error;
           }
-        } else if (ev === "overseer_start" || ev === "overseer_status" || ev === "overseer_done") {
-          aMsg.overseer.push({
-            status: ev === "overseer_done" ? (data.verdict || "ок") : "проверка",
-            text: data.message || data.reason || data.summary || "",
-          });
+        } else if (ev === "subagent_error") {
+          const card = findSubCard(data);
+          if (card) {
+            card.status = "error";
+            card.error = data.message || data.error || "Ошибка субагента";
+          }
+        } else if (ev === "overseer_start" || ev === "overseer_status" || ev === "overseer_reasoning" || ev === "overseer_done") {
+          let ov = aMsg.overseer.find((o) => o.subagentRunKey && data.subagentRunKey && o.subagentRunKey === data.subagentRunKey);
+          if (!ov && aMsg.overseer.length && ev !== "overseer_start") {
+            ov = aMsg.overseer[aMsg.overseer.length - 1];
+          }
+          if (!ov) {
+            ov = { subagentRunKey: data.subagentRunKey || "", status: "проверка", reasoning: "", text: "", summary: "" };
+            aMsg.overseer.push(ov);
+          }
+          if (ev === "overseer_reasoning") {
+            ov.reasoning = typeof data.text === "string" ? data.text : (ov.reasoning || "") + String(data.delta || "");
+          } else {
+            ov.status = ev === "overseer_done" ? (data.verdict || "проверено") : (data.status || "проверка");
+            const msgTxt = data.text || data.message || data.reason || data.summary;
+            if (msgTxt) ov.text = msgTxt;
+          }
         } else if (ev === "done") {
           aMsg.status = "готово";
           if (data.text && !aMsg.content) aMsg.content = data.text;
-          if (Array.isArray(data.files)) aMsg.files = data.files;
+          if (Array.isArray(data.files)) {
+            for (const df of data.files) upsertFileEntry(aMsg.files, df);
+          }
           if (data.usage) aMsg.usage = data.usage;
         } else if (ev === "error") {
           aMsg.error = true;
@@ -717,21 +1054,43 @@ export function mountAgentTab(root, ctx) {
       st.abortCtrl = null;
       root.querySelector("#ag-send-btn").style.display = "";
       root.querySelector("#ag-stop-stream-btn").style.display = "none";
+      await refreshSandbox();
       renderAgentMessages();
-      // Сохраняем итоговый ответ ассистента в БД
-      if (aMsg.content || aMsg.actions.length) {
+      const subReportsForDb = (aMsg.subagents || []).map((s) => ({
+        type: "subagent_report",
+        runKey: s.runKey,
+        subagentName: s.subagentName,
+        subagentSlug: s.subagentSlug,
+        status: s.status,
+        outputSummary: s.outputSummary || "",
+        text: (s.text || "").slice(0, 8000),
+        reasoning: (s.reasoning || "").slice(0, 8000),
+      }));
+      const cleanActsForDb = [
+        ...aMsg.actions.map(sanitizeActionForDb).filter(Boolean),
+        ...subReportsForDb,
+      ];
+      const cleanFilesForDb = (aMsg.files || []).map((f) => ({
+        name: f.name || "file",
+        mime: f.mime || "application/octet-stream",
+        size: Number(f.size || 0) || 0,
+        ...(f.sandboxPath ? { sandboxPath: f.sandboxPath } : {}),
+      }));
+      if (aMsg.content || cleanActsForDb.length || cleanFilesForDb.length) {
         apiJson(`/api/agent/conversations/${convId}/messages`, {
           method: "POST",
           body: JSON.stringify({
             role: "assistant",
             content: aMsg.content || "[Выполнено]",
             reasoning: aMsg.reasoning,
-            actions: aMsg.actions,
-            files: aMsg.files,
+            actions: cleanActsForDb,
+            files: cleanFilesForDb,
             error: aMsg.error ? aMsg.content : undefined,
           }),
         }).catch(() => {});
       }
+      refreshConvs();
+      if (aMsg.subagents.length) refreshSubagents();
       apiJson("/api/ai/agent").then(renderAgentHealth).catch(() => {});
     }
   }
@@ -774,10 +1133,37 @@ export function mountAgentTab(root, ctx) {
   };
   root.querySelector("#ag-send-btn").onclick = sendAgentMessage;
   root.querySelector("#ag-stop-stream-btn").onclick = () => st.abortCtrl?.abort();
+
+  const elAgSearch = root.querySelector("#ag-conv-search");
+  const elAgSearchClear = root.querySelector("#ag-conv-search-clear");
+  elAgSearch.oninput = () => {
+    st.convSearch = elAgSearch.value;
+    elAgSearchClear.style.display = st.convSearch ? "" : "none";
+    renderConvList();
+  };
+  elAgSearchClear.onclick = () => {
+    st.convSearch = "";
+    elAgSearch.value = "";
+    elAgSearchClear.style.display = "none";
+    renderConvList();
+  };
+  root.querySelector("#ag-rename-conv").onclick = () => {
+    if (!st.activeConvId) return;
+    const active = st.conversations.find((c) => c.id === st.activeConvId);
+    renameAgentConv(st.activeConvId, active?.title || "");
+  };
+
   root.querySelector("#ag-new-conv").onclick = async () => {
+    const chosen = await promptDialog({
+      title: "Новый чат Агента",
+      defaultValue: "",
+      placeholder: "Название чата (можно оставить пустым)",
+      confirmLabel: "Создать",
+    });
+    if (chosen === null) return;
     st.activeConvId = 0;
     st.messages = [];
-    await ensureConvId("Новый чат");
+    await ensureConvId(chosen.trim() || "Новый чат");
     renderAgentMessages();
   };
 
@@ -873,6 +1259,12 @@ export function mountAgentTab(root, ctx) {
   };
   root.querySelector("#ag-save-cfg-btn").onclick = async () => {
     syncAgentSettingsFromDom();
+    await apiJson("/api/app/prefs", {
+      method: "POST",
+      body: JSON.stringify({
+        localModel: { baseUrl: st.settings.baseUrl, model: st.settings.model, apiKey: st.settings.apiKey },
+      }),
+    }).catch(() => {});
     try {
       const saved = await apiJson("/api/ai/settings", {
         method: "PUT",
@@ -882,12 +1274,6 @@ export function mountAgentTab(root, ctx) {
           ...(st.settings.apiKey ? { apiKey: st.settings.apiKey } : {}),
         }),
       });
-      await apiJson("/api/app/prefs", {
-        method: "POST",
-        body: JSON.stringify({
-          localModel: { baseUrl: st.settings.baseUrl, model: st.settings.model, apiKey: st.settings.apiKey },
-        }),
-      }).catch(() => {});
       const s = saved?.settings || {};
       const keyInp = root.querySelector("#ag-api-key");
       if (keyInp) {
@@ -895,7 +1281,11 @@ export function mountAgentTab(root, ctx) {
       }
       showToast("Настройки Агента сохранены в БД CRM", "ok");
     } catch (err) {
-      showToast(err.message, "error");
+      if (err.status === 400 && /127\.0\.0\.1|localhost|запрещ/i.test(err.message || "")) {
+        showToast("Локальные настройки Агента сохранены в приложении", "ok");
+      } else {
+        showToast(err.message, "error");
+      }
     }
   };
 
@@ -978,53 +1368,130 @@ export function mountAgentTab(root, ctx) {
       const sb = await apiJson("/api/ai/agent/sandbox");
       st.sandbox = sb;
       root.querySelector("#ag-sb-dl-all").href = withHtQuery("/api/ai/agent/sandbox?download=.");
-      const projHost = root.querySelector("#ag-sb-projects");
+
       const projects = sb.projects || [];
-      const files = sb.files || [];
+      const allItems = (sb.items || sb.files || []).filter((it) => it && it.path);
+      const fileItems = allItems.filter((it) => it.type === "file" || (!it.type && !projects.some((p) => p.name === it.path)));
+      const totalProjects = sb.totalProjects ?? projects.length;
+      const totalFiles = sb.totalFiles ?? (fileItems.length || projects.reduce((sum, p) => sum + Number(p.files ?? p.filesCount ?? 0), 0));
+      const totalSize = sb.totalSize ?? (fileItems.reduce((sum, f) => sum + Number(f.size || 0), 0) || projects.reduce((sum, p) => sum + Number(p.size || 0), 0));
+
+      const statsEl = root.querySelector("#ag-sb-stats");
+      if (statsEl) {
+        statsEl.textContent = `Проектов: ${totalProjects} · Файлов: ${totalFiles} · Размер: ${formatBytes(totalSize)}${sb.agentRunning ? "" : " (чтение с диска)"}`;
+      }
+      const rootEl = root.querySelector("#ag-sb-root-path");
+      if (rootEl) rootEl.textContent = sb.root ? `📁 ${sb.root}` : "";
+      const quickBadge = root.querySelector("#ag-sb-quick-badge");
+      if (quickBadge) quickBadge.textContent = `Sandbox: ${totalProjects} проект. · ${totalFiles} файл.`;
+
+      const projHost = root.querySelector("#ag-sb-projects");
       projHost.innerHTML = projects.length
         ? projects.map((p) => {
             const pUrl = withHtQuery(`/api/ai/agent/sandbox/preview/${encodeURIComponent(p.name)}`);
             const dUrl = withHtQuery(`/api/ai/agent/sandbox?download=${encodeURIComponent(p.name)}`);
+            const cnt = Number(p.files ?? p.filesCount ?? 0) || 0;
             return `
               <div class="card-sm row-between">
                 <div>
                   <b>📁 ${esc(p.name)}</b>
-                  <div class="muted" style="font-size:10.5px;">${p.filesCount || 0} файлов · ${esc(formatBytes(p.size || 0))}</div>
+                  <div class="muted" style="font-size:10.5px;">${cnt} файл. · ${esc(formatBytes(p.size || 0))}${p.hasIndex ? " · HTML" : ""}</div>
                 </div>
                 <div class="row">
-                  <a class="btn btn-xs btn-primary" href="${esc(pUrl)}" target="_blank">🌐 Превью</a>
+                  ${p.hasIndex ? `<a class="btn btn-xs btn-primary" href="${esc(pUrl)}" target="_blank">🌐 Превью</a>` : ""}
                   <a class="btn btn-xs" href="${esc(dUrl)}">⬇ ZIP</a>
                   <button type="button" class="btn btn-xs" data-sb-export="${esc(p.name)}">📤 На ПК</button>
-                  <button type="button" class="btn btn-xs btn-danger" data-sb-del="${esc(p.name)}">✕</button>
+                  <button type="button" class="btn btn-xs btn-danger" data-sb-del="${esc(p.name)}" title="Удалить проект">✕</button>
                 </div>
               </div>
             `;
           }).join("")
-        : (files.length
-          ? files.slice(0, 30).map((f) => `<div class="card-sm row-between"><span class="mono" style="font-size:11px;">${esc(f.path || f.name)}</span><a class="btn btn-xs" href="${esc(withHtQuery(`/api/ai/agent/sandbox?download=${encodeURIComponent(f.path || f.name)}`))}">⬇</a></div>`).join("")
-          : `<div class="muted">Песочница пока пуста</div>`);
+        : `<div class="muted" style="font-size:11.5px;">Папок проектов пока нет</div>`;
 
-      projHost.querySelectorAll("[data-sb-export]").forEach((b) => {
-        b.onclick = async () => {
-          const src = b.getAttribute("data-sb-export");
-          const pick = await apiJson("/api/app/pick-folder", { method: "POST", body: "{}" });
-          if (!pick.ok || !pick.path) return;
-          try {
-            await apiJson("/api/ai/agent/sandbox", {
-              method: "POST",
-              body: JSON.stringify({ action: "export", source: src, destination: pick.path, mode: "copy", confirmed: true }),
+      const filesWrap = root.querySelector("#ag-sb-files-wrap");
+      const rootFiles = sb.rootFiles?.length
+        ? sb.rootFiles
+        : fileItems.filter((f) => !String(f.path).includes("/") || String(f.path).startsWith("downloads/"));
+      const treeOpen = st.openDetails.has("sb-all-files") ? "open" : "";
+      filesWrap.innerHTML = `
+        ${rootFiles.length ? `
+          <div style="font-weight:600; font-size:12.5px;" class="mb-1">Файлы (${rootFiles.length})</div>
+          <div class="col mb-2" style="max-height:190px; overflow-y:auto;">
+            ${rootFiles.map((f) => `
+              <div class="card-sm row-between">
+                <div style="min-width:0; flex:1;">
+                  <div class="mono" style="font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">📄 ${esc(f.path || f.name)}</div>
+                  <div class="muted" style="font-size:10px;">${esc(formatBytes(f.size || 0))}</div>
+                </div>
+                <div class="row">
+                  <a class="btn btn-xs btn-primary" href="${esc(withHtQuery(`/api/ai/agent/sandbox?download=${encodeURIComponent(f.path || f.name)}`))}">⬇ Скачать</a>
+                  <button type="button" class="btn btn-xs" data-sb-export="${esc(f.path || f.name)}" title="Сохранить на ПК">📤</button>
+                  <button type="button" class="btn btn-xs btn-danger" data-sb-del="${esc(f.path || f.name)}" title="Удалить файл">✕</button>
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        ` : ""}
+        ${fileItems.length ? `
+          <details data-sb-detail="sb-all-files" ${treeOpen}>
+            <summary class="muted" style="cursor:pointer; font-size:11.5px;">📂 Все файлы в Sandbox (${fileItems.length})</summary>
+            <div class="col mt-1" style="max-height:220px; overflow-y:auto;">
+              ${fileItems.slice(0, 200).map((f) => `
+                <div class="card-sm row-between" style="padding:4px 8px;">
+                  <span class="mono" style="font-size:10.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${esc(f.path)} <span class="muted">(${esc(formatBytes(f.size || 0))})</span></span>
+                  <div class="row">
+                    <a class="btn btn-xs btn-ghost" href="${esc(withHtQuery(`/api/ai/agent/sandbox?download=${encodeURIComponent(f.path)}`))}">⬇</a>
+                    <button type="button" class="btn btn-xs btn-ghost text-red" data-sb-del="${esc(f.path)}">✕</button>
+                  </div>
+                </div>
+              `).join("")}
+            </div>
+          </details>
+        ` : (!projects.length ? `<div class="muted" style="font-size:11.5px;">Файлов в Sandbox пока нет</div>` : "")}
+      `;
+
+      const treeDet = filesWrap.querySelector("details[data-sb-detail='sb-all-files']");
+      if (treeDet) {
+        treeDet.ontoggle = () => {
+          if (treeDet.open) st.openDetails.add("sb-all-files");
+          else st.openDetails.delete("sb-all-files");
+        };
+      }
+
+      const bindSbActions = (scope) => {
+        scope.querySelectorAll("[data-sb-export]").forEach((b) => {
+          b.onclick = async () => {
+            const src = b.getAttribute("data-sb-export");
+            const pick = await apiJson("/api/app/pick-folder", { method: "POST", body: "{}" });
+            if (!pick.ok || !pick.path) return;
+            try {
+              await apiJson("/api/ai/agent/sandbox", {
+                method: "POST",
+                body: JSON.stringify({ action: "export", path: src, source: src, destination: pick.path, mode: "copy", confirmed: true }),
+              });
+              showToast(`Скопировано в ${pick.path}`, "ok");
+            } catch (err) { showToast(err.message, "error"); }
+          };
+        });
+        scope.querySelectorAll("[data-sb-del]").forEach((b) => {
+          b.onclick = async () => {
+            const p = b.getAttribute("data-sb-del");
+            const ok = await confirmDialog({
+              title: "Удалить из Sandbox?",
+              message: `Удалить «${p}» из песочницы? Это действие необратимо.`,
+              confirmLabel: "Удалить",
             });
-            showToast(`Скопировано в ${pick.path}`, "ok");
-          } catch (err) { showToast(err.message, "error"); }
-        };
-      });
-      projHost.querySelectorAll("[data-sb-del]").forEach((b) => {
-        b.onclick = async () => {
-          const p = b.getAttribute("data-sb-del");
-          await apiJson("/api/ai/agent/sandbox", { method: "POST", body: JSON.stringify({ action: "delete", path: p, confirmed: true }) });
-          await refreshSandbox();
-        };
-      });
+            if (!ok) return;
+            try {
+              await apiJson("/api/ai/agent/sandbox", { method: "POST", body: JSON.stringify({ action: "delete", path: p, confirmed: true }) });
+              await refreshSandbox();
+              showToast(`Удалено: ${p}`, "ok");
+            } catch (err) { showToast(err.message, "error"); }
+          };
+        });
+      };
+      bindSbActions(projHost);
+      bindSbActions(filesWrap);
 
       const procHost = root.querySelector("#ag-sb-processes");
       const procs = sb.processes || [];
@@ -1038,8 +1505,17 @@ export function mountAgentTab(root, ctx) {
         : `<div class="muted" style="font-size:11px;">Активных фоновых серверов нет</div>`;
       procHost.querySelectorAll("[data-sb-stop-pid]").forEach((b) => {
         b.onclick = async () => {
-          await apiJson("/api/ai/agent/sandbox", { method: "POST", body: JSON.stringify({ action: "stop_process", pid: Number(b.getAttribute("data-sb-stop-pid")) }) });
-          await refreshSandbox();
+          const pid = Number(b.getAttribute("data-sb-stop-pid"));
+          const ok = await confirmDialog({
+            title: "Остановить процесс Sandbox?",
+            message: `Завершить фоновый процесс PID ${pid}?`,
+            confirmLabel: "Остановить",
+          });
+          if (!ok) return;
+          try {
+            await apiJson("/api/ai/agent/sandbox", { method: "POST", body: JSON.stringify({ action: "stop_process", pid }) });
+            await refreshSandbox();
+          } catch (err) { showToast(err.message, "error"); }
         };
       });
     } catch {}
@@ -1057,10 +1533,30 @@ export function mountAgentTab(root, ctx) {
                 <div style="font-weight:500;">${esc(t.title)}</div>
                 <div class="muted" style="font-size:10.5px;">${esc(formatDateTime(t.createdAt))}</div>
               </div>
-              <a class="btn btn-xs" href="${esc(withHtQuery(`/api/agent/transcripts/${t.id}`))}">⬇ .md</a>
+              <div class="row">
+                <a class="btn btn-xs" href="${esc(withHtQuery(`/api/agent/transcripts/${t.id}`))}">⬇ .md</a>
+                <button type="button" class="btn btn-xs btn-danger" data-tr-del="${t.id}" title="Удалить стенограмму">✕</button>
+              </div>
             </div>
           `).join("")
         : `<div class="muted">Стенограмм пока нет</div>`;
+      host.querySelectorAll("[data-tr-del]").forEach((b) => {
+        b.onclick = async () => {
+          const id = Number(b.getAttribute("data-tr-del"));
+          const tr = st.transcripts.find((x) => x.id === id);
+          const ok = await confirmDialog({
+            title: "Удалить стенограмму?",
+            message: `Удалить стенограмму «${tr?.title || `#${id}`}»?`,
+            confirmLabel: "Удалить",
+          });
+          if (!ok) return;
+          try {
+            await apiJson(`/api/agent/transcripts/${id}`, { method: "DELETE" });
+            await refreshTranscripts();
+            showToast("Стенограмма удалена", "ok");
+          } catch (err) { showToast(err.message, "error"); }
+        };
+      });
     } catch {}
   }
 
@@ -1355,11 +1851,19 @@ export function mountAgentTab(root, ctx) {
     host.querySelectorAll("[data-sa-del]").forEach((b) => {
       b.onclick = async () => {
         const id = Number(b.getAttribute("data-sa-del"));
+        const sa = subagents.find((x) => x.id === id);
+        const ok = await confirmDialog({
+          title: "Удалить субагента?",
+          message: `Удалить субагента «${sa?.name || `#${id}`}»?`,
+          confirmLabel: "Удалить",
+        });
+        if (!ok) return;
         try {
           await apiJson(`/api/agent/subagents/${id}`, { method: "DELETE" });
           if (st.editingSubagentId === id) st.editingSubagentId = 0;
           if (st.selectedSubId === id) { st.selectedSubId = 0; st.activeSubConvId = 0; st.subMessages = []; }
           await refreshSubagents();
+          showToast("Субагент удалён", "ok");
         } catch (err) { showToast(err.message, "error"); }
       };
     });
@@ -1454,10 +1958,24 @@ export function mountAgentTab(root, ctx) {
         });
         await consumeSseStream(res, (ev, d) => {
           if (!d) return;
-          if ((ev === "text" || ev === "subagent_text") && d.text) reply.content = d.text;
+          if ((ev === "reasoning" || ev === "subagent_reasoning") && (typeof d.text === "string" || d.delta)) {
+            reply.reasoning = typeof d.text === "string" ? d.text : (reply.reasoning || "") + String(d.delta || "");
+          }
+          if ((ev === "text" || ev === "subagent_text") && (typeof d.text === "string" || d.delta)) {
+            reply.content = typeof d.text === "string" ? d.text : (reply.content === "…" ? "" : reply.content) + String(d.delta || "");
+          }
           if (ev === "done" && d.text && reply.content === "…") reply.content = d.text;
           const dm = host.querySelector("#sa-direct-msgs");
-          if (dm) dm.innerHTML = st.subMessages.map((m) => `<div class="card-sm"><b>${m.role === "user" ? "Вы" : "Субагент"}:</b> ${renderMarkdown(m.content || "")}</div>`).join("");
+          if (dm) {
+            dm.innerHTML = st.subMessages.map((m) => `
+              <div class="card-sm">
+                <b>${m.role === "user" ? "Вы" : "Субагент"}:</b>
+                ${m.reasoning ? `<details class="reasoning-box mt-1"><summary class="reasoning-toggle"><span>🧠 Раздумья (${m.reasoning.length})</span></summary><div class="reasoning-body">${esc(m.reasoning)}</div></details>` : ""}
+                <div class="mt-1">${renderMarkdown(m.content || "")}</div>
+              </div>
+            `).join("");
+            dm.scrollTop = dm.scrollHeight;
+          }
         });
       } catch (err) {
         showToast(err.message, "error");
@@ -1468,92 +1986,42 @@ export function mountAgentTab(root, ctx) {
     };
   }
 
-  // ---- Тестировщик (QA) ----
-  async function refreshTesterConvs() {
-    try {
-      const res = await apiJson("/api/agent/conversations?kind=tester");
-      st.testerConvs = res.conversations || [];
-      root.querySelector("#qa-conv-list").innerHTML = st.testerConvs.map((c) => `
-        <div class="list-item ${c.id === st.activeTesterConvId ? "active" : ""}" data-qa-conv="${c.id}">
-          <div>${esc(c.title)}</div>
-        </div>
-      `).join("") || `<div class="muted" style="font-size:11px;">Сессий QA нет</div>`;
-      root.querySelectorAll("[data-qa-conv]").forEach((row) => {
-        row.onclick = async () => {
-          const id = Number(row.getAttribute("data-qa-conv"));
-          st.activeTesterConvId = id;
-          const det = await apiJson(`/api/agent/conversations/${id}`);
-          st.testerMessages = det.messages || [];
-          renderQaMsgs();
-        };
-      });
-    } catch {}
-  }
-  function renderQaMsgs() {
-    const h = root.querySelector("#qa-messages");
-    h.innerHTML = st.testerMessages.map((m) => `
-      <div class="bubble ${m.role === "user" ? "bubble-user" : "bubble-assistant"}">
-        <div class="bubble-meta"><span>${m.role === "user" ? "Вы" : "🧪 QA"}</span></div>
-        ${renderMarkdown(m.content || "")}
-      </div>
-    `).join("") || `<div class="card-2" style="padding:16px; margin:auto;">Опишите, что протестировать в проекте песочницы.</div>`;
-    h.scrollTop = h.scrollHeight;
-  }
-  root.querySelector("#qa-new-conv").onclick = async () => {
-    const c = await apiJson("/api/agent/conversations", { method: "POST", body: JSON.stringify({ kind: "tester", title: "QA проверка" }) });
-    st.activeTesterConvId = c.conversation.id;
-    st.testerMessages = [];
-    await refreshTesterConvs();
-    renderQaMsgs();
-  };
-  root.querySelector("#qa-send-btn").onclick = async () => {
-    const inp = root.querySelector("#qa-input");
-    const text = inp.value.trim();
-    if (!text || st.testerStreaming) return;
-    syncAgentSettingsFromDom();
-    inp.value = "";
-    st.testerStreaming = true;
-    try {
-      if (!st.activeTesterConvId) {
-        const c = await apiJson("/api/agent/conversations", { method: "POST", body: JSON.stringify({ kind: "tester", title: text.slice(0, 60) }) });
-        st.activeTesterConvId = c.conversation.id;
+  async function refreshAll(opts = {}) {
+    apiJson("/api/ai/agent").then(renderAgentHealth).catch(() => {});
+    if (st.streaming || st.subStreaming) return;
+    if (st.subtab === "chat") {
+      await refreshConvs({ background: Boolean(opts.background), syncActive: true });
+      await refreshSandbox();
+    } else if (st.subtab === "sandbox") {
+      await Promise.all([refreshSandbox(), refreshTranscripts()]);
+    } else if (st.subtab === "subagents") {
+      const saPanel = root.querySelector("#ag-panel-subagents");
+      const activeEl = document.activeElement;
+      const userTyping = Boolean(
+        opts.background &&
+        saPanel &&
+        activeEl &&
+        saPanel.contains(activeEl) &&
+        ["INPUT", "TEXTAREA", "SELECT"].includes(activeEl.tagName)
+      );
+      if (!userTyping) {
+        await refreshSubagents();
       }
-      st.testerMessages.push({ role: "user", content: text });
-      const ans = { role: "assistant", content: "Проверяю…" };
-      st.testerMessages.push(ans);
-      renderQaMsgs();
-      const res = await apiFetch("/api/ai/agent", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          agentRole: "tester",
-          testerConversationId: st.activeTesterConvId,
-          messages: st.testerMessages.slice(0, -1).map((m) => ({ role: m.role, content: m.content })),
-          settings: { baseUrl: st.settings.baseUrl, apiKey: st.settings.apiKey, model: st.settings.model },
-          trustLevel: st.settings.trustLevel,
-          sandboxProject: st.sandboxProject,
-        }),
-      });
-      await consumeSseStream(res, (ev, d) => {
-        if (!d) return;
-        if ((ev === "text" || ev === "tester_text") && d.text) ans.content = d.text;
-        if (ev === "tester_done" && d.fullResponse && ans.content === "Проверяю…") ans.content = d.fullResponse;
-        if (ev === "done" && d.text && ans.content === "Проверяю…") ans.content = d.text;
-        renderQaMsgs();
-      });
-    } catch (err) {
-      showToast(err.message, "error");
-    } finally {
-      st.testerStreaming = false;
-      await refreshTesterConvs();
+    } else if (st.subtab === "config" && !opts.background) {
+      await loadRagAndGithub();
     }
-  };
+  }
+
+  subscribeAppEvents(() => {
+    refreshAll({ background: true });
+  });
 
   refreshConvs();
+  refreshSandbox();
   renderAgentMessages();
   loadSavedAgentSettings();
   loadRagAndGithub();
   apiJson("/api/ai/agent").then(renderAgentHealth).catch(() => {});
 
-  return { refresh: refreshConvs };
+  return { refresh: refreshAll };
 }

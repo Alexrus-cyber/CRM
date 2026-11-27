@@ -123,6 +123,129 @@ export function formatBytes(bytes) {
   return `${(b / (1024 * 1024)).toFixed(1)} МБ`;
 }
 
+export function triggerFileDownload(file) {
+  if (!file) return;
+  const name = String(file.name || (file.path ? String(file.path).split("/").pop() : "") || "file.bin");
+  if (file.sandboxPath || file.path) {
+    const rel = String(file.sandboxPath || file.path);
+    const url = withHtQuery(`/api/ai/agent/sandbox?download=${encodeURIComponent(rel)}`);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return;
+  }
+  if (file.data) {
+    try {
+      const bin = atob(String(file.data));
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+      const blob = new Blob([bytes], { type: file.mime || "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    } catch {
+      showToast("Не удалось подготовить файл для скачивания", "error");
+    }
+  }
+}
+
+export function confirmDialog({
+  title = "Подтвердите действие",
+  message = "Вы уверены?",
+  confirmLabel = "Удалить",
+  cancelLabel = "Отмена",
+  danger = true,
+} = {}) {
+  return new Promise((resolve) => {
+    const host = document.getElementById("modal-container") || document.body;
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    backdrop.innerHTML = `
+      <div class="modal-card" role="dialog" aria-modal="true">
+        <h3 class="modal-title">${esc(title)}</h3>
+        <div class="modal-body">${esc(message)}</div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-sm" data-modal-cancel>${esc(cancelLabel)}</button>
+          <button type="button" class="btn btn-sm ${danger ? "btn-danger" : "btn-primary"}" data-modal-ok>${esc(confirmLabel)}</button>
+        </div>
+      </div>
+    `;
+    const cleanup = (result) => {
+      document.removeEventListener("keydown", onKey);
+      backdrop.remove();
+      resolve(result);
+    };
+    const onKey = (ev) => {
+      if (ev.key === "Escape") { ev.preventDefault(); cleanup(false); }
+      if (ev.key === "Enter") { ev.preventDefault(); cleanup(true); }
+    };
+    backdrop.onclick = (ev) => {
+      if (ev.target === backdrop) cleanup(false);
+    };
+    backdrop.querySelector("[data-modal-cancel]").onclick = () => cleanup(false);
+    backdrop.querySelector("[data-modal-ok]").onclick = () => cleanup(true);
+    document.addEventListener("keydown", onKey);
+    host.appendChild(backdrop);
+    backdrop.querySelector("[data-modal-ok]").focus();
+  });
+}
+
+export function promptDialog({
+  title = "Введите название",
+  message = "",
+  defaultValue = "",
+  placeholder = "",
+  confirmLabel = "Сохранить",
+  cancelLabel = "Отмена",
+} = {}) {
+  return new Promise((resolve) => {
+    const host = document.getElementById("modal-container") || document.body;
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    backdrop.innerHTML = `
+      <div class="modal-card" role="dialog" aria-modal="true">
+        <h3 class="modal-title">${esc(title)}</h3>
+        ${message ? `<div class="modal-body">${esc(message)}</div>` : ""}
+        <input class="input" data-modal-input value="${esc(defaultValue)}" placeholder="${esc(placeholder)}" />
+        <div class="modal-actions">
+          <button type="button" class="btn btn-sm" data-modal-cancel>${esc(cancelLabel)}</button>
+          <button type="button" class="btn btn-sm btn-primary" data-modal-ok>${esc(confirmLabel)}</button>
+        </div>
+      </div>
+    `;
+    const input = backdrop.querySelector("[data-modal-input]");
+    const cleanup = (result) => {
+      document.removeEventListener("keydown", onKey);
+      backdrop.remove();
+      resolve(result);
+    };
+    const submit = () => cleanup(input.value.trim());
+    const onKey = (ev) => {
+      if (ev.key === "Escape") { ev.preventDefault(); cleanup(null); }
+    };
+    input.onkeydown = (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); submit(); }
+    };
+    backdrop.onclick = (ev) => {
+      if (ev.target === backdrop) cleanup(null);
+    };
+    backdrop.querySelector("[data-modal-cancel]").onclick = () => cleanup(null);
+    backdrop.querySelector("[data-modal-ok]").onclick = submit;
+    document.addEventListener("keydown", onKey);
+    host.appendChild(backdrop);
+    input.focus();
+    input.select();
+  });
+}
+
 export function formatDateTime(iso) {
   if (!iso) return "";
   try {
@@ -337,6 +460,10 @@ const appState = {
   boot: null,
   activeTab: "chat",
   eventsSource: null,
+  reconnectTimer: null,
+  autoPollTimer: null,
+  focusHandler: null,
+  visHandler: null,
   listeners: new Set(),
   tabsApi: {},
 };
@@ -352,6 +479,10 @@ function applyTheme(theme) {
 }
 
 function renderLogin(state) {
+  if (appState.autoPollTimer) { clearInterval(appState.autoPollTimer); appState.autoPollTimer = null; }
+  if (appState.reconnectTimer) { clearTimeout(appState.reconnectTimer); appState.reconnectTimer = null; }
+  if (appState.focusHandler) { window.removeEventListener("focus", appState.focusHandler); appState.focusHandler = null; }
+  if (appState.visHandler) { document.removeEventListener("visibilitychange", appState.visHandler); appState.visHandler = null; }
   applyTheme(state.theme);
   const root = document.getElementById("app-root");
   root.innerHTML = `
@@ -476,15 +607,31 @@ function startEventsStream() {
     try { appState.eventsSource.close(); } catch {}
     appState.eventsSource = null;
   }
+  if (appState.reconnectTimer) {
+    clearTimeout(appState.reconnectTimer);
+    appState.reconnectTimer = null;
+  }
   const src = new EventSource(withHtQuery("/api/events"));
-  src.addEventListener("update", (ev) => {
+  const notify = (kind, rawData) => {
     try {
-      const payload = JSON.parse(ev.data || "{}");
-      for (const fn of appState.listeners) fn(payload);
+      const payload = rawData ? JSON.parse(rawData) : {};
+      for (const fn of appState.listeners) fn({ ...payload, _event: kind });
     } catch {
       /* ignore */
     }
-  });
+  };
+  src.addEventListener("update", (ev) => notify("update", ev.data));
+  src.onmessage = (ev) => notify("message", ev.data);
+  src.onerror = () => {
+    try { src.close(); } catch {}
+    if (appState.eventsSource === src) appState.eventsSource = null;
+    if (!appState.reconnectTimer) {
+      appState.reconnectTimer = setTimeout(() => {
+        appState.reconnectTimer = null;
+        if (appState.boot?.authenticated) startEventsStream();
+      }, 5000);
+    }
+  };
   appState.eventsSource = src;
 }
 
@@ -548,6 +695,18 @@ function renderMain(state) {
     </div>
   `;
 
+  const refreshActiveTab = (opts = {}) => {
+    const api = appState.tabsApi[appState.activeTab];
+    if (api && typeof api.refresh === "function") {
+      try {
+        return api.refresh(opts);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
+
   const switchTab = (tabId) => {
     appState.activeTab = tabId;
     document.querySelectorAll("[data-main-tab]").forEach((btn) => {
@@ -560,9 +719,7 @@ function renderMain(state) {
       method: "POST",
       body: JSON.stringify({ harnessState: { activeTab: tabId } }),
     }).catch(() => {});
-    if (tabId === "limits" && appState.tabsApi.limits?.refresh) {
-      appState.tabsApi.limits.refresh();
-    }
+    refreshActiveTab({ reason: "tab" });
   };
 
   document.querySelectorAll("[data-main-tab]").forEach((btn) => {
@@ -631,6 +788,31 @@ function renderMain(state) {
   appState.tabsApi.limits = mountLimitsTab(document.getElementById("panel-limits"), ctx);
 
   startEventsStream();
+
+  // Автообновление контента при возврате фокуса, смене видимости и мягком фоновом тике
+  if (appState.autoPollTimer) clearInterval(appState.autoPollTimer);
+  if (appState.focusHandler) window.removeEventListener("focus", appState.focusHandler);
+  if (appState.visHandler) document.removeEventListener("visibilitychange", appState.visHandler);
+
+  let lastFocusRefresh = 0;
+  const triggerSoftRefresh = (reason) => {
+    const now = Date.now();
+    if (now - lastFocusRefresh < 1200) return;
+    lastFocusRefresh = now;
+    if (document.hidden) return;
+    const modalOpen = Boolean(document.querySelector(".modal-backdrop"));
+    if (modalOpen) return;
+    refreshActiveTab({ reason, background: true });
+  };
+  appState.focusHandler = () => triggerSoftRefresh("focus");
+  appState.visHandler = () => { if (!document.hidden) triggerSoftRefresh("visibility"); };
+  window.addEventListener("focus", appState.focusHandler);
+  document.addEventListener("visibilitychange", appState.visHandler);
+  appState.autoPollTimer = setInterval(() => {
+    if (!document.hidden && appState.boot?.authenticated) {
+      refreshActiveTab({ reason: "poll", background: true });
+    }
+  }, 6000);
 }
 
 async function boot(opts = {}) {
