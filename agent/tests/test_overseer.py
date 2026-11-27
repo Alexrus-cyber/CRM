@@ -132,30 +132,83 @@ class OverseerGuardExecutionTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_disabled_overseer_allows_safe_but_still_blocks_hard_sandbox_threat(self):
+    def test_disabled_overseer_does_not_monitor_or_block_tools(self):
         events = []
-        res = overseer_mod.guard_tool_execution(
-            tool_name="run_command",
-            args={"command": "npm test", "cwd": "."},
-            sandbox_root=self.sandbox_root,
-            trust_level="full",
-            overseer_ctx={"enabled": False},
-            emit_sse=lambda ev, d: events.append((ev, d)),
-            approval_fn=None,
-        )
-        self.assertFalse(res["humanApproved"])
-        self.assertEqual(events, [])
+        llm_calls = []
 
+        def _never_called_model(*_a, **_kw):
+            llm_calls.append(True)
+            return {"choices": [{"message": {"content": "{}"}}]}
+
+        for disabled_flag in (False, 0, "false", "0"):
+            for tool_name, args in (
+                ("run_command", {"command": "npm test", "cwd": "."}),
+                ("run_command", {"command": "printenv", "cwd": "."}),
+                ("run_command", {"command": "python3 -c \"print(123)\"", "cwd": "."}),
+                ("sandbox_read_file", {"path": ".env"}),
+                ("pc_command", {"command": "echo hi"}),
+                ("export_from_sandbox", {"source": "demo", "destination": "/tmp/out"}),
+            ):
+                res = overseer_mod.guard_tool_execution(
+                    tool_name=tool_name,
+                    args=args,
+                    sandbox_root=self.sandbox_root,
+                    trust_level="full",
+                    overseer_ctx={"enabled": disabled_flag, "mode": "strict", "base_url": "http://ov.local/v1", "model": "guard-7b"},
+                    call_model_fn=_never_called_model,
+                    emit_sse=lambda ev, d: events.append((ev, d)),
+                    approval_fn=None,
+                )
+                self.assertFalse(res["humanApproved"])
+                self.assertIsNone(res["overseerMeta"])
+                self.assertFalse(res.get("attachToNativeApproval"))
+        self.assertEqual(events, [])
+        self.assertEqual(llm_calls, [])
+
+    def test_missing_overseer_ctx_keeps_hard_sandbox_fallback(self):
         with self.assertRaises(overseer_mod.OverseerBlockedError):
             overseer_mod.guard_tool_execution(
                 tool_name="run_command",
                 args={"command": "printenv", "cwd": "."},
                 sandbox_root=self.sandbox_root,
                 trust_level="full",
-                overseer_ctx={"enabled": False},
+                overseer_ctx=None,
                 emit_sse=lambda ev, d: None,
                 approval_fn=None,
             )
+
+    def test_run_tool_with_disabled_overseer_runs_without_overseer_and_keeps_sandbox_isolation(self):
+        proj = self.sandbox_root / "demo"
+        proj.mkdir(parents=True, exist_ok=True)
+        events = []
+        asked = []
+
+        txt, _ = agent_mod.run_tool(
+            "run_command",
+            {"command": "python3 -c \"print('OV_OFF_OK')\"", "cwd": "demo"},
+            trust_level="full",
+            sandbox_root=self.sandbox_root,
+            approval_fn=lambda req: asked.append(req) or {"approved": False},
+            overseer_ctx={
+                "enabled": False,
+                "mode": "strict",
+                "emit_sse": lambda ev, d: events.append((ev, d)),
+            },
+        )
+        self.assertIn("OV_OFF_OK", txt)
+        self.assertEqual(asked, [])
+        self.assertFalse(any(ev.startswith("overseer_") for ev, _ in events))
+
+        # Базовая защита Sandbox от реального побега продолжает работать и при выключенном Надсмотрщике
+        with self.assertRaises(agent_mod.AgentError):
+            agent_mod.run_tool(
+                "sandbox_write_file",
+                {"path": "../../escape.txt", "content": "x"},
+                trust_level="full",
+                sandbox_root=self.sandbox_root,
+                overseer_ctx={"enabled": False, "emit_sse": lambda ev, d: events.append((ev, d))},
+            )
+        self.assertFalse(any(ev.startswith("overseer_") for ev, _ in events))
 
     def test_rules_only_blocks_without_approval_and_allows_with_human_approval(self):
         events = []
@@ -303,6 +356,177 @@ class OverseerGuardExecutionTests(unittest.TestCase):
             )
         self.assertEqual(len(asked), 1)
         self.assertEqual(asked[0]["overseer"]["category"], "secret_access")
+
+    def test_orchestrator_http_run_with_disabled_overseer_runs_subagent_without_overseer_events(self):
+        import threading
+        import urllib.request
+        from unittest.mock import patch
+
+        proj = self.sandbox_root / "app"
+        proj.mkdir(parents=True, exist_ok=True)
+        (proj / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+        stage = {"step": 0}
+
+        def _fake_model(_url, _key, _model, msgs, *_a, **_kw):
+            stage["step"] += 1
+            sys_txt = str((msgs[0] or {}).get("content") or "") if msgs else ""
+            is_sub = "Твой профиль субагента: «Кодер»" in sys_txt
+            if is_sub:
+                has_tool_res = any((m or {}).get("role") == "tool" for m in msgs)
+                if not has_tool_res:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "sub_cmd_1",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "run_command",
+                                                "arguments": json.dumps(
+                                                    {"command": "python3 -c \"print('SUBAGENT_OK')\"", "cwd": "app"}
+                                                ),
+                                            },
+                                        }
+                                    ],
+                                }
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                    }
+                if not any("SUBAGENT_OK" in str((m or {}).get("content") or "") for m in msgs):
+                    return {
+                        "choices": [{"message": {"content": "Не удалось выполнить команду"}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                    }
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "sub_rep_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "report_to_orchestrator",
+                                            "arguments": json.dumps(
+                                                {"summary": "Команда выполнена: SUBAGENT_OK", "status": "completed"}
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                }
+
+            tool_results = [m for m in msgs if (m or {}).get("role") == "tool"]
+            if not tool_results:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "orch_call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "call_subagent",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "subagent": "coder",
+                                                    "summary": "Проверь python-однострочник",
+                                                    "task": "Запусти команду",
+                                                    "sandbox_project": "app",
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                }
+            return {
+                "choices": [{"message": {"content": "Готово, субагент отработал без Надсмотрщика."}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }
+
+        server = agent_mod.Server(("127.0.0.1", 0), agent_mod.Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            with patch.object(agent_mod, "SANDBOX_ROOT", self.sandbox_root), patch.object(
+                agent_mod, "call_model", side_effect=_fake_model
+            ):
+                payload = {
+                    "agentRole": "agent",
+                    "trustLevel": "full",
+                    "overseer": {"enabled": False, "mode": "strict"},
+                    "settings": {"baseUrl": "http://127.0.0.1:9999/v1", "model": "m", "apiKey": ""},
+                    "orchestratorSettings": {"baseUrl": "http://127.0.0.1:9999/v1", "model": "m", "apiKey": ""},
+                    "subagents": [
+                        {
+                            "id": 1,
+                            "slug": "coder",
+                            "name": "Кодер",
+                            "orchestratorCanCall": True,
+                            "allowedCallees": ["*"],
+                            "toolProfile": "restricted",
+                            "unlockApi": False,
+                        }
+                    ],
+                    "messages": [{"role": "user", "content": "Запусти субагента"}],
+                }
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/run",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {server._http_token}",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    status_code = resp.status
+                    raw_sse = resp.read().decode("utf-8", errors="replace")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(status_code, 200)
+        parsed_events = []
+        for frame in raw_sse.split("\n\n"):
+            ev_name = "message"
+            data_lines = []
+            for line in frame.splitlines():
+                if line.startswith("event:"):
+                    ev_name = line[6:].strip()
+                elif line.startswith("data:"):
+                    data_lines.append(line[5:].strip())
+            if data_lines:
+                try:
+                    parsed_events.append((ev_name, json.loads("\n".join(data_lines))))
+                except ValueError:
+                    pass
+
+        self.assertFalse(
+            any(ev.startswith("overseer_") for ev, _ in parsed_events),
+            f"Не ожидались события Надсмотрщика при enabled=False, получены: {[ev for ev, _ in parsed_events]}",
+        )
+        self.assertFalse(any(ev == "approval_required" for ev, _ in parsed_events))
+        sub_done = [d for ev, d in parsed_events if ev == "subagent_done"]
+        self.assertEqual(len(sub_done), 1)
+        self.assertEqual(sub_done[0].get("status"), "completed")
+        self.assertIn("SUBAGENT_OK", str(sub_done[0].get("outputSummary") or ""))
 
 
 if __name__ == "__main__":

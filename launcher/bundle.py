@@ -57,6 +57,15 @@ def assets_dir() -> Path:
     return bundle_root() / "assets"
 
 
+def ui_dir() -> Path:
+    """Папка с встроенным Web-UI приложения: в exe — `ui/`, в исходниках — `launcher/ui/`."""
+    root = bundle_root()
+    for candidate in (root / "ui", root / "launcher" / "ui", Path(__file__).resolve().parent / "ui"):
+        if candidate.is_dir():
+            return candidate
+    return Path(__file__).resolve().parent / "ui"
+
+
 def launcher_prefix() -> List[str]:
     """Как запустить наш же «интерпретатор» для агента."""
     if is_frozen():

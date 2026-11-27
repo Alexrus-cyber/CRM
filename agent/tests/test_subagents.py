@@ -633,6 +633,124 @@ class SubagentRestrictionsAndTesterOrderTests(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
 
+    def test_orchestrator_http_run_second_subagent_starts_fresh_after_first_times_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sb_root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            agent_mod.sandbox_mod.write_file(sb_root, "app/index.html", "<h1>Hi</h1>")
+            prev_sb = agent_mod.SANDBOX_ROOT
+            agent_mod.SANDBOX_ROOT = sb_root
+            srv = agent_mod.Server(("127.0.0.1", 0), agent_mod.Handler)
+            port = srv.server_address[1]
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            import json as _json
+            import urllib.request as _req
+
+            # Оркестратор работает дольше SUBAGENT_SESSION_SECONDS до вызова субагентов,
+            # затем sub1 исчерпывает свой SUBAGENT_SESSION_SECONDS, после чего sub2 всё равно стартует с нуля.
+            stage = {"idx": 0}
+
+            def _fake_model(_url, _key, _model, msgs, *_a, **_kw):
+                stage["idx"] += 1
+                sys_txt = str((msgs[0] or {}).get("content") or "") if msgs else ""
+                is_sub1 = "Твой профиль субагента: «Первый»" in sys_txt
+                is_sub2 = "Твой профиль субагента: «Второй»" in sys_txt
+                if not is_sub1 and not is_sub2:
+                    # Оркестратор
+                    tool_outputs = [m for m in msgs if m.get("role") == "tool"]
+                    if len(tool_outputs) == 0:
+                        time.sleep(0.14)  # дольше лимита субагента 0.08с, но у Оркестратора нет общего дедлайна
+                        return {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": "",
+                                        "tool_calls": [
+                                            {
+                                                "id": "call_s1",
+                                                "function": {
+                                                    "name": "call_subagent",
+                                                    "arguments": '{"subagent":"sub1","summary":"Этап 1","sandbox_project":"app"}',
+                                                },
+                                            }
+                                        ],
+                                    }
+                                }
+                            ]
+                        }
+                    if len(tool_outputs) == 1:
+                        return {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": "",
+                                        "tool_calls": [
+                                            {
+                                                "id": "call_s2",
+                                                "function": {
+                                                    "name": "call_subagent",
+                                                    "arguments": '{"subagent":"sub2","summary":"Этап 2","sandbox_project":"app"}',
+                                                },
+                                            }
+                                        ],
+                                    }
+                                }
+                            ]
+                        }
+                    return {"choices": [{"message": {"content": "Оркестратор завершил оба этапа.", "tool_calls": []}}]}
+                if is_sub1:
+                    time.sleep(0.14)  # sub1 полностью сжигает свои 0.08с на первом шаге
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "s1_list",
+                                            "function": {"name": "sandbox_list", "arguments": '{"path":"app"}'},
+                                        }
+                                    ],
+                                }
+                            }
+                        ]
+                    }
+                return {"choices": [{"message": {"content": "Второй субагент успешно выполнил работу.", "tool_calls": []}}]}
+
+            real_model = agent_mod.call_model
+            agent_mod.call_model = _fake_model
+            try:
+                with mock.patch.object(agent_mod, "SUBAGENT_SESSION_SECONDS", 0.08):
+                    payload = _json.dumps(
+                        {
+                            "agentRole": "agent",
+                            "sandboxProject": "app",
+                            "messages": [{"role": "user", "content": "Запусти двух субагентов"}],
+                            "trustLevel": "full",
+                            "settings": {"baseUrl": "http://127.0.0.1:9999/v1", "model": "m"},
+                            "subagents": [
+                                {"id": 1, "slug": "sub1", "name": "Первый", "orchestratorCanCall": True},
+                                {"id": 2, "slug": "sub2", "name": "Второй", "orchestratorCanCall": True},
+                            ],
+                        }
+                    ).encode("utf-8")
+                    req = _req.Request(
+                        f"http://127.0.0.1:{port}/run",
+                        data=payload,
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {srv._http_token}"},
+                        method="POST",
+                    )
+                    with _req.urlopen(req, timeout=10) as resp:
+                        raw = resp.read().decode("utf-8")
+                self.assertIn("Превышен лимит времени сеанса субагента", raw)
+                self.assertIn("Второй субагент успешно выполнил работу.", raw)
+                self.assertIn("Оркестратор завершил оба этапа.", raw)
+            finally:
+                agent_mod.call_model = real_model
+                agent_mod.SANDBOX_ROOT = prev_sb
+                srv.shutdown()
+                srv.server_close()
+
 
 class SubagentAuditFixesTests(unittest.TestCase):
     """Регрессии аудита «Агент ↔ Субагенты»: права дерева, адресация, лимиты, статусы."""
@@ -924,6 +1042,214 @@ class SubagentAuditFixesTests(unittest.TestCase):
         self.assertIn("agentText", res)
         self.assertEqual(captured.get("target_ref"), "arch")
         self.assertEqual(captured["subagent_ctx"].get("session_deadline"), deadline)
+
+    def test_call_subagent_and_request_subagent_get_independent_fresh_deadlines(self):
+        # Даже если у предыдущего вызова/в базовом subagent_ctx дедлайн уже истёк,
+        # call_subagent и request_subagent выдают каждому запускаемому субагенту свежий бюджет.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            subs = [
+                {
+                    "id": 1,
+                    "slug": "dev-a",
+                    "name": "Разработчик A",
+                    "parentSubagentId": None,
+                    "orchestratorCanCall": True,
+                    "allowedCallees": ["*"],
+                },
+                {
+                    "id": 2,
+                    "slug": "qa-b",
+                    "name": "QA B",
+                    "parentSubagentId": None,
+                    "orchestratorCanCall": True,
+                    "allowedCallees": ["*"],
+                },
+            ]
+            orch_ctx = {
+                "base_url": "http://127.0.0.1:8888/v1",
+                "api_key": "k",
+                "model": "m",
+                "routing_mode": "linear",
+                "subagents": subs,
+                "session_deadline": time.monotonic() - 120.0,  # уже истёк для старого сеанса
+                "emit_sse": lambda *_a: None,
+            }
+            called_models: list[str] = []
+
+            def _ok_model(*_a, **_kw):
+                called_models.append("step")
+                return {"choices": [{"message": {"content": "Задача выполнена полностью.", "tool_calls": []}}]}
+
+            real_model = agent_mod.call_model
+            agent_mod.call_model = _ok_model
+            try:
+                res1, _ = agent_mod.run_tool(
+                    "call_subagent",
+                    {"subagent": "dev-a", "summary": "Сделай модуль", "task": "Модуль готовь"},
+                    trust_level="verified",
+                    sandbox_root=root,
+                    subagent_ctx=orch_ctx,
+                )
+                self.assertIn("Задача выполнена полностью.", res1)
+                self.assertEqual(len(called_models), 1)
+                # Исходный контекст Оркестратора не мутирован.
+                self.assertLess(orch_ctx["session_deadline"], time.monotonic())
+
+                res2, _ = agent_mod.run_tool(
+                    "request_subagent",
+                    {"target_subagent": "qa-b", "summary": "Проверь", "next_task": "Проведи QA"},
+                    trust_level="verified",
+                    sandbox_root=root,
+                    subagent_ctx=orch_ctx,
+                    subagent_state={"subagent": subs[0], "sandboxProject": "."},
+                )
+                self.assertIn("Задача выполнена полностью.", res2)
+                self.assertEqual(len(called_models), 2)
+            finally:
+                agent_mod.call_model = real_model
+
+    def test_sequential_subagents_when_first_exhausts_deadline_second_still_runs(self):
+        # Первый субагент полностью расходует свой лимит времени (SUBAGENT_SESSION_SECONDS),
+        # но второй субагент от того же Оркестратора начинает с новым бюджетом и не падает на 0 шаге.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            agent_mod.sandbox_mod.mkdir(root, "app")
+            subs = [
+                {
+                    "id": 1,
+                    "slug": "worker-1",
+                    "name": "Воркер 1",
+                    "parentSubagentId": None,
+                    "orchestratorCanCall": True,
+                    "allowedCallees": ["*"],
+                },
+                {
+                    "id": 2,
+                    "slug": "worker-2",
+                    "name": "Воркер 2",
+                    "parentSubagentId": None,
+                    "orchestratorCanCall": True,
+                    "allowedCallees": ["*"],
+                },
+            ]
+            events: list[tuple[str, dict]] = []
+            orch_ctx = {
+                "base_url": "http://127.0.0.1:8888/v1",
+                "api_key": "k",
+                "model": "m",
+                "routing_mode": "linear",
+                "subagents": subs,
+                "session_deadline": None,
+                "emit_sse": lambda ev, d: events.append((ev, d)),
+            }
+            phase = {"current": "first", "second_steps": 0}
+
+            def _model(*_a, **_kw):
+                if phase["current"] == "first":
+                    time.sleep(0.18)
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "c1",
+                                            "function": {"name": "sandbox_list", "arguments": '{"path":"app"}'},
+                                        }
+                                    ],
+                                }
+                            }
+                        ]
+                    }
+                phase["second_steps"] += 1
+                return {"choices": [{"message": {"content": "Второй субагент успешно отработал.", "tool_calls": []}}]}
+
+            real_model = agent_mod.call_model
+            agent_mod.call_model = _model
+            try:
+                with mock.patch.object(agent_mod, "SUBAGENT_SESSION_SECONDS", 0.12):
+                    res1, _ = agent_mod.run_tool(
+                        "call_subagent",
+                        {"subagent": "worker-1", "summary": "Шаг 1", "sandbox_project": "app"},
+                        trust_level="verified",
+                        sandbox_root=root,
+                        subagent_ctx=orch_ctx,
+                    )
+                    self.assertIn("Превышен лимит времени сеанса субагента", res1)
+
+                    phase["current"] = "second"
+                    res2, _ = agent_mod.run_tool(
+                        "call_subagent",
+                        {"subagent": "worker-2", "summary": "Шаг 2", "sandbox_project": "app"},
+                        trust_level="verified",
+                        sandbox_root=root,
+                        subagent_ctx=orch_ctx,
+                    )
+                    self.assertIn("Второй субагент успешно отработал.", res2)
+                    self.assertEqual(phase["second_steps"], 1)
+                    self.assertIsNone(orch_ctx["session_deadline"])
+            finally:
+                agent_mod.call_model = real_model
+
+    def test_subagent_approval_wait_extends_session_deadline(self):
+        # Время ожидания подтверждения от пользователя на сайте не сжирает бюджет субагента.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = agent_mod.sandbox_mod.get_sandbox_root(os.path.join(tmp, "sb"))
+            agent_mod.sandbox_mod.mkdir(root, "app")
+            events: list[tuple[str, dict]] = []
+            calls = {"n": 0}
+
+            def _model(*_a, **_kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "cmd1",
+                                            "function": {
+                                                "name": "sandbox_run_command",
+                                                "arguments": '{"command":"echo ok","cwd":"app"}',
+                                            },
+                                        }
+                                    ],
+                                }
+                            }
+                        ]
+                    }
+                return {"choices": [{"message": {"content": "Завершено после подтверждения.", "tool_calls": []}}]}
+
+            def _slow_approval(_req):
+                time.sleep(0.18)
+                return {"approved": True}
+
+            real_model = agent_mod.call_model
+            agent_mod.call_model = _model
+            try:
+                sub_ctx = self._worker_ctx(
+                    lambda ev, d: events.append((ev, d)),
+                    session_deadline=time.monotonic() + 0.12,
+                )
+                res = agent_mod.run_subagent_session(
+                    target_ref="worker",
+                    summary="s",
+                    task="t",
+                    sandbox_project="app",
+                    caller_kind="orchestrator",
+                    trust_level="verified",
+                    approval_fn=_slow_approval,
+                    sandbox_root=root,
+                    subagent_ctx=sub_ctx,
+                )
+                self.assertEqual(res["done"]["status"], "completed")
+                self.assertIn("Завершено после подтверждения.", res["done"]["fullResponse"])
+            finally:
+                agent_mod.call_model = real_model
 
     # ---------------------------------------------------------- P0-2c / P1-1
     def test_broken_pipe_on_emit_does_not_lose_subagent_done(self):

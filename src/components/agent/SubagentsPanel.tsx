@@ -32,6 +32,8 @@ import {
 } from "lucide-react";
 import { ApprovalToast } from "../ApprovalToast";
 import { LiveReasoningBox } from "../LiveReasoningBox";
+
+export const SUBAGENT_SSE_IDLE_TIMEOUT_MS = 1_200_000;
 import {
   formatFileSize,
   readOperatorFiles,
@@ -670,13 +672,13 @@ export function SubagentsPanel({
 
   const saveOverseer = useCallback(
     async (payload: {
-      enabled: boolean;
-      mode: OverseerMode;
-      systemPrompt: string;
-      unlockApi: boolean;
-      provider: string;
-      baseUrl: string;
-      model: string;
+      enabled?: boolean;
+      mode?: OverseerMode;
+      systemPrompt?: string;
+      unlockApi?: boolean;
+      provider?: string;
+      baseUrl?: string;
+      model?: string;
       apiKey?: string;
       clearApiKey?: boolean;
     }) => {
@@ -1677,13 +1679,13 @@ function OverseerConfigCard({
   onOpenModelTab?: () => void;
   onClose: () => void;
   onSave: (payload: {
-    enabled: boolean;
-    mode: OverseerMode;
-    systemPrompt: string;
-    unlockApi: boolean;
-    provider: string;
-    baseUrl: string;
-    model: string;
+    enabled?: boolean;
+    mode?: OverseerMode;
+    systemPrompt?: string;
+    unlockApi?: boolean;
+    provider?: string;
+    baseUrl?: string;
+    model?: string;
     apiKey?: string;
     clearApiKey?: boolean;
   }) => Promise<void>;
@@ -1698,6 +1700,7 @@ function OverseerConfigCard({
   const [apiKey, setApiKey] = useState("");
   const [clearApiKey, setClearApiKey] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [togglingEnabled, setTogglingEnabled] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
 
@@ -1708,6 +1711,23 @@ function OverseerConfigCard({
     setProvider(p.id);
     if (p.id !== "custom") setBaseUrl(p.baseUrl);
     if (p.model) setModel(p.model);
+  };
+
+  const handleToggleEnabled = async (nextEnabled: boolean) => {
+    const prev = enabled;
+    setEnabled(nextEnabled);
+    setTogglingEnabled(true);
+    setErr(null);
+    setSavedMsg(null);
+    try {
+      await onSave({ enabled: nextEnabled });
+      setSavedMsg(nextEnabled ? "Надсмотрщик включён" : "Надсмотрщик отключён");
+    } catch (e) {
+      setEnabled(prev);
+      setErr(e instanceof Error ? e.message : "Не удалось переключить Надсмотрщика");
+    } finally {
+      setTogglingEnabled(false);
+    }
   };
 
   const handleSave = async () => {
@@ -1780,13 +1800,14 @@ function OverseerConfigCard({
             <input
               type="checkbox"
               checked={enabled}
-              onChange={(e) => setEnabled(e.target.checked)}
+              disabled={togglingEnabled || busy}
+              onChange={(e) => void handleToggleEnabled(e.target.checked)}
               className="mt-0.5 h-4 w-4 accent-[#10b981]"
             />
             <div>
               <div className="text-xs font-semibold text-text">Включить Надсмотрщика</div>
               <div className="mt-0.5 text-[11px] text-muted">
-                При угрозе или сомнительной операции запрашивает явное решение человека в окне подтверждения на сайте.
+                Переключается и сохраняется сразу. Когда включён — проверяет сомнительные действия и запрашивает решение человека на сайте; когда выключен — не следит за агентами.
               </div>
             </div>
           </label>
@@ -1935,7 +1956,7 @@ function OverseerConfigCard({
       </div>
 
       <div className="mt-3 flex justify-end border-t border-border pt-3">
-        <Button size="md" variant="primary" onClick={() => void handleSave()} disabled={busy}>
+        <Button size="md" variant="primary" onClick={() => void handleSave()} disabled={busy || togglingEnabled}>
           {busy ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
           {busy ? "Сохраняю…" : "Сохранить Надсмотрщика"}
         </Button>
@@ -2024,6 +2045,8 @@ function SubagentChatViewer({
   const streamAbortRef = useRef<AbortController | null>(null);
   const convAbortRef = useRef<AbortController | null>(null);
   const streamRunningRef = useRef(false);
+  const subApprovalRef = useRef(subApproval);
+  subApprovalRef.current = subApproval;
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -2312,6 +2335,34 @@ function SubagentChatViewer({
     const ctrl = new AbortController();
     streamAbortRef.current = ctrl;
     streamRunningRef.current = true;
+    let subIdleTimer: number | null = null;
+    let subStalled = false;
+    let lastSubSseAt = Date.now();
+    const clearSubWatchdog = () => {
+      if (subIdleTimer !== null) {
+        window.clearTimeout(subIdleTimer);
+        subIdleTimer = null;
+      }
+    };
+    const armSubWatchdog = (delayMs = SUBAGENT_SSE_IDLE_TIMEOUT_MS, markActivity = true) => {
+      if (markActivity) {
+        lastSubSseAt = Date.now();
+      }
+      clearSubWatchdog();
+      subIdleTimer = window.setTimeout(() => {
+        if (subApprovalRef.current !== null) {
+          armSubWatchdog(SUBAGENT_SSE_IDLE_TIMEOUT_MS, true);
+          return;
+        }
+        const silentMs = Date.now() - lastSubSseAt;
+        if (silentMs < SUBAGENT_SSE_IDLE_TIMEOUT_MS) {
+          armSubWatchdog(Math.max(1_000, SUBAGENT_SSE_IDLE_TIMEOUT_MS - silentMs), false);
+          return;
+        }
+        subStalled = true;
+        ctrl.abort();
+      }, delayMs);
+    };
     let resolvedConvId: number | null = targetConvId;
     let pendingHandoff: { summary: string; continuationPrompt: string; steps: number } | null = null;
 
@@ -2491,15 +2542,30 @@ function SubagentChatViewer({
         }
       };
 
+      armSubWatchdog();
       for (;;) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          append(decoder.decode());
+          if (trailingCr) {
+            trailingCr = false;
+            buffer += "\r";
+          }
+          break;
+        }
+        armSubWatchdog();
         append(decoder.decode(value, { stream: true }));
         let idx: number;
         while ((idx = buffer.indexOf("\n\n")) >= 0) {
           const frame = buffer.slice(0, idx);
           buffer = buffer.slice(idx + 2);
           if (frame.trim()) process(frame);
+        }
+      }
+      clearSubWatchdog();
+      if (buffer.trim()) {
+        for (const leftover of buffer.split("\n\n")) {
+          if (leftover.trim()) process(leftover);
         }
       }
 
@@ -2543,12 +2609,15 @@ function SubagentChatViewer({
         await loadConversation(resolvedConvId);
       }
     } catch (e) {
-      if (!ctrl.signal.aborted) {
+      if (subStalled) {
+        setChatError(`Субагент не отвечает (нет данных по SSE более ${Math.round(SUBAGENT_SSE_IDLE_TIMEOUT_MS / 1000)} с)`);
+      } else if (!ctrl.signal.aborted) {
         setChatError(e instanceof Error ? e.message : "Ошибка");
       }
       setLive({ reasoning: "", text: "", status: "", actorLabel: "", overseerReasoning: "" });
       setSubApproval(null);
     } finally {
+      clearSubWatchdog();
       streamRunningRef.current = false;
       setRunning(false);
     }

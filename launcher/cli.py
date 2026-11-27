@@ -27,7 +27,17 @@ if __package__ in (None, ""):  # запуск из исходников: python 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from launcher import APP_NAME, APP_VERSION  # noqa: E402
-from launcher import bundle, commands, crm_client, deps, runner, settings as settings_mod  # noqa: E402
+from launcher import (  # noqa: E402
+    bundle,
+    commands,
+    crm_client,
+    deps,
+    desktop_window,
+    file_extract,
+    harness_server,
+    runner,
+    settings as settings_mod,
+)
 from launcher.catalog import DEFAULT_AGENTS, PROVIDER_PRESETS, REASONING_MODES, agent_by_id, load_catalog  # noqa: E402
 
 
@@ -336,6 +346,7 @@ def self_test() -> int:
 
     _spec_checks(check)
     _crm_auth_checks(check)
+    _harness_checks(check)
     _gui_smoke(check)
 
     passed = sum(1 for _, ok in checks if ok)
@@ -389,9 +400,175 @@ def _spec_checks(check) -> None:
     hidden = set(captured.get("hiddenimports", []))
     check("сборка: tkinter и зависимости в hiddenimports",
           {"tkinter", "pyautogui", "PIL", "pyperclip", "launcher.crm_client"} <= hidden)
+    check("сборка: модули нового harness и webview в hiddenimports",
+          {"launcher.harness_server", "launcher.file_extract", "launcher.desktop_window", "webview"} <= hidden)
+    ui_bundled = {
+        Path(src).name for src, dest in captured.get("datas", []) if dest == "ui"
+    }
+    check("сборка: веб-интерфейс launcher/ui попадает в datas",
+          {"index.html", "styles.css", "app.js", "tab_chat.js", "tab_agent.js", "tab_operator.js", "tab_limits.js"} <= ui_bundled)
     check("сборка: stdlib-модули агентов (uuid, http.server, hmac, xml.sax.saxutils, zipfile) в hiddenimports",
           {"uuid", "hmac", "http.client", "http.server", "socketserver", "xml.sax.saxutils", "zipfile", "csv", "ast", "ipaddress", "ssl"} <= hidden)
     check("сборка: exe оконный (без консоли)", captured.get("exe", {}).get("console") is False)
+
+
+def _harness_checks(check) -> None:
+    """Проверки локального веб-сервера harness, разбора файлов и настольного окна."""
+    import json
+    import urllib.error
+    import urllib.request
+    import zipfile
+
+    ui_path = bundle.ui_dir()
+    required_ui = {"index.html", "styles.css", "app.js", "tab_chat.js", "tab_agent.js", "tab_operator.js", "tab_limits.js"}
+    check("harness: папка ui и все 7 модулей на месте",
+          ui_path.is_dir() and all((ui_path / name).is_file() for name in required_ui))
+
+    txt_res = file_extract.extract_attachment("notes.txt", "Привет CRM!\nСтрока 2".encode("utf-8"), "text/plain")
+    check("file_extract: извлекает текст из .txt",
+          "Привет CRM!" in txt_res.get("text", "") and txt_res.get("kind") == "text")
+
+    docx_buf = io.BytesIO()
+    with zipfile.ZipFile(docx_buf, "w") as zf:
+        zf.writestr(
+            "word/document.xml",
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:body><w:p><w:r><w:t>Договор аренды №42</w:t></w:r></w:p></w:body></w:document>',
+        )
+    docx_res = file_extract.extract_attachment("contract.docx", docx_buf.getvalue())
+    check("file_extract: извлекает текст из .docx",
+          "Договор аренды №42" in docx_res.get("text", "") and docx_res.get("note") == "DOCX")
+
+    xlsx_buf = io.BytesIO()
+    with zipfile.ZipFile(xlsx_buf, "w") as zf:
+        zf.writestr(
+            "xl/sharedStrings.xml",
+            '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Выручка</t></si></sst>',
+        )
+        zf.writestr(
+            "xl/worksheets/sheet1.xml",
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+            '<row><c t="s"><v>0</v></c><c><v>150000</v></c></row></sheetData></worksheet>',
+        )
+    xlsx_res = file_extract.extract_attachment("report.xlsx", xlsx_buf.getvalue())
+    check("file_extract: извлекает таблицу из .xlsx",
+          "Выручка" in xlsx_res.get("text", "") and "150000" in xlsx_res.get("text", ""))
+
+    check("crm_client: определяет локальные LLM URL",
+          crm_client.is_local_model_url("http://127.0.0.1:1234/v1")
+          and crm_client.is_local_model_url("http://localhost:11434/v1")
+          and not crm_client.is_local_model_url("https://api.openai.com/v1"))
+
+    check("desktop_window: определяет способ запуска окна",
+          desktop_window.detect_window_backend() in {"pywebview", "browser_app", "webbrowser"})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        prev_cfg = os.environ.get("CRM_LAUNCHER_CONFIG")
+        os.environ["CRM_LAUNCHER_CONFIG"] = str(Path(tmp) / "settings.json")
+        srv = None
+        try:
+            prof_dir = desktop_window._app_profile_dir()
+            check("desktop_window: папка профиля браузера создаётся в config_dir",
+                  prof_dir.is_dir() and prof_dir.parent == settings_mod.config_dir())
+            srv = harness_server.HarnessServer(port=0)
+            srv.start()
+            base = srv.base_url()
+
+            # 1. Главная страница доступна с ?ht=... и содержит мета-тег токена
+            with urllib.request.urlopen(srv.entry_url(), timeout=5) as resp:
+                html_body = resp.read().decode("utf-8")
+                check("harness_server: отдаёт index.html с токеном доступа",
+                      resp.status == 200 and 'name="crm-harness-token"' in html_body and srv.app_token in html_body)
+
+            # 2. Без X-Harness-Token API отвечает 403
+            unauth_code = 0
+            try:
+                urllib.request.urlopen(f"{base}/api/app/state", timeout=5)
+            except urllib.error.HTTPError as err:
+                unauth_code = err.code
+            check("harness_server: блокирует API-запросы без X-Harness-Token (403)", unauth_code == 403)
+
+            # 3. С валидным X-Harness-Token state, runtime, logs работают
+            req_state = urllib.request.Request(
+                f"{base}/api/app/state",
+                headers={"X-Harness-Token": srv.token},
+            )
+            with urllib.request.urlopen(req_state, timeout=5) as resp:
+                state_json = json.loads(resp.read().decode("utf-8"))
+                check("harness_server: /api/app/state отдаёт конфигурацию",
+                      bool(state_json.get("ok")) and "presets" in state_json and "agentHealth" in state_json)
+
+            req_rt = urllib.request.Request(
+                f"{base}/api/app/runtime",
+                headers={"X-Harness-Token": srv.token},
+            )
+            with urllib.request.urlopen(req_rt, timeout=5) as resp:
+                rt_json = json.loads(resp.read().decode("utf-8"))
+                check("harness_server: /api/app/runtime отдаёт диагностику среды",
+                      bool(rt_json.get("ok")) and "runtime" in rt_json and "agentHealth" in rt_json)
+
+            # 4. Без входа в CRM запросы к /api/ai/agent отклоняются 401, а после подстановки сессии работают
+            unauth_crm = 0
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(f"{base}/api/ai/agent", headers={"X-Harness-Token": srv.token}),
+                    timeout=5,
+                )
+            except urllib.error.HTTPError as err:
+                unauth_crm = err.code
+            check("harness_server: без учётки CRM /api/ai/agent возвращает 401", unauth_crm == 401)
+
+            srv.settings.crm_url = "https://crm.example.com"
+            srv.settings.crm_session_token = "sess-ok"
+            req_agent = urllib.request.Request(
+                f"{base}/api/ai/agent",
+                headers={"X-Harness-Token": srv.token},
+            )
+            with urllib.request.urlopen(req_agent, timeout=5) as resp:
+                ag_json = json.loads(resp.read().decode("utf-8"))
+                check("harness_server: /api/ai/agent отдаёт статус локального агента",
+                      "available" in ag_json and "workspace" in ag_json)
+
+            req_theme = urllib.request.Request(
+                f"{base}/api/app/theme",
+                data=json.dumps({"theme": "light"}).encode("utf-8"),
+                headers={"X-Harness-Token": srv.token, "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_theme, timeout=5) as resp:
+                th_json = json.loads(resp.read().decode("utf-8"))
+                check("harness_server: переключение темы сохраняется",
+                      th_json.get("theme") == "light" and srv.settings.theme == "light")
+
+            # 5. crm_client отправляет и Authorization: Bearer, и Cookie: crm_session
+            captured_headers: Dict[str, str] = {}
+            class FakeResp:
+                status = 200
+                headers = {}
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def read(self): return b'{"ok":true}'
+            orig_urlopen = crm_client.urllib.request.urlopen
+            try:
+                def spy_open(req, timeout=10):
+                    for k, v in req.header_items():
+                        captured_headers[k.lower()] = v
+                    return FakeResp()
+                crm_client.urllib.request.urlopen = spy_open  # type: ignore[assignment]
+                with crm_client.open_crm_stream("GET", "http://localhost:3000", "/api/ai/settings", bearer_token="tok_cookie_123"):
+                    pass
+                check("crm_client: open_crm_stream передаёт и Bearer, и Cookie crm_session",
+                      captured_headers.get("authorization") == "Bearer tok_cookie_123"
+                      and "crm_session=tok_cookie_123" in captured_headers.get("cookie", ""))
+            finally:
+                crm_client.urllib.request.urlopen = orig_urlopen  # type: ignore[assignment]
+        finally:
+            if srv is not None:
+                srv.shutdown()
+            if prev_cfg is None:
+                os.environ.pop("CRM_LAUNCHER_CONFIG", None)
+            else:
+                os.environ["CRM_LAUNCHER_CONFIG"] = prev_cfg
 
 
 def _crm_auth_checks(check) -> None:
@@ -648,11 +825,14 @@ def list_agents() -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="CRM Agents", description="Запускатор ИИ-агентов CRM")
+    parser = argparse.ArgumentParser(prog="CRM Agents", description="Настольный CRM ИИ-harness и запускатор агентов")
     parser.add_argument("--run-agent", nargs=argparse.REMAINDER, metavar="SCRIPT",
                         help="выполнить скрипт агента внутри приложения и выйти")
     parser.add_argument("--self-test", action="store_true", help="самопроверки без экрана")
     parser.add_argument("--list", action="store_true", help="показать каталог агентов")
+    parser.add_argument("--classic-tk", action="store_true", help="открыть классический Tkinter-интерфейс")
+    parser.add_argument("--headless", action="store_true", help="запустить только локальный сервер (без окна)")
+    parser.add_argument("--port", type=int, default=0, help="порт локального сервера интерфейса (по умолчанию авто)")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
     return parser
 
@@ -668,10 +848,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return self_test()
     if args.list:
         return list_agents()
+    if args.classic_tk:
+        from launcher.gui import run_gui
 
-    from launcher.gui import run_gui
+        return run_gui()
 
-    return run_gui()
+    server = harness_server.HarnessServer(port=max(0, int(args.port or 0)))
+    server.start()
+    try:
+        return desktop_window.open_desktop_window(server.entry_url(), headless=bool(args.headless))
+    finally:
+        server.shutdown()
 
 
 if __name__ == "__main__":

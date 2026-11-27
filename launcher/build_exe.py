@@ -51,6 +51,9 @@ def main(argv: list[str] | None = None) -> int:
     if not (REPO / "agent" / "desktop_operator.py").is_file():
         print("не найден agent/desktop_operator.py — запускайте из корня репозитория", file=sys.stderr)
         return 2
+    if not (ROOT / "ui" / "index.html").is_file():
+        print("не найден launcher/ui/index.html — веб-интерфейс harness отсутствует", file=sys.stderr)
+        return 2
 
     if not args.no_install:
         run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])

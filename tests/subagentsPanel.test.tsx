@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { SubagentsPanel } from "@/components/agent/SubagentsPanel";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { SubagentsPanel, SUBAGENT_SSE_IDLE_TIMEOUT_MS } from "@/components/agent/SubagentsPanel";
 import type {
   OverseerConfig,
   Subagent,
@@ -59,7 +59,7 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
   let approvePayloads: Array<Record<string, unknown>>;
   let routingModeStore: SubagentRoutingMode;
   let overseerStore: OverseerConfig;
-  let sseResponder: ((body: Record<string, unknown>) => Response) | null;
+  let sseResponder: ((body: Record<string, unknown>, init?: RequestInit) => Response) | null;
   let runActionCalls: Array<{ id: number; action: "cancel" | "retry" }>;
 
   beforeEach(() => {
@@ -333,7 +333,7 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
           chatTokensTotal = 610;
           if (sseResponder) {
             const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
-            return sseResponder(body);
+            return sseResponder(body, init);
           }
           const sse = [
             `event: subagent_start\ndata: ${JSON.stringify({ subagentConversationId: 201 })}\n\n`,
@@ -600,6 +600,39 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
     const ov = patchRootPayloads[0].overseer as Record<string, unknown>;
     expect(ov.enabled).toBe(true);
     expect(ov.mode).toBe("rules_only");
+  });
+
+  it("мгновенно сохраняет отключение Надсмотрщика при снятии галочки и обновляет статистику", async () => {
+    const onStats = vi.fn();
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="full"
+        onStats={onStats}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/Надсмотрщик: строгий/i)).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^Надсмотрщик$/i }));
+    const checkbox = (await screen.findByLabelText(/Включить Надсмотрщика/i)) as HTMLInputElement;
+    expect(checkbox.checked).toBe(true);
+
+    // Снимаем галочку — PATCH должен уйти сразу, без нажатия нижней кнопки «Сохранить Надсмотрщика»
+    fireEvent.click(checkbox);
+
+    await waitFor(() => {
+      expect(patchRootPayloads.some((p) => (p.overseer as Record<string, unknown> | undefined)?.enabled === false)).toBe(true);
+    });
+    expect(await screen.findByText(/Надсмотрщик: выкл/i)).toBeTruthy();
+    expect(onStats).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        overseerEnabled: false,
+      }),
+    );
   });
 
   it("в чате субагента показывает проверку Надсмотрщика и отправляет решение ApprovalToast", async () => {
@@ -977,5 +1010,125 @@ describe("SubagentsPanel & DependencyTreeCanvas", () => {
       fromHistory: true,
     });
     expect(await screen.findByText(/Подвал доделан в новом чате!/i)).toBeTruthy();
+  });
+
+  it("прямой чат субагента держит SSE до 1200 с и прерывается только при полной тишине 1200 с", async () => {
+    expect(SUBAGENT_SSE_IDLE_TIMEOUT_MS).toBe(1_200_000);
+
+    const encoder = new TextEncoder();
+    let streamCtrl: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let aborted = false;
+    let callIdx = 0;
+
+    sseResponder = (_body, init) => {
+      callIdx += 1;
+      const stream = new ReadableStream({
+        start(controller) {
+          streamCtrl = controller;
+          init?.signal?.addEventListener("abort", () => {
+            aborted = true;
+            try {
+              controller.error(new DOMException("Aborted", "AbortError"));
+            } catch {
+              // ignore
+            }
+          });
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    render(
+      <SubagentsPanel
+        settings={{ baseUrl: "http://127.0.0.1:8888/v1", model: "qwen3:8b" }}
+        params={{}}
+        trustLevel="verified"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Чаты \(1\)/i })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Чаты \(1\)/i }));
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText(/Сообщение субагенту/i)).toBeTruthy();
+    });
+
+    // 1) Долгий поток с кадрами через 150 с (> 120 с) завершается без таймаута.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      await act(async () => {
+        fireEvent.change(screen.getByPlaceholderText(/Сообщение субагенту/i), {
+          target: { value: "Долгая задача" },
+        });
+        fireEvent.click(screen.getByRole("button", { name: /Отправить/i }));
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(callIdx).toBe(1);
+      expect(streamCtrl).not.toBeNull();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(150_000);
+        streamCtrl!.enqueue(encoder.encode(": keepalive\n\n"));
+        await vi.advanceTimersByTimeAsync(150_000);
+        streamCtrl!.enqueue(
+          encoder.encode(`event: subagent_text\ndata: ${JSON.stringify({ text: "Субагент закончил долгий анализ." })}\n\n`),
+        );
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      expect(aborted).toBe(false);
+      expect(screen.getByText(/Субагент закончил долгий анализ\./i)).toBeTruthy();
+
+      await act(async () => {
+        messagesByConvStore[201] = [
+          ...(messagesByConvStore[201] ?? []),
+          {
+            id: 901,
+            conversationId: 201,
+            role: "assistant",
+            content: "Субагент закончил долгий анализ.",
+            reasoning: "",
+            attachments: [],
+            actions: [],
+            files: [],
+            error: "",
+            createdAt: "2026-11-17T10:10:00.000Z",
+          },
+        ];
+        streamCtrl!.enqueue(
+          encoder.encode(`event: subagent_done\ndata: ${JSON.stringify({ subagentConversationId: 201 })}\n\n`),
+        );
+        streamCtrl!.close();
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(aborted).toBe(false);
+      expect(screen.getByText(/Субагент закончил долгий анализ\./i)).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // 2) Полная тишина >= 1200 с прерывает соединение watchdog-таймером.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      await act(async () => {
+        fireEvent.change(screen.getByPlaceholderText(/Сообщение субагенту/i), {
+          target: { value: "Зависший поток" },
+        });
+        fireEvent.click(screen.getByRole("button", { name: /Отправить/i }));
+        await vi.advanceTimersByTimeAsync(1_190_000);
+      });
+      expect(aborted).toBe(false);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(aborted).toBe(true);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(screen.getByText(/Субагент не отвечает \(нет данных по SSE более 1200 с\)/i)).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

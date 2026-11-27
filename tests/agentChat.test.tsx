@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { AgentChat } from "@/components/AgentChat";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { AgentChat, SSE_IDLE_TIMEOUT_MS } from "@/components/AgentChat";
 
 type Sent = {
   messages?: Array<{ role: string; content: string }>;
@@ -1762,5 +1762,106 @@ describe("вкладка «Агент»", () => {
     expect(openSpy).toHaveBeenCalledWith("/api/ai/agent/sandbox/proxy/4100", "crm_sandbox_preview");
     expect(fakePreviewWin.location.href).toBe("/api/ai/agent/sandbox/proxy/4101");
     openSpy.mockRestore();
+  });
+
+  it("держит SSE-поток до 1200 с: не обрывает при активных кадрах дольше 120 с и рвёт ровно после 1200 с тишины", async () => {
+    expect(SSE_IDLE_TIMEOUT_MS).toBe(1_200_000);
+
+    // 1) Долгий ответ (> 400 с с паузами по 150 с между кадрами) НЕ обрывается на 120 с.
+    render(<AgentChat userName="Тест" />);
+    const textarea = await screen.findByPlaceholderText(/Например: открой ютуб/i);
+    await waitFor(() => expect((textarea as HTMLTextAreaElement).disabled).toBe(false));
+
+    const encoder = new TextEncoder();
+    let streamCtrl: ReadableStreamDefaultController<Uint8Array> | null = null;
+    sseResponder = () => {
+      const stream = new ReadableStream({
+        start(controller) {
+          streamCtrl = controller;
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      await act(async () => {
+        fireEvent.change(textarea, { target: { value: "Сделай тяжёлый проект" } });
+        fireEvent.click(screen.getByText("Запустить"));
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(streamCtrl).not.toBeNull();
+
+      // Через 150 с (> прежних 120 с) модель шлёт reasoning + status, таймер сбрасывается.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(150_000);
+        streamCtrl!.enqueue(
+          encoder.encode(
+            `event: reasoning\ndata: ${JSON.stringify({ text: "Анализирую модули проекта…" })}\n\n`,
+          ),
+        );
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(150_000);
+        streamCtrl!.enqueue(
+          encoder.encode(
+            `event: status\ndata: ${JSON.stringify({ text: "Модель формирует вызов sandbox_write_file…" })}\n\n`,
+          ),
+        );
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(150_000);
+        streamCtrl!.enqueue(encoder.encode('event: text\ndata: {"text":"Тяжёлый проект готов."}\n\n'));
+        streamCtrl!.enqueue(encoder.encode('event: done\ndata: {"steps":1}\n\n'));
+        streamCtrl!.close();
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(screen.getByText(/Тяжёлый проект готов\./i)).toBeTruthy();
+      expect(screen.queryByText(/Агент не отвечает/i)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // 2) При реальном отсутствии данных по SSE в течение 1200 с появляется ошибка.
+    let aborted = false;
+    sseResponder = (_url, init) => {
+      const stream = new ReadableStream({
+        start(controller) {
+          init?.signal?.addEventListener("abort", () => {
+            aborted = true;
+            try {
+              controller.error(new DOMException("Aborted", "AbortError"));
+            } catch {
+              // ignore
+            }
+          });
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    };
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      await act(async () => {
+        const nextBox = screen.getByPlaceholderText(/Например: открой ютуб/i);
+        fireEvent.change(nextBox, { target: { value: "Зависший запрос" } });
+        fireEvent.click(screen.getByText("Запустить"));
+        await vi.advanceTimersByTimeAsync(1_190_000);
+      });
+      expect(aborted).toBe(false);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(aborted).toBe(true);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(screen.getByText(/Агент не отвечает \(нет данных по SSE более 1200 с\)/i)).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

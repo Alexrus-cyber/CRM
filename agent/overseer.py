@@ -11,8 +11,11 @@
   1. Транслирует свой статус и живые размышления в SSE (`overseer_start`, `overseer_status`,
      `overseer_reasoning`, `overseer_done`).
   2. Обращается исключительно к человеку на сайте через `approval_fn` (`/api/ai/agent/approve`).
-  3. Не может быть отключён или обманут инструментами модели (детерминированные правила
+  3. Включённый Надсмотрщик не может быть обманут инструментами модели (детерминированные правила
      принудительно переводят подозрительные вызовы в `require_human`).
+  4. Если пользователь явно отключил Надсмотрщика в настройках (`enabled=False`),
+     Надсмотрщик полностью неактивен и не наблюдает за агентами; базовая изоляция
+     Sandbox при этом продолжает действовать на уровне `sandbox.py`.
 """
 
 from __future__ import annotations
@@ -536,24 +539,33 @@ def guard_tool_execution(
     static = analyze_static_security(tool_name, args_dict, sandbox_root)
 
     # Определяем, активен ли Надсмотрщик:
-    # - при переданном overseer_ctx ориентируемся на enabled (по умолчанию True);
-    # - даже если overseer_ctx не передан (например, прямой unit-вызов run_tool),
-    #   критические сигнатуры побега/опасных команд (flagged=True) для не-экспортных/не-native
-    #   инструментов всё равно перехватываются!
-    ctx_enabled = bool(ctx.get("enabled", True)) if ctx is not None else False
-    # Критические системные правила (побег из Sandbox / опасные команды) не могут быть выключены.
-    is_hard_sandbox_threat = bool(
-        static["flagged"]
-        and (
-            static["category"] in ("sandbox_escape", "secret_access", "privilege_escalation", "destructive")
-            or tool_name in ("pc_command",)
-        )
-    )
-    should_run = False
-    if is_hard_sandbox_threat:
-        should_run = True
-    elif ctx_enabled:
+    # - если передан overseer_ctx с enabled=False (пользователь выключил Надсмотрщика в настройках),
+    #   Надсмотрщик полностью выключен и НЕ следит за агентами (не эмитит события и не блокирует).
+    #   При этом физическая защита границ песочницы остаётся на уровне `sandbox.py` и `trust_level`.
+    # - если overseer_ctx не передан (None, прямой вызов извне без конфига), страхуем только критические угрозы.
+    if ctx is not None:
+        raw_enabled = ctx.get("enabled", True)
+        if isinstance(raw_enabled, bool):
+            ctx_enabled = raw_enabled
+        elif raw_enabled is None:
+            ctx_enabled = True
+        elif isinstance(raw_enabled, (int, float)):
+            ctx_enabled = raw_enabled != 0
+        else:
+            ctx_enabled = str(raw_enabled).strip().lower() not in ("false", "0", "no", "off", "")
+        if not ctx_enabled:
+            return {"humanApproved": False, "decision": None, "overseerMeta": None}
         should_run = bool(static["flagged"] or static["needs_ai_review"])
+    else:
+        ctx_enabled = False
+        is_hard_sandbox_threat = bool(
+            static["flagged"]
+            and (
+                static["category"] in ("sandbox_escape", "secret_access", "privilege_escalation", "destructive")
+                or tool_name in ("pc_command",)
+            )
+        )
+        should_run = is_hard_sandbox_threat
 
     if not should_run:
         return {"humanApproved": False, "decision": None, "overseerMeta": None}

@@ -1,7 +1,13 @@
 import { readFileSync } from "node:fs";
+import http from "node:http";
+import https from "node:https";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { assertSafeAgentUrl, isLoopbackHostname } from "./ssrf";
+
+const NATIVE_FETCH = globalThis.fetch;
+const UNDICI_DEFAULT_STREAM_TIMEOUT_MS = 300_000;
 
 function readLocalAgentTokenFile(port: number): string {
   try {
@@ -79,6 +85,151 @@ export function agentLoopbackCandidates(agentUrl: string): string[] {
   return out;
 }
 
+/**
+ * Прямой Node.js HTTP/HTTPS запрос без встроенного 300-секундного `headersTimeout` / `bodyTimeout`
+ * у undici `fetch()`, чтобы длинные SSE-потоки (> 300 с, например 1200+ с на тяжёлых проектах)
+ * не обрывались на стороне Next.js прокси.
+ */
+async function performLongTimeoutNodeRequest(
+  urlStr: string,
+  init: RequestInit,
+  timeoutMs: number,
+  signal?: AbortSignal | null,
+): Promise<Response> {
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException("Aborted", "AbortError");
+  }
+  const target = new URL(urlStr);
+  const isHttps = target.protocol === "https:";
+  const transport = isHttps ? https : http;
+  const method = (init.method ?? "GET").toUpperCase();
+
+  const outHeaders: Record<string, string> = {};
+  if (init.headers) {
+    new Headers(init.headers).forEach((value, key) => {
+      outHeaders[key] = value;
+    });
+  }
+
+  let bodyBuf: Buffer | string | undefined;
+  if (init.body !== undefined && init.body !== null) {
+    if (typeof init.body === "string") {
+      bodyBuf = init.body;
+    } else if (init.body instanceof Uint8Array) {
+      bodyBuf = Buffer.from(init.body);
+    } else if (init.body instanceof ArrayBuffer) {
+      bodyBuf = Buffer.from(init.body);
+    } else {
+      bodyBuf = String(init.body);
+    }
+    if (!Object.keys(outHeaders).some((k) => k.toLowerCase() === "content-length")) {
+      outHeaders["content-length"] = String(
+        typeof bodyBuf === "string" ? Buffer.byteLength(bodyBuf, "utf8") : bodyBuf.byteLength,
+      );
+    }
+  }
+
+  return await new Promise<Response>((resolve, reject) => {
+    let settled = false;
+    let activeIncoming: http.IncomingMessage | null = null;
+
+    const req = transport.request(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname.replace(/^\[|\]$/g, ""),
+        port: target.port ? Number(target.port) : isHttps ? 443 : 80,
+        path: `${target.pathname}${target.search}`,
+        method,
+        headers: outHeaders,
+        agent: false,
+      },
+      (res) => {
+        if (settled) {
+          res.resume();
+          return;
+        }
+        settled = true;
+        activeIncoming = res;
+        res.socket?.setNoDelay(true);
+        res.on("close", cleanupAbort);
+        res.on("end", cleanupAbort);
+
+        const respHeaders = new Headers();
+        for (const [key, rawVal] of Object.entries(res.headers)) {
+          if (rawVal === undefined) continue;
+          if (Array.isArray(rawVal)) {
+            for (const item of rawVal) respHeaders.append(key, item);
+          } else {
+            respHeaders.set(key, rawVal);
+          }
+        }
+        const status = res.statusCode ?? 502;
+        const noBody = method === "HEAD" || status === 204 || status === 304;
+        if (noBody) {
+          res.resume();
+        }
+        const webBody = noBody
+          ? null
+          : (Readable.toWeb(res) as unknown as ReadableStream<Uint8Array>);
+        resolve(
+          new Response(webBody, {
+            status,
+            statusText: res.statusMessage ?? "",
+            headers: respHeaders,
+          }),
+        );
+      },
+    );
+
+    const onAbort = () => {
+      const reason = signal?.reason ?? new DOMException("Aborted", "AbortError");
+      if (!settled) {
+        settled = true;
+        cleanupAbort();
+        req.destroy();
+        reject(reason);
+        return;
+      }
+      cleanupAbort();
+      req.destroy();
+      if (activeIncoming && !activeIncoming.destroyed) {
+        activeIncoming.destroy(reason instanceof Error ? reason : new Error("Aborted"));
+      }
+    };
+
+    const cleanupAbort = () => {
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    req.on("socket", (sock) => {
+      sock.setNoDelay(true);
+    });
+
+    req.setTimeout(timeoutMs, () => {
+      const err = new DOMException(`Agent request timed out after ${timeoutMs}ms`, "TimeoutError");
+      req.destroy(err);
+    });
+
+    req.on("error", (err) => {
+      if (!settled) {
+        settled = true;
+        cleanupAbort();
+        reject(err);
+      }
+    });
+
+    if (bodyBuf !== undefined) {
+      req.end(bodyBuf);
+    } else {
+      req.end();
+    }
+  });
+}
+
 export async function fetchAgent(
   agentUrl: string,
   pathAndQuery: string,
@@ -99,11 +250,28 @@ export async function fetchAgent(
         : options?.timeoutMs
           ? Math.min(options.timeoutMs, 2_000)
           : undefined;
-    const timeoutSig = perAttemptTimeout ? AbortSignal.timeout(perAttemptTimeout) : undefined;
+    const useLongNodeTransport =
+      typeof perAttemptTimeout === "number" &&
+      perAttemptTimeout > UNDICI_DEFAULT_STREAM_TIMEOUT_MS &&
+      globalThis.fetch === NATIVE_FETCH;
+    const timeoutSig =
+      !useLongNodeTransport && perAttemptTimeout ? AbortSignal.timeout(perAttemptTimeout) : undefined;
     const signal =
       options?.reqSignal && timeoutSig && typeof AbortSignal.any === "function"
         ? AbortSignal.any([options.reqSignal, timeoutSig])
         : (timeoutSig ?? options?.reqSignal ?? init.signal);
+
+    const doRequest = async (reqInit: RequestInit): Promise<Response> => {
+      if (useLongNodeTransport && perAttemptTimeout) {
+        return await performLongTimeoutNodeRequest(
+          `${endpoint}${pathAndQuery}`,
+          reqInit,
+          perAttemptTimeout,
+          signal,
+        );
+      }
+      return await fetch(`${endpoint}${pathAndQuery}`, reqInit);
+    };
 
     try {
       const auth = resolveAgentAuthToken(endpoint);
@@ -118,13 +286,14 @@ export async function fetchAgent(
         ...(hasHeaders ? { headers: reqHeaders } : {}),
         signal,
       };
-      let response = await fetch(`${endpoint}${pathAndQuery}`, reqInit);
+      let response = await doRequest(reqInit);
       if (response.status === 401 && !hasCallerAuth && auth.fromFile) {
         const refreshed = resolveAgentAuthToken(endpoint);
         if (refreshed.token && refreshed.token !== auth.token) {
+          await response.body?.cancel().catch(() => undefined);
           const retryHeaders = new Headers(init.headers);
           retryHeaders.set("Authorization", `Bearer ${refreshed.token}`);
-          response = await fetch(`${endpoint}${pathAndQuery}`, {
+          response = await doRequest({
             ...init,
             headers: retryHeaders,
             signal,

@@ -150,7 +150,7 @@ SUBAGENT_MAX_STEPS_TOTAL = _env_int("CRM_SUBAGENT_MAX_STEPS", 900, minimum=0)
 # Жёсткий дедлайн сеанса субагента (включая вложенные эскалации/каскад/request_subagent).
 SUBAGENT_SESSION_SECONDS = _env_int("CRM_SUBAGENT_SESSION_SECONDS", 1800, minimum=60)
 TIMEOUT = _env_int("AGENT_TIMEOUT", 180, minimum=5)
-HEADER_TIMEOUT = _env_int("AGENT_HEADER_TIMEOUT", 60, minimum=2)
+HEADER_TIMEOUT = _env_int("AGENT_HEADER_TIMEOUT", 120, minimum=2)
 SSE_WRITE_TIMEOUT = _env_int("AGENT_SSE_WRITE_TIMEOUT", 30, minimum=5)
 APPROVAL_TIMEOUT = _env_int("AGENT_APPROVAL_TIMEOUT", 600, minimum=10)
 AGENT_HTTP_TOKEN = (
@@ -2079,6 +2079,10 @@ def run_tool(
                 sandbox_mod.safe_resolve(sandbox_root, sandbox_proj, allow_root=True)
             except sandbox_mod.SandboxError as error:
                 raise AgentError(str(error)) from error
+        call_ctx = {
+            **(subagent_ctx or {}),
+            "session_deadline": time.monotonic() + SUBAGENT_SESSION_SECONDS,
+        }
         sub_res = run_subagent_session(
             target_ref=target_ref,
             summary=summary_txt,
@@ -2094,7 +2098,7 @@ def run_tool(
             github_ctx=github_ctx,
             unlimited=unlimited,
             tester_ctx=tester_ctx,
-            subagent_ctx=subagent_ctx,
+            subagent_ctx=call_ctx,
         )
         events.extend(sub_res.get("agentEvents") or [])
         return str(sub_res.get("agentText") or "Субагент завершил работу."), events
@@ -2113,6 +2117,10 @@ def run_tool(
         if not next_task_txt:
             raise AgentError("Укажите next_task — что должен сделать целевой субагент")
         caller_meta = (subagent_state or {}).get("subagent") if isinstance(subagent_state, dict) else None
+        req_ctx = {
+            **(subagent_ctx or {}),
+            "session_deadline": time.monotonic() + SUBAGENT_SESSION_SECONDS,
+        }
         sub_res = run_subagent_session(
             target_ref=target_ref,
             summary=summary_txt,
@@ -2128,7 +2136,7 @@ def run_tool(
             github_ctx=github_ctx,
             unlimited=unlimited,
             tester_ctx=tester_ctx,
-            subagent_ctx=subagent_ctx,
+            subagent_ctx=req_ctx,
         )
         events.extend(sub_res.get("agentEvents") or [])
         return str(sub_res.get("agentText") or "Целевой субагент завершил работу."), events
@@ -3527,6 +3535,17 @@ def _fit_request_to_context(
     return work_messages, work_payload, info
 
 
+def _adaptive_stream_emit_interval(char_len: int) -> float:
+    """Адаптивный интервал отправки промежуточных reasoning/text кадров по SSE."""
+    if char_len < 4_000:
+        return 0.2
+    if char_len < 24_000:
+        return 0.5
+    if char_len < 80_000:
+        return 1.0
+    return 1.5
+
+
 def call_model(
     base_url: str,
     api_key: str,
@@ -3727,6 +3746,8 @@ def call_model(
                     raw_lines: List[str] = []
                     content_parts: List[str] = []
                     reasoning_parts: List[str] = []
+                    reason_chars = 0
+                    content_chars = 0
                     tool_calls_map: Dict[int, Dict[str, Any]] = {}
                     in_think = False
                     tag_buf = ""
@@ -3846,8 +3867,12 @@ def call_model(
                             if isinstance(r_piece, str) and r_piece:
                                 got_meaningful = True
                                 reasoning_parts.append(r_piece)
+                                reason_chars += len(r_piece)
                                 now = time.monotonic()
-                                if on_reasoning and (last_reason_emit == 0.0 or now - last_reason_emit >= 0.2):
+                                if on_reasoning and (
+                                    last_reason_emit == 0.0
+                                    or now - last_reason_emit >= _adaptive_stream_emit_interval(reason_chars)
+                                ):
                                     last_reason_emit = now
                                     on_reasoning("".join(reasoning_parts))
 
@@ -3857,14 +3882,26 @@ def call_model(
                                 c_out, t_out, in_think, tag_buf = _process_stream_think_chunk(c_piece, in_think, tag_buf)
                                 if t_out:
                                     reasoning_parts.append(t_out)
+                                    reason_chars += len(t_out)
                                     now = time.monotonic()
-                                    if on_reasoning and (last_reason_emit == 0.0 or now - last_reason_emit >= 0.2):
+                                    if on_reasoning and (
+                                        last_reason_emit == 0.0
+                                        or now - last_reason_emit >= _adaptive_stream_emit_interval(reason_chars)
+                                    ):
                                         last_reason_emit = now
                                         on_reasoning("".join(reasoning_parts))
                                 if c_out:
                                     content_parts.append(c_out)
+                                    content_chars += len(c_out)
                                     now = time.monotonic()
-                                    if on_text and not tool_calls_map and (last_text_emit == 0.0 or now - last_text_emit >= 0.2):
+                                    if (
+                                        on_text
+                                        and not tool_calls_map
+                                        and (
+                                            last_text_emit == 0.0
+                                            or now - last_text_emit >= _adaptive_stream_emit_interval(content_chars)
+                                        )
+                                    ):
                                         last_text_emit = now
                                         on_text("".join(content_parts))
 
@@ -6033,6 +6070,7 @@ def _generate_subagent_handoff_summary(
     last_thinking: str = "",
     task: str = "",
     context_limit: int = 0,
+    on_status: Optional[Callable[[str], None]] = None,
     cancel_check: Optional[Any] = None,
 ) -> Tuple[str, Dict[str, int]]:
     fallback = _build_fallback_handoff_summary(
@@ -6082,6 +6120,7 @@ def _generate_subagent_handoff_summary(
             summary_msgs,
             None,
             params,
+            on_status=on_status,
             context_limit=context_limit,
             cancel_check=cancel_check,
         )
@@ -6433,6 +6472,7 @@ def run_subagent_session(
         **ctx,
         "chain_depth": chain_depth + 1,
     }
+    deadline_state = {"deadline": session_deadline}
 
     handoff_steps_threshold = max(1, int(ctx.get("handoff_steps") or SUBAGENT_HANDOFF_STEPS))
     use_tools = True
@@ -6475,9 +6515,14 @@ def run_subagent_session(
                 "actor": "approval",
             },
         )
+        wait_started = time.monotonic()
         try:
             return approval_fn(enriched_req)
         finally:
+            if deadline_state["deadline"] > 0:
+                waited_sec = max(0.0, time.monotonic() - wait_started)
+                deadline_state["deadline"] += waited_sec
+                nested_subagent_ctx["session_deadline"] = deadline_state["deadline"]
             _emit(
                 "subagent_status",
                 {
@@ -6494,7 +6539,8 @@ def run_subagent_session(
 
     try:
         while steps_cap == 0 or steps < steps_cap:
-            if session_deadline and time.monotonic() > session_deadline:
+            cur_deadline = deadline_state["deadline"]
+            if cur_deadline and time.monotonic() > cur_deadline:
                 run_error = (
                     f"Превышен лимит времени сеанса субагента "
                     f"({max(1, SUBAGENT_SESSION_SECONDS // 60)} мин) — работа остановлена, "
@@ -6520,21 +6566,39 @@ def run_subagent_session(
                 },
             )
 
+            sub_live_emit_state = {"reason_at": 0.0, "text_at": 0.0}
+
             def _on_sub_reasoning(piece: str) -> None:
                 combined = ((sub_thinking + "\n\n" if sub_thinking else "") + piece).strip()
-                if combined:
-                    _emit(
-                        "subagent_reasoning",
-                        {"runKey": run_key, "subagentId": sub_id, "text": combined, "step": steps},
-                    )
+                if not combined:
+                    return
+                now_e = time.monotonic()
+                if (
+                    sub_live_emit_state["reason_at"] > 0.0
+                    and now_e - sub_live_emit_state["reason_at"] < _adaptive_stream_emit_interval(len(combined))
+                ):
+                    return
+                sub_live_emit_state["reason_at"] = now_e
+                _emit(
+                    "subagent_reasoning",
+                    {"runKey": run_key, "subagentId": sub_id, "text": combined, "step": steps},
+                )
 
             def _on_sub_content(piece: str) -> None:
                 cleaned = piece.strip()
-                if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
-                    _emit(
-                        "subagent_text",
-                        {"runKey": run_key, "subagentId": sub_id, "text": cleaned, "step": steps},
-                    )
+                if not cleaned or cleaned.startswith("{") or cleaned.startswith("```json"):
+                    return
+                now_e = time.monotonic()
+                if (
+                    sub_live_emit_state["text_at"] > 0.0
+                    and now_e - sub_live_emit_state["text_at"] < _adaptive_stream_emit_interval(len(cleaned))
+                ):
+                    return
+                sub_live_emit_state["text_at"] = now_e
+                _emit(
+                    "subagent_text",
+                    {"runKey": run_key, "subagentId": sub_id, "text": cleaned, "step": steps},
+                )
 
             use_tools_for_step = use_tools and not force_no_tools_next
             force_no_tools_next = False
@@ -6950,6 +7014,18 @@ def run_subagent_session(
                     last_thinking=sub_thinking,
                     task=task or summary,
                     context_limit=discovered_max_context,
+                    on_status=lambda msg_s: _emit(
+                        "subagent_status",
+                        {
+                            "runKey": run_key,
+                            "subagentId": sub_id,
+                            "subagentName": sub_name,
+                            "text": f"Субагент «{sub_name}» (перенос чата): {msg_s}",
+                            "source": "subagent",
+                            "actor": "subagent",
+                            "step": step_in_chat,
+                        },
+                    ),
                     cancel_check=cancel_check,
                 )
                 sub_usage_prompt += h_usage["prompt"]
@@ -7640,6 +7716,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "CrmAgent/2.0"
     protocol_version = "HTTP/1.1"
     timeout = 30.0
+    disable_nagle_algorithm = True
 
     def _is_authorized(self) -> bool:
         expected = _expected_http_token(getattr(self, "server", None))
@@ -8278,14 +8355,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
     def _try_write_keepalive(self, chunk: bytes = b": keepalive\n\n") -> bool:
-        if getattr(self, "_client_disconnected", False):
+        if getattr(self, "_client_disconnected", False) or getattr(self, "wfile", None) is None:
             return False
         lock = self._get_write_lock()
         if not lock.acquire(timeout=0.15):
             # Основной поток прямо сейчас отправляет данные — не встаём в очередь за lock.
             return not getattr(self, "_client_disconnected", False)
         try:
-            if getattr(self, "_client_disconnected", False):
+            if getattr(self, "_client_disconnected", False) or getattr(self, "wfile", None) is None:
                 return False
             self._ensure_sse_socket_timeout()
             self.wfile.write(chunk)
@@ -8312,6 +8389,18 @@ class Handler(BaseHTTPRequestHandler):
 
     @contextlib.contextmanager
     def _sse_keepalive(self, interval: float = 2.0):
+        depth = int(getattr(self, "_keepalive_depth", 0) or 0)
+        if depth > 0:
+            self._keepalive_depth = depth + 1
+            try:
+                yield
+            finally:
+                self._keepalive_depth = max(0, int(getattr(self, "_keepalive_depth", 1)) - 1)
+            return
+        if getattr(self, "wfile", None) is None:
+            yield
+            return
+        self._keepalive_depth = 1
         stop_ev = threading.Event()
 
         def _beat() -> None:
@@ -8328,6 +8417,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             stop_ev.set()
             th.join(timeout=0.5)
+            self._keepalive_depth = 0
 
     def await_website_approval(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         approval_id = str(payload.get("approvalId") or uuid.uuid4().hex)
@@ -8430,8 +8520,17 @@ class Handler(BaseHTTPRequestHandler):
             if overseer_unlocked
             else orch_model
         )
+        raw_ov_enabled = raw_overseer.get("enabled", True)
+        if isinstance(raw_ov_enabled, bool):
+            ov_enabled = raw_ov_enabled
+        elif raw_ov_enabled is None:
+            ov_enabled = True
+        elif isinstance(raw_ov_enabled, (int, float)):
+            ov_enabled = raw_ov_enabled != 0
+        else:
+            ov_enabled = str(raw_ov_enabled).strip().lower() not in ("false", "0", "no", "off", "")
         overseer_cfg: Dict[str, Any] = {
-            "enabled": raw_overseer.get("enabled", True) is not False,
+            "enabled": ov_enabled,
             "mode": str(raw_overseer.get("mode") or "strict").strip().lower(),
             "systemPrompt": str(raw_overseer.get("systemPrompt") or "").strip(),
             "unlockApi": overseer_unlocked,
@@ -8759,7 +8858,9 @@ class Handler(BaseHTTPRequestHandler):
             "cancel_check": _is_disconnected,
             "chain_depth": 1 if agent_role == "subagent" else 0,
             "subagent_max_steps": SUBAGENT_MAX_STEPS_TOTAL,
-            "session_deadline": time.monotonic() + SUBAGENT_SESSION_SECONDS,
+            # Для Главного Агента (Оркестратора) общий session_deadline не выставляется на весь запрос:
+            # каждый субагент получает свой 30-минутный бюджет времени с момента своего запуска.
+            "session_deadline": (time.monotonic() + SUBAGENT_SESSION_SECONDS) if agent_role == "subagent" else None,
             "overseer_ctx": overseer_ctx,
             "tester_ctx": tester_ctx,
             "written_projects": set(),
@@ -8857,6 +8958,9 @@ class Handler(BaseHTTPRequestHandler):
             raw_token_cap = 0
         run_token_cap = 0 if unlimited_role else (raw_token_cap if raw_token_cap > 0 else MAX_RUN_TOKENS)
 
+        _run_ka = self._sse_keepalive()
+        _run_ka.__enter__()
+        _run_ka_exc: Any = (None, None, None)
         try:
             while steps_limit == 0 or steps < steps_limit:
                 if _is_disconnected():
@@ -8891,28 +8995,45 @@ class Handler(BaseHTTPRequestHandler):
                     f"{role_label} шаг {steps}: запрос к модели "
                     f"(msgs={len(messages)}, imgs={_count_message_images(messages)})"
                 )
+                live_emit_state = {"reason_at": 0.0, "text_at": 0.0}
 
                 def _emit_live_reasoning(step_reasoning: str) -> None:
                     combined = ((thinking + "\n\n" if thinking else "") + step_reasoning).strip()
-                    if combined:
-                        self.write(
-                            sse(
-                                {
-                                    "text": combined,
-                                    "actor": (
-                                        "subagent_llm"
-                                        if agent_role == "subagent"
-                                        else ("tester_llm" if agent_role == "tester" else "agent_llm")
-                                    ),
-                                },
-                                "reasoning",
-                            )
+                    if not combined:
+                        return
+                    now_e = time.monotonic()
+                    if (
+                        live_emit_state["reason_at"] > 0.0
+                        and now_e - live_emit_state["reason_at"] < _adaptive_stream_emit_interval(len(combined))
+                    ):
+                        return
+                    live_emit_state["reason_at"] = now_e
+                    self.write(
+                        sse(
+                            {
+                                "text": combined,
+                                "actor": (
+                                    "subagent_llm"
+                                    if agent_role == "subagent"
+                                    else ("tester_llm" if agent_role == "tester" else "agent_llm")
+                                ),
+                            },
+                            "reasoning",
                         )
+                    )
 
                 def _emit_live_text(step_text: str) -> None:
                     cleaned = step_text.strip()
-                    if cleaned and not cleaned.startswith("{") and not cleaned.startswith("```json"):
-                        self.write(sse({"text": cleaned}, "text"))
+                    if not cleaned or cleaned.startswith("{") or cleaned.startswith("```json"):
+                        return
+                    now_e = time.monotonic()
+                    if (
+                        live_emit_state["text_at"] > 0.0
+                        and now_e - live_emit_state["text_at"] < _adaptive_stream_emit_interval(len(cleaned))
+                    ):
+                        return
+                    live_emit_state["text_at"] = now_e
+                    self.write(sse({"text": cleaned}, "text"))
 
                 step_forced_no_tools = force_no_tools_next
                 use_tools_for_step = use_tools and not step_forced_no_tools
@@ -9497,6 +9618,17 @@ class Handler(BaseHTTPRequestHandler):
                         last_thinking=thinking,
                         task=str(incoming[-1].get("content") or "") if incoming else "",
                         context_limit=discovered_max_context,
+                        on_status=lambda msg_s: self.write(
+                            sse(
+                                {
+                                    "text": f"Перенос чата субагента «{sub_disp_name}»: {msg_s}",
+                                    "source": "subagent",
+                                    "actor": "subagent",
+                                    "step": steps,
+                                },
+                                "status",
+                            )
+                        ),
                         cancel_check=_is_disconnected,
                     )
                     usage_prompt += h_usage["prompt"]
@@ -9509,7 +9641,11 @@ class Handler(BaseHTTPRequestHandler):
                         f"Сформировано summary для автоматического продолжения в новом чате:\n\n{h_sum}"
                     )
                     break
+        except BaseException as _exc_ka:
+            _run_ka_exc = (type(_exc_ka), _exc_ka, _exc_ka.__traceback__)
+            raise
         finally:
+            _run_ka.__exit__(*_run_ka_exc)
             if browser_mgr is not None:
                 browser_mgr.close_all()
 

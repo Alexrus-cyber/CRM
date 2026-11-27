@@ -727,7 +727,14 @@ export async function POST(req: Request) {
     const lines = frame.split(/\r?\n/);
     const evLine = lines.find((l) => l.startsWith("event:"));
     const dataLines = lines.filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart());
-    if (dataLines.length === 0) return `${frame}\n\n`;
+    if (dataLines.length === 0) {
+      for (const [rk, mappedSub] of activeSubagentRuns) {
+        if (!closedSubagentRuns.has(rk)) {
+          touchRunHeartbeat(rk, mappedSub.runId);
+        }
+      }
+      return `${frame}\n\n`;
+    }
     const ev = evLine ? evLine.slice(6).trim() : "message";
     try {
       const parsed = JSON.parse(dataLines.join("\n").trim()) as Record<string, unknown>;

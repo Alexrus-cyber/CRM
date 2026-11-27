@@ -214,9 +214,27 @@ export async function getRequestUser(req: Request): Promise<SafeUser | null> {
   return getCurrentUser();
 }
 
+async function readBearerTokenFromHeaders(): Promise<string> {
+  try {
+    const hdrs = await headers();
+    const auth = hdrs.get("authorization") ?? "";
+    const match = auth.match(/^Bearer\s+(.+)$/i);
+    return match ? match[1].trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 export async function getCurrentSessionToken(): Promise<string | null> {
-  const store = await cookies();
-  return store.get(SESSION_COOKIE)?.value ?? null;
+  try {
+    const store = await cookies();
+    const cookieToken = store.get(SESSION_COOKIE)?.value;
+    if (cookieToken) return cookieToken;
+  } catch {
+    /* в тестах или вне request-контекста cookies() может быть недоступен */
+  }
+  const bearer = await readBearerTokenFromHeaders();
+  return bearer || null;
 }
 
 export async function destroySession() {
@@ -229,8 +247,16 @@ export async function destroySession() {
 }
 
 export const getCurrentUser = cache(async (): Promise<SafeUser | null> => {
-  const store = await cookies();
-  const token = store.get(SESSION_COOKIE)?.value;
+  let token = "";
+  try {
+    const store = await cookies();
+    token = store.get(SESSION_COOKIE)?.value ?? "";
+  } catch {
+    token = "";
+  }
+  if (!token) {
+    token = await readBearerTokenFromHeaders();
+  }
   if (!token) return null;
   const found = await findSessionUser(token);
   if (!found) return null;
