@@ -830,3 +830,109 @@ html:not(.dark) .alert-error { color: #b91c1c; }
   background: rgba(245, 158, 11, 0.1);
   color: var(--amber);
 }
+
+/* Модальные диалоги подтверждения и переименования */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(5, 5, 12, 0.72);
+  backdrop-filter: blur(4px);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+}
+.modal-card {
+  width: 100%;
+  max-width: 440px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 18px 20px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+}
+.modal-title {
+  font-size: 15px;
+  font-weight: 700;
+  margin: 0 0 8px;
+}
+.modal-body {
+  font-size: 12.5px;
+  color: var(--muted);
+  margin-bottom: 14px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* Поиск по чатам и кнопки действий в списке */
+.search-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.search-wrap .input {
+  padding-right: 26px;
+}
+.search-clear {
+  position: absolute;
+  right: 6px;
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 5px;
+}
+.search-clear:hover {
+  color: var(--text);
+}
+.list-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* Карточки скачиваемых файлов и шаги субагентов */
+.file-dl-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 8px;
+}
+.file-dl-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(6, 182, 212, 0.45);
+  background: rgba(6, 182, 212, 0.12);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+  transition: all 0.14s ease;
+}
+.file-dl-btn:hover {
+  border-color: var(--cyan);
+  background: rgba(6, 182, 212, 0.22);
+}
+.subagent-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+  padding-left: 8px;
+  border-left: 2px solid rgba(124, 92, 255, 0.35);
+  font-size: 11px;
+}
+
